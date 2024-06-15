@@ -1,0 +1,230 @@
+\documentclass[11pt]{article}
+\usepackage{shared/luxcover}
+\usepackage{amsmath, amssymb, algpseudocode, graphicx, hyperref, booktabs}
+
+\title{Cryptographic Agility Architecture for Long-Lived Blockchain Systems}
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+\date{2024}
+
+\usepackage{amsthm}
+\newtheorem{definition}{Definition}
+\newtheorem{theorem}{Theorem}
+\begin{document}
+\luxcoverpage
+
+\begin{abstract}
+Long-lived blockchain systems face a fundamental tension: cryptographic primitives have finite lifespans, but blockchain state is permanent. We present Lux Network's cryptographic agility architecture, enabling live rotation of signature schemes, hash functions, and key encapsulation mechanisms without chain halts, state migration, or consensus forks. The design introduces versioned key schedules, algorithm negotiation at the validator handshake layer, and a hybrid classical--post-quantum transition path that preserves backward verification of historical blocks while enforcing forward security for new ones. We describe the wire protocol extensions, the key schedule versioning scheme, and the operational procedures for executing a primitive rotation across a live validator set. The architecture has been deployed on Lux mainnet to migrate from ECDSA to hybrid BLS+ML-DSA without downtime.
+\end{abstract}
+
+\section{Introduction}
+
+Cryptographic algorithms are not permanent. Advances in cryptanalysis, hardware capability, and standardization regularly obsolete primitives that were considered secure at deployment time. For ephemeral systems, this is manageable: rotate keys, update libraries, redeploy. For blockchains, the problem is structural. Every historical block is signed with the primitive that was current at its creation time. Validators must verify the entire chain, which means they must support every primitive ever used.
+
+Lux Network's multi-chain architecture---spanning C-Chain (EVM), Q-Chain (platform management), X-Chain (DAG assets), and application-specific subnets---amplifies this challenge. Each chain may adopt new primitives on independent timelines, and cross-chain messages (Warp, Teleport) must remain verifiable across primitive boundaries.
+
+This paper describes the cryptographic agility layer embedded in Lux's ZAP wire protocol \cite{zap-wire} and consensus stack \cite{quasar}, enabling:
+\begin{enumerate}
+\item Algorithm negotiation during peer handshake without breaking existing connections.
+\item Versioned key schedules that bind algorithm identifiers to epoch ranges.
+\item Hybrid classical+PQ signing during transition periods.
+\item Migration procedures that require no chain halt and no state export/import.
+\end{enumerate}
+
+\subsection{Threat Model}
+
+We assume an adversary who can:
+\begin{itemize}
+\item Harvest ciphertexts today for future quantum decryption (harvest-now-decrypt-later).
+\item Exploit implementation vulnerabilities in deprecated primitives.
+\item Observe the timing and structure of algorithm transitions to mount downgrade attacks.
+\end{itemize}
+
+The goal is to ensure that no single primitive compromise---past, present, or future---invalidates the chain's integrity guarantees.
+
+\section{Architecture}
+
+\subsection{Algorithm Registry}
+
+Every cryptographic primitive used in Lux is registered in a global algorithm registry with a unique identifier, version, status, and security classification.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Algorithm ID} & \textbf{Primitive} & \textbf{Status} & \textbf{Security} \\
+\midrule
+\texttt{SIG\_ECDSA\_SECP256K1} & ECDSA (secp256k1) & Deprecated & 128-bit classical \\
+\texttt{SIG\_BLS12\_381} & BLS (BLS12-381) & Active & 128-bit classical \\
+\texttt{SIG\_MLDSA\_65} & ML-DSA-65 (FIPS 204) & Active & 128-bit PQ \\
+\texttt{SIG\_RINGTAIL} & Ringtail threshold & Active & 128-bit PQ \\
+\texttt{HASH\_SHA256} & SHA-256 & Active & 128-bit classical \\
+\texttt{HASH\_SHA3\_256} & SHA3-256 & Active & 128-bit classical \\
+\texttt{KEM\_MLKEM\_768} & ML-KEM-768 (FIPS 203) & Active & 128-bit PQ \\
+\bottomrule
+\end{tabular}
+\caption{Excerpt from the Lux algorithm registry.}
+\label{tab:registry}
+\end{table}
+
+Each algorithm transitions through four lifecycle states: \texttt{CANDIDATE} $\to$ \texttt{ACTIVE} $\to$ \texttt{DEPRECATED} $\to$ \texttt{REJECTED}. A governance proposal on Q-Chain triggers state transitions. Validators enforce that blocks produced after a deprecation epoch do not use deprecated primitives for new signatures, while still accepting them for historical verification.
+
+\subsection{Versioned Key Schedules}
+
+A \textbf{key schedule} binds a set of algorithm identifiers to an epoch range. Each validator maintains keys for all active schedules simultaneously.
+
+\begin{definition}[Key Schedule]
+A key schedule $\mathcal{K}_v = (\text{epoch}_{\text{start}}, \text{epoch}_{\text{end}}, \text{sig}, \text{hash}, \text{kem})$ specifies the algorithms a validator $v$ uses for signing, hashing, and key encapsulation during epochs $[\text{epoch}_{\text{start}}, \text{epoch}_{\text{end}})$.
+\end{definition}
+
+During a transition, two key schedules overlap. Validators sign blocks with both the outgoing and incoming signature schemes. Verifiers accept a block if \emph{either} signature is valid during the overlap window, and \emph{only} the new signature after the overlap closes.
+
+\begin{algorithmic}[1]
+\State \textbf{function} \textsc{VerifyBlockSignature}(block, epoch)
+\State $schedule \gets \text{KeyScheduleForEpoch}(epoch)$
+\If{$schedule.\text{isTransition}$}
+    \State \Return $\text{Verify}(block, schedule.\text{outgoing}) \lor \text{Verify}(block, schedule.\text{incoming})$
+\Else
+    \State \Return $\text{Verify}(block, schedule.\text{current})$
+\EndIf
+\State \textbf{end function}
+\end{algorithmic}
+
+\subsection{Algorithm Negotiation in ZAP Handshake}
+
+The ZAP wire protocol \cite{zap-wire} handshake is extended with an \texttt{AlgorithmSet} field. During connection establishment, peers exchange their supported algorithm sets and select the strongest mutually supported configuration.
+
+\begin{verbatim}
+ZAP Handshake Extension:
+  AlgorithmSet {
+    signatures: [SIG_BLS12_381, SIG_MLDSA_65]
+    hashes:     [HASH_SHA3_256, HASH_SHA256]
+    kems:       [KEM_MLKEM_768]
+    min_epoch:  current_epoch - 1
+  }
+\end{verbatim}
+
+Peers that do not support the minimum required algorithm set for the current epoch are rejected. This prevents downgrade attacks where an adversary forces a connection to use a weaker primitive.
+
+\subsection{Hybrid Classical--Post-Quantum Signing}
+
+During the transition from classical to post-quantum signatures, Lux uses a hybrid approach: each block carries both a classical (BLS) and a post-quantum (ML-DSA or Ringtail) signature. This is the foundation of Quasar's triple-proof finality \cite{quasar}.
+
+The hybrid signature is not a concatenation but a structured composite:
+
+\begin{align}
+\sigma_{\text{hybrid}} &= (\sigma_{\text{classical}}, \sigma_{\text{PQ}}, \text{binding}) \\
+\text{binding} &= H(\sigma_{\text{classical}} \| \sigma_{\text{PQ}} \| \text{epoch})
+\end{align}
+
+The binding hash prevents an attacker from stripping one signature component without detection.
+
+\section{Migration Procedure}
+
+A primitive rotation follows a four-phase protocol:
+
+\begin{enumerate}
+\item \textbf{Proposal} (epoch $e$): A governance transaction on Q-Chain proposes the new algorithm, specifying the overlap window length.
+\item \textbf{Key Distribution} (epochs $e+1$ to $e+k$): Validators generate and register new keys for the incoming algorithm. For threshold schemes, this requires a DKG round.
+\item \textbf{Overlap} (epochs $e+k+1$ to $e+k+w$): Both old and new algorithms are accepted. Validators sign with both. Monitoring tracks adoption percentage.
+\item \textbf{Cutover} (epoch $e+k+w+1$): The old algorithm moves to \texttt{DEPRECATED}. Only new-algorithm signatures are accepted for new blocks. Historical verification continues to accept old signatures.
+\end{enumerate}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Phase} & \textbf{Duration} & \textbf{Validator Action} \\
+\midrule
+Proposal & 1 epoch & Vote on governance transaction \\
+Key Distribution & $k$ epochs & Generate + register new keys \\
+Overlap & $w$ epochs & Dual-sign all blocks \\
+Cutover & 1 epoch & Drop old signing path \\
+\bottomrule
+\end{tabular}
+\caption{Migration phases. Typical values: $k=10$, $w=100$ epochs.}
+\label{tab:migration}
+\end{table}
+
+No chain halt occurs at any phase. Validators that fail to generate new keys by the cutover epoch are excluded from the active set until they comply.
+
+\section{Cross-Chain Considerations}
+
+Warp messages and Teleport transfers carry signatures from the source chain's current key schedule. The receiving chain must maintain a registry of valid key schedules per source chain to verify cross-chain messages produced during any epoch.
+
+\begin{algorithmic}[1]
+\State \textbf{function} \textsc{VerifyWarpMessage}(msg, sourceChain)
+\State $epoch \gets msg.\text{sourceEpoch}$
+\State $schedule \gets \text{SourceKeySchedule}(sourceChain, epoch)$
+\State \Return $\text{VerifyAggregate}(msg.\text{signature}, schedule.\text{algorithm})$
+\State \textbf{end function}
+\end{algorithmic}
+
+This requires that receiving chains track source chain key schedule transitions. Q-Chain broadcasts key schedule updates as Warp messages to all registered chains.
+
+\section{Security Analysis}
+
+\begin{theorem}[No Downgrade]
+An adversary controlling $< n/3$ validators cannot force the network to accept a block signed with a deprecated algorithm after the cutover epoch.
+\end{theorem}
+
+\begin{proof}
+Block acceptance requires $\geq 2n/3$ valid signatures under the current key schedule. Since honest validators ($> 2n/3$) reject deprecated-algorithm signatures after cutover, no block using only the old algorithm can achieve quorum.
+\end{proof}
+
+\begin{theorem}[Historical Integrity]
+Deprecating an algorithm does not invalidate previously finalized blocks.
+\end{theorem}
+
+\begin{proof}
+Verification dispatches on the epoch embedded in the block header. Blocks produced during epoch $e$ are verified against the key schedule active at $e$, regardless of the current schedule. The algorithm registry retains verification-only support for deprecated algorithms indefinitely.
+\end{proof}
+
+\section{Conclusion}
+
+Cryptographic agility is not optional for systems expected to operate across decades. Lux's architecture treats primitive rotation as a first-class operational concern, with versioned key schedules, negotiated handshakes, and structured hybrid signatures providing a migration path that requires no downtime, no state export, and no consensus fork. The same mechanism that enabled the ECDSA-to-BLS transition now supports the classical-to-PQ transition via Quasar's triple-proof finality \cite{quasar}.
+
+\begin{thebibliography}{99}
+
+\bibitem{quasar}
+Kelling, Z. (2025).
+\textit{Quasar: Quantum-Secure Multi-Engine Consensus with Triple-Proof Quantum Finality}.
+Lux Industries Research.
+
+\bibitem{zap-wire}
+Kelling, Z. (2023).
+\textit{ZAP: A Binary Wire Protocol for Sub-Microsecond Serialization}.
+Lux Industries Research.
+
+\bibitem{nist-pqc}
+NIST (2024).
+\textit{Post-Quantum Cryptography Standardization: FIPS 203, 204, 205}.
+National Institute of Standards and Technology.
+
+\bibitem{pq-suite}
+Kelling, Z. (2024).
+\textit{Post-Quantum Cryptographic Suite for Blockchain Infrastructure}.
+Lux Industries Research.
+
+\bibitem{ringtail}
+Kelling, Z. (2024).
+\textit{Ringtail: Lattice-Based Threshold Signatures for Validator Networks}.
+Lux Industries Research.
+
+\bibitem{mosca2018}
+Mosca, M. (2018).
+\textit{Cybersecurity in an Era with Quantum Computers}.
+IEEE Security \& Privacy, 16(5), 38--41.
+
+\bibitem{barker2020}
+Barker, E. \& Roginsky, A. (2020).
+\textit{Transitioning the Use of Cryptographic Algorithms and Key Lengths}.
+NIST SP 800-131A Rev. 2.
+
+\end{thebibliography}
+
+\end{document}
