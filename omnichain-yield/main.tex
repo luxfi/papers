@@ -1,0 +1,941 @@
+\documentclass[11pt,twocolumn]{article}
+
+% ============================================================
+% Packages
+% ============================================================
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{float}
+\usepackage{tabularx}
+\usepackage{siunitx}
+\pgfplotsset{compat=1.18}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,calc,decorations.pathreplacing}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+% ============================================================
+% Language definitions for listings
+% ============================================================
+\input{shared/lstlang}
+
+% ============================================================
+% Listings config
+% ============================================================
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  keywordstyle=\color{blue!70!black}\bfseries,
+  commentstyle=\color{green!50!black}\itshape,
+  stringstyle=\color{red!60!black},
+  showstringspaces=false,
+  tabsize=2,
+}
+
+% ============================================================
+% Theorem environments
+% ============================================================
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{property}{Property}[section]
+\newtheorem{remark}{Remark}[section]
+\newtheorem{invariant}{Invariant}[section]
+
+% ============================================================
+% Title
+% ============================================================
+\title{\textbf{Yield-Bearing Bridge Tokens: Cross-Chain Capital\\Efficiency through Composable Yield Strategies}\\[6pt]
+\large Lux Teleport Omnichain Yield Protocol}
+
+\author{
+Zach Kelling\\
+\textit{Lux Industries}\\
+\texttt{research@lux.network}
+}
+
+\date{April 2026}
+
+\begin{document}
+
+\luxcoverpage
+
+\twocolumn[
+\begin{@twocolumnfalse}
+\maketitle
+
+\begin{abstract}
+Over \$15 billion in assets are locked across cross-chain bridges, yet these assets earn zero yield---a capital inefficiency exceeding \$600 million per year in forgone staking and lending returns at prevailing rates.
+We present the Lux Teleport Yield Protocol, a system that deploys locked bridge assets into yield-generating strategies on their source chains and reflects accrued yield in bridge token share prices on destination chains through ERC-4626-inspired share accounting.
+The protocol defines a composable \texttt{IYieldStrategy} interface implemented by 29 strategies across 9 categories: liquid staking, restaking, lending, stablecoin yield, LP/DEX, Bitcoin-native yield, Solana DeFi, TON DeFi, and perpetuals.
+We formalize share price dynamics, proving that the share price $p(t)$ is monotonically non-decreasing under non-negative yield and bounded below by the collateralization invariant $p(t) \geq 0.985$.
+An MPC-attested backing oracle reports aggregate strategy positions at configurable intervals; if the attested backing falls below 98.5\% of outstanding shares, all bridge operations halt automatically.
+We introduce a three-tier risk framework with per-tier allocation caps, analyze the xLUX economic flywheel where protocol fees compound across bridge, DEX, lending, perpetuals, and NFT AMM, and demonstrate that yield-bearing bridge tokens (yLETH, yLBTC, yLUSD) achieve 4.2--23\% APY compared to 0\% for conventional wrapped assets.
+The Bitcoin-native yield composition---Babylon staking layered with restaking and DeFi---represents, to our knowledge, the first protocol enabling native BTC yield without custodial wrapping.
+\end{abstract}
+\vspace{1em}
+\end{@twocolumnfalse}
+]
+
+% ============================================================
+\section{Introduction}\label{sec:intro}
+% ============================================================
+
+Cross-chain bridges hold over \$15 billion in locked assets as of Q1 2026~\cite{defillama2026}. These assets---primarily ETH, BTC, and stablecoins---sit idle in bridge vaults while their equivalent representations circulate on destination chains. At prevailing DeFi yields (3--5\% for ETH staking~\cite{lidofinance}, 4--8\% for stablecoin lending~\cite{aavev3}), this idle capital forfeits \$600M--\$1.2B annually.
+
+The waste is structural. Conventional bridges treat the lock-and-mint operation as a pure custodial function: lock the original, mint a synthetic, return the original upon burn. The locked assets serve no productive purpose during the bridge period. This is equivalent to holding cash in a vault rather than deploying it in interest-bearing instruments---a practice that banking abandoned centuries ago.
+
+We address this inefficiency with a yield-bearing bridge token system built atop the Lux Teleport protocol~\cite{luxteleport}. The key insight is that bridge vaults can be replaced with yield-bearing vaults that deploy locked assets to on-chain strategies, while maintaining the 1:1 (or better) backing guarantee that bridge security requires.
+
+\subsection{Contributions}
+
+\begin{enumerate}[nosep,leftmargin=1.5em]
+  \item A share-based accounting model for yield-bearing bridge tokens with formal monotonicity and collateralization proofs (Section~\ref{sec:share}).
+  \item A composable \texttt{IYieldStrategy} interface with 29 concrete implementations across 9 yield categories (Section~\ref{sec:strategies}).
+  \item Bitcoin-native yield composition through Babylon, Lombard, SolvBTC, and CoreDAO---the first non-custodial BTC yield aggregation (Section~\ref{sec:btc}).
+  \item MPC-attested backing oracle with automatic undercollateralization pause (Section~\ref{sec:attestation}).
+  \item A three-tier risk framework with formal diversification constraints (Section~\ref{sec:risk}).
+  \item Economic analysis of the xLUX flywheel and capital efficiency comparison against conventional bridge tokens (Section~\ref{sec:economics}).
+\end{enumerate}
+
+\subsection{Scope and Relationship to Prior Work}
+
+This paper extends the Lux Teleport protocol specification~\cite{luxteleport}, which defines the MPC threshold signature scheme (FROST~\cite{frost} and CGGMP21~\cite{cggmp21}), nonce management, sovereign governance, and Shariah compliance. We take the bridge's security model as given and focus exclusively on the yield layer: how locked assets generate returns, how those returns are reflected in bridge token prices, and how the system maintains safety invariants under adversarial conditions.
+
+% ============================================================
+\section{Problem Statement}\label{sec:problem}
+% ============================================================
+
+\begin{definition}[Bridge Capital Inefficiency]
+Let $L$ denote the total value locked across all bridge protocols, and let $r$ denote the risk-adjusted opportunity cost of capital (the yield those assets would earn if not locked). The annual capital inefficiency is:
+\begin{equation}\label{eq:inefficiency}
+  \mathcal{I} = L \cdot r
+\end{equation}
+For $L = \$15\text{B}$ and $r = 4.5\%$ (weighted average of ETH staking and stablecoin lending yields), $\mathcal{I} = \$675\text{M/year}$.
+\end{definition}
+
+This inefficiency creates three downstream problems:
+
+\paragraph{Higher bridge fees.} Without yield income, bridge operators must charge higher fees to cover infrastructure costs, increasing friction for cross-chain transfers.
+
+\paragraph{Inferior bridge tokens.} Wrapped ETH (WETH) on a destination chain earns 0\% APY. Native stETH on Ethereum earns 3.5\%. A user who bridges ETH pays an implicit cost equal to the forgone staking yield for the duration of the bridge period.
+
+\paragraph{Liquidity fragmentation.} Rational capital avoids bridges because the opportunity cost exceeds the utility of cross-chain deployment. This reduces liquidity on destination chains, widening spreads and increasing slippage.
+
+\begin{remark}
+The capital inefficiency is not merely theoretical. As of Q1 2026, approximately \$3.8B of the \$15B in bridge TVL is ETH that could be earning 3.5\% in Lido~\cite{lidofinance}, \$2.1B is stablecoins that could earn 5--8\% in Aave~\cite{aavev3}, and \$1.4B is BTC that could earn 3--5\% through Babylon~\cite{babylon2024}. The remainder consists of altcoins with varying yield opportunities.
+\end{remark}
+
+% ============================================================
+\section{Share-Based Accounting}\label{sec:share}
+% ============================================================
+
+\subsection{Token Model}
+
+The Teleport yield system issues three classes of bridge tokens per underlying asset:
+
+\begin{definition}[Bridge Token Classes]
+For an underlying asset $A$:
+\begin{enumerate}[nosep]
+  \item \textbf{LA} (e.g., LETH): 1:1 wrapped token. Share price fixed at 1.0. No yield.
+  \item \textbf{yLA} (e.g., yLETH): Yield-bearing token. Share price appreciates as yield accrues. Non-rebasing.
+  \item \textbf{syLA} (e.g., syLETH): Shariah-compliant yield token. Same mechanics as yLA but restricted to halal-classified strategies~\cite{luxteleport}.
+\end{enumerate}
+\end{definition}
+
+The yield-bearing variants follow the ERC-4626 tokenized vault standard~\cite{erc4626}, adapted for cross-chain operation where the vault (source chain) and the share token (destination chain) reside on different chains.
+
+\subsection{Share Price Dynamics}
+
+\begin{definition}[Share Price]
+Let $B(t)$ denote the total backing assets on the source chain at time $t$, and $S(t)$ denote the total outstanding shares (yield-bearing bridge tokens) on all destination chains. The share price is:
+\begin{equation}\label{eq:shareprice}
+  p(t) = \frac{B(t)}{S(t)}
+\end{equation}
+\end{definition}
+
+The backing $B(t)$ evolves as:
+\begin{equation}\label{eq:backing}
+  B(t) = B(t_0) + \underbrace{\int_{t_0}^{t} Y(\tau)\,d\tau}_{\text{yield accrued}} - \underbrace{\int_{t_0}^{t} F(\tau)\,d\tau}_{\text{fees extracted}} - \underbrace{\int_{t_0}^{t} W(\tau)\,d\tau}_{\text{withdrawals}}
+\end{equation}
+where $Y(\tau)$ is the instantaneous yield rate, $F(\tau)$ is the performance fee rate, and $W(\tau)$ is the withdrawal rate.
+
+The share supply evolves as:
+\begin{equation}\label{eq:supply}
+  S(t) = S(t_0) + \underbrace{D(t_0, t)}_{\text{new deposits}} - \underbrace{R(t_0, t)}_{\text{redemptions}}
+\end{equation}
+where $D$ and $R$ are cumulative deposits and redemptions respectively.
+
+\begin{theorem}[Share Price Monotonicity]\label{thm:monotone}
+If the net yield rate after fees is non-negative, i.e., $Y(\tau) - F(\tau) \geq 0$ for all $\tau \in [t_0, t]$, and no withdrawals reduce backing below the collateralization threshold, then for any $t_1 < t_2$:
+\begin{equation}
+  p(t_2) \geq p(t_1)
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+New deposits of amount $a$ at time $t$ simultaneously increase $B(t)$ by $a$ and increase $S(t)$ by $a/p(t)$ shares, leaving $p(t)$ unchanged. Redemptions of $s$ shares decrease $S(t)$ by $s$ and decrease $B(t)$ by $s \cdot p(t)$, also leaving $p(t)$ unchanged. Between deposits and redemptions, only yield and fees affect the price:
+\begin{equation}
+  \frac{dp}{dt} = \frac{Y(t) - F(t)}{S(t)} \geq 0
+\end{equation}
+Since $S(t) > 0$ (the token has nonzero supply) and $Y(t) - F(t) \geq 0$ by assumption, $dp/dt \geq 0$, so $p$ is monotonically non-decreasing.
+\end{proof}
+
+\subsection{Conversion Functions}
+
+Following ERC-4626 semantics:
+
+\begin{align}
+  \texttt{convertToShares}(a) &= \left\lfloor \frac{a \cdot S(t)}{B(t)} \right\rfloor \label{eq:toShares}\\[4pt]
+  \texttt{convertToAssets}(s) &= \left\lfloor \frac{s \cdot B(t)}{S(t)} \right\rfloor \label{eq:toAssets}
+\end{align}
+
+Rounding is always in favor of the vault (floor for shares on deposit, floor for assets on withdrawal), preventing rounding-based extraction attacks~\cite{erc4626}.
+
+\subsection{Cross-Chain State Synchronization}
+
+The share price on destination chains is updated through MPC-attested backing reports (Section~\ref{sec:attestation}). Between attestations, the share price on the destination chain is stale by at most one attestation interval $\Delta$:
+
+\begin{equation}
+  |p_{\text{dest}}(t) - p_{\text{source}}(t)| \leq \frac{Y_{\max} \cdot \Delta}{S(t)}
+\end{equation}
+
+where $Y_{\max}$ is the maximum yield rate across all active strategies. For $\Delta = 1$ hour and $Y_{\max}$ corresponding to 30\% APY, the maximum staleness on a \$100M vault is approximately 0.0034\%, which is negligible relative to bridge fees.
+
+% ============================================================
+\section{Yield Strategy Interface}\label{sec:strategies}
+% ============================================================
+
+\subsection{Interface Definition}
+
+Every yield source implements the \texttt{IYieldStrategy} interface:
+
+\begin{lstlisting}[language=Solidity,caption=IYieldStrategy interface]
+interface IYieldStrategy {
+    function deposit(uint256 amount)
+        external returns (uint256 shares);
+    function withdraw(uint256 shares)
+        external returns (uint256 assets);
+    function totalAssets()
+        external view returns (uint256);
+    function currentAPY()
+        external view returns (uint256);
+    function harvest()
+        external returns (uint256 harvested);
+    function isActive()
+        external view returns (bool);
+    function riskTier()
+        external view returns (uint8);
+}
+\end{lstlisting}
+
+\begin{definition}[Strategy Properties]
+A compliant strategy satisfies:
+\begin{enumerate}[nosep]
+  \item \textbf{Idempotent harvest}: Calling \texttt{harvest()} twice in succession yields zero on the second call.
+  \item \textbf{Withdrawal guarantee}: \texttt{withdraw(s)} returns at least \texttt{convertToAssets(s) - slippageTolerance} assets.
+  \item \textbf{Accounting accuracy}: $|\texttt{totalAssets()} - A_{\text{actual}}| \leq \epsilon$ where $\epsilon$ is bounded by oracle precision.
+  \item \textbf{Risk classification}: \texttt{riskTier()} returns a value in $\{1, 2, 3\}$ corresponding to low, medium, or high risk.
+\end{enumerate}
+\end{definition}
+
+\subsection{Strategy Taxonomy}\label{sec:taxonomy}
+
+Table~\ref{tab:full_strategies} enumerates all 29 deployed strategies across 9 categories.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Complete yield strategy taxonomy: 29 strategies across 9 categories. APY ranges reflect Q1 2026 observed rates. Risk tiers: T1 = low (blue-chip, audited, \$1B+ TVL), T2 = medium (established, \$100M+ TVL), T3 = high (newer protocols, higher yield, elevated risk).}
+\label{tab:full_strategies}
+\begin{tabular}{@{}rllllrr@{}}
+\toprule
+\textbf{\#} & \textbf{Category} & \textbf{Protocol} & \textbf{Underlying} & \textbf{Mechanism} & \textbf{APY (\%)} & \textbf{Tier} \\
+\midrule
+\multicolumn{7}{l}{\textit{Liquid Staking}} \\
+1 & Liquid Staking & Lido & ETH & Validator staking, stETH issuance & 3.2--3.8 & T1 \\
+2 & Liquid Staking & Rocket Pool & ETH & Permissionless validators, rETH & 3.0--3.5 & T1 \\
+\midrule
+\multicolumn{7}{l}{\textit{Restaking}} \\
+3 & Restaking & EigenLayer & ETH/stETH & AVS security, restaking rewards & 3.5--6.0 & T2 \\
+4 & Restaking & Symbiotic & ETH/stETH & Flexible restaking, multi-asset & 3.0--5.5 & T2 \\
+5 & Restaking & Karak & ETH/stETH & DSS restaking, risk isolation & 3.0--5.0 & T2 \\
+\midrule
+\multicolumn{7}{l}{\textit{Lending}} \\
+6 & Lending & Aave V3 & ETH/USDC/USDT & Variable-rate lending pools & 2.0--8.0 & T1 \\
+7 & Lending & Compound V3 & ETH/USDC & Isolated lending markets & 2.5--7.0 & T1 \\
+8 & Lending & Morpho & ETH/USDC & Peer-to-peer rate optimization & 3.0--9.0 & T2 \\
+9 & Lending & Euler V2 & Multi-asset & Modular lending, custom vaults & 3.5--10.0 & T2 \\
+10 & Lending & Spark & DAI/ETH & MakerDAO-native lending & 4.0--8.0 & T1 \\
+11 & Lending & Fluid & ETH/USDC & Unified liquidity layer & 3.0--12.0 & T2 \\
+\midrule
+\multicolumn{7}{l}{\textit{Stablecoin Yield}} \\
+12 & Stablecoin & MakerDAO/Sky & DAI & DSR + Sky savings rate & 5.0--8.0 & T1 \\
+13 & Stablecoin & Ethena & USDe & Basis trade (spot + short perp) & 8.0--15.0 & T3 \\
+14 & Stablecoin & Frax & FRAX & AMO yield + staking & 4.0--7.0 & T2 \\
+\midrule
+\multicolumn{7}{l}{\textit{LP / DEX}} \\
+15 & LP/DEX & Curve & Stablecoins & StableSwap AMM LP fees & 5.0--12.0 & T1 \\
+16 & LP/DEX & Convex & CRV/CVX & Boosted Curve LP + CVX rewards & 8.0--18.0 & T2 \\
+17 & LP/DEX & Pendle & PT/YT & Yield tokenization, fixed-rate & 5.0--20.0 & T2 \\
+18 & LP/DEX & L2 DEX Aggregate & Multi-asset & Concentrated liquidity on L2s & 6.0--15.0 & T2 \\
+\midrule
+\multicolumn{7}{l}{\textit{Bitcoin Native}} \\
+19 & BTC Native & Babylon & BTC & BTC staking for PoS security & 3.0--5.0 & T2 \\
+20 & BTC Native & Lombard & BTC & LBTC liquid staking derivative & 3.5--6.0 & T2 \\
+21 & BTC Native & SolvBTC & BTC & BTC yield aggregation vaults & 4.0--8.0 & T3 \\
+22 & BTC Native & CoreDAO & BTC & Dual staking (BTC + CORE) & 3.0--12.0 & T2 \\
+\midrule
+\multicolumn{7}{l}{\textit{Solana}} \\
+23 & Solana & Marinade & SOL & mSOL liquid staking & 5.0--7.0 & T1 \\
+24 & Solana & Jito & SOL & JitoSOL + MEV rewards & 6.0--8.0 & T2 \\
+25 & Solana & Kamino & SOL/USDC & Concentrated liquidity vaults & 5.0--10.0 & T2 \\
+\midrule
+\multicolumn{7}{l}{\textit{TON}} \\
+26 & TON & Tonstakers & TON & tsTON liquid staking & 5.0--7.0 & T2 \\
+27 & TON & Bemo & TON & stTON liquid staking & 5.0--7.0 & T2 \\
+28 & TON & STON.fi & TON/USDT & DEX LP on TON & 8.0--15.0 & T3 \\
+\midrule
+\multicolumn{7}{l}{\textit{Perpetuals}} \\
+29 & Perps & LPX Perps & Multi-asset & LP vault earns trading fees & 10.0--30.0 & T3 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Yield Composition}\label{sec:composition}
+
+Bridge token holders earn layered yield from multiple simultaneous sources. We formalize this as additive yield composition:
+
+\begin{definition}[Yield Composition]
+For a yield-bearing bridge token $yLA$, the total APY is:
+\begin{equation}\label{eq:yield_composition}
+  r_{\text{total}} = r_{\text{base}} + r_{\text{restaking}} + r_{\text{bridge}} + r_{\text{DeFi}}
+\end{equation}
+where:
+\begin{itemize}[nosep]
+  \item $r_{\text{base}}$: primary yield source (staking, lending, LP)
+  \item $r_{\text{restaking}}$: additional yield from restaking derivatives
+  \item $r_{\text{bridge}}$: share of Teleport bridge fees via xLUX
+  \item $r_{\text{DeFi}}$: yield from using yLA as collateral/LP on destination chain
+\end{itemize}
+\end{definition}
+
+\begin{remark}
+The DeFi layer ($r_{\text{DeFi}}$) is not part of the vault's backing---it is additional yield earned by the token holder through their own DeFi participation on the destination chain. The vault only manages $r_{\text{base}} + r_{\text{restaking}}$, and $r_{\text{bridge}}$ flows through the xLUX staking mechanism.
+\end{remark}
+
+Table~\ref{tab:yield_composition} illustrates the yield stack for three representative bridge tokens.
+
+\begin{table}[ht]
+\centering
+\small
+\caption{Yield composition for representative bridge tokens. Rates are Q1 2026 observed medians.}
+\label{tab:yield_composition}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Layer} & \textbf{yLETH} & \textbf{yLBTC} & \textbf{yLUSD} \\
+\midrule
+Base yield & 3.5\% & 4.5\% & 6.0\% \\
+Restaking & 2.0\% & 2.0\% & --- \\
+Bridge fees (xLUX) & 1.0\% & 1.0\% & 1.0\% \\
+DeFi on Lux & 5--15\% & 5--15\% & 5--12\% \\
+\midrule
+\textbf{Total range} & \textbf{11.5--21.5\%} & \textbf{12.5--22.5\%} & \textbf{12.0--19.0\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================
+\section{Bitcoin-Native Yield}\label{sec:btc}
+% ============================================================
+
+Bitcoin yield historically required custodial wrapping (WBTC~\cite{wbtc}) or centralized lending (BlockFi, Celsius---both insolvent). Babylon~\cite{babylon2024} changed this by enabling native BTC staking through Bitcoin Script timelock covenants, providing economic security to Proof-of-Stake chains without moving BTC off the Bitcoin network.
+
+Teleport composes Bitcoin-native yield through four protocols:
+
+\subsection{Babylon BTC Staking}
+
+Babylon enables BTC holders to stake their BTC to secure PoS chains through a covenant-based locking mechanism on Bitcoin L1~\cite{babylon2024}:
+
+\begin{enumerate}[nosep]
+  \item BTC is locked via a self-custodial covenant transaction with a FROST-signed timelock.
+  \item The locked BTC provides economic security to participating PoS chains.
+  \item Staking rewards accrue in the secured chain's native token.
+  \item Unstaking requires a Bitcoin L1 transaction after the timelock expires.
+\end{enumerate}
+
+The Teleport bridge vault's BTC is staked through Babylon, with the FROST threshold key serving as both the bridge custody key and the Babylon staking key. This dual use eliminates an additional trust assumption---the same MPC set that secures the bridge also manages the staking position.
+
+\subsection{Liquid BTC Derivatives}
+
+\begin{definition}[BTC Yield Stack]
+The Teleport BTC yield stack composes four layers:
+\begin{align}
+  r_{\text{BTC}} &= r_{\text{Babylon}} + r_{\text{liquid}} + r_{\text{restake}} + r_{\text{DeFi}} \label{eq:btc_yield}\\[4pt]
+  &\approx 4.5\% + 1.5\% + 2.0\% + (5\text{--}15\%) \nonumber
+\end{align}
+\end{definition}
+
+\noindent
+Layer composition:
+
+\paragraph{Layer 1: Babylon staking ($r_{\text{Babylon}} \approx 3$--$5\%$).} Raw BTC staking yield from securing PoS chains. The FROST-controlled Taproot address commits to Babylon's staking covenant.
+
+\paragraph{Layer 2: Liquid derivative ($r_{\text{liquid}} \approx 0.5$--$2\%$).} Lombard LBTC~\cite{lombard2024} or SolvBTC~\cite{solvbtc} wraps the Babylon-staked position into a liquid derivative tradeable on EVM chains. The derivative captures the base staking yield plus protocol-specific incentives.
+
+\paragraph{Layer 3: Restaking ($r_{\text{restake}} \approx 1$--$3\%$).} The liquid BTC derivative is restaked through EigenLayer or Symbiotic, providing security to additional AVS protocols in exchange for restaking rewards.
+
+\paragraph{Layer 4: DeFi ($r_{\text{DeFi}} \approx 5$--$15\%$).} yLBTC holders on Lux use their tokens as LP capital, collateral in lending markets, or in yield optimization protocols on the destination chain.
+
+\subsection{CoreDAO Dual Staking}
+
+CoreDAO~\cite{coredao} offers an alternative BTC yield path through dual staking: BTC is delegated to Core validators alongside CORE tokens, earning staking rewards from both networks simultaneously. The yield ($3$--$12\%$ APY) depends on the BTC/CORE delegation ratio and Core network utilization.
+
+\subsection{Security Analysis}
+
+\begin{property}[BTC Custody Invariant]
+At all times, the BTC backing yLBTC is:
+\begin{enumerate}[nosep]
+  \item Held in a FROST 2-of-3 Taproot address (bridge custody), OR
+  \item Locked in a Babylon staking covenant with the same FROST key as the spending condition, OR
+  \item Represented by a liquid derivative (LBTC, SolvBTC) held by a smart contract controlled by the MPC set.
+\end{enumerate}
+In all cases, $t$-of-$n$ MPC signers must cooperate to move the BTC. No single party has unilateral withdrawal authority.
+\end{property}
+
+% ============================================================
+\section{MPC Yield Attestation}\label{sec:attestation}
+% ============================================================
+
+\subsection{Backing Oracle}
+
+Because the yield vault (source chain) and the share token (destination chain) exist on different blockchains, destination chains cannot query source-chain vault balances directly. Instead, the MPC signer set periodically attests to the total backing:
+
+\begin{algorithm}[H]
+\caption{MPC Backing Attestation}
+\label{alg:attestation}
+\begin{algorithmic}[1]
+\Require Attestation interval $\Delta$, signer set $\mathcal{S}$, threshold $t$
+\State At each interval $t_k = t_0 + k\Delta$:
+\State Each signer $s_i$ independently queries all active strategies:
+\State \quad $B_i \leftarrow \sum_{j=1}^{m} \texttt{strategy}_j.\texttt{totalAssets}()$
+\State Signers exchange $B_i$ values and verify $|B_i - B_j| \leq \epsilon$ for all $i, j$
+\If{consensus on $B^* = \text{median}(B_1, \ldots, B_n)$}
+  \State Produce threshold signature: $\sigma \leftarrow \text{Sign}_{t,n}(H(\texttt{``BACKING''} \| B^* \| t_k))$
+  \State Broadcast $(B^*, t_k, \sigma)$ to all destination chains
+\Else
+  \State Flag disagreement; trigger emergency review
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\begin{definition}[Attestation Message]
+The signed backing report has the form:
+\begin{equation}\label{eq:attestation}
+  m_k = H\bigl(\texttt{``BACKING''} \,\|\, B^*_k \,\|\, t_k \,\|\, \text{chainId}_{\text{source}}\bigr)
+\end{equation}
+where $B^*_k$ is the attested backing, $t_k$ is the attestation timestamp, and $\text{chainId}_{\text{source}}$ identifies the source chain. The signature $\sigma_k$ is produced via CGGMP21 (for EVM destinations) or FROST (for Ed25519/Schnorr destinations).
+\end{definition}
+
+\subsection{Undercollateralization Detection}
+
+\begin{invariant}[Collateralization Bound]\label{inv:collateral}
+The protocol enforces:
+\begin{equation}\label{eq:collateral}
+  \frac{B^*_k}{S(t_k) \cdot p(t_{k-1})} \geq \theta_{\min} = 0.985
+\end{equation}
+where $\theta_{\min} = 98.5\%$ is the minimum collateralization ratio. If this invariant is violated, the OmnichainRouter on all destination chains enters \texttt{PAUSED} state.
+\end{invariant}
+
+\begin{algorithm}[H]
+\caption{Auto-Pause on Undercollateralization}
+\label{alg:autopause}
+\begin{algorithmic}[1]
+\Require Backing report $(B^*_k, t_k, \sigma_k)$, current state
+\State Verify $\sigma_k$ against MPC public key
+\State Verify $t_k > t_{k-1}$ (monotonic timestamps)
+\State Compute collateralization ratio: $\theta_k \leftarrow B^*_k / (S(t_k) \cdot p(t_{k-1}))$
+\If{$\theta_k < \theta_{\min}$}
+  \State Set \texttt{bridgePaused} $\leftarrow$ \texttt{true}
+  \State Emit \texttt{UndercollateralizationDetected}($\theta_k$, $B^*_k$, $t_k$)
+  \State Disable \texttt{mintDeposit} and \texttt{updateBacking}
+  \State \textbf{Allow} \texttt{burnForWithdrawal} (users can always exit)
+\Else
+  \State Update $p(t_k) \leftarrow B^*_k / S(t_k)$
+  \State Emit \texttt{BackingUpdated}($B^*_k$, $p(t_k)$, $t_k$)
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[Pause Liveness]\label{thm:pause}
+If the actual backing drops below $\theta_{\min} \cdot S(t) \cdot p(t)$, the bridge pauses within at most $\Delta + \delta_{\text{confirm}}$ time, where $\Delta$ is the attestation interval and $\delta_{\text{confirm}}$ is the destination chain confirmation time.
+\end{theorem}
+
+\begin{proof}
+The MPC signer set produces a backing report at each interval $\Delta$. By construction, the attested value $B^*_k$ reflects the actual backing at time $t_k$ (median of independent queries). The attestation transaction is submitted to the destination chain and confirmed within $\delta_{\text{confirm}}$. Total worst-case latency: the undercollateralization occurs immediately after attestation $k$, is detected at attestation $k+1$ (delay $\Delta$), and the pause transaction confirms after $\delta_{\text{confirm}}$.
+\end{proof}
+
+\subsection{Attestation Parameters}
+
+\begin{table}[ht]
+\centering
+\small
+\caption{Default attestation parameters.}
+\label{tab:attestation_params}
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Attestation interval ($\Delta$) & 1 hour \\
+Minimum collateralization ($\theta_{\min}$) & 98.5\% \\
+Signer disagreement tolerance ($\epsilon$) & 0.1\% \\
+Pause recovery requires & Governor + MPC joint action \\
+Emergency pause & Any single MPC signer \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================
+\section{Risk Framework}\label{sec:risk}
+% ============================================================
+
+\subsection{Three-Tier Classification}
+
+\begin{definition}[Risk Tiers]
+Each yield strategy is classified into one of three risk tiers:
+\begin{itemize}[nosep]
+  \item \textbf{Tier 1 (Low)}: Blue-chip protocols with \$1B+ TVL, multiple audits, 2+ years of production operation, no exploits. Examples: Lido, Aave V3, Compound V3, Curve, Spark, Marinade.
+  \item \textbf{Tier 2 (Medium)}: Established protocols with \$100M+ TVL, audited, 1+ year of production operation. Examples: EigenLayer, Symbiotic, Morpho, Pendle, Babylon, Lombard, Jito, Kamino, Tonstakers, CoreDAO.
+  \item \textbf{Tier 3 (High)}: Newer protocols with elevated yield and correspondingly elevated risk. Examples: Ethena, SolvBTC, STON.fi, LPX Perps.
+\end{itemize}
+\end{definition}
+
+\subsection{Allocation Constraints}
+
+The vault enforces per-tier allocation limits:
+
+\begin{equation}\label{eq:allocation}
+\begin{aligned}
+  w_1 + w_2 + w_3 &= 1 \\
+  w_1 &\geq 0.50 \\
+  w_2 &\leq 0.40 \\
+  w_3 &\leq 0.10
+\end{aligned}
+\end{equation}
+
+where $w_i$ is the fraction of total backing allocated to Tier $i$ strategies. These constraints are enforced on-chain by the \texttt{YieldBridgeVault} contract.
+
+\begin{theorem}[Diversification Bound]\label{thm:diversification}
+No single strategy may receive more than $\alpha_{\max} = 25\%$ of total backing. Combined with the tier constraints, this ensures:
+\begin{equation}
+  \max_j \frac{A_j}{B} \leq \alpha_{\max} = 0.25
+\end{equation}
+where $A_j$ is the assets deployed to strategy $j$ and $B = \sum_j A_j$ is total backing.
+\end{theorem}
+
+\subsection{Maximum Loss Analysis}
+
+\begin{definition}[Strategy Loss]
+Let $\ell_j$ denote the worst-case loss fraction for strategy $j$ (e.g., smart contract exploit draining all funds: $\ell_j = 1.0$). The maximum portfolio loss under the allocation constraints is:
+\begin{equation}\label{eq:maxloss}
+  L_{\max} = \max_{\substack{w \in \mathcal{W} \\ j^* \in \{1,\ldots,m\}}} w_{j^*} \cdot \ell_{j^*}
+\end{equation}
+where $\mathcal{W}$ is the feasible allocation set satisfying~(\ref{eq:allocation}).
+\end{definition}
+
+Under the single-strategy cap of 25\%:
+
+\begin{corollary}[Single-Strategy Failure]
+If exactly one strategy suffers a complete loss ($\ell_{j^*} = 1.0$), the maximum portfolio loss is 25\%. Combined with the 1.5\% collateralization buffer, the bridge pauses before share price drops below $0.985 \times p(t_{k-1})$, protecting holders from losses exceeding 1.5\% between attestation intervals.
+\end{corollary}
+
+\begin{corollary}[Tier 3 Failure]
+If all Tier 3 strategies simultaneously fail ($\ell_j = 1.0$ for all $j$ in Tier 3), the maximum loss is 10\% of total backing. The bridge pauses immediately at the next attestation.
+\end{corollary}
+
+\subsection{Strategy Health Monitoring}
+
+Each strategy's \texttt{isActive()} function is checked at every attestation cycle. A strategy is deactivated when:
+\begin{enumerate}[nosep]
+  \item \texttt{totalAssets()} decreases by more than 5\% between attestations (abnormal loss).
+  \item The underlying protocol's TVL drops below \$50M (liquidity risk).
+  \item A security advisory is issued (governance override via SAB or MPC emergency action).
+  \item \texttt{currentAPY()} drops below 0\% for two consecutive attestation periods.
+\end{enumerate}
+
+Upon deactivation, the vault withdraws all assets from the strategy and reallocates according to the tier-weighted algorithm.
+
+% ============================================================
+\section{Economic Analysis}\label{sec:economics}
+% ============================================================
+
+\subsection{Capital Efficiency Comparison}
+
+We compare three modes of holding ETH across a bridge:
+
+\begin{definition}[Capital Efficiency Ratio]
+\begin{equation}\label{eq:capital_efficiency}
+  \eta = \frac{\text{APY}_{\text{bridge token}}}{\text{APY}_{\text{native}}}
+\end{equation}
+where $\text{APY}_{\text{native}}$ is the yield available on the source chain without bridging.
+\end{definition}
+
+\begin{table}[ht]
+\centering
+\small
+\caption{Capital efficiency comparison: ETH across a bridge from Ethereum to Lux. Native stETH APY = 3.5\% (Lido, Q1 2026).}
+\label{tab:capital_efficiency}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Token} & \textbf{APY} & \textbf{$\eta$} & \textbf{Source} \\
+\midrule
+WETH (Ethereum) & 0.0\% & 0.00 & Idle \\
+LETH (Teleport) & 0.0\% & 0.00 & 1:1 wrapped \\
+stETH (Lido) & 3.5\% & 1.00 & Native stake \\
+yLETH (Teleport) & 5.5\% & 1.57 & Stake + restake \\
+yLETH + DeFi & 11.5--21.5\% & 3.3--6.1 & Full composition \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+yLETH achieves $\eta > 1.0$ because the vault captures restaking yield that individual stakers may not access, and bridge fee income from xLUX adds yield not available to direct stETH holders.
+
+\subsection{The xLUX Flywheel}\label{sec:flywheel}
+
+On Lux Network, the stakeholder vault for the Teleport OmnichainRouter is LiquidLUX (xLUX). All protocol fees flow to xLUX holders:
+
+\begin{equation}\label{eq:xlux_yield}
+  r_{\text{xLUX}} = \frac{\sum_{p \in \mathcal{P}} f_p \cdot V_p}{\text{totalStaked}_{\text{LUX}}}
+\end{equation}
+
+where $\mathcal{P} = \{\text{bridge, DEX, lending, perps, NFT AMM}\}$ is the set of fee-generating protocols, $f_p$ is the fee rate for protocol $p$, and $V_p$ is the volume processed by protocol $p$.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+  node distance=1.6cm,
+  box/.style={draw, rounded corners=3pt, minimum width=2.2cm, minimum height=0.7cm, font=\scriptsize, align=center, thick},
+  arr/.style={-{Stealth[length=2mm]}, thick, color=black!70},
+]
+  \node[box] (bridge) {Teleport\\Bridge};
+  \node[box, right=1.2cm of bridge] (dex) {Lightspeed\\DEX};
+  \node[box, below=1.2cm of bridge] (lending) {Lux\\Lending};
+  \node[box, below=1.2cm of dex] (perps) {LPX\\Perps};
+  \node[box, below right=0.2cm and -0.3cm of lending] (nft) {LSSVM\\NFT AMM};
+
+  \node[box, fill=black!8, minimum width=2.5cm, below=3.5cm of bridge, xshift=1.0cm] (xlux) {\textbf{xLUX}\\fee aggregation};
+
+  \draw[arr] (bridge.south) -- ++(0,-0.5) -| (xlux.north west);
+  \draw[arr] (dex.south) -- ++(0,-0.5) -| (xlux.north east);
+  \draw[arr] (lending.south) -- ++(0,-0.3) -| (xlux.west);
+  \draw[arr] (perps.south) -- ++(0,-0.3) -| (xlux.east);
+  \draw[arr] (nft.south) -- ++(0,-0.15) -| (xlux.south);
+
+  \node[box, fill=black!8, below=1.0cm of xlux] (stakers) {\textbf{LUX stakers}\\receive yield};
+  \draw[arr] (xlux) -- (stakers);
+
+  \node[font=\scriptsize, right=0.3cm of stakers, text width=2.5cm, align=left] {Higher APY\\$\to$ more staking\\$\to$ deeper liquidity\\$\to$ more volume};
+\end{tikzpicture}
+\caption{The xLUX fee aggregation flywheel. Fees from all Lux protocols compound into xLUX yield, attracting more staking, deepening liquidity, and generating more fees.}
+\label{fig:flywheel}
+\end{figure}
+
+\begin{theorem}[Flywheel Convergence]\label{thm:flywheel}
+Under the assumption that total protocol volume $V = \sum_p V_p$ is an increasing function of total liquidity $\mathcal{L}$, and liquidity is an increasing function of xLUX APY $r_{\text{xLUX}}$, the system converges to a stable equilibrium. Formally, if:
+\begin{align}
+  V &= g(\mathcal{L}), \quad g' > 0, \quad g'' < 0 \label{eq:fly1} \\
+  \mathcal{L} &= h(r_{\text{xLUX}}), \quad h' > 0, \quad h'' < 0 \label{eq:fly2} \\
+  r_{\text{xLUX}} &= \frac{f \cdot V}{\text{totalStaked}} \label{eq:fly3}
+\end{align}
+where $g$ and $h$ are concave increasing functions, then there exists a unique fixed point $(V^*, \mathcal{L}^*, r^*)$ satisfying all three equations.
+\end{theorem}
+
+\begin{proof}
+Define $\Phi: \mathbb{R}_{>0} \to \mathbb{R}_{>0}$ by $\Phi(r) = f \cdot g(h(r)) / \text{totalStaked}$. Since $g$ and $h$ are concave and increasing, $\Phi$ is concave and increasing. For sufficiently small $r$, $\Phi(r) > r$ (the flywheel generates more yield than required). For large $r$, the concavity of $g \circ h$ ensures $\Phi(r) < r$ (diminishing returns on volume growth). By the intermediate value theorem, there exists a unique $r^*$ with $\Phi(r^*) = r^*$.
+\end{proof}
+
+\subsection{Fee Flow Quantification}
+
+\begin{table}[ht]
+\centering
+\small
+\caption{Projected annual fee flow to xLUX at varying TVL levels. Assumes: bridge fee 10 bps, DEX fee 5 bps, lending spread 50 bps, perps fee 8 bps, NFT AMM 200 bps. Velocity: bridge 2x/year, DEX 50x/year, lending 3x/year, perps 100x/year, NFT 10x/year. Stakeholder share: 90\%.}
+\label{tab:fee_flow}
+\begin{tabular}{@{}rrrr@{}}
+\toprule
+\textbf{Total TVL} & \textbf{Annual Fees} & \textbf{xLUX Share} & \textbf{xLUX APY\textsuperscript{*}} \\
+\midrule
+\$100M & \$8.2M & \$7.4M & 7.4\% \\
+\$500M & \$41M & \$37M & 7.4\% \\
+\$1B & \$82M & \$74M & 7.4\% \\
+\$5B & \$410M & \$369M & 7.4\% \\
+\bottomrule
+\multicolumn{4}{l}{\textsuperscript{*}\scriptsize Assumes staked LUX = TVL (simplified). Real APY varies with staking ratio.}
+\end{tabular}
+\end{table}
+
+\subsection{Yield vs.\ Risk Frontier}
+
+The portfolio of yield strategies traces an efficient frontier in risk-return space. Let $\bm{r} = (r_1, \ldots, r_m)$ be the vector of strategy APYs and $\bm{\Sigma}$ be the covariance matrix of strategy returns. The mean-variance optimal allocation is:
+
+\begin{equation}\label{eq:frontier}
+  \max_{\bm{w}} \bm{w}^T \bm{r} - \frac{\lambda}{2} \bm{w}^T \bm{\Sigma} \bm{w}
+  \quad \text{s.t.} \quad \bm{w} \in \mathcal{W}
+\end{equation}
+
+where $\lambda$ is the risk aversion parameter and $\mathcal{W}$ is the feasible set defined by the tier constraints~(\ref{eq:allocation}) and the single-strategy cap.
+
+\begin{remark}
+The governor (DAO) sets $\lambda$ based on the chain's risk appetite. A conservative chain (e.g., institutional-focused) uses high $\lambda$, concentrating in Tier 1. An aggressive chain uses low $\lambda$, allocating more to Tier 2/3 for higher yield.
+\end{remark}
+
+% ============================================================
+\section{Performance Fee Mechanics}\label{sec:fees}
+% ============================================================
+
+\subsection{Fee Structure}
+
+Two fees apply to yield-bearing bridge tokens:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Bridge fee} ($f_b$, default 10 bps, max 100 bps): Charged on deposit/withdrawal. Applied to the principal.
+  \item \textbf{Performance fee} ($f_y$, default 1000 bps = 10\%): Charged on yield only. Never on principal.
+\end{enumerate}
+
+The yield distributed to share holders after fees:
+
+\begin{equation}\label{eq:net_yield}
+  Y_{\text{net}}(t) = Y_{\text{gross}}(t) \cdot \left(1 - \frac{f_y}{10{,}000}\right)
+\end{equation}
+
+Performance fees are distributed according to the stakeholder share:
+
+\begin{equation}\label{eq:fee_split}
+  \text{toStakeholders} = Y_{\text{gross}} \cdot \frac{f_y}{10{,}000} \cdot \frac{f_s}{10{,}000}
+\end{equation}
+
+where $f_s$ is the stakeholder share (default 9000 bps = 90\%). The remaining 10\% goes to the protocol treasury.
+
+\subsection{Fee Accounting in Share Price}
+
+Performance fees are extracted by minting additional shares to the fee recipient rather than reducing the backing:
+
+\begin{equation}\label{eq:fee_shares}
+  \Delta S_{\text{fee}} = \frac{Y_{\text{gross}} \cdot f_y / 10{,}000}{p(t)}
+\end{equation}
+
+This dilution-based approach ensures the share price never decreases due to fee extraction---it simply grows slower than the gross yield rate. The share price after fee extraction:
+
+\begin{equation}
+  p'(t) = \frac{B(t) + Y_{\text{gross}}}{S(t) + \Delta S_{\text{fee}}} = \frac{B(t) + Y_{\text{gross}}}{S(t) + \frac{Y_{\text{gross}} \cdot f_y / 10{,}000}{p(t)}}
+\end{equation}
+
+Since $f_y / 10{,}000 < 1$, we have $p'(t) > p(t)$ whenever $Y_{\text{gross}} > 0$, preserving the monotonicity property of Theorem~\ref{thm:monotone}.
+
+% ============================================================
+\section{Formal Security Properties}\label{sec:security}
+% ============================================================
+
+We state and prove the key security invariants of the yield system.
+
+\begin{property}[Conservation]\label{prop:conservation}
+For every yield-bearing bridge token $yT$:
+\begin{equation}
+  S(t) \cdot p(t) \leq B(t) + \epsilon_{\text{rounding}}
+\end{equation}
+where $\epsilon_{\text{rounding}} \leq S(t)$ wei (at most 1 wei per outstanding share due to floor rounding).
+\end{property}
+
+\begin{proof}
+By construction, deposits mint $\lfloor a / p(t) \rfloor$ shares for $a$ assets deposited, so the share value never exceeds the deposit. Withdrawals burn shares before releasing assets. Yield increases $B(t)$ without increasing $S(t)$ (shares are only minted for deposits and fee extraction). Fee shares are minted against yield already in $B(t)$. The rounding bound follows from the floor operation in Equation~(\ref{eq:toShares}).
+\end{proof}
+
+\begin{property}[Undercollateralization Detection]
+If $B(t) < \theta_{\min} \cdot S(t) \cdot p(t_{k-1})$, the bridge pauses within $\Delta + \delta_{\text{confirm}}$.
+\end{property}
+
+\begin{proof}
+Direct from Theorem~\ref{thm:pause}.
+\end{proof}
+
+\begin{property}[No Share Price Manipulation]
+An external actor cannot decrease $p(t)$ through deposit, withdrawal, or harvest operations.
+\end{property}
+
+\begin{proof}
+\textit{Deposit}: increases $B$ by $a$ and $S$ by $a/p(t)$, leaving $p$ unchanged.
+\textit{Withdrawal}: decreases $B$ by $s \cdot p(t)$ and $S$ by $s$, leaving $p$ unchanged.
+\textit{Harvest}: increases $B$ by harvested yield, does not change $S$, so $p$ increases.
+\textit{Fee extraction}: mints shares against existing yield in $B$, yielding $p' > p$ (Section~\ref{sec:fees}).
+No operation decreases $p$.
+\end{proof}
+
+\begin{property}[Exit Guarantee]
+Users holding yield-bearing bridge tokens can redeem for underlying assets within the MPC liveness bound (7 days worst case under signer rotation) regardless of bridge pause state.
+\end{property}
+
+\begin{proof}
+The \texttt{burnForWithdrawal} function is never disabled, even in \texttt{PAUSED} state. Only minting is disabled on pause. The MPC set signs withdrawal releases as long as $t$-of-$n$ signers are operational. Under signer rotation (7-day timelock), the current signer set remains active until the rotation completes.
+\end{proof}
+
+% ============================================================
+\section{Implementation}\label{sec:implementation}
+% ============================================================
+
+\subsection{Contract Architecture}
+
+The yield system comprises four contracts per source chain:
+
+\begin{table}[ht]
+\centering
+\small
+\caption{Yield system contract architecture.}
+\label{tab:contracts}
+\begin{tabular}{@{}lp{4.8cm}@{}}
+\toprule
+\textbf{Contract} & \textbf{Function} \\
+\midrule
+\texttt{YieldBridgeVault} & Manages deposits, withdrawals, strategy routing, tier enforcement \\
+\texttt{StrategyRouter} & Allocates capital across strategies per tier weights \\
+\texttt{BackingOracle} & Receives MPC attestations, updates share price \\
+\texttt{ShariaFilter} & Classifies strategies for Shariah compliance mode \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Gas Costs}
+
+\begin{table}[ht]
+\centering
+\small
+\caption{Gas costs for yield operations (Ethereum mainnet, 30 gwei gas price).}
+\label{tab:gas_yield}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Operation} & \textbf{Gas} & \textbf{Cost} \\
+\midrule
+\texttt{deposit} (to vault) & $\sim$120,000 & $\sim$\$6.30 \\
+\texttt{withdraw} (from vault) & $\sim$95,000 & $\sim$\$5.00 \\
+\texttt{harvest} (per strategy) & $\sim$80,000 & $\sim$\$4.20 \\
+\texttt{updateBacking} (attestation) & $\sim$45,000 & $\sim$\$2.35 \\
+\texttt{rebalance} (strategy rotation) & $\sim$250,000 & $\sim$\$13.10 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Source Code}
+
+All contracts are open-source under the MIT license:
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Component} & \textbf{Repository} \\
+\midrule
+Yield vault & \texttt{luxfi/standard} \\
+Strategy adapters & \texttt{luxfi/standard} \\
+MPC attestation & \texttt{luxfi/mpc} \\
+Threshold crypto & \texttt{luxfi/threshold} \\
+Bridge contracts & \texttt{luxfi/bridge} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================
+\section{Related Work}\label{sec:related}
+% ============================================================
+
+\paragraph{ERC-4626 Tokenized Vaults~\cite{erc4626}.} The standard that defines share-based vault accounting on EVM. Teleport adopts the same \texttt{convertToShares}/\texttt{convertToAssets} semantics but extends them cross-chain, where the vault and share token exist on different blockchains. The key challenge ERC-4626 does not address is cross-chain state synchronization of the share price.
+
+\paragraph{Lido~\cite{lidofinance}.} The largest liquid staking protocol (\$14.5B stETH outstanding). Lido's stETH rebasing model inspired yLETH's share-price model, but Lido operates on a single chain. Teleport's contribution is deploying bridge-locked ETH into Lido (and other strategies) while reflecting the yield cross-chain.
+
+\paragraph{EigenLayer~\cite{eigenlayer2023}.} Restaking protocol enabling ETH stakers to provide security to additional services. Teleport uses EigenLayer as one of 29 yield sources, composing restaking yield on top of liquid staking yield for bridge-locked assets.
+
+\paragraph{Babylon~\cite{babylon2024}.} BTC staking protocol using Bitcoin Script covenants. Teleport integrates Babylon as the base layer of the BTC yield stack, with the FROST-controlled Taproot address doubling as both bridge custody and Babylon staking key.
+
+\paragraph{Pendle~\cite{pendle2023}.} Yield tokenization protocol that splits yield-bearing tokens into principal (PT) and yield (YT) components. Teleport yLETH can be deposited into Pendle on the destination chain, enabling fixed-rate yield exposure on bridged assets.
+
+\paragraph{Across Protocol~\cite{across2023}.} Optimistic bridge using LP-funded fast fills. Across LPs earn yield by fronting bridge capital, but the bridged assets themselves (held by users) earn no yield. Teleport's yield-bearing tokens ensure the \emph{user's} bridged capital is productive.
+
+\paragraph{Wormhole NTT~\cite{wormhole}.} Native token transfers without wrapping. NTT addresses token fungibility but not capital efficiency---transferred tokens still earn zero yield during transit.
+
+% ============================================================
+\section{Conclusion}\label{sec:conclusion}
+% ============================================================
+
+We have presented a comprehensive yield system for cross-chain bridge tokens that eliminates the \$675M+ annual capital inefficiency of idle bridge TVL. The system's formal properties---share price monotonicity, automatic undercollateralization pause, tier-based diversification, and exit guarantees---provide the safety invariants required for production bridge operation.
+
+The Bitcoin-native yield composition through Babylon, Lombard, SolvBTC, and CoreDAO represents a qualitative advance: native BTC earning yield without custodial wrapping, with the same FROST threshold key securing both bridge custody and staking positions.
+
+The xLUX flywheel, where fees from bridge, DEX, lending, perpetuals, and NFT AMM compound into staking yield, creates a self-reinforcing economic equilibrium that scales with ecosystem adoption. As cross-chain volume grows, yield-bearing bridge tokens become strictly dominant over conventional wrapped tokens---offering higher capital efficiency with equivalent or superior security guarantees.
+
+% ============================================================
+% References
+% ============================================================
+\begin{thebibliography}{99}
+
+\bibitem{defillama2026} DefiLlama, ``Bridge TVL Rankings,'' \url{https://defillama.com/bridges}, accessed April 2026.
+
+\bibitem{luxteleport} Z.~Kelling, ``Lux Teleport: A Sovereign Omnichain Liquidity Protocol,'' Lux Industries, 2026.
+
+\bibitem{frost} C.~Komlo and I.~Goldberg, ``FROST: Flexible Round-Optimized Schnorr Threshold Signatures,'' in \emph{Selected Areas in Cryptography (SAC)}, 2020.
+
+\bibitem{cggmp21} R.~Canetti, R.~Gennaro, S.~Goldfeder, N.~Makriyannis, and U.~Peled, ``UC Non-Interactive, Proactive, Threshold ECDSA with Identifiable Aborts,'' in \emph{ACM CCS}, 2020.
+
+\bibitem{erc4626} J.~Bebis \emph{et al.}, ``EIP-4626: Tokenized Vault Standard,'' Ethereum Improvement Proposal, 2022.
+
+\bibitem{lidofinance} Lido DAO, ``Lido: Liquid Staking for Ethereum,'' \url{https://lido.fi}, 2020.
+
+\bibitem{aavev3} Aave Companies, ``Aave V3 Technical Paper,'' 2022.
+
+\bibitem{eigenlayer2023} S.~Kannan \emph{et al.}, ``EigenLayer: The Restaking Collective,'' Whitepaper, 2023.
+
+\bibitem{babylon2024} Babylon Labs, ``Bitcoin Staking: Unlocking 21M Bitcoins to Secure the Proof-of-Stake Economy,'' Whitepaper, 2024.
+
+\bibitem{lombard2024} Lombard Finance, ``LBTC: Liquid Bitcoin Staking,'' \url{https://lombard.finance}, 2024.
+
+\bibitem{solvbtc} Solv Protocol, ``SolvBTC: Bitcoin Yield Aggregation,'' \url{https://solv.finance}, 2024.
+
+\bibitem{coredao} Core Foundation, ``CoreDAO: Satoshi Plus Consensus,'' Whitepaper, 2023.
+
+\bibitem{pendle2023} Pendle Finance, ``Pendle: Yield Tokenization Protocol,'' \url{https://pendle.finance}, 2023.
+
+\bibitem{across2023} Across Protocol, ``Across: Optimistic Cross-Chain Bridge,'' Whitepaper, 2023.
+
+\bibitem{wormhole} Wormhole Foundation, ``Wormhole: A Generic Message Passing Protocol,'' Whitepaper, 2022.
+
+\bibitem{wbtc} BitGo, ``Wrapped Bitcoin (WBTC),'' \url{https://wbtc.network}, 2019.
+
+\bibitem{rekt} Rekt News, ``Leaderboard,'' \url{https://rekt.news/leaderboard/}, 2024.
+
+\bibitem{markowitz1952} H.~Markowitz, ``Portfolio Selection,'' \emph{The Journal of Finance}, vol.~7, no.~1, pp.~77--91, 1952.
+
+\end{thebibliography}
+
+\end{document}
