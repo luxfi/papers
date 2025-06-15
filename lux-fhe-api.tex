@@ -1,0 +1,304 @@
+\documentclass[11pt]{article}
+\usepackage{shared/luxcover}
+\usepackage{amsmath, amssymb, algpseudocode, graphicx, hyperref, booktabs, listings}
+
+\title{FHE API and Developer Model for Practical Private Applications}
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+\date{2025}
+
+\lstset{basicstyle=\ttfamily\small, frame=single, breaklines=true}
+
+\usepackage{amsthm}
+\newtheorem{definition}{Definition}
+\begin{document}
+\luxcoverpage
+
+\begin{abstract}
+We describe the Go API and developer model for Lux FHE, an original lattice-based fully homomorphic encryption implementation built on \texttt{luxfi/lattice}. The library provides boolean gate evaluation on encrypted bits with programmable bootstrapping, radix-decomposed encrypted integers (uint8--uint256), and SIMD-optimized NTT for polynomial arithmetic. This paper specifies the developer-facing abstractions: parameter selection, key lifecycle (generation, serialization, threshold distribution), encryption/decryption patterns, evaluator design, error handling, batching strategies for amortized cost, and safe-by-default API patterns that prevent common misuse (key reuse, nonce collision, ciphertext malleability). The API is designed for blockchain integration via EVM precompiles and the \texttt{fhed} daemon's HTTP interface, with supported circuits including comparison, arithmetic, bitwise operations, and conditional selection.
+\end{abstract}
+
+\section{Introduction}
+
+FHE enables computation on encrypted data without decryption, but its practical adoption is limited by two problems: performance and usability. Performance is addressed in the companion benchmarking paper \cite{fhe-benchmarks}. This paper addresses usability: how should a developer interact with an FHE library without needing to understand lattice cryptography, noise budgets, or bootstrapping schedules?
+
+Lux FHE (\texttt{github.com/luxfi/fhe}) is a pure Go implementation built on the \texttt{luxfi/lattice/v7} library. It provides:
+\begin{itemize}
+\item Boolean circuit evaluation with automatic bootstrapping after each gate.
+\item Radix-decomposed integers supporting arithmetic, comparison, and bitwise operations.
+\item NTT SIMD optimization with Barrett and Montgomery reduction.
+\item C FFI bindings (\texttt{bindings/cabi/}) and Rust bindings (\texttt{bindings/rust/}) for cross-language use.
+\item HTTP API via the \texttt{fhed} daemon for integration with non-Go applications.
+\item Threshold mode with LSSS key sharing and mDNS-based peer discovery.
+\end{itemize}
+
+\section{Parameter Selection}
+
+\subsection{Standard Parameter Sets}
+
+Developers choose from three pre-validated parameter sets:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Name} & \textbf{Security} & \textbf{LWE Dim} & \textbf{Use Case} \\
+\midrule
+\texttt{PN10QP27} & 128-bit classical & $N=1024$ & Default, good performance \\
+\texttt{PN11QP54} & 128-bit classical & $N=2048$ & Higher precision \\
+\texttt{PN9QP28\_STD128} & 128-bit classical & $N=512/1024$ & OpenFHE compatible \\
+\bottomrule
+\end{tabular}
+\caption{Standard parameter sets. All use NTT-friendly primes $Q \equiv 1 \pmod{2N}$.}
+\label{tab:params}
+\end{table}
+
+Custom parameter construction is deliberately not exposed in the public API. Choosing incorrect parameters can silently degrade security. Developers who need non-standard parameters must use the internal \texttt{ParametersLiteral} type and accept responsibility for security analysis.
+
+\subsection{Parameter Encoding}
+
+Parameters define the LWE dimension, blind rotation dimension, modulus, and base-two decomposition level. The encoding uses the \texttt{luxfi/lattice/v7} RLWE parameter structure:
+
+\begin{lstlisting}[language=Go]
+params, err := fhe.NewParameters(fhe.PN10QP27)
+if err != nil {
+    return fmt.Errorf("create params: %w", err)
+}
+// params.NLWE() = 1024
+// params.NBR()  = 1024
+// params.QLWE() = 0x7fff801
+\end{lstlisting}
+
+\section{Key Lifecycle}
+
+\subsection{Generation}
+
+Key generation produces three artifacts: a secret key, a public evaluation key (bootstrap key), and optionally a key-switching key:
+
+\begin{lstlisting}[language=Go]
+sk, bsk, err := fhe.GenerateKeys(params)
+if err != nil {
+    return fmt.Errorf("keygen: %w", err)
+}
+enc := fhe.NewEncryptor(params, sk)
+eval := fhe.NewEvaluator(params, bsk)
+dec := fhe.NewDecryptor(params, sk)
+\end{lstlisting}
+
+The evaluator does not require the secret key. This separation is the fundamental safety property: the entity performing computation never sees plaintext.
+
+\subsection{Serialization}
+
+All key types implement \texttt{encoding.BinaryMarshaler} and \texttt{encoding.BinaryUnmarshaler}:
+
+\begin{lstlisting}[language=Go]
+data, err := sk.MarshalBinary()
+// store securely via KMS
+
+var sk2 fhe.SecretKey
+err = sk2.UnmarshalBinary(data)
+\end{lstlisting}
+
+\subsection{Threshold Key Distribution}
+
+For threshold mode ($t$-of-$n$), key generation uses LSSS (Linear Secret Sharing Scheme):
+
+\begin{lstlisting}[language=Go]
+shares, bsk, err := fhe.GenerateThresholdKeys(
+    params, t, n,
+)
+// Distribute shares[i] to party i
+// bsk (bootstrap key) is public
+\end{lstlisting}
+
+Resharing to a new $(t', n')$ configuration does not require reconstructing the original secret key:
+
+\begin{lstlisting}[language=Go]
+newShares, err := fhe.Reshare(
+    shares, newT, newN,
+)
+\end{lstlisting}
+
+\section{Encryption and Decryption}
+
+\subsection{Boolean Encryption}
+
+Single-bit encryption produces an LWE ciphertext:
+
+\begin{lstlisting}[language=Go]
+ct, err := enc.EncryptBit(true)
+bit, err := dec.DecryptBit(ct)
+// bit == true
+\end{lstlisting}
+
+\subsection{Integer Encryption}
+
+Integers are decomposed into radix blocks, each block being a \texttt{ShortInt} (1--4 bits) encrypted in a single LWE ciphertext:
+
+\begin{lstlisting}[language=Go]
+intEnc := fhe.NewIntegerEncryptor(params, sk)
+ct, err := intEnc.EncryptUint32(42)
+val, err := intEnc.DecryptUint32(ct)
+// val == 42
+\end{lstlisting}
+
+The \texttt{RadixCiphertext} type carries metadata about its FHE type (\texttt{FheUint8}, \texttt{FheUint16}, \texttt{FheUint32}, \texttt{FheUint64}, \texttt{FheUint128}, \texttt{FheUint256}) and enforces type matching at the API boundary.
+
+\section{Evaluator Operations}
+
+\subsection{Boolean Gates}
+
+The evaluator supports standard boolean gates, each followed by automatic bootstrapping:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Gate} & \textbf{Method} \\
+\midrule
+AND, OR, XOR, NOT & \texttt{eval.AND(a, b)}, etc. \\
+NAND, NOR, XNOR & \texttt{eval.NAND(a, b)}, etc. \\
+MUX (ternary select) & \texttt{eval.MUX(cond, a, b)} \\
+MAJORITY (2-of-3) & \texttt{eval.MAJORITY(a, b, c)} \\
+\bottomrule
+\end{tabular}
+\caption{Boolean gate API. Each returns \texttt{(*Ciphertext, error)}.}
+\label{tab:gates}
+\end{table}
+
+\subsection{Integer Operations}
+
+The \texttt{IntegerEvaluator} provides arithmetic and comparison on radix-decomposed encrypted integers:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Category} & \textbf{Operations} \\
+\midrule
+Arithmetic & Add, Sub, Mul, Div, Rem, Neg \\
+Comparison & Eq, Ne, Lt, Le, Gt, Ge \\
+Bitwise & And, Or, Xor, Not, Shl, Shr \\
+Selection & Mux (conditional select) \\
+Scalar & AddScalar, MulScalar, SubScalar \\
+\bottomrule
+\end{tabular}
+\caption{Integer evaluator operations. All accept \texttt{*RadixCiphertext} arguments.}
+\label{tab:int-ops}
+\end{table}
+
+\subsection{Error Handling}
+
+Every operation returns an explicit error. Common error conditions:
+
+\begin{itemize}
+\item \textbf{Type mismatch}: Attempting to add a \texttt{FheUint8} to a \texttt{FheUint32}. Rejected at the API boundary.
+\item \textbf{Nil ciphertext}: Passing an uninitialized ciphertext. Returns \texttt{ErrNilCiphertext}.
+\item \textbf{Parameter mismatch}: Evaluating with keys generated for different parameters. Returns \texttt{ErrParamMismatch}.
+\end{itemize}
+
+No operation panics. All errors are returned, never swallowed.
+
+\section{Batching and Amortization}
+
+Boolean gates have high per-gate cost due to bootstrapping. Batching amortizes the cost of key material transfer and NTT setup across multiple operations.
+
+The \texttt{fhed} daemon's \texttt{/evaluate} endpoint accepts batched operations:
+
+\begin{lstlisting}[language=Go]
+// Batch of 100 AND gates in a single request
+results, err := client.EvaluateBatch(
+    fhe.OpAND, pairs,
+)
+\end{lstlisting}
+
+Batched evaluation reuses the NTT engine's precomputed twiddle factors and Montgomery constants across all operations in the batch, reducing amortized setup cost to near zero.
+
+\section{Safe-by-Default Patterns}
+
+The API enforces several safety invariants:
+
+\begin{enumerate}
+\item \textbf{No key reuse across parameter sets}: Attempting to use a key generated for \texttt{PN10QP27} with \texttt{PN11QP54} parameters returns an error at construction time, not at operation time.
+\item \textbf{Ciphertext type tagging}: Every ciphertext carries its FHE type. Operations between mismatched types are rejected before any computation occurs.
+\item \textbf{No plaintext in evaluator}: The \texttt{Evaluator} type does not accept or produce plaintext values. The only path to plaintext is through the \texttt{Decryptor}, which requires the secret key.
+\item \textbf{Deterministic randomness for testing}: The \texttt{fhe.NewDeterministicEncryptor()} variant uses a seeded PRNG for reproducible tests but is marked as unsafe for production via build tags.
+\end{enumerate}
+
+\section{EVM Integration}
+
+FHE operations are exposed as EVM precompiles on Lux C-Chain:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Precompile} & \textbf{FHE Operation} \\
+\midrule
+FHEAdd, FHESub, FHEMul & Encrypted integer arithmetic \\
+FHEEq, FHELt, FHEGt, FHELe, FHEGe & Encrypted comparison \\
+FHEAnd, FHEOr, FHEXor, FHENot & Encrypted bitwise \\
+TrivialEncrypt & Plaintext $\to$ ciphertext (public value) \\
+Decrypt, Reencrypt & Async decryption via T-Chain \\
+\bottomrule
+\end{tabular}
+\caption{FHE EVM precompiles at addresses \texttt{0x0200...0080}--\texttt{0x0200...0083}.}
+\label{tab:precompiles}
+\end{table}
+
+Solidity developers interact via the \texttt{@luxfi/contracts} library:
+
+\begin{lstlisting}[language=Java]
+import "@luxfi/contracts/FHE.sol";
+euint32 a = FHE.asEuint32(encrypted_input);
+euint32 b = FHE.add(a, FHE.asEuint32(10));
+\end{lstlisting}
+
+\section{Conclusion}
+
+FHE is unusable if the API leaks implementation complexity to the developer. Lux FHE's API provides three levels of abstraction: boolean gates for circuit designers, integer operations for application developers, and EVM precompiles for Solidity developers. All levels enforce type safety, prevent key misuse, and return explicit errors. The threshold mode extends the same API to distributed settings without changing the programming model. Performance characteristics of these operations are detailed in the companion benchmarking paper \cite{fhe-benchmarks}.
+
+\begin{thebibliography}{99}
+
+\bibitem{fhe-benchmarks}
+Kelling, Z. (2025).
+\textit{FHE Benchmarking, Cost Models, and Operational SLOs}.
+Lux Industries Research.
+
+\bibitem{tfhe}
+Kelling, Z. (2025).
+\textit{Threshold Fully Homomorphic Encryption for Confidential DeFi}.
+Lux Industries Research.
+
+\bibitem{quasar}
+Kelling, Z. (2025).
+\textit{Quasar: Quantum-Secure Multi-Engine Consensus with Triple-Proof Quantum Finality}.
+Lux Industries Research.
+
+\bibitem{threshold-decrypt}
+Kelling, Z. (2024).
+\textit{Threshold Decryption and Recovery for Confidential Systems}.
+Lux Industries Research.
+
+\bibitem{hsm-boundary}
+Kelling, Z. (2025).
+\textit{Secure Enclave, HSM, and Threshold Boundary Design}.
+Lux Industries Research.
+
+\bibitem{cggi}
+Chillotti, I., Gama, N., Georgieva, M., \& Izabachene, M. (2020).
+\textit{TFHE: Fast Fully Homomorphic Encryption over the Torus}.
+Journal of Cryptology, 33(1), 34--91.
+
+\bibitem{lmkcdey}
+Lee, Y., Micciancio, D., Kim, A., Choi, R., Deryabin, M., Eom, J., \& Yoo, D. (2023).
+\textit{Efficient FHEW Bootstrapping with Small Evaluation Keys}.
+EUROCRYPT 2023.
+
+\end{thebibliography}
+
+\end{document}
