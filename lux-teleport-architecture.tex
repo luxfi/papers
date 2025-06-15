@@ -1,0 +1,786 @@
+\documentclass[11pt]{article}
+\usepackage{shared/luxcover}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{tikz}
+\usepackage{float}
+\usepackage{array}
+\usepackage{multirow}
+\input{shared/lstlang}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,calc}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  keywordstyle=\color{blue!70!black}\bfseries,
+  commentstyle=\color{green!50!black}\itshape,
+  stringstyle=\color{red!60!black},
+  showstringspaces=false,
+}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}{Definition}
+\newtheorem{property}{Property}
+\newtheorem{invariant}{Invariant}
+
+\title{Teleport Universal Bridge Architecture:\\Frozen Wire Format, Pluggable Chain Adapters,\\and Multi-Tenant Deployment}
+
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}
+\quad
+Vishnu Seesahai\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+
+\date{2025}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+We describe the engineering architecture of Lux Teleport, a universal cross-chain bridge serving 270+ chains through a single protocol binary. The design separates concerns into four layers: (1)~a \emph{frozen wire protocol} comprising four canonical proof tags---\texttt{DEPOSIT}, \texttt{YIELD}, \texttt{BACKING}, \texttt{RELEASE}---encoded as \texttt{bytes32}-tagged \texttt{abi.encode} payloads with MPC-signed proofs, per-\texttt{srcChainId} replay protection, and monotonic backing attestations with configurable staleness windows; (2)~a \emph{chain-agnostic Teleporter contract} that implements the wire protocol against an abstract chain adapter interface, enabling a single audited contract to serve all EVM deployments; (3)~a \emph{pluggable chain adapter} layer supporting four support classes---Lux-native (Warp, no MPC hop), external EVM (\texttt{TeleportVault} template), Bitcoin-family script chains (watcher-first: OP\_NET, Litecoin, Dogecoin), and non-EVM account-model chains (Solana Ed25519, TON Ed25519, XRP secp256k1); and (4)~a \emph{multi-tenant architecture} where hostname-based routing, per-tenant manifests, and shared MPC infrastructure enable white-label bridge deployments from a single binary. We specify the threshold signing interface unifying CGGMP21 (ECDSA/secp256k1 for EVM), FROST (Schnorr for Bitcoin Taproot), and BLS (Lux Warp internal) under \texttt{github.com/luxfi/crypto/threshold}. We formalize the security model including per-chain confirmation depths, backing attestation monotonicity, sequential withdraw nonces, peg oracle auto-pause thresholds, and hot wallet / MPC key separation. We describe the yield composition pipeline through which bridged assets earn layered returns via Babylon staking, D-Chain LP, and bridge fees through the xLUX instrument. Finally, we specify the 6-artifact conformance testing framework that gates chain onboarding through CI/CD.
+\end{abstract}
+
+\tableofcontents
+
+%% =========================================================================
+\section{Introduction}
+\label{sec:intro}
+%% =========================================================================
+
+Cross-chain bridge protocols face a tension between generality and security. A bridge that supports $n$ chains requires $O(n)$ contract implementations, each a distinct attack surface. Teleport resolves this by separating the protocol into a chain-independent wire format and a chain-dependent adapter layer, connected through a narrow typed interface.
+
+Three prior Lux papers define components used here: Lux Teleport Protocol~\cite{luxtp2022} established lock-and-mint semantics, Lux Bridge~\cite{luxbridge2023} formalized threshold MPC custody, and Lux Warp Messaging~\cite{luxwarp2023} specified intra-ecosystem BLS messaging. This paper unifies these into a single deployable architecture and adds four contributions:
+
+\begin{enumerate}[nosep]
+  \item A frozen wire format with exactly four proof tags, audited once and never modified (\S\ref{sec:wire}).
+  \item A chain adapter taxonomy with formal adapter interface contracts (\S\ref{sec:adapters}).
+  \item A multi-tenant deployment model for white-label bridge instances (\S\ref{sec:multitenant}).
+  \item A conformance test framework that enforces correctness at onboarding time (\S\ref{sec:conformance}).
+\end{enumerate}
+
+%% =========================================================================
+\section{Wire Protocol}
+\label{sec:wire}
+%% =========================================================================
+
+The wire protocol defines the canonical format for all cross-chain proofs. It is frozen: no new tags, no field reordering, no encoding changes. Upgrades occur exclusively at the adapter layer.
+
+\subsection{Proof Tags}
+
+Every proof is a \texttt{bytes32}-tagged ABI-encoded payload signed by the MPC threshold committee. Four tags exist:
+
+\begin{definition}[Canonical Proof Tags]
+\label{def:tags}
+\begin{align}
+  \mathsf{DEPOSIT}  &= \texttt{keccak256("DEPOSIT")}  \label{eq:tag-deposit} \\
+  \mathsf{YIELD}    &= \texttt{keccak256("YIELD")}    \label{eq:tag-yield} \\
+  \mathsf{BACKING}  &= \texttt{keccak256("BACKING")}  \label{eq:tag-backing} \\
+  \mathsf{RELEASE}  &= \texttt{keccak256("RELEASE")}  \label{eq:tag-release}
+\end{align}
+These four values are compile-time constants in the Teleporter contract. No mechanism exists to add, remove, or modify tags post-deployment.
+\end{definition}
+
+\subsection{Proof Encoding}
+
+Each proof $\pi$ consists of a tag, a payload, and a threshold signature:
+
+\begin{definition}[Wire Proof Format]
+\label{def:proof}
+\begin{equation}
+  \pi = \bigl(\mathsf{tag},\; \mathsf{payload},\; \sigma\bigr)
+\end{equation}
+where:
+\begin{align}
+  \mathsf{payload} &= \texttt{abi.encode}(\mathsf{tag}, C_s, \nu, T, r, a, \mathsf{extra}) \\
+  \sigma &= \mathrm{ThresholdSign}_{t,n}\bigl(H(\mathsf{payload})\bigr)
+\end{align}
+$C_s$ is the source chain identifier, $\nu$ is the operation nonce, $T$ is the token address, $r$ is the recipient, $a$ is the amount, and $\mathsf{extra}$ is a tag-specific extension field (empty for \texttt{DEPOSIT} and \texttt{RELEASE}).
+\end{definition}
+
+The hash function $H$ is chain-determined: \texttt{keccak256} for EVM targets, SHA-256 for Bitcoin-family, and the native hash for other environments. The adapter layer handles this mapping (see \S\ref{sec:adapters}).
+
+\subsection{Tag Semantics}
+
+\paragraph{DEPOSIT.} Attests that a user locked $a$ units of asset $T$ on source chain $C_s$, destined for recipient $r$ on the destination chain. The destination Teleporter verifies $\sigma$ and mints wrapped tokens.
+
+\begin{equation}
+  m_{\mathsf{dep}} = H\bigl(\mathsf{DEPOSIT} \,\|\, C_s \,\|\, \nu \,\|\, T \,\|\, r \,\|\, a\bigr)
+  \label{eq:deposit}
+\end{equation}
+
+\paragraph{YIELD.} Attests that accrued yield $\delta$ has increased the share price of bridge token $T$. The $\mathsf{extra}$ field carries the new share price numerator $p'$ and the epoch index $e$.
+
+\begin{equation}
+  m_{\mathsf{yld}} = H\bigl(\mathsf{YIELD} \,\|\, C_s \,\|\, \nu \,\|\, T \,\|\, p' \,\|\, e\bigr)
+  \label{eq:yield}
+\end{equation}
+
+\paragraph{BACKING.} Attests that total backing $B$ exists for token $T$ on source chain $C_s$ at timestamp $\tau$. The Teleporter enforces that $\tau$ is strictly greater than any previously accepted $\tau$ (monotonicity) and that $\tau \geq \mathrm{block.timestamp} - \Delta_{\mathsf{stale}}$ (staleness bound, default $\Delta_{\mathsf{stale}} = 7200\,\text{s}$).
+
+\begin{equation}
+  m_{\mathsf{back}} = H\bigl(\mathsf{BACKING} \,\|\, T \,\|\, B \,\|\, \tau \,\|\, C_s\bigr)
+  \label{eq:backing}
+\end{equation}
+
+\begin{invariant}[Backing Monotonicity]
+For successive backing proofs $\pi_k, \pi_{k+1}$ on a given token:
+\begin{equation}
+  \tau_{k+1} > \tau_k \quad \text{and} \quad \tau_{k+1} \geq \mathrm{block.timestamp} - \Delta_{\mathsf{stale}}
+\end{equation}
+\end{invariant}
+
+\paragraph{RELEASE.} Attests that the MPC authorizes releasing $a$ units of underlying asset $T$ to recipient $r'$ on source chain $C_s$. Issued after a user burns wrapped tokens on a destination chain.
+
+\begin{equation}
+  m_{\mathsf{rel}} = H\bigl(\mathsf{RELEASE} \,\|\, C_d \,\|\, \nu' \,\|\, T \,\|\, r' \,\|\, a\bigr)
+  \label{eq:release}
+\end{equation}
+
+The distinct tag prefixes in Equations~\eqref{eq:deposit}--\eqref{eq:release} guarantee domain separation: a signature valid for \texttt{DEPOSIT} cannot verify as \texttt{RELEASE}.
+
+\subsection{Replay Protection}
+\label{sec:replay}
+
+Each Teleporter contract maintains a per-source-chain nonce bitmap:
+
+\begin{equation}
+  \mathcal{N}: \mathbb{Z}_{\mathsf{chainId}} \times \mathbb{Z}_{\mathsf{nonce}} \to \{0, 1\}
+\end{equation}
+
+The verify-and-mark operation executes atomically within a single transaction:
+
+\begin{algorithm}[H]
+\caption{Atomic Nonce Check-and-Set}
+\begin{algorithmic}[1]
+\Require Source chain $C_s$, nonce $\nu$
+\State \textbf{assert} $\mathcal{N}(C_s, \nu) = 0$ \Comment{Not yet processed}
+\State $\mathcal{N}(C_s, \nu) \leftarrow 1$
+\end{algorithmic}
+\end{algorithm}
+
+Nonces are \emph{not} required to be sequential for \texttt{DEPOSIT} operations (out-of-order relay is permitted). Withdraw nonces for \texttt{RELEASE} operations \emph{are} sequential per destination chain, preventing front-running reordering of withdrawals.
+
+\begin{property}[Sequential Withdraw Nonces]
+\label{prop:seq-nonce}
+For \texttt{RELEASE} operations on chain $C$, the Teleporter enforces:
+\begin{equation}
+  \nu'_{k+1} = \nu'_k + 1
+\end{equation}
+where $\nu'_k$ is the last processed release nonce for chain $C$.
+\end{property}
+
+%% =========================================================================
+\section{Teleporter Contract}
+\label{sec:teleporter}
+%% =========================================================================
+
+The Teleporter is a chain-agnostic contract that implements the wire protocol. One audited Solidity implementation is deployed across all EVM chains. Non-EVM chains receive functionally identical implementations in their native languages, each tested against the same conformance suite (\S\ref{sec:conformance}).
+
+\subsection{Contract Interface}
+
+\begin{lstlisting}[language=Solidity,caption={Core Teleporter interface (simplified)}]
+interface ITeleporter {
+    // User-facing
+    function deposit(
+        address token,
+        uint256 amount,
+        uint64  dstChainId,
+        bytes32 recipient
+    ) external;
+
+    function withdraw(
+        bytes32 tag,    // RELEASE only
+        uint64  srcChainId,
+        uint256 nonce,
+        address token,
+        address recipient,
+        uint256 amount,
+        bytes   calldata proof
+    ) external;
+
+    // MPC-submitted
+    function submitBacking(
+        address token,
+        uint256 backing,
+        uint256 timestamp,
+        uint64  srcChainId,
+        bytes   calldata proof
+    ) external;
+
+    function submitYield(
+        address token,
+        uint256 newSharePrice,
+        uint256 epoch,
+        uint64  srcChainId,
+        bytes   calldata proof
+    ) external;
+
+    // Views
+    function isNonceUsed(uint64 srcChainId, uint256 nonce)
+        external view returns (bool);
+    function backingRatio(address token)
+        external view returns (uint256);
+}
+\end{lstlisting}
+
+\subsection{State Variables}
+
+The contract holds five categories of state:
+
+\begin{enumerate}[nosep]
+  \item \textbf{MPC public key} --- set once at deployment, rotated via 7-day timelock.
+  \item \textbf{Nonce bitmaps} --- \texttt{mapping(uint64 => mapping(uint256 => bool))}, one per source chain.
+  \item \textbf{Release counters} --- \texttt{mapping(uint64 => uint256)}, enforcing Property~\ref{prop:seq-nonce}.
+  \item \textbf{Backing state} --- per-token latest backing amount, timestamp, and derived pause flag.
+  \item \textbf{Yield state} --- per-token share price numerator and epoch index.
+\end{enumerate}
+
+The contract is non-upgradeable. No proxy pattern, no \texttt{delegatecall}, no admin functions beyond timelocked MPC key rotation.
+
+%% =========================================================================
+\section{Chain Support Classes}
+\label{sec:adapters}
+%% =========================================================================
+
+Teleport classifies connected chains into four support classes. Each class defines an adapter interface that translates the wire protocol into chain-native operations.
+
+\subsection{Class A: Lux-Native (No MPC Hop)}
+\label{sec:class-a}
+
+Transfers between Lux appchains use Warp Messaging~\cite{luxwarp2023} with BLS12-381 aggregate signatures. No MPC threshold ceremony is required---the source appchain's validator set signs the Warp message directly.
+
+\begin{property}[Warp Bypass]
+For transfers where both $C_s$ and $C_d$ are Lux appchains, the Teleporter verifies BLS aggregate signatures via the \texttt{0x0200000005} precompile rather than MPC ECDSA signatures via \texttt{ecrecover}.
+\end{property}
+
+Latency: sub-second (limited by appchain block time). Cost: no external gas, precompile verification only.
+
+\subsection{Class B: External EVM (TeleportVault Template)}
+\label{sec:class-b}
+
+External EVM chains (Ethereum, Arbitrum, Optimism, Base, BSC, Polygon, etc.) deploy a \texttt{TeleportVault} contract from a shared template. The template provides:
+
+\begin{itemize}[nosep]
+  \item ERC-4626 compatible vault for lock/release accounting
+  \item \texttt{ecrecover}-based MPC signature verification (CGGMP21 / secp256k1)
+  \item Per-token daily mint limits and global pause
+  \item Yield strategy integration hooks (see \S\ref{sec:yield})
+\end{itemize}
+
+\begin{lstlisting}[language=Solidity,caption={TeleportVault lock function (simplified)}]
+function lock(
+    address token,
+    uint256 amount,
+    uint64  dstChainId,
+    bytes32 recipient
+) external nonReentrant whenNotPaused {
+    IERC20(token).safeTransferFrom(
+        msg.sender, address(this), amount
+    );
+    uint256 nonce = ++lockNonces[dstChainId];
+    emit Lock(
+        block.chainid, dstChainId,
+        nonce, token, recipient, amount
+    );
+}
+\end{lstlisting}
+
+Confirmation depth before the MPC signs: configurable per chain, defaults listed in Table~\ref{tab:depths}.
+
+\subsection{Class C: Bitcoin-Family / Script Chains (Watcher-First)}
+\label{sec:class-c}
+
+Bitcoin, OP\_NET, Litecoin, and Dogecoin lack smart contract runtimes capable of verifying threshold signatures on-chain. The adapter uses a \emph{watcher-first} architecture:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Deposit path}: A watcher service monitors the chain for deposits to a FROST-derived Taproot address. Upon reaching confirmation depth (6 blocks for Bitcoin, 12 for Litecoin, 40 for Dogecoin), the watcher submits a deposit attestation to the MPC cluster.
+  \item \textbf{Release path}: The MPC cluster constructs and signs a Bitcoin transaction using FROST (Schnorr/BIP-340) threshold signing, producing a valid Taproot spend.
+\end{enumerate}
+
+% [FIGURE: Watcher-first flow diagram showing deposit detection, confirmation
+%  depth waiting, MPC attestation, and FROST-signed release transaction]
+
+\begin{property}[Script Chain Asymmetry]
+On Class~C chains, deposits are permissionless (any user sends to the Taproot address) but releases require MPC coordination. There is no on-chain contract to enforce nonces; the MPC cluster maintains canonical nonce state.
+\end{property}
+
+For OP\_NET specifically, the watcher interfaces with the OP\_NET runtime's AssemblyScript contracts, which can emit structured events but cannot verify external signatures. The adapter treats OP\_NET as a script chain with event-emitting capability.
+
+\subsection{Class D: Non-EVM Account-Model Chains}
+\label{sec:class-d}
+
+Solana, TON, and XRP use account-model architectures with non-EVM signature schemes.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{llll}
+\toprule
+\textbf{Chain} & \textbf{Curve} & \textbf{Threshold Protocol} & \textbf{Verify Method} \\
+\midrule
+Solana   & Ed25519     & FROST    & \texttt{Ed25519SigVerify} precompile \\
+TON      & Ed25519     & FROST    & \texttt{check\_signature} TVM opcode \\
+XRP      & secp256k1   & CGGMP21  & Native transaction signing \\
+Sui      & Ed25519     & FROST    & \texttt{ed25519::verify} Move \\
+Aptos    & Ed25519     & FROST    & \texttt{ed25519::verify} Move \\
+Cosmos   & secp256k1   & CGGMP21  & \texttt{VerifySignature} SDK \\
+\bottomrule
+\end{tabular}
+\caption{Non-EVM chain adapter configurations}
+\label{tab:non-evm}
+\end{table}
+
+Each Class~D adapter implements the same four-tag wire protocol. The hash function $H$ and signature encoding vary per chain but the proof semantics remain identical.
+
+%% =========================================================================
+\section{Threshold Signing Architecture}
+\label{sec:threshold}
+%% =========================================================================
+
+The MPC cluster exposes a unified signing interface regardless of the underlying cryptographic protocol. The interface is defined at \texttt{github.com/luxfi/crypto/threshold}.
+
+\subsection{Protocol Selection}
+
+\begin{definition}[Unified Threshold Interface]
+\label{def:threshold-iface}
+The threshold signing interface exposes three operations:
+\begin{itemize}[nosep]
+  \item $\mathrm{KeyGen}(t, n, \mathsf{curve}) \to (\mathsf{pk}, \{\mathsf{sk}_i\}_{i=1}^{n})$
+  \item $\mathrm{Sign}(m, S) \to \sigma$ where $|S| \geq t$
+  \item $\mathrm{Verify}(\mathsf{pk}, m, \sigma) \to \{0, 1\}$
+\end{itemize}
+The $\mathsf{curve}$ parameter selects the concrete protocol:
+\end{definition}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{llll}
+\toprule
+\textbf{Protocol} & \textbf{Curve} & \textbf{Chains} & \textbf{Signature Size} \\
+\midrule
+CGGMP21 & secp256k1 & EVM, XRP, Cosmos & 65 bytes (r,s,v) \\
+FROST   & Ed25519   & Solana, TON, Sui, Aptos & 64 bytes (R,s) \\
+FROST   & secp256k1 (BIP-340) & Bitcoin Taproot & 64 bytes (Schnorr) \\
+BLS     & BLS12-381 & Lux Warp internal & 48 bytes (compressed) \\
+\bottomrule
+\end{tabular}
+\caption{Threshold protocol selection by chain family}
+\label{tab:protocols}
+\end{table}
+
+\subsection{CGGMP21 for EVM Chains}
+
+EVM chains verify signatures via the \texttt{ecrecover} precompile, which expects ECDSA signatures on the secp256k1 curve. CGGMP21~\cite{cggmp21} provides threshold ECDSA with identifiable abort: if a participant deviates from the protocol, the honest majority can identify the cheater and exclude them.
+
+Key properties:
+\begin{itemize}[nosep]
+  \item $t$-of-$n$ threshold with $t = 2, n = 3$ default (production configuration).
+  \item 4-round signing protocol (can be preprocessed to 1 effective round).
+  \item Signatures are indistinguishable from standard ECDSA: no on-chain changes required.
+  \item Forgery probability: $2^{-139.6}$ for $t = 67$-of-$n = 100$~\cite{luxbridge2023}.
+\end{itemize}
+
+\subsection{FROST for Bitcoin Taproot and EdDSA Chains}
+
+FROST~\cite{frost} provides threshold Schnorr signatures. For Bitcoin Taproot (BIP-340), FROST produces 64-byte Schnorr signatures that spend from a Taproot address derived from the group public key. For Ed25519 chains, FROST produces standard EdDSA signatures.
+
+\begin{property}[FROST Two-Round Signing]
+FROST signing completes in exactly 2 rounds:
+\begin{enumerate}[nosep]
+  \item Commitment round: each signer broadcasts $(D_i, E_i)$.
+  \item Signature round: each signer produces partial signature $z_i$; aggregator computes $\sigma = (R, s)$.
+\end{enumerate}
+\end{property}
+
+\subsection{BLS for Lux Warp}
+
+Intra-Lux transfers bypass the MPC cluster entirely. Appchain validators sign Warp messages using their BLS12-381 keys. The destination appchain verifies the aggregate signature via precompile, checking that the signing set represents $\geq 2/3$ of the source appchain's staked weight.
+
+\subsection{Implementation: \texttt{luxfi/crypto/threshold}}
+
+The Go implementation provides a single entry point:
+
+\begin{lstlisting}[language=Go,caption={Threshold signing entry point}]
+package threshold
+
+type Signer interface {
+    KeyGen(ctx context.Context, t, n int,
+           curve Curve) (*KeyShare, error)
+    Sign(ctx context.Context, msg []byte,
+         participants []PartyID) (*Signature, error)
+}
+
+type Curve int
+const (
+    Secp256k1 Curve = iota // CGGMP21
+    Ed25519                // FROST
+    BIP340                 // FROST (Schnorr)
+    BLS12381               // BLS aggregate
+)
+\end{lstlisting}
+
+The caller specifies the curve; the library selects the protocol. No protocol-specific API is exposed to bridge logic.
+
+%% =========================================================================
+\section{Security Model}
+\label{sec:security}
+%% =========================================================================
+
+\subsection{Confirmation Depths}
+\label{sec:depths}
+
+The MPC cluster waits for chain-specific confirmation depths before signing a \texttt{DEPOSIT} proof. These depths are chosen to make chain reorganization economically infeasible.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrl}
+\toprule
+\textbf{Chain} & \textbf{Depth} & \textbf{Rationale} \\
+\midrule
+Bitcoin        & 6    & $\sim$60 min; 51\% attack cost $>\$10$B/hr \\
+Litecoin       & 12   & $\sim$30 min; proportional to hashrate \\
+Dogecoin       & 40   & $\sim$40 min; lower hashrate margin \\
+Ethereum       & 64   & $\sim$13 min; 2 finalized epochs \\
+Arbitrum       & 1    & Sequencer + L1 finality inherited \\
+Optimism       & 1    & Sequencer + L1 finality inherited \\
+Base           & 1    & Sequencer + L1 finality inherited \\
+BSC            & 15   & $\sim$45 sec; fast finality mode \\
+Polygon PoS    & 128  & $\sim$4 min; probabilistic finality \\
+Solana         & 32   & $\sim$13 sec; confirmed commitment \\
+TON            & 1    & Instant finality (masterchain) \\
+Lux (Warp)     & 0    & Sub-second finality; Warp proof suffices \\
+\bottomrule
+\end{tabular}
+\caption{Confirmation depth configuration per chain}
+\label{tab:depths}
+\end{table}
+
+\subsection{Backing Attestation}
+
+The MPC cluster periodically attests to total backing. The Teleporter enforces three invariants on backing proofs:
+
+\begin{invariant}[Monotonic Timestamp]
+$\tau_{k+1} > \tau_k$ for successive backing proofs on a given token.
+\end{invariant}
+
+\begin{invariant}[Staleness Bound]
+$\tau \geq \mathrm{block.timestamp} - \Delta_{\mathsf{stale}}$ where $\Delta_{\mathsf{stale}} = 7200\,\text{s}$ (2 hours) by default.
+\end{invariant}
+
+\begin{invariant}[Auto-Pause Threshold]
+If the backing ratio $B / \mathrm{totalMinted}(T) < 0.985$, the Teleporter sets $\mathsf{paused} \leftarrow \mathsf{true}$. No \texttt{DEPOSIT} or \texttt{YIELD} operations are processed while paused. Unpausing requires a separate MPC-signed proof with a fresh backing attestation showing ratio $\geq 1.0$.
+\end{invariant}
+
+\subsection{Sequential Withdraw Nonces}
+
+Deposit nonces use a bitmap and may arrive out of order. Withdraw nonces are strictly sequential (Property~\ref{prop:seq-nonce}). This prevents an attacker who observes multiple pending \texttt{RELEASE} proofs from selectively replaying a subset in a different order to manipulate vault accounting.
+
+\subsection{Peg Oracle}
+
+An independent peg oracle monitors the price ratio of each wrapped token against its underlying on external markets. If the peg deviates beyond a configurable threshold (default: 2\% for stablecoins, 5\% for volatile assets), the oracle submits a pause transaction.
+
+The peg oracle is defense-in-depth: it triggers only if the on-chain backing attestation fails to catch an undercollateralization event. The oracle runs as a separate process with its own signing key, distinct from the MPC committee.
+
+\subsection{Key Separation}
+
+\begin{definition}[Key Hierarchy]
+The system maintains three distinct key classes:
+\begin{enumerate}[nosep]
+  \item \textbf{MPC threshold key}: distributed across $n$ signer nodes; used exclusively for wire protocol proofs. Never held by a single entity.
+  \item \textbf{Hot wallet keys}: per-chain operational keys for gas payment, relay submission, and watcher operations. Individually compromisable without bridge fund risk.
+  \item \textbf{Admin timelock key}: controls MPC public key rotation with a 7-day delay. Held by a separate multisig.
+\end{enumerate}
+Compromise of hot wallet keys cannot produce valid wire protocol proofs. Compromise of the admin key introduces a 7-day window for detection and response.
+\end{definition}
+
+\subsection{Security Properties}
+
+\begin{theorem}[Wire Protocol Soundness]
+\label{thm:soundness}
+Under the ECDLP assumption on secp256k1, the DLP assumption on Ed25519, and the co-CDH assumption on BLS12-381, an adversary controlling fewer than $t$ MPC signer nodes cannot produce a valid proof $\pi$ for any tag.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Each tag's proof requires a valid threshold signature. By the unforgeability of CGGMP21~\cite{cggmp21} and FROST~\cite{frost} under their respective hardness assumptions, an adversary with $< t$ shares cannot produce a valid signature. Domain separation via distinct \texttt{bytes32} tags ensures that a signature valid for one tag cannot verify under another. The per-\texttt{srcChainId} nonce bitmap prevents replay. See formal proofs in~\cite{luxproof-teleport}.
+\end{proof}
+
+\begin{theorem}[Conservation]
+\label{thm:conservation}
+For any token $T$ and any execution trace, the total supply of wrapped tokens across all destination chains does not exceed the total backing on source chains.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Minting requires a valid \texttt{DEPOSIT} proof with unused nonce. Backing attestation with auto-pause ensures that if backing drops below 98.5\% of minted supply, minting halts. Sequential release nonces prevent double-withdraw. See formal proof in~\cite{luxproof-teleport}.
+\end{proof}
+
+%% =========================================================================
+\section{Multi-Tenant Architecture}
+\label{sec:multitenant}
+%% =========================================================================
+
+Teleport supports white-label deployment: multiple independent bridge brands operate from a single binary, sharing MPC infrastructure while maintaining distinct identities, fee structures, and chain sets.
+
+\subsection{Routing}
+
+Incoming requests are routed by hostname:
+
+\begin{lstlisting}[language=Go,caption={Hostname-based tenant routing}]
+func (s *Server) resolveTenant(
+    r *http.Request,
+) (*TenantConfig, error) {
+    host := r.Host
+    cfg, ok := s.tenants[host]
+    if !ok {
+        return nil, ErrUnknownTenant
+    }
+    return cfg, nil
+}
+\end{lstlisting}
+
+Each tenant hostname (e.g., \texttt{bridge.lux.network}, \texttt{bridge.example.com}) maps to a \texttt{TenantConfig} specifying allowed chains, fee parameters, branding assets, and yield strategy set.
+
+\subsection{Tenant Manifest}
+
+\begin{lstlisting}[language=JSON,caption={Tenant manifest example}]
+{
+  "id": "tenant-lux",
+  "hostnames": ["bridge.lux.network"],
+  "chains": [1, 56, 137, 42161, 10, 8453, 96369],
+  "fee_bps": 30,
+  "stakeholder_bps": 5000,
+  "yield_strategies": ["babylon", "dchain-lp"],
+  "shariah_mode": false,
+  "mpc_group": "default"
+}
+\end{lstlisting}
+
+The \texttt{mpc\_group} field selects which MPC key set to use. Multiple tenants can share the same MPC group (shared security) or use dedicated groups (isolated key material).
+
+\subsection{Isolation Guarantees}
+
+\begin{property}[Tenant Isolation]
+Tenants share MPC signing infrastructure but are isolated in:
+\begin{enumerate}[nosep]
+  \item Nonce namespaces: each tenant's nonce bitmaps are independent.
+  \item Fee accounting: bridge fees accrue to tenant-specific addresses.
+  \item Chain access: a tenant can only bridge to chains listed in its manifest.
+  \item Rate limits: per-tenant daily volume caps.
+\end{enumerate}
+\end{property}
+
+The on-chain Teleporter contract does not encode tenant identity. Tenant isolation is enforced at the API and MPC relay layer. The contract's security properties (soundness, conservation) hold regardless of tenant configuration.
+
+%% =========================================================================
+\section{Yield Composition}
+\label{sec:yield}
+%% =========================================================================
+
+Bridged assets are not idle. Locked assets on source chains are deployed to yield strategies, and the returns are reflected in bridge token share prices on destination chains via the \texttt{YIELD} wire tag.
+
+\subsection{Yield Layers}
+
+Teleport composes yield from three sources:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Babylon staking}: BTC locked on Bitcoin earns yield through Babylon's Bitcoin staking protocol. The MPC cluster delegates staked BTC to Babylon validators and collects rewards.
+  \item \textbf{D-Chain LP}: Assets bridged to Lux D-Chain (the native DEX chain) are deployed to automated market maker pools, earning trading fees.
+  \item \textbf{Bridge fees}: A portion of bridge fees (configurable per tenant) is distributed pro-rata to bridge token holders.
+\end{enumerate}
+
+\subsection{Share Price Mechanism}
+
+Bridge tokens on destination chains use a share-price model:
+
+\begin{equation}
+  \mathrm{value}(s) = s \times \frac{p'}{10^{18}}
+\end{equation}
+
+where $s$ is the number of bridge token shares held and $p'$ is the current share price numerator. The share price only increases---the protocol never performs negative rebases.
+
+When yield accrues, the MPC attests to the new share price:
+
+\begin{algorithm}[H]
+\caption{Yield Attestation}
+\begin{algorithmic}[1]
+\Require Token $T$, new backing $B'$, epoch $e$
+\State $p' \leftarrow B' \times 10^{18} / \mathrm{totalShares}(T)$
+\State \textbf{assert} $p' \geq p_{\mathrm{prev}}$ \Comment{Monotonic share price}
+\State $\sigma \leftarrow \mathrm{ThresholdSign}(H(\mathsf{YIELD} \| C_s \| \nu \| T \| p' \| e))$
+\State Submit $(\mathsf{YIELD}, C_s, \nu, T, p', e, \sigma)$ to destination Teleporters
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{xLUX}
+
+The xLUX instrument represents a claim on all three yield layers for LUX-denominated bridge positions. xLUX is minted when a user bridges LUX and opts into yield; the xLUX share price reflects accumulated Babylon rewards, D-Chain LP fees, and bridge fee distributions.
+
+\begin{equation}
+  \mathrm{APY}_{\mathsf{xLUX}} = r_{\mathsf{babylon}} + r_{\mathsf{dchain}} + r_{\mathsf{fees}} - r_{\mathsf{slashing}}
+\end{equation}
+
+where $r_{\mathsf{slashing}}$ accounts for potential Babylon slashing events. The backing attestation mechanism (\S\ref{sec:security}) ensures that any slashing event is reflected in the share price within $\Delta_{\mathsf{stale}}$ seconds.
+
+%% =========================================================================
+\section{Conformance Testing}
+\label{sec:conformance}
+%% =========================================================================
+
+Adding a new chain to Teleport requires producing 6 artifacts that are validated by CI/CD before the chain is activated in production.
+
+\subsection{Onboarding Kit}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{rp{9cm}}
+\toprule
+\textbf{\#} & \textbf{Artifact} \\
+\midrule
+1 & \textbf{Chain adapter implementation}: source code implementing the adapter interface for the target chain. \\
+2 & \textbf{Contract deployment script}: idempotent deployment of the Teleporter (or TeleportVault) contract with constructor arguments matching the wire protocol. \\
+3 & \textbf{Conformance test results}: passing output from the 47-case conformance test suite covering all four tags, nonce replay, backing monotonicity, staleness rejection, and auto-pause. \\
+4 & \textbf{Confirmation depth justification}: written analysis of the chain's finality model with recommended confirmation depth and attack cost estimates. \\
+5 & \textbf{Watcher configuration} (Class~C/D only): configuration for chain-specific event monitoring, including block polling interval, event signatures, and confirmation logic. \\
+6 & \textbf{Gas cost profile}: measured gas costs for verify, mint, burn, and release operations on the target chain, with comparison to the reference EVM implementation. \\
+\bottomrule
+\end{tabular}
+\caption{Required onboarding artifacts per chain}
+\label{tab:artifacts}
+\end{table}
+
+\subsection{Conformance Test Suite}
+
+The test suite exercises all wire protocol operations against a chain-specific adapter:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Tag verification} (4 tests): each of the four tags verifies correctly with a valid MPC signature.
+  \item \textbf{Tag rejection} (12 tests): each tag rejects signatures with wrong tag, wrong chain, wrong nonce, expired staleness, invalid signature, and insufficient backing.
+  \item \textbf{Nonce replay} (4 tests): resubmitting a processed nonce reverts.
+  \item \textbf{Sequential release nonces} (4 tests): out-of-order release nonces revert.
+  \item \textbf{Backing monotonicity} (4 tests): non-monotonic timestamps revert.
+  \item \textbf{Auto-pause} (6 tests): undercollateralization triggers pause; recovery requires fresh backing proof.
+  \item \textbf{Yield monotonicity} (4 tests): share price decrease reverts.
+  \item \textbf{Domain separation} (9 tests): cross-tag signature reuse fails for all tag pairs.
+\end{enumerate}
+
+Total: 47 test cases. All must pass before a chain adapter is merged.
+
+\subsection{CI/CD Gating}
+
+The conformance suite runs in CI on every pull request that modifies a chain adapter. A chain adapter cannot be deployed to production unless:
+
+\begin{enumerate}[nosep]
+  \item All 47 conformance tests pass against a local testnet or devnet instance of the target chain.
+  \item Gas cost profile shows no operation exceeding $2\times$ the reference EVM cost (normalized by chain gas pricing).
+  \item Confirmation depth justification is reviewed and approved by at least two engineers.
+\end{enumerate}
+
+%% =========================================================================
+\section{Related Work}
+\label{sec:related}
+%% =========================================================================
+
+\paragraph{LayerZero.} Ultra Light Node architecture with configurable oracles and relayers~\cite{layerzero}. Teleport differs in using frozen wire format (no per-deployment configuration of proof structure) and threshold MPC rather than oracle-relayer separation.
+
+\paragraph{Wormhole.} Guardian network with 19-of-19 multisig~\cite{wormhole}. Teleport uses $t$-of-$n$ threshold cryptography with $t < n$, providing liveness under $n - t$ node failures.
+
+\paragraph{Across.} Optimistic bridge with intent-based settlement~\cite{across}. Complementary approach: fast settlement but 7-day fraud proof windows for worst case. Teleport provides MPC-attested proofs with no fraud proof delay.
+
+\paragraph{Axelar.} Proof-of-stake validation with threshold ECDSA~\cite{axelar}. Similar threshold approach but Axelar runs its own consensus chain. Teleport leverages existing chain finality.
+
+%% =========================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+%% =========================================================================
+
+Teleport's architecture separates a frozen wire protocol from pluggable chain adapters, enabling support for 270+ chains without per-chain protocol changes. The four-tag proof format (\texttt{DEPOSIT}, \texttt{YIELD}, \texttt{BACKING}, \texttt{RELEASE}) is audited once and deployed everywhere. The unified threshold signing interface abstracts over CGGMP21, FROST, and BLS, selecting the correct protocol per chain family. Multi-tenant deployment enables white-label bridge instances from a single binary. The conformance test framework enforces protocol correctness at chain onboarding time.
+
+This paper specifies the engineering architecture. Formal security proofs are provided in~\cite{luxproof-teleport}. The Teleport Omnichain paper~\cite{luxtp-omni2025} covers sovereign governance and Shariah compliance. The Lux Universal Threshold Signatures paper~\cite{luxthreshold2025} provides cryptographic analysis of the underlying threshold protocols.
+
+%% =========================================================================
+%% References
+%% =========================================================================
+
+\bibliographystyle{plain}
+\begin{thebibliography}{99}
+
+\bibitem{luxtp2022}
+Z.~Kelling and V.~Seesahai.
+\newblock Teleport Protocol: Trustless Cross-Chain Asset Transfer via Light Client Verification.
+\newblock Lux Industries, Inc., 2022.
+
+\bibitem{luxbridge2023}
+Z.~Kelling and V.~Seesahai.
+\newblock Lux Bridge: Threshold-Secured Cross-Chain Communication with MPC Custody, Post-Quantum Verification, and Formally Verified Contract Invariants.
+\newblock Lux Industries, Inc., 2023.
+
+\bibitem{luxwarp2023}
+Z.~Kelling.
+\newblock Lux Warp Messaging: Cross-Appchain Communication with BLS Aggregate Signatures.
+\newblock Lux Industries, Inc., 2023.
+
+\bibitem{luxtp-omni2025}
+Z.~Kelling and V.~Seesahai.
+\newblock Lux Teleport: Sovereign Omnichain Liquidity via Threshold Cryptography and Per-Chain Governance.
+\newblock Lux Industries, Inc., 2022 (Revised December 2025).
+
+\bibitem{luxthreshold2025}
+Z.~Kelling and V.~Seesahai.
+\newblock Universal Threshold Signatures: Multi-Chain Cryptographic Infrastructure with Post-Quantum Security.
+\newblock Lux Industries, Inc., 2021.
+
+\bibitem{luxproof-teleport}
+Z.~Kelling.
+\newblock Formal Verification: Teleport Bridge Protocol.
+\newblock Lux Industries, Inc., 2024. Lean~4 proofs.
+
+\bibitem{cggmp21}
+R.~Canetti, R.~Gennaro, S.~Goldfeder, N.~Makriyannis, and U.~Peled.
+\newblock UC Non-Interactive, Proactive, Threshold ECDSA with Identifiable Aborts.
+\newblock In \emph{ACM CCS}, 2020.
+
+\bibitem{frost}
+C.~Komlo and I.~Goldberg.
+\newblock FROST: Flexible Round-Optimized Schnorr Threshold Signatures.
+\newblock In \emph{SAC}, 2020.
+
+\bibitem{layerzero}
+R.~Zarick, B.~Pellegrino, and C.~Bhartia.
+\newblock LayerZero: An Omnichain Interoperability Protocol.
+\newblock LayerZero Labs, 2021.
+
+\bibitem{wormhole}
+Wormhole Foundation.
+\newblock Wormhole: Generic Message Passing Protocol.
+\newblock 2022.
+
+\bibitem{across}
+UMA Protocol.
+\newblock Across: Intent-Based Cross-Chain Bridge.
+\newblock 2023.
+
+\bibitem{axelar}
+S.~Lau et al.
+\newblock Axelar: Connecting Web3.
+\newblock Axelar Network, 2021.
+
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,262 @@
+\documentclass[11pt]{article}
+\usepackage{shared/luxcover}
+\usepackage{amsmath, amssymb, algpseudocode, graphicx, hyperref, booktabs}
+
+\title{Signed Software, Reproducible Builds, and Quantum-Resilient Release Pipelines}
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+\date{2025}
+
+\usepackage{amsthm}
+\newtheorem{definition}{Definition}
+\newtheorem{theorem}{Theorem}
+\begin{document}
+\luxcoverpage
+
+\begin{abstract}
+A blockchain node binary is the ultimate trust anchor: if the binary is compromised, no amount of cryptographic protocol design matters. We describe Lux Network's release pipeline, which enforces deterministic builds, ML-DSA (FIPS 204) signed binaries, and an attestation chain from source commit to deployed container image. Every release artifact carries a hybrid BLS+ML-DSA signature over a content-addressed manifest that includes source commit hash, build environment hash, compiler version, and dependency lockfile digest. Reproducibility is verified by independent rebuilders, and attestations are published to a transparency log anchored in Q-Chain. The pipeline covers \texttt{luxd}, EVM plugins, and subnet VM binaries across Linux (amd64, arm64) targets.
+\end{abstract}
+
+\section{Introduction}
+
+Supply chain attacks on software dependencies have escalated from theoretical concern to operational reality. The SolarWinds incident (2020), the xz/liblzma backdoor (2024), and numerous npm/PyPI compromises demonstrate that build pipelines are high-value targets. For blockchain infrastructure, a compromised node binary can steal funds, halt consensus, or silently corrupt state.
+
+Lux Network addresses this with three interlocking guarantees:
+\begin{enumerate}
+\item \textbf{Deterministic builds}: Given the same source commit and build environment, any party produces the identical binary.
+\item \textbf{Quantum-resilient signatures}: Release artifacts are signed with ML-DSA-65 (FIPS 204) in addition to classical Ed25519, ensuring signature validity even against future quantum adversaries.
+\item \textbf{Attestation transparency}: Every step from source to deployment is recorded in an append-only log anchored in Q-Chain, enabling public audit.
+\end{enumerate}
+
+\subsection{Scope}
+
+The pipeline covers:
+\begin{itemize}
+\item \texttt{luxd} node binary (Go, \texttt{CGO\_ENABLED=0})
+\item EVM plugin binaries (Go, compiled against \texttt{luxfi/evm})
+\item Subnet VM binaries (application-specific)
+\item Container images (\texttt{ghcr.io/luxfi/*}, \texttt{--platform linux/amd64})
+\end{itemize}
+
+\section{Deterministic Build System}
+
+\subsection{Build Environment Specification}
+
+Each release specifies a locked build environment:
+
+\begin{verbatim}
+build-env.lock:
+  go_version: 1.22.4
+  os: linux
+  arch: amd64
+  cgo: disabled
+  ldflags: -s -w -X main.version=v1.23.23
+  go_sum_hash: sha256:<digest>
+  toolchain_hash: sha256:<digest>
+\end{verbatim}
+
+The build environment itself is a content-addressed container image. The image is built once, signed, and reused for all builds at that Go version. Changing the Go version requires a new environment image with a new signature.
+
+\subsection{Reproducibility Protocol}
+
+\begin{algorithmic}[1]
+\State \textbf{function} \textsc{Build}(commit, envImage)
+\State $source \gets \text{GitCheckout}(commit)$
+\State $deps \gets \text{GoModDownload}(source)$
+\State $binary \gets \text{GoBuild}(source, deps, envImage)$
+\State $digest \gets \text{SHA256}(binary)$
+\State \Return $(binary, digest)$
+\State \textbf{end function}
+\end{algorithmic}
+
+Two properties ensure reproducibility:
+\begin{enumerate}
+\item \textbf{No embedded timestamps}: Build flags strip debug info (\texttt{-s -w}) and inject only the version string and commit hash. No build time, hostname, or path is embedded.
+\item \textbf{Locked dependencies}: \texttt{go.sum} is committed and verified. The dependency fetch is hermetic---no network access during compilation.
+\end{enumerate}
+
+\subsection{Independent Rebuilder Verification}
+
+At least two independent rebuilders (community-operated, not Lux Industries) reproduce each release. A release is considered verified when $\geq 2$ independent rebuilders produce the identical binary digest.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}llr@{}}
+\toprule
+\textbf{Artifact} & \textbf{Target} & \textbf{Binary Size} \\
+\midrule
+luxd & linux/amd64 & $\sim$48 MB \\
+luxd & linux/arm64 & $\sim$45 MB \\
+evm-plugin & linux/amd64 & $\sim$32 MB \\
+\bottomrule
+\end{tabular}
+\caption{Typical artifact sizes for Lux v1.23.x releases.}
+\label{tab:artifacts}
+\end{table}
+
+\section{Hybrid Signature Scheme}
+
+\subsection{Release Manifest}
+
+Each release produces a signed manifest:
+
+\begin{verbatim}
+manifest.json:
+{
+  "version": "v1.23.23",
+  "commit": "abc123def456",
+  "artifacts": [
+    {
+      "name": "luxd-linux-amd64",
+      "sha256": "<digest>",
+      "size": 50331648
+    }
+  ],
+  "build_env_hash": "<digest>",
+  "go_version": "1.22.4",
+  "go_sum_hash": "<digest>",
+  "timestamp": "2025-03-01T00:00:00Z"
+}
+\end{verbatim}
+
+\subsection{Dual Signature}
+
+The manifest is signed with both Ed25519 (classical) and ML-DSA-65 (post-quantum):
+
+\begin{align}
+\sigma_{\text{ed25519}} &= \text{Sign}_{\text{Ed25519}}(sk_c, H(\text{manifest})) \\
+\sigma_{\text{mldsa}} &= \text{Sign}_{\text{MLDSA}}(sk_{pq}, H(\text{manifest})) \\
+\text{release} &= (\text{manifest}, \sigma_{\text{ed25519}}, \sigma_{\text{mldsa}})
+\end{align}
+
+The signing keys are held in an HSM \cite{hsm-boundary}. The ML-DSA key is generated and stored in the same HSM boundary as the Ed25519 key. Neither key is extractable.
+
+\subsection{Verification}
+
+Validators verify release signatures before applying upgrades:
+
+\begin{algorithmic}[1]
+\State \textbf{function} \textsc{VerifyRelease}(release)
+\State $h \gets \text{SHA256}(release.\text{manifest})$
+\State $v_c \gets \text{VerifyEd25519}(pk_c, \sigma_{\text{ed25519}}, h)$
+\State $v_{pq} \gets \text{VerifyMLDSA}(pk_{pq}, \sigma_{\text{mldsa}}, h)$
+\State \Return $v_c \land v_{pq}$
+\State \textbf{end function}
+\end{algorithmic}
+
+\section{Attestation Transparency}
+
+\subsection{Attestation Chain}
+
+Every build step produces an attestation record:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Step} & \textbf{Attestation} & \textbf{Signer} \\
+\midrule
+Source & Commit signed (GPG/SSH) & Developer \\
+Build & Binary digest + env hash & CI runner \\
+Rebuild & Matching digest confirmation & Independent rebuilder \\
+Sign & Manifest + dual signature & Release HSM \\
+Publish & Container image digest & Registry (GHCR) \\
+Deploy & Running image digest & Validator node \\
+\bottomrule
+\end{tabular}
+\caption{Attestation chain from source to deployment.}
+\label{tab:attestation}
+\end{table}
+
+\subsection{Q-Chain Anchor}
+
+Attestation records are batched and their Merkle root is submitted to Q-Chain as a governance transaction. This provides a tamper-evident, publicly auditable record that cannot be rewritten without breaking Q-Chain consensus.
+
+Validators can verify that the binary they are running corresponds to a release whose attestation root is recorded on-chain:
+
+\begin{algorithmic}[1]
+\State \textbf{function} \textsc{VerifyDeployment}(binaryDigest)
+\State $root \gets \text{QChain.LatestAttestationRoot}()$
+\State $proof \gets \text{FetchMerkleProof}(binaryDigest, root)$
+\State \Return $\text{VerifyMerkleProof}(proof, root, binaryDigest)$
+\State \textbf{end function}
+\end{algorithmic}
+
+\section{Container Image Pipeline}
+
+Container images are built from the signed binary, not from source. The Dockerfile is minimal:
+
+\begin{verbatim}
+FROM debian:bookworm-slim
+COPY --from=signed luxd /usr/local/bin/luxd
+COPY --from=signed plugins/ /usr/local/lib/luxd/plugins/
+ENTRYPOINT ["luxd"]
+\end{verbatim}
+
+Images are built using Kaniko (no Docker daemon) inside the Kubernetes cluster, pushed to \texttt{ghcr.io/luxfi/node:<tag>}, and signed with Cosign using the same ML-DSA key. The image digest is included in the attestation chain.
+
+Images are built for \texttt{linux/amd64} only. Multi-arch images are produced by CI runners on the target architecture, not by cross-compilation or emulation.
+
+\section{Threat Model and Mitigations}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Threat} & \textbf{Mitigation} & \textbf{Detection} \\
+\midrule
+Compromised CI runner & Reproducible builds & Rebuilder mismatch \\
+Dependency backdoor & Locked go.sum, hermetic build & Hash mismatch on rebuild \\
+Signing key theft & HSM-bound keys, dual signature & Requires both key types \\
+Quantum signature forge & ML-DSA alongside Ed25519 & Hybrid check fails \\
+Binary swap post-sign & Content-addressed manifest & Digest verification \\
+\bottomrule
+\end{tabular}
+\caption{Threat mitigations in the release pipeline.}
+\label{tab:threats}
+\end{table}
+
+\section{Conclusion}
+
+The distance from source code to running validator is the most security-critical path in a blockchain system. Lux's release pipeline closes every link in this chain: deterministic builds eliminate the ``it built differently'' class of attacks, hybrid ML-DSA+Ed25519 signatures protect against both current and future adversaries, and Q-Chain-anchored attestation transparency makes every step publicly auditable. Independent rebuilders provide the final check: if the binary cannot be reproduced, it is not released.
+
+\begin{thebibliography}{99}
+
+\bibitem{hsm-boundary}
+Kelling, Z. (2025).
+\textit{Secure Enclave, HSM, and Threshold Boundary Design}.
+Lux Industries Research.
+
+\bibitem{quasar}
+Kelling, Z. (2025).
+\textit{Quasar: Quantum-Secure Multi-Engine Consensus with Triple-Proof Quantum Finality}.
+Lux Industries Research.
+
+\bibitem{nist-fips204}
+NIST (2024).
+\textit{FIPS 204: Module-Lattice-Based Digital Signature Standard (ML-DSA)}.
+National Institute of Standards and Technology.
+
+\bibitem{reproducible-builds}
+Reproducible Builds Project (2024).
+\textit{Reproducible Builds: A Set of Software Development Practices}.
+\url{https://reproducible-builds.org/}.
+
+\bibitem{sigstore}
+Sigstore Project (2024).
+\textit{Sigstore: A New Standard for Signing, Verifying, and Protecting Software}.
+Linux Foundation.
+
+\bibitem{slsa}
+SLSA Contributors (2024).
+\textit{Supply-chain Levels for Software Artifacts (SLSA)}.
+\url{https://slsa.dev/}.
+
+\end{thebibliography}
+
+\end{document}
