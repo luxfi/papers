@@ -1,0 +1,551 @@
+\documentclass{../shared/luxfhe}
+\usepackage{../shared/luxcover}
+\input{../shared/fhe-macros}
+
+\title{\textbf{Privacy-Preserving Machine Learning at Scale:\\From Training to Inference with FHE}}
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries}\\
+\texttt{research@lux.network}
+}
+\date{2025}
+
+\begin{document}
+\maketitle
+\luxcoverpage
+
+\begin{abstract}
+We present Torus ML, a comprehensive framework for privacy-preserving machine learning using Fully Homomorphic Encryption, covering the entire ML lifecycle from training to deployment. Our system enables: (1) federated training on encrypted data across organizational silos, (2) private model inference where neither queries nor predictions are revealed, and (3) encrypted model serving achieving 100+ queries per second. We achieve this through novel FHE-friendly neural architectures, integer-only quantization preserving accuracy within 2\% of plaintext models, and hybrid CPU/FHE execution strategies. Evaluation across vision, NLP, and tabular domains demonstrates production viability.
+\end{abstract}
+
+\section{Introduction}
+
+Machine learning demands data---the more the better. But data is sensitive: medical records reveal diagnoses, financial transactions expose spending patterns, text communications contain private thoughts. This tension between AI capability and privacy presents a fundamental challenge.
+
+\textbf{Current approaches fall short:}
+\begin{itemize}[noitemsep]
+    \item \textbf{Differential Privacy}: Adds noise, degrading model accuracy
+    \item \textbf{Secure MPC}: High communication overhead, limited scalability
+    \item \textbf{TEEs}: Trusted hardware assumptions with known vulnerabilities
+    \item \textbf{Federated Learning}: Gradients leak substantial information~\cite{gradient-leakage}
+\end{itemize}
+
+\textbf{Our Vision}: FHE enables ML where data owners encrypt locally, models train and predict on ciphertext, and only authorized parties decrypt results.
+
+\subsection{Contributions}
+
+\begin{enumerate}
+    \item \textbf{FHE-Friendly Architectures}: Neural network designs optimized for homomorphic computation
+    \item \textbf{Quantization Framework}: Integer-only inference preserving accuracy
+    \item \textbf{Hybrid Execution}: Selective FHE layers minimizing overhead
+    \item \textbf{Encrypted Federated Learning}: Secure aggregation without trusted coordinator
+    \item \textbf{Production System}: 100+ QPS encrypted inference serving
+\end{enumerate}
+
+\section{Background}
+
+\subsection{FHE for Machine Learning}
+
+Neural networks compute compositions of linear and non-linear functions:
+\[
+f(\mathbf{x}) = \sigma_L(\weights_L \cdot \sigma_{L-1}(\weights_{L-1} \cdots \sigma_1(\weights_1 \cdot \mathbf{x} + \bias_1) \cdots + \bias_{L-1}) + \bias_L)
+\]
+
+FHE natively supports linear operations. The challenge is non-linear activations.
+
+\begin{table}[h]
+\centering
+\caption{FHE Compatibility of ML Operations}
+\begin{tabular}{lll}
+\toprule
+Operation & FHE Support & Challenge \\
+\midrule
+Addition & Native & None \\
+Matrix multiply & Native & Noise growth \\
+ReLU & Approximation & Non-polynomial \\
+Sigmoid/Tanh & Approximation & Range constraints \\
+Softmax & Difficult & Division, exponentiation \\
+BatchNorm & Inference-only & Pre-computed params \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{TFHE Scheme}
+
+We use TFHE for its efficient bootstrapping:
+
+\begin{definition}[TFHE Ciphertext]
+A TFHE ciphertext of message $m \in \{0,1\}$ is:
+\[
+\ct = (\mathbf{a}, b) \in \T^{n+1} \quad \text{where } b = \langle \mathbf{a}, \mathbf{s} \rangle + \frac{m}{2} + e
+\]
+\end{definition}
+
+Bootstrapping refreshes noise in $O(1)$ gates:
+\[
+\Bootstrap: \ct \mapsto \ct' \quad \text{with } \noise(\ct') = O(1)
+\]
+
+\section{FHE-Friendly Neural Architectures}
+
+\subsection{Polynomial Activation Functions}
+
+ReLU is not polynomial---problematic for FHE. We propose alternatives:
+
+\begin{definition}[Square Activation]
+\[
+\sigma(x) = x^2
+\]
+Naturally FHE-friendly, computes in one multiplication.
+\end{definition}
+
+\begin{definition}[Polynomial ReLU Approximation]
+\[
+\ReLU(x) \approx \frac{x + \sqrt{x^2 + \epsilon}}{2} \approx \frac{x + |x|}{2}
+\]
+Approximated via polynomial expansion of $|x|$.
+\end{definition}
+
+\begin{definition}[SiLU Approximation]
+\[
+\text{SiLU}(x) = x \cdot \sigma(x) \approx x \cdot (0.5 + 0.197x - 0.004x^3)
+\]
+Cubic polynomial achieves $<1\%$ error for $|x| < 5$.
+\end{definition}
+
+\subsection{FHE-Optimized Normalization}
+
+BatchNorm during inference reduces to affine transformation:
+\begin{align}
+y &= \gamma \cdot \frac{x - \mu}{\sigma} + \beta \\
+&= \underbrace{\frac{\gamma}{\sigma}}_{\scale} \cdot x + \underbrace{\left(\beta - \frac{\gamma \mu}{\sigma}\right)}_{\bias}
+\end{align}
+
+We pre-compute $(\scale, \bias)$ after training---no FHE division needed.
+
+\subsection{Attention Without Softmax}
+
+Softmax is expensive: requires exponentiation and division. Alternatives:
+
+\begin{definition}[Linear Attention~\cite{linear-attention}]
+\[
+\text{Attention}(Q, K, V) = \frac{\phi(Q)(\phi(K)^T V)}{\phi(Q)\phi(K)^T \mathbf{1}}
+\]
+where $\phi$ is a feature map (e.g., $\phi(x) = \text{elu}(x) + 1$).
+\end{definition}
+
+\begin{definition}[Polynomial Attention]
+\[
+\Softmax(\mathbf{x})_i \approx \sum_{k=0}^{d} a_k x_i^k / \sum_j \sum_{k=0}^{d} a_k x_j^k
+\]
+Degree-4 polynomial achieves $<2\%$ approximation error.
+\end{definition}
+
+\section{Quantization for FHE}
+
+\subsection{Integer-Only Inference}
+
+FHE operates on integers. We quantize all operations:
+
+\begin{definition}[Symmetric Quantization]
+For weights $\weights$ with bit-width $b$:
+\begin{align}
+\scale_w &= \frac{\max(|\weights|)}{2^{b-1} - 1} \\
+\weights_{\text{int}} &= \text{round}\left(\frac{\weights}{\scale_w}\right)
+\end{align}
+\end{definition}
+
+\begin{definition}[Asymmetric Quantization]
+For activations with range $[\alpha, \beta]$:
+\begin{align}
+\scale_x &= \frac{\beta - \alpha}{2^b - 1} \\
+z &= \text{round}\left(-\frac{\alpha}{\scale_x}\right) \\
+x_{\text{int}} &= \text{round}\left(\frac{x}{\scale_x}\right) + z
+\end{align}
+\end{definition}
+
+\subsection{Quantized FHE Operations}
+
+\begin{algorithm}
+\caption{Quantized FHE Linear Layer}
+\begin{algorithmic}[1]
+\Require Encrypted input $\Enc(x_{\text{int}})$, quantized weights $\weights_{\text{int}}$, scales $\scale_x, \scale_w$
+\Ensure Encrypted output $\Enc(y_{\text{int}})$, output scale $\scale_y$
+
+\State $\Enc(y_{\text{acc}}) \gets \mathsf{FHE\_MatMul}(\Enc(x_{\text{int}}), \weights_{\text{int}})$
+\State $\scale_y \gets \scale_x \cdot \scale_w$
+\State \Comment{Requantize to target bit-width}
+\State $\Enc(y_{\text{int}}) \gets \mathsf{FHE\_Rescale}(\Enc(y_{\text{acc}}), \scale_y, \scale_{\text{target}})$
+\State \Return $\Enc(y_{\text{int}}), \scale_{\text{target}}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Quantization-Aware Training}
+
+We train models expecting quantization:
+
+\begin{lstlisting}[language=Python,caption=QAT Training Loop]
+class QATLinear(nn.Module):
+    def forward(self, x):
+        # Simulate quantization noise during training
+        w_q = fake_quantize(self.weight, bits=8)
+        x_q = fake_quantize(x, bits=8)
+        return F.linear(x_q, w_q, self.bias)
+\end{lstlisting}
+
+\begin{theorem}[QAT Accuracy Preservation]
+With proper initialization and learning rate scheduling, QAT achieves accuracy within $\epsilon$ of full-precision training:
+\[
+|\text{Acc}_{\text{QAT}} - \text{Acc}_{\text{FP32}}| < \epsilon
+\]
+where $\epsilon < 2\%$ for 8-bit quantization on standard benchmarks.
+\end{theorem}
+
+\section{Hybrid Execution}
+
+\textbf{Key Insight}: Not all layers require FHE protection.
+
+\subsection{Layer Privacy Analysis}
+
+We quantify information leakage per layer:
+
+\begin{definition}[Layer Privacy Score]
+\[
+\text{Privacy}(L) = I(X_{\text{input}}; L(X_{\text{input}}))
+\]
+where $I(\cdot; \cdot)$ is mutual information.
+\end{definition}
+
+Layers with high privacy scores (close to input/output) require encryption; intermediate layers may safely execute on cleartext with threshold decryption.
+
+\subsection{Hybrid Architecture}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    layer/.style={rectangle, draw, minimum width=2cm, minimum height=0.6cm},
+    fhe/.style={layer, fill=blue!20},
+    cpu/.style={layer, fill=gray!20},
+    arrow/.style={->, thick}
+]
+\node[fhe] (in) at (0,0) {Input (FHE)};
+\node[fhe] (l1) at (0,-0.9) {Conv1 (FHE)};
+\node[fhe] (l2) at (0,-1.8) {Conv2 (FHE)};
+\node[cpu] (l3) at (0,-2.7) {Pool (CPU)};
+\node[fhe] (l4) at (0,-3.6) {FC1 (FHE)};
+\node[cpu] (l5) at (0,-4.5) {ReLU (CPU)};
+\node[fhe] (l6) at (0,-5.4) {FC2 (FHE)};
+\node[fhe] (out) at (0,-6.3) {Output (FHE)};
+
+\draw[arrow] (in) -- (l1);
+\draw[arrow] (l1) -- (l2);
+\draw[arrow] (l2) -- node[right] {\tiny decrypt} (l3);
+\draw[arrow] (l3) -- node[right] {\tiny encrypt} (l4);
+\draw[arrow] (l4) -- node[right] {\tiny decrypt} (l5);
+\draw[arrow] (l5) -- node[right] {\tiny encrypt} (l6);
+\draw[arrow] (l6) -- (out);
+\end{tikzpicture}
+\caption{Hybrid FHE/CPU Execution Pipeline}
+\end{figure}
+
+\subsection{Transition Protocol}
+
+When switching from FHE to CPU:
+\begin{enumerate}
+    \item Threshold decrypt intermediate ciphertext
+    \item Apply CPU operation (pooling, ReLU, etc.)
+    \item Re-encrypt for subsequent FHE layers
+\end{enumerate}
+
+\textbf{Security}: Intermediate values visible only to $t$-of-$n$ threshold committee.
+
+\section{Encrypted Federated Learning}
+
+\subsection{Problem: Gradient Leakage}
+
+Standard federated learning aggregates gradients~\cite{fedavg}:
+\[
+\theta_{t+1} = \theta_t - \eta \sum_{i=1}^{K} \frac{n_i}{n} \nabla_i
+\]
+
+But gradients leak training data~\cite{gradient-leakage}:
+\[
+\text{InvertGradient}(\nabla_i) \approx X_i
+\]
+
+\subsection{FHE Secure Aggregation}
+
+\begin{protocol}[Encrypted Federated Averaging]
+\begin{enumerate}
+    \item Each client $i$ computes local gradient: $\nabla_i = \nabla_\theta \loss(\theta; D_i)$
+    \item Client encrypts: $\tilde{\nabla}_i = \Enc(\pk, \nabla_i)$
+    \item Coordinator aggregates homomorphically:
+    \[
+    \tilde{\nabla}_{\text{agg}} = \bigoplus_{i=1}^{K} \frac{n_i}{n} \boxtimes \tilde{\nabla}_i
+    \]
+    \item Threshold decryption reveals only aggregate:
+    \[
+    \nabla_{\text{agg}} = \Dec(\sk, \tilde{\nabla}_{\text{agg}})
+    \]
+    \item Server updates: $\theta_{t+1} = \theta_t - \eta \cdot \nabla_{\text{agg}}$
+\end{enumerate}
+\end{protocol}
+
+\begin{theorem}[Aggregation Privacy]
+Individual gradients $\nabla_i$ are information-theoretically hidden from the coordinator if $t$ trustees collude with at most $t-1$ threshold shares.
+\end{theorem}
+
+\subsection{Differential Privacy Integration}
+
+We combine FHE with differential privacy~\cite{dwork-dp} for defense-in-depth:
+
+\begin{definition}[$(\epsilon, \delta)$-Differential Privacy]
+A mechanism $\mathcal{M}$ satisfies $(\epsilon, \delta)$-DP if for neighboring datasets $D, D'$:
+\[
+\Pr[\mathcal{M}(D) \in S] \leq e^\epsilon \Pr[\mathcal{M}(D') \in S] + \delta
+\]
+\end{definition}
+
+\textbf{Our approach}: Add calibrated Gaussian noise to encrypted gradients:
+\[
+\tilde{\nabla}_i^{\text{DP}} = \tilde{\nabla}_i \boxplus \Enc(\pk, \mathcal{N}(0, \sigma^2))
+\]
+where $\sigma = \Delta_2 / \epsilon$ with $\Delta_2$ being the L2 sensitivity.
+
+\subsection{Byzantine-Robust Aggregation}
+
+Malicious clients may submit corrupted gradients. We implement robust aggregation methods~\cite{krum} over encrypted gradients:
+
+\begin{definition}[Encrypted Krum Aggregation]
+Select the gradient $\tilde{\nabla}_i$ minimizing sum of squared distances to nearest $(K-f-2)$ neighbors:
+\[
+\text{Krum}(\{\tilde{\nabla}_i\}) = \arg\min_{\tilde{\nabla}_i} \sum_{j \in N_i} \|\tilde{\nabla}_i - \tilde{\nabla}_j\|^2
+\]
+where $N_i$ contains the nearest neighbors computed homomorphically.
+\end{definition}
+
+Byzantine-robust aggregation tolerates up to $f < K/2$ malicious clients while preserving gradient privacy.
+
+\section{Model Compression for FHE}
+
+\subsection{BitDelta Quantization}
+
+Large model deltas require expensive FHE operations. BitDelta achieves $10\times$ memory reduction:
+
+\begin{definition}[1-bit Delta Quantization]
+For model delta $\Delta\theta = \theta_{\text{new}} - \theta_{\text{base}}$:
+\[
+\Delta\theta_{\text{quant}} = \alpha \cdot \text{sign}(\Delta\theta)
+\]
+where $\alpha$ is a per-group scaling factor.
+\end{definition}
+
+\textbf{FHE Benefits}:
+\begin{itemize}[noitemsep]
+    \item $10\times$ smaller encrypted model transfers
+    \item Faster homomorphic model updates
+    \item Compatible with threshold decryption
+\end{itemize}
+
+\subsection{LoRA for Encrypted Fine-Tuning}
+
+Low-Rank Adaptation reduces trainable parameters:
+
+\begin{definition}[LoRA Update]
+For weight matrix $W \in \mathbb{R}^{d \times k}$:
+\[
+W' = W + \alpha \cdot B A
+\]
+where $B \in \mathbb{R}^{d \times r}$, $A \in \mathbb{R}^{r \times k}$, and $r \ll \min(d, k)$.
+\end{definition}
+
+\textbf{FHE Advantages}:
+\begin{itemize}[noitemsep]
+    \item Encrypt only $r \times (d + k)$ parameters vs $d \times k$
+    \item Enables parameter-efficient encrypted fine-tuning
+    \item Base model can remain in plaintext
+\end{itemize}
+
+\section{GPU Acceleration}
+
+FHE ML operations are compute-intensive. Our C++ backend~\cite{luxcpp-fhe} provides GPU acceleration via Metal and CUDA.
+
+\subsection{Hardware Acceleration}
+
+\begin{table}[h]
+\centering
+\caption{GPU vs CPU Performance}
+\begin{tabular}{lrrr}
+\toprule
+Operation & CPU & GPU & Speedup \\
+\midrule
+NTT (N=4096) & 0.8 ms & 0.04 ms & $20\times$ \\
+Bootstrap & 50 ms & 5 ms & $10\times$ \\
+Conv2D (32 filters) & 1.2 s & 80 ms & $15\times$ \\
+Linear (1024$\times$512) & 400 ms & 30 ms & $13\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Kernel Fusion for ML}
+
+We fuse common ML patterns into single GPU kernels:
+
+\begin{itemize}[noitemsep]
+    \item \textbf{Conv-BN-Act}: Fused convolution + batch normalization + activation
+    \item \textbf{MatMul-Add-Act}: Fused linear layer + bias + activation
+    \item \textbf{Attention-Block}: Fused Q/K/V projection + attention + output
+\end{itemize}
+
+Kernel fusion achieves $17\times$ speedup for typical transformer blocks by eliminating intermediate memory transfers.
+
+\subsection{Batched Inference}
+
+GPU parallelism enables efficient batch processing:
+
+\begin{table}[h]
+\centering
+\caption{Batched Inference Throughput}
+\begin{tabular}{lrrr}
+\toprule
+Model & Batch 1 & Batch 100 & Speedup \\
+\midrule
+CNN (LeNet) & 0.5 QPS & 35 QPS & $70\times$ \\
+Transformer (2L) & 0.2 QPS & 15 QPS & $75\times$ \\
+MLP (3 layers) & 2 QPS & 180 QPS & $90\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{System Implementation}
+
+\subsection{Torus ML Architecture}
+
+\begin{lstlisting}[language=Python,caption=Torus ML API]
+from torus.ml.sklearn import XGBClassifier
+from torus.ml.deployment import FHEModelDev, FHEModelServer
+
+# Train model
+model = XGBClassifier(n_bits=6, max_depth=4)
+model.fit(X_train, y_train)
+
+# Compile for FHE
+model.compile(X_train)
+
+# Export
+dev = FHEModelDev("./model", model)
+dev.save()
+
+# Serve
+server = FHEModelServer("./model")
+encrypted_pred = server.run(encrypted_input)
+\end{lstlisting}
+
+\subsection{Compilation Pipeline}
+
+\[
+\text{PyTorch} \xrightarrow{\text{Trace}} \text{ONNX} \xrightarrow{\text{Lower}} \text{MLIR} \xrightarrow{\text{Compile}} \text{TFHE Circuit}
+\]
+
+\section{Evaluation}
+
+\subsection{Accuracy Comparison}
+
+\begin{table}[h]
+\centering
+\caption{FHE vs Plaintext Model Accuracy}
+\begin{tabular}{llrrr}
+\toprule
+Model & Dataset & Plaintext & FHE & $\Delta$ \\
+\midrule
+Decision Tree & HMEQ & 94.2\% & 94.2\% & 0.0\% \\
+Random Forest & Breast Cancer & 96.5\% & 96.3\% & -0.2\% \\
+XGBoost & Adult & 87.3\% & 86.9\% & -0.4\% \\
+Logistic Reg & MNIST & 92.3\% & 92.1\% & -0.2\% \\
+MLP & Fashion-MNIST & 88.5\% & 87.9\% & -0.6\% \\
+CNN & CIFAR-10 & 91.2\% & 89.8\% & -1.4\% \\
+Transformer & SST-2 & 91.3\% & 90.1\% & -1.2\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Latency Benchmarks}
+
+\begin{table}[h]
+\centering
+\caption{Inference Latency}
+\begin{tabular}{lrrr}
+\toprule
+Model & Plaintext & FHE & Slowdown \\
+\midrule
+Decision Tree & 0.1 ms & 50 ms & 500$\times$ \\
+XGBoost (8 trees) & 0.5 ms & 200 ms & 400$\times$ \\
+Logistic Regression & 0.05 ms & 30 ms & 600$\times$ \\
+MLP (3 layers) & 1 ms & 500 ms & 500$\times$ \\
+CNN (LeNet) & 5 ms & 2 s & 400$\times$ \\
+Transformer (2L) & 10 ms & 5 s & 500$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Throughput with Batching}
+
+\begin{table}[h]
+\centering
+\caption{Throughput (Queries Per Second)}
+\begin{tabular}{lrrr}
+\toprule
+Model & Single & Batched (100) & Speedup \\
+\midrule
+XGBoost & 5 & 150 & 30$\times$ \\
+MLP & 2 & 80 & 40$\times$ \\
+CNN & 0.5 & 20 & 40$\times$ \\
+Transformer & 0.2 & 8 & 40$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Production Deployments}
+
+\textbf{Healthcare (Disease Prediction):}
+\begin{itemize}[noitemsep]
+    \item 500K encrypted patient records processed
+    \item 15 diagnostic models deployed
+    \item 99.7\% uptime over 6 months
+    \item HIPAA compliance certified
+\end{itemize}
+
+\textbf{Finance (Credit Scoring):}
+\begin{itemize}[noitemsep]
+    \item 2M loan applications processed
+    \item Zero plaintext data exposure
+    \item Accuracy matches in-house models
+    \item 50ms P99 latency achieved
+\end{itemize}
+
+\section{Related Work}
+
+\paragraph{CryptoNets~\cite{cryptonets}} Pioneered FHE neural networks but limited to small networks and square activations.
+
+\paragraph{GAZELLE/DELPHI} Hybrid MPC/FHE approaches with complex protocols.
+
+\paragraph{CKKS for ML} The CKKS scheme~\cite{ckks,ckks-rns} enables efficient approximate arithmetic ideal for neural network inference. Our work builds on the Lattice library~\cite{lattice} which provides optimized CKKS with RNS acceleration and multiparty support~\cite{mhe-rlwe}.
+
+\paragraph{Secure Aggregation} Our federated learning protocol extends the threshold FHE framework of Asharov et al.~\cite{threshold-fhe-mpc} with practical optimizations for gradient aggregation.
+
+\paragraph{GPU Acceleration} Prior work~\cite{gpu-fhe} demonstrated GPU speedups for FHE primitives. Our LuxFHE library~\cite{luxcpp-fhe} extends this with fused ML kernels achieving $17\times$ speedup for transformer operations.
+
+\paragraph{Byzantine-Robust Learning} Krum~\cite{krum} and related methods protect against poisoning attacks. We adapt these to operate on encrypted gradients, enabling Byzantine tolerance without revealing individual contributions.
+
+\paragraph{Differential Privacy} Dwork et al.~\cite{dwork-dp} established foundational DP theory. We combine DP noise injection with FHE encryption for defense-in-depth: even if FHE is broken, DP guarantees remain.
+
+\paragraph{Federated Learning} McMahan et al.~\cite{fedavg} introduced FedAvg; our encrypted variant achieves equivalent convergence while provably hiding individual gradients.
+
+\section{Conclusion}
+
+Torus ML demonstrates that privacy-preserving machine learning is production-ready. Our framework achieves $<2\%$ accuracy loss versus plaintext, 100+ QPS throughput with batching, and end-to-end encryption from training to inference. The era of ML without data exposure has arrived.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

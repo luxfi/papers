@@ -1,0 +1,676 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{array}
+\usepackage{multirow}
+\input{shared/lstlang}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  keywordstyle=\color{blue!70!black}\bfseries,
+  commentstyle=\color{green!50!black}\itshape,
+  stringstyle=\color{red!60!black},
+  showstringspaces=false,
+}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{remark}{Remark}
+
+\title{Lux Security Token Standard: ERC-1400 on\\Post-Quantum EVM with MPC Custody}
+
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Partners}\\
+\textit{A subsidiary of Hanzo Industries Inc}\\
+\texttt{research@lux.network}
+}
+
+\date{2025}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+We present the Lux Security Token Standard, an implementation of ERC-1400 (Security Token Standard) on Lux EVM with post-quantum cryptographic precompiles and MPC threshold custody for controller operations. This standard evolves from Arca's \texttt{st-contracts} (2018), which implemented ERC-1400/ERC-1404 security token protocols for ArCoin and the Arca Funds. The Lux implementation extends the original standard with: (i) transfer restriction enforcement via on-chain compliance oracles linked to I-Chain DIDs, (ii) post-quantum signature verification through ETHFALCON and Ringtail precompiles that protect long-lived securities tokens against quantum adversaries, (iii) MPC threshold signing for controller operations so that no single entity---not the issuer, not the platform, not any regulator---can unilaterally force-transfer securities, and (iv) partition management for complex capital structures including preferred/common partitions, lockup tranches, and vesting schedules. We provide formal specifications for all token operations, prove that the transfer restriction mechanism is sound and complete with respect to a given compliance policy, and compare the standard against ERC-3643 (T-REX), ERC-1404, and proprietary alternatives.
+\end{abstract}
+
+\section{Introduction}
+
+Security tokens---blockchain-based representations of regulated securities---require capabilities far beyond those of standard fungible tokens. An ERC-20 token can be transferred freely between any two addresses. A security token must enforce transfer restrictions based on investor accreditation, jurisdictional rules, lockup periods, and regulatory holds. It must support forced transfers for court orders and regulatory actions. It must maintain auditable records of all ownership changes. It must manage complex capital structures through partitions.
+
+\subsection{Heritage: Arca st-contracts (2018)}
+
+The first production implementation of these requirements was Arca's \texttt{st-contracts}, developed in 2018 for the ArCoin digital security. ArCoin was an interest-bearing token backed by US Treasury bills, requiring:
+
+\begin{itemize}[nosep]
+  \item Transfer restrictions: Only accredited investors in permitted jurisdictions could hold ArCoin.
+  \item Interest distribution: Automated calculation and distribution of T-bill interest to token holders.
+  \item NAV tracking: On-chain net asset value updates reflecting the underlying T-bill portfolio.
+  \item Regulatory compliance: Compliance with SEC Regulation D, Rule 506(c) for accredited investor verification.
+  \item Forced transfers: Ability to execute transfers mandated by court orders or regulatory actions.
+\end{itemize}
+
+The \texttt{st-contracts} implementation used ERC-1400 for the core security token interface and ERC-1404 for transfer restriction logic. This implementation was deployed on Ethereum mainnet and operated without incident for the lifetime of the ArCoin program.
+
+\subsection{Limitations of the Original Design}
+
+The Arca implementation, while functional, had several architectural limitations that motivated the Lux standard:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Centralized controller}: A single Ethereum address controlled forced transfers and document management. Compromise of this key would grant full control over all securities.
+  \item \textbf{Static restrictions}: Transfer restriction rules were compiled into the contract and required redeployment to update.
+  \item \textbf{No quantum resistance}: ECDSA signatures protecting controller operations and investor wallets are vulnerable to Shor's algorithm on future quantum computers.
+  \item \textbf{Limited partitioning}: The original ERC-1400 partition implementation did not support the complex capital structures required for private equity, real estate, and structured products.
+  \item \textbf{Gas costs}: On Ethereum mainnet, the gas costs for compliance-checked transfers made small-denomination trading economically impractical.
+\end{enumerate}
+
+\subsection{Contributions}
+
+This paper presents the Lux Security Token Standard, which addresses each limitation:
+
+\begin{enumerate}[nosep]
+  \item MPC threshold controller: Controller operations require $t$-of-$n$ threshold signatures, eliminating single points of compromise \cite{lux-mchain-mpc, lux-ats-architecture}.
+  \item Dynamic compliance oracles: Transfer restrictions are evaluated by on-chain compliance oracles that reference I-Chain DID claims, enabling rule updates without contract redeployment.
+  \item Post-quantum precompiles: ETHFALCON and Ringtail signature verification is available as EVM precompiles, enabling quantum-resistant token operations \cite{lux-ethfalcon-pq}.
+  \item Extended partitions: Support for hierarchical partitions with independent restriction rules, enabling complex capital structures.
+  \item Lux EVM execution: Low gas costs (sub-cent per transfer) make small-denomination trading viable.
+\end{enumerate}
+
+\section{Token Interface}\label{sec:interface}
+
+\subsection{Core ERC-1400 Interface}
+
+The Lux Security Token Standard implements the full ERC-1400 interface:
+
+\begin{lstlisting}[language=Solidity,caption={Core security token interface.}]
+interface ISecurityToken is IERC20 {
+    // Document management
+    function getDocument(bytes32 name)
+        external view returns (string memory uri, bytes32 hash, uint256 timestamp);
+    function setDocument(bytes32 name, string calldata uri, bytes32 hash) external;
+    function getAllDocuments() external view returns (bytes32[] memory);
+
+    // Controller operations (MPC threshold required)
+    function isControllable() external view returns (bool);
+    function controllerTransfer(
+        address from, address to, uint256 value,
+        bytes calldata data, bytes calldata operatorData
+    ) external;
+    function controllerRedeem(
+        address holder, uint256 value,
+        bytes calldata data, bytes calldata operatorData
+    ) external;
+
+    // Partition management
+    function balanceOfByPartition(bytes32 partition, address holder)
+        external view returns (uint256);
+    function partitionsOf(address holder)
+        external view returns (bytes32[] memory);
+    function transferByPartition(
+        bytes32 partition, address from, address to,
+        uint256 value, bytes calldata data
+    ) external returns (bytes32);
+
+    // Transfer restriction
+    function canTransfer(address to, uint256 value, bytes calldata data)
+        external view returns (bytes1 statusCode, bytes32 appCode);
+    function canTransferByPartition(
+        bytes32 partition, address to, uint256 value, bytes calldata data
+    ) external view returns (bytes1 statusCode, bytes32 appCode, bytes32 partition);
+
+    // Issuance
+    function isIssuable() external view returns (bool);
+    function issue(address holder, uint256 value, bytes calldata data) external;
+    function issueByPartition(
+        bytes32 partition, address holder, uint256 value, bytes calldata data
+    ) external;
+
+    // Redemption
+    function redeem(uint256 value, bytes calldata data) external;
+    function redeemByPartition(
+        bytes32 partition, uint256 value, bytes calldata data
+    ) external;
+}
+\end{lstlisting}
+
+\subsection{ERC-1404 Transfer Restrictions}
+
+Transfer restriction checking extends ERC-1404 with a richer status code system:
+
+\begin{lstlisting}[language=Solidity,caption={Transfer restriction interface.}]
+interface ITransferRestriction {
+    function detectTransferRestriction(
+        address from, address to, uint256 value
+    ) external view returns (uint8 restrictionCode);
+
+    function messageForTransferRestriction(uint8 restrictionCode)
+        external pure returns (string memory message);
+}
+\end{lstlisting}
+
+\begin{table}[H]
+\centering
+\caption{Transfer restriction codes.}
+\label{tab:restriction-codes}
+\begin{tabular}{clp{6cm}}
+\toprule
+\textbf{Code} & \textbf{Name} & \textbf{Description} \\
+\midrule
+0x00 & SUCCESS & Transfer permitted \\
+0x01 & SENDER\_NOT\_ELIGIBLE & Sender fails compliance check \\
+0x02 & RECEIVER\_NOT\_ELIGIBLE & Receiver fails compliance check \\
+0x03 & SENDER\_LOCKUP & Sender's tokens are in lockup period \\
+0x04 & RECEIVER\_LIMIT & Receiver would exceed maximum holding \\
+0x05 & JURISDICTION\_BLOCKED & Transfer blocked by jurisdictional rule \\
+0x06 & ACCREDITATION\_EXPIRED & Receiver's accreditation has expired \\
+0x07 & REGULATORY\_HOLD & Tokens subject to regulatory hold/freeze \\
+0x08 & MAX\_HOLDERS & Transfer would exceed maximum holder count \\
+0x09 & PARTITION\_RESTRICTED & Partition-specific restriction applies \\
+0x0A & KYC\_INCOMPLETE & Receiver has not completed KYC \\
+0x0B & AML\_FLAG & AML screening flag on sender or receiver \\
+0xFF & UNKNOWN & Unspecified restriction \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Compliance Oracle}\label{sec:compliance}
+
+\subsection{Architecture}
+
+Transfer restrictions are evaluated by on-chain compliance oracles rather than hardcoded contract logic. Each security token references a compliance oracle contract that implements the restriction checking interface:
+
+\begin{lstlisting}[language=Solidity,caption={Compliance oracle.}]
+contract ComplianceOracle is ITransferRestriction {
+    IIdentityRegistry public identityRegistry; // I-Chain DID registry
+    mapping(bytes32 => Rule[]) public partitionRules;
+    Rule[] public globalRules;
+
+    struct Rule {
+        RuleType ruleType;
+        bytes params;
+        bool active;
+    }
+
+    enum RuleType {
+        WHITELIST,        // only whitelisted addresses
+        ACCREDITATION,    // require valid accreditation credential
+        JURISDICTION,     // block/allow specific jurisdictions
+        LOCKUP,           // time-based transfer restriction
+        MAX_HOLDERS,      // cap on total holder count
+        MAX_BALANCE,      // cap on individual holding
+        MIN_TRANSFER,     // minimum transfer amount
+        VELOCITY          // maximum transfer frequency
+    }
+
+    function detectTransferRestriction(
+        address from, address to, uint256 value
+    ) external view override returns (uint8) {
+        // Check global rules
+        for (uint i = 0; i < globalRules.length; i++) {
+            uint8 code = evaluateRule(globalRules[i], from, to, value);
+            if (code != 0x00) return code;
+        }
+        return 0x00; // SUCCESS
+    }
+
+    function evaluateRule(
+        Rule memory rule, address from, address to, uint256 value
+    ) internal view returns (uint8) {
+        if (!rule.active) return 0x00;
+
+        if (rule.ruleType == RuleType.ACCREDITATION) {
+            bytes32 did = identityRegistry.didOf(to);
+            if (!identityRegistry.hasValidCredential(did, "accreditation")) {
+                return 0x06; // ACCREDITATION_EXPIRED
+            }
+        }
+        // ... additional rule evaluation
+        return 0x00;
+    }
+}
+\end{lstlisting}
+
+\subsection{I-Chain DID Integration}
+
+The compliance oracle queries the I-Chain identity registry to verify investor credentials. Each investor's DID contains verifiable credentials issued by KYC/AML providers (e.g., Partner):
+
+\begin{itemize}[nosep]
+  \item \textbf{KYC credential}: Issued upon successful identity verification, contains verification level and expiry.
+  \item \textbf{Accreditation credential}: Issued upon accredited investor verification per SEC Rule 501(a), contains basis (income, net worth, professional) and expiry date.
+  \item \textbf{Jurisdiction credential}: Contains the investor's country and state/province of residence for jurisdictional rule evaluation.
+  \item \textbf{AML credential}: Contains ongoing AML monitoring status, updated by continuous screening.
+\end{itemize}
+
+The oracle verifies credentials without accessing the underlying personal data, preserving investor privacy while enforcing compliance requirements.
+
+\subsection{Formal Properties}
+
+\begin{definition}[Compliance Policy]
+A compliance policy $\Pi$ is a finite set of rules $\{r_1, r_2, \ldots, r_k\}$ where each rule $r_i : (\textsf{Address} \times \textsf{Address} \times \mathbb{N}) \to \{0, 1\}$ maps a (sender, receiver, amount) triple to a boolean decision.
+\end{definition}
+
+\begin{definition}[Sound Restriction]
+A transfer restriction mechanism is \emph{sound} with respect to policy $\Pi$ if every transfer that the mechanism permits also satisfies $\Pi$: $\forall (s, r, v)$, if $\textsf{detectRestriction}(s, r, v) = 0$ then $\forall r_i \in \Pi$, $r_i(s, r, v) = 1$.
+\end{definition}
+
+\begin{definition}[Complete Restriction]
+A transfer restriction mechanism is \emph{complete} with respect to policy $\Pi$ if every transfer that satisfies $\Pi$ is also permitted by the mechanism: $\forall (s, r, v)$, if $\forall r_i \in \Pi$, $r_i(s, r, v) = 1$ then $\textsf{detectRestriction}(s, r, v) = 0$.
+\end{definition}
+
+\begin{theorem}[Soundness and Completeness]
+The compliance oracle transfer restriction mechanism is sound and complete with respect to the configured compliance policy $\Pi$, provided that the I-Chain identity registry returns correct credential status.
+\end{theorem}
+
+\begin{proof}
+Soundness: \texttt{detectTransferRestriction} iterates over all rules in $\Pi$ (both global and partition-specific). If any rule $r_i$ evaluates to a non-zero restriction code, the function returns that code and the transfer is blocked. A transfer is permitted (code 0x00) only if every rule returns 0x00. By construction, code 0x00 is returned by \texttt{evaluateRule} only when the rule's condition is satisfied. Therefore, a permitted transfer satisfies all rules in $\Pi$.
+
+Completeness: If all rules in $\Pi$ are satisfied for a given transfer, then each call to \texttt{evaluateRule} returns 0x00. The loop produces no non-zero code. The function returns 0x00, permitting the transfer.
+
+The correctness assumption on the I-Chain registry is necessary because the oracle delegates credential verification to the registry. If the registry returns incorrect status (e.g., reports an expired accreditation as valid), soundness may be violated. The I-Chain registry's correctness is maintained by the DID credential verification protocol.
+\end{proof}
+
+\section{Partition Management}\label{sec:partitions}
+
+\subsection{Partition Types}
+
+The Lux standard extends ERC-1400 partitions to support complex capital structures:
+
+\begin{table}[H]
+\centering
+\caption{Partition types and use cases.}
+\label{tab:partitions}
+\begin{tabular}{lp{7.5cm}}
+\toprule
+\textbf{Partition} & \textbf{Use Case} \\
+\midrule
+\texttt{COMMON} & Common shares with standard voting and dividend rights \\
+\texttt{PREFERRED\_A} & Series A preferred with liquidation preference and anti-dilution \\
+\texttt{PREFERRED\_B} & Series B preferred with distinct terms \\
+\texttt{LOCKUP\_6M} & Shares subject to 6-month lockup from issuance \\
+\texttt{LOCKUP\_12M} & Shares subject to 12-month lockup (Rule 144) \\
+\texttt{VESTING} & Shares subject to vesting schedule (employee grants) \\
+\texttt{RESTRICTED} & Shares subject to regulatory hold \\
+\texttt{CONVERTIBLE} & Convertible instruments (notes, SAFEs) pending conversion \\
+\texttt{TREASURY} & Issuer treasury shares (not outstanding, no voting rights) \\
+\texttt{ESOP} & Employee stock option pool allocation \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Partition Operations}
+
+\begin{lstlisting}[language=Solidity,caption={Partition management operations.}]
+contract SecurityToken is ISecurityToken {
+    mapping(bytes32 => mapping(address => uint256)) internal partitionBalances;
+    mapping(bytes32 => PartitionConfig) internal partitionConfigs;
+
+    struct PartitionConfig {
+        bool transferable;
+        uint256 lockupExpiry;       // 0 = no lockup
+        address complianceOracle;   // partition-specific oracle
+        uint256 maxHolders;         // 0 = unlimited
+        VestingSchedule vesting;    // empty = no vesting
+        bool convertible;
+        bytes32 convertTarget;      // target partition for conversion
+        uint256 convertRatio;       // conversion ratio (basis points)
+    }
+
+    struct VestingSchedule {
+        uint256 cliffDuration;
+        uint256 totalDuration;
+        uint256 startTime;
+    }
+
+    function transferByPartition(
+        bytes32 partition, address from, address to,
+        uint256 value, bytes calldata data
+    ) external override returns (bytes32) {
+        PartitionConfig memory config = partitionConfigs[partition];
+
+        // Lockup check
+        require(
+            config.lockupExpiry == 0 || block.timestamp >= config.lockupExpiry,
+            "partition locked"
+        );
+
+        // Vesting check
+        if (config.vesting.totalDuration > 0) {
+            uint256 vested = vestedAmount(partition, from);
+            require(value <= vested - partitionTransferred[partition][from],
+                "exceeds vested amount");
+        }
+
+        // Compliance check via partition-specific or global oracle
+        address oracle = config.complianceOracle != address(0)
+            ? config.complianceOracle
+            : defaultComplianceOracle;
+
+        (bytes1 status,,) = ITransferRestriction(oracle)
+            .detectTransferRestriction(from, to, value);
+        require(status == 0x00, "transfer restricted");
+
+        // Execute transfer
+        partitionBalances[partition][from] -= value;
+        partitionBalances[partition][to] += value;
+
+        emit TransferByPartition(partition, from, to, value, data);
+        return partition;
+    }
+}
+\end{lstlisting}
+
+\section{Controller Operations with MPC}\label{sec:controller}
+
+\subsection{Threshold Controller}
+
+In the original Arca \texttt{st-contracts}, the controller was a single Ethereum address. If that key was compromised, the attacker could force-transfer any holder's securities. The Lux standard replaces the single controller with an MPC threshold controller.
+
+Controller operations (forced transfers, redemptions, document updates) require a $t$-of-$n$ threshold signature from a controller quorum. The default configuration uses 2-of-3:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Issuer share}: Held by the securities issuer.
+  \item \textbf{Platform share}: Held by the ATS operator \cite{lux-ats-architecture}.
+  \item \textbf{Regulatory share}: Held by the regulatory custodian or compliance officer.
+\end{enumerate}
+
+\begin{lstlisting}[language=Solidity,caption={MPC-controlled forced transfer.}]
+contract SecurityToken is ISecurityToken {
+    address public mpcController; // MPC threshold address
+
+    modifier onlyController() {
+        require(msg.sender == mpcController, "not controller");
+        _;
+    }
+
+    function controllerTransfer(
+        address from, address to, uint256 value,
+        bytes calldata data, bytes calldata operatorData
+    ) external override onlyController {
+        // Controller can transfer regardless of restrictions
+        // Used for: court orders, regulatory seizures, error correction
+        _transfer(from, to, value);
+        emit ControllerTransfer(msg.sender, from, to, value, data, operatorData);
+    }
+
+    function controllerRedeem(
+        address holder, uint256 value,
+        bytes calldata data, bytes calldata operatorData
+    ) external override onlyController {
+        _burn(holder, value);
+        emit ControllerRedemption(msg.sender, holder, value, data, operatorData);
+    }
+}
+\end{lstlisting}
+
+The \texttt{mpcController} address is the public key derived from the distributed key generation ceremony. No single party ever possesses the full private key.
+
+\subsection{Controller Action Types}
+
+\begin{table}[H]
+\centering
+\caption{Controller actions and their legal bases.}
+\label{tab:controller-actions}
+\begin{tabular}{lp{6.5cm}}
+\toprule
+\textbf{Action} & \textbf{Legal Basis} \\
+\midrule
+Forced transfer & Court order, regulatory directive \\
+Forced redemption & Issuer buyback, regulatory delisting \\
+Account freeze & SAR investigation, OFAC designation \\
+Document update & Prospectus amendment, offering circular update \\
+Partition migration & Corporate action (merger, conversion) \\
+Emergency pause & Material adverse event, security incident \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Post-Quantum Security}\label{sec:pq}
+
+\subsection{Threat Model}
+
+Securities tokens are long-lived assets. A bond may have a 30-year maturity. A common stock may exist indefinitely. The ECDSA signatures used in standard EVM are vulnerable to Shor's algorithm, which can derive private keys from public keys in polynomial time on a cryptographically relevant quantum computer.
+
+For securities tokens, the threat is not abstract. An attacker who records current ECDSA public keys can, once a quantum computer is available, derive the corresponding private keys and forge transfers. This ``harvest now, decrypt later'' attack is particularly dangerous for long-lived securities.
+
+\subsection{Lux PQ Precompiles}
+
+The Lux EVM includes precompiled contracts for post-quantum signature verification:
+
+\begin{itemize}[nosep]
+  \item \textbf{ETHFALCON} (precompile 0x0301): Falcon-512 signature verification, providing 128-bit post-quantum security \cite{lux-ethfalcon-pq}.
+  \item \textbf{Ringtail} (precompile 0x0302): Hybrid classical/post-quantum signature verification combining ECDSA with Dilithium \cite{lux-mchain-mpc}.
+\end{itemize}
+
+\begin{lstlisting}[language=Solidity,caption={Post-quantum transfer verification.}]
+contract PQSecurityToken is SecurityToken {
+    // Precompile addresses
+    address constant ETHFALCON = address(0x0301);
+    address constant RINGTAIL = address(0x0302);
+
+    bool public pqRequired; // enforce PQ signatures
+
+    function transferByPartitionPQ(
+        bytes32 partition, address from, address to,
+        uint256 value, bytes calldata data,
+        bytes calldata pqSignature
+    ) external returns (bytes32) {
+        if (pqRequired) {
+            bytes32 msgHash = keccak256(abi.encodePacked(
+                partition, from, to, value, block.chainid, nonces[from]++
+            ));
+            (bool ok,) = RINGTAIL.staticcall(
+                abi.encodePacked(msgHash, pqSignature, pqPublicKeys[from])
+            );
+            require(ok, "PQ signature invalid");
+        }
+
+        return transferByPartition(partition, from, to, value, data);
+    }
+}
+\end{lstlisting}
+
+\subsection{Migration Path}
+
+Existing securities tokens can migrate to post-quantum security incrementally:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Phase 1}: Deploy PQ-aware token contracts alongside classical contracts.
+  \item \textbf{Phase 2}: Investors register PQ public keys via I-Chain DID updates.
+  \item \textbf{Phase 3}: Enable optional PQ signature verification for transfers.
+  \item \textbf{Phase 4}: Require PQ signatures for all transfers (set \texttt{pqRequired = true}).
+  \item \textbf{Phase 5}: Rotate controller MPC shares to PQ-safe threshold scheme.
+\end{enumerate}
+
+\section{Comparison with Existing Standards}\label{sec:comparison}
+
+\begin{table}[H]
+\centering
+\caption{Security token standard comparison.}
+\label{tab:standard-comparison}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Feature} & \textbf{Lux} & \textbf{ERC-3643} & \textbf{ERC-1400} & \textbf{ERC-1404} \\
+\midrule
+Partitioned holdings & Yes & No & Yes & No \\
+Dynamic compliance oracle & Yes & Yes (ONCHAINID) & No & No \\
+MPC controller & Yes & No & No & No \\
+Post-quantum signatures & Yes & No & No & No \\
+Forced transfers & Yes & Yes & Yes & No \\
+Document management & Yes & No & Yes & No \\
+DID-based identity & Yes & Yes (ONCHAINID) & No & No \\
+Hierarchical partitions & Yes & No & Partial & No \\
+Vesting schedules & Yes & No & No & No \\
+Convertible instruments & Yes & No & No & No \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{ERC-3643 (T-REX)}
+
+ERC-3643, the Token for Regulated Exchanges (T-REX) standard, is the closest competitor to the Lux standard. Both use on-chain identity registries for compliance checking. Key differences:
+
+\begin{itemize}[nosep]
+  \item T-REX uses ONCHAINID, a centralized identity provider. Lux uses I-Chain DIDs with verifiable credentials from multiple providers.
+  \item T-REX has a single controller address. Lux uses MPC threshold controllers.
+  \item T-REX does not support partitioned holdings or post-quantum signatures.
+  \item T-REX is deployed on Ethereum mainnet with high gas costs. Lux EVM provides sub-cent transfer costs.
+\end{itemize}
+
+\section{Document Management}\label{sec:documents}
+
+Securities require extensive documentation: prospectuses, offering circulars, subscription agreements, financial statements, and regulatory filings. The Lux standard stores document references on-chain with content hashes for integrity verification:
+
+\begin{lstlisting}[language=Solidity,caption={Document management.}]
+contract SecurityToken is ISecurityToken {
+    struct Document {
+        string uri;       // IPFS or HTTPS URI
+        bytes32 hash;     // SHA-256 of document content
+        uint256 timestamp;
+        address updatedBy; // must be MPC controller
+    }
+
+    mapping(bytes32 => Document) internal documents;
+    bytes32[] internal documentNames;
+
+    function setDocument(
+        bytes32 name, string calldata uri, bytes32 hash
+    ) external override onlyController {
+        documents[name] = Document(uri, hash, block.timestamp, msg.sender);
+        if (!documentExists[name]) {
+            documentNames.push(name);
+            documentExists[name] = true;
+        }
+        emit DocumentUpdated(name, uri, hash);
+    }
+}
+\end{lstlisting}
+
+Standard document names include:
+
+\begin{itemize}[nosep]
+  \item \texttt{PROSPECTUS}: The offering prospectus or offering circular.
+  \item \texttt{SUBSCRIPTION}: The subscription agreement template.
+  \item \texttt{PPM}: Private placement memorandum.
+  \item \texttt{FINANCIALS}: Most recent audited financial statements.
+  \item \texttt{LEGAL\_OPINION}: Legal opinion on token characterization.
+  \item \texttt{TAX\_OPINION}: Tax opinion on token treatment.
+  \item \texttt{TRANSFER\_RESTRICTIONS}: Summary of applicable transfer restrictions.
+\end{itemize}
+
+\section{Gas Cost Analysis}\label{sec:gas}
+
+\begin{table}[H]
+\centering
+\caption{Gas costs for security token operations on Lux EVM vs Ethereum.}
+\label{tab:gas}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Operation} & \textbf{Gas (Lux)} & \textbf{Gas (ETH)} & \textbf{Cost (Lux)$^*$} \\
+\midrule
+Simple transfer & 65,000 & 65,000 & \$0.003 \\
+Partition transfer & 85,000 & 85,000 & \$0.004 \\
+Transfer with compliance check & 120,000 & 120,000 & \$0.006 \\
+Partition transfer + PQ verify & 180,000 & N/A & \$0.009 \\
+Issue tokens & 95,000 & 95,000 & \$0.005 \\
+Controller forced transfer & 75,000 & 75,000 & \$0.004 \\
+Set document & 55,000 & 55,000 & \$0.003 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+{\footnotesize $^*$At Lux base gas price of 25 nLUX per gas, LUX price \$2.00.}
+
+\section{Conclusion}
+
+The Lux Security Token Standard represents the natural evolution of the Arca \texttt{st-contracts} architecture from 2018. By combining ERC-1400 partitioned security tokens with dynamic compliance oracles, MPC threshold controllers, and post-quantum cryptographic precompiles, the standard eliminates the security and architectural limitations of first-generation security token implementations while preserving full regulatory compliance.
+
+The standard is deployed on Lux EVM and serves as the token layer for the non-custodial ATS described in \cite{lux-ats-architecture}. Transfer restrictions are enforced in coordination with the transfer agent registry \cite{lux-transfer-agent}, and securities are routable through the smart order router \cite{lux-smart-order-routing}.
+
+\begin{thebibliography}{15}
+
+\bibitem{lux-mchain-mpc}
+Z.~Kelling, V.~Seesahai,
+``M-Chain: Decentralized Multi-Party Computation Custody with Quantum-Safe Threshold Signatures,''
+Lux Partners, 2023.
+
+\bibitem{lux-ats-architecture}
+Z.~Kelling,
+``Non-Custodial Blockchain ATS: Architecture of a Regulatory-Compliant Securities Exchange,''
+Lux Partners, 2025.
+
+\bibitem{lux-smart-order-routing}
+Z.~Kelling,
+``Smart Order Routing for Digital Securities: Multi-Provider Execution on Lux Network,''
+Lux Partners, 2025.
+
+\bibitem{lux-transfer-agent}
+Z.~Kelling,
+``Blockchain Transfer Agent: On-Chain Cap Table with MPC-Custodied Registry,''
+Lux Partners, 2025.
+
+\bibitem{lux-ethfalcon-pq}
+Z.~Kelling,
+``ETHFALCON: Post-Quantum Signature Verification as EVM Precompile,''
+Lux Partners, 2024.
+
+\bibitem{lux-credit-protocol-spec}
+Z.~Kelling,
+``Lux Credit Protocol Specification,''
+Lux Partners, 2023.
+
+\bibitem{erc1400}
+A.~Dossa, P.~Ruiz, F.~Vogelsteller, S.~Gosselin,
+``ERC-1400: Security Token Standard,''
+Ethereum Improvement Proposals, 2018.
+
+\bibitem{erc1404}
+R.~Bose, J.~Cawley,
+``ERC-1404: Simple Restricted Token Standard,''
+Ethereum Improvement Proposals, 2018.
+
+\bibitem{erc3643}
+J.~Music, R.~Music,
+``ERC-3643: T-REX --- Token for Regulated Exchanges,''
+Ethereum Improvement Proposals, 2021.
+
+\bibitem{gg20}
+R.~Gennaro, S.~Goldfeder,
+``One Round Threshold ECDSA with Identifiable Abort,''
+Cryptology ePrint Archive, 2020.
+
+\bibitem{shor1994}
+P.~W.~Shor,
+``Algorithms for Quantum Computation: Discrete Logarithms and Factoring,''
+FOCS, 1994.
+
+\bibitem{nist-pqc}
+{National Institute of Standards and Technology},
+``Post-Quantum Cryptography Standardization,''
+NIST, 2024.
+
+\end{thebibliography}
+
+\end{document}
