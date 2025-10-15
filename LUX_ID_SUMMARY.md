@@ -317,7 +317,7 @@ did:lux:testnet:P-lux1g65uqn6t77p656w64023nh8nd9updzmxh8ttv # Testnet
 - **Custom Subnet**: `<subnet-id>` → `did:lux:2oYMBNV4eNHy...`
 
 ### Address Formats
-- **X-Chain (UTXO)**: `X-lux1<bech32>` — AVM address
+- **X-Chain (UTXO)**: `X-lux1<bech32>` — XVM address
 - **C-Chain (EVM)**: `0x<hex>` — Ethereum-compatible
 - **P-Chain (Platform)**: `P-lux1<bech32>` — Validator/staking
 
