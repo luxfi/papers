@@ -1,7 +1,13 @@
 # Lux Blockchain Research Papers
 
+[![Compile Papers](https://github.com/luxfi/papers/actions/workflows/compile-papers.yml/badge.svg)](https://github.com/luxfi/papers/actions/workflows/compile-papers.yml)
+[![Papers](https://img.shields.io/badge/papers-3-blue)](https://github.com/luxfi/papers)
+[![License](https://img.shields.io/badge/license-CC--BY--4.0-green)](LICENSE)
+
 **Post-Quantum Secure, High-Performance Blockchain Infrastructure**  
 *By Lux Partners*
+
+📥 **[Download All PDFs](https://github.com/luxfi/papers/releases/latest)**
 
 ---
 
