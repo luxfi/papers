@@ -11,10 +11,16 @@ export function Header({ config }: HeaderProps) {
       <div className="container mx-auto px-4 py-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-4">
-            {/* Logo would go here if available */}
             <div className="flex items-center gap-2">
-              <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-blue-500 to-purple-500 flex items-center justify-center text-white font-bold text-xl">
-                {config.name.charAt(0)}
+              {/* Lux downward-pointing triangle logo */}
+              <div className="w-10 h-10 flex items-center justify-center">
+                <svg
+                  viewBox="0 0 100 100"
+                  className="w-8 h-8"
+                  xmlns="http://www.w3.org/2000/svg"
+                >
+                  <path d="M50 85 L15 25 L85 25 Z" fill="currentColor" className="text-gray-900 dark:text-white"/>
+                </svg>
               </div>
               <div>
                 <h1 className="text-xl font-bold">{config.name}</h1>
