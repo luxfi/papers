@@ -72,7 +72,7 @@ message TeeQuote {
 
 **Problem:** Centralized job coordinators create single points of failure and censorship risk.
 
-**Solution:** libp2p gossipsub protocol with `/lux/jobs/v1` topic for peer-to-peer job distribution.
+**Solution:** ZAP gossip protocol with `/lux/jobs/v1` topic for peer-to-peer job distribution.
 
 **Algorithm:**
 1. Workers subscribe to gossip network
@@ -285,7 +285,7 @@ console.log('Risk score:', result.riskScore);
 |---------|-------------|----------------|----------------|-------|
 | **Multi-Vendor TEE** | ✅ Intel/AMD/NVIDIA | ❌ Intel SGX only | ❌ Intel SGX only | ❌ None (plaintext) |
 | **On-Chain Verification** | ✅ Smart contracts | ⚠️ Trusted coordinator | ⚠️ All validators TEE | ❌ Off-chain |
-| **Decentralized Scheduler** | ✅ Gossip (libp2p) | ❌ Centralized | ❌ Validator set | ✅ Distributed |
+| **Decentralized Scheduler** | ✅ Gossip (ZAP) | ❌ Centralized | ❌ Validator set | ✅ Distributed |
 | **Hardware Confidentiality** | ✅ TEE encryption | ✅ TEE encryption | ✅ TEE encryption | ❌ No guarantees |
 | **GPU TEE Support** | ✅ NVIDIA Hopper | ❌ None | ❌ None | ❌ None |
 | **Fraud Proofs** | ✅ Merkle traces | ❌ None | ❌ None | ✅ Interactive |
@@ -388,7 +388,7 @@ console.log('Risk score:', result.riskScore);
 - iExec decentralized cloud
 - TrueBit verification protocol
 - MPC foundations
-- libp2p GossipSub
+- ZAP GossipSub
 - SGX side-channel attacks
 - Flashbots SUAVE
 - Arbitrum Nitro rollups
