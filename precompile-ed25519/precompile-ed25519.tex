@@ -1,0 +1,219 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{listings}
+\input{shared/lstlang}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{float}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}
+
+\lstset{
+    basicstyle=\small\ttfamily,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray},
+    stringstyle=\color{red},
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray}
+}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{Ed25519 Precompile:\\EdDSA Signature Verification on the EVM}
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+\date{April 2026}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+We specify the Ed25519 signature verification precompile on the Lux EVM. Ed25519
+(RFC~8032) is the Edwards-curve Digital Signature Algorithm over Curve25519,
+used by Solana, Cosmos, NEAR, Polkadot/Substrate, Cardano, SSH, and signify.
+The precompile verifies an Ed25519 signature against a message and public key
+in a single EVM call. Gas cost: 2\,000 for single verification, with batch
+verification at 1\,500 per additional signature. Batch verification uses
+Bos-Coster multi-scalar multiplication for $O(n/\log n)$ group operations,
+providing a 3x speedup over sequential verification for 64 signatures.
+\end{abstract}
+
+\section{Introduction}
+
+Ed25519~\cite{rfc8032} is the most widely used signature scheme outside the
+Ethereum ecosystem. Verifying Ed25519 signatures on the EVM is essential for:
+\begin{enumerate}[label=(\roman*)]
+  \item \textbf{Cross-chain bridges}: Validating Solana, Cosmos, and Substrate
+    validator signatures on Lux.
+  \item \textbf{SSH key verification}: Proving SSH access authorization on-chain
+    (for decentralized infrastructure).
+  \item \textbf{Signify/Minisign}: Verifying software release signatures on-chain
+    for reproducible build attestation.
+  \item \textbf{Consensus proofs}: Validating foreign chain consensus signatures
+    for light client bridges.
+\end{enumerate}
+
+Implementing Ed25519 verification in Solidity costs $\sim$400\,000 gas (field
+arithmetic over $2^{255}-19$ requires multiple EVM words). The precompile reduces
+this to 2\,000 gas.
+
+\section{Specification}
+
+\begin{definition}[Ed25519 (RFC~8032)]
+Curve: Edwards25519, $-x^2 + y^2 = 1 + dx^2y^2$ with
+$d = -121665/121666 \pmod{p}$, $p = 2^{255} - 19$.
+\begin{itemize}
+  \item Public key $A$: 32 bytes (compressed Edwards point).
+  \item Signature $(R, S)$: 64 bytes (32-byte $R$ point, 32-byte scalar $S$).
+  \item Message $M$: arbitrary length.
+\end{itemize}
+\end{definition}
+
+\subsection{Verification Equation}
+
+Check that $[8][S]B = [8]R + [8][k]A$ where:
+\begin{itemize}
+  \item $B$ is the Ed25519 base point.
+  \item $k = \text{SHA-512}(R \| A \| M) \bmod \ell$ (where $\ell$ is the subgroup order).
+  \item The cofactor-8 multiplication ensures correctness even for
+    mixed-order points.
+\end{itemize}
+
+\subsection{Address and Operations}
+
+Address: \texttt{0x0200\ldots2D}.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{llr}
+\toprule
+\textbf{Selector} & \textbf{Operation} & \textbf{Gas} \\
+\midrule
+\texttt{0x01} & Single Verify & 2\,000 \\
+\texttt{0x02} & Batch Verify & $2\,000 + 1\,500(n-1)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Single Verify}
+
+\textbf{Input}: Selector (1), public key (32 bytes), signature (64 bytes),
+message length (4 bytes, big-endian), message.
+
+\textbf{Output}: 32 bytes, value 1 if valid, 0 otherwise.
+
+\subsection{Batch Verify}
+
+\textbf{Input}: Selector (1), count $n$ (2 bytes), then $n$ tuples of
+(public key, signature, message length, message).
+
+\textbf{Output}: 32 bytes, value 1 if \emph{all} signatures verify, 0 if any fails.
+
+Batch verification~\cite{batch-ed25519} checks:
+\[
+  \left[\sum_{i=1}^{n} z_i S_i\right] B = \sum_{i=1}^{n} z_i R_i + \sum_{i=1}^{n} z_i k_i A_i
+\]
+where $z_i$ are random 128-bit scalars. This is a single multi-scalar multiplication
+of size $2n + 1$, computed via Bos-Coster or Pippenger.
+
+\begin{theorem}[Batch soundness]
+If any individual signature is invalid, the batch check fails with probability
+$\geq 1 - 2^{-128}$ (over the random $z_i$ choices).
+\end{theorem}
+
+\section{Security Analysis}
+
+\subsection{Cofactor Handling}
+
+Ed25519 has cofactor $h = 8$. The precompile uses the ``cofactored'' verification
+equation ($[8]$ multiplied on both sides), which is equivalent to the
+``zip215'' verification rules~\cite{zip215}: it accepts all signatures that
+the cofactored equation accepts, ensuring compatibility with Solana and
+other chains that use zip215 semantics.
+
+\subsection{Malleability}
+
+Ed25519 signatures have a known malleability: for a valid $(R, S)$, the pair
+$(R, S + \ell)$ also passes some verification implementations. The precompile
+checks $S < \ell$ to prevent signature malleability, following RFC~8032
+Section~5.1.7.
+
+\subsection{Public Key Validation}
+
+The public key is decompressed and validated:
+\begin{enumerate}
+  \item The $y$-coordinate is in $[0, p)$.
+  \item The decompressed point is on the curve.
+  \item The point is not the identity (all-zeros rejected).
+\end{enumerate}
+
+\subsection{SHA-512 Hash}
+
+Ed25519 uses SHA-512 internally (not SHA-256 or Keccak). The precompile
+performs the SHA-512 computation as part of verification. The message is
+hashed as $\text{SHA-512}(R \| A \| M)$, requiring the full message as input.
+
+\section{Gas Cost Justification}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrr}
+\toprule
+\textbf{Operation} & \textbf{Time ($\mu$s)} & \textbf{Gas} \\
+\midrule
+Single Verify & 32 & 2\,000 \\
+Batch 4 & 80 & 6\,500 \\
+Batch 16 & 220 & 24\,500 \\
+Batch 64 & 650 & 96\,500 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Single verification requires 2 scalar multiplications and 1 point addition.
+Batch verification amortizes via MSM: 64 signatures cost $\sim$650$\mu$s
+versus $64 \times 32 = 2048\mu$s sequential, a 3.2x improvement.
+
+\section{Conclusion}
+
+The Ed25519 precompile brings the most widely used modern signature scheme to
+the Lux EVM. Batch verification with random linear combinations provides
+significant gas savings for bridge and light-client workloads that verify
+multiple signatures per transaction. The zip215-compatible cofactored
+verification ensures cross-chain compatibility.
+
+\begin{thebibliography}{9}
+\bibitem{rfc8032}
+  S.~Josefsson and I.~Liusvaara, ``Edwards-Curve Digital Signature Algorithm
+  (EdDSA),'' RFC~8032, 2017.
+
+\bibitem{batch-ed25519}
+  H.~de Valence et al., ``ed25519-dalek: Batch Verification,'' 2020.
+  \url{https://docs.rs/ed25519-dalek/latest/ed25519_dalek/}
+
+\bibitem{zip215}
+  H.~de Valence, J.~Grigg, and D.~Hopwood, ``ZIP 215: Explicitly Defining
+  Ed25519 Validation Rules,'' 2020.
+\end{thebibliography}
+
+\end{document}

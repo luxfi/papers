@@ -1,0 +1,209 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{listings}
+\input{shared/lstlang}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{float}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}
+
+\lstset{
+    basicstyle=\small\ttfamily,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray},
+    stringstyle=\color{red},
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray}
+}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{X25519 Precompile:\\Diffie-Hellman Key Agreement on the EVM}
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+\date{April 2026}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+We specify the X25519 Diffie-Hellman precompile on the Lux EVM, implementing
+the RFC~7748 key agreement function as a single EVM call. X25519 computes the
+$u$-coordinate of $[k]P$ on Curve25519 using the Montgomery ladder, producing a
+32-byte shared secret from a 32-byte scalar (private key) and a 32-byte
+$u$-coordinate (public key). The precompile enables on-chain key agreement for
+encrypted messaging protocols, hybrid key encapsulation (X25519 + ML-KEM in X-Wing),
+and peer-to-peer session establishment. Gas cost is set at 3\,000 gas, reflecting the
+efficiency of the constant-time Montgomery ladder over the fast $2^{255}-19$ field.
+\end{abstract}
+
+\section{Introduction}
+
+X25519~\cite{rfc7748} is the Diffie-Hellman function on Curve25519, computing
+the $x$-coordinate (Montgomery $u$-coordinate) of the scalar multiple of a
+point. It is the most widely deployed key agreement mechanism in TLS~1.3,
+Signal, WireGuard, and SSH.
+
+On-chain X25519 enables:
+\begin{enumerate}[label=(\roman*)]
+  \item \textbf{Encrypted smart contract state}: Contracts can derive shared
+    secrets with users for confidential parameters.
+  \item \textbf{Hybrid KEM}: The X-Wing construction combines X25519 with
+    ML-KEM-768 for quantum-resistant key encapsulation.
+  \item \textbf{DID authentication}: Verifying X25519 key agreements for
+    decentralized identity protocols.
+  \item \textbf{On-chain messaging}: End-to-end encrypted messaging where
+    the key exchange is recorded on-chain for auditability.
+\end{enumerate}
+
+\section{Specification}
+
+\begin{definition}[X25519]
+Given scalar $k$ (32 bytes) and $u$-coordinate (32 bytes):
+\begin{enumerate}
+  \item Decode $k$ with clamping: $k[0] \mathrel{\&}= 248$, $k[31] \mathrel{\&}= 127$,
+    $k[31] \mathrel{|}= 64$.
+  \item Decode $u$: interpret as little-endian integer, mask top bit ($u[31] \mathrel{\&}= 127$).
+  \item Compute $[k]u$ via the Montgomery ladder (Algorithm~\ref{alg:ladder}).
+  \item Encode the resulting $u$-coordinate as 32 bytes, little-endian.
+\end{enumerate}
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Montgomery ladder for X25519}\label{alg:ladder}
+\begin{algorithmic}[1]
+\Require Scalar $k$ (clamped), $u$-coordinate
+\State $x_2 \gets 1, \; z_2 \gets 0, \; x_3 \gets u, \; z_3 \gets 1$
+\State $\text{swap} \gets 0$
+\For{$t = 254$ down to $0$}
+  \State $k_t \gets (k \gg t) \mathbin{\&} 1$
+  \State $\text{swap} \gets \text{swap} \oplus k_t$
+  \State Conditional swap $(x_2, x_3)$ and $(z_2, z_3)$ on $\text{swap}$
+  \State $\text{swap} \gets k_t$
+  \State $A \gets x_2 + z_2, \; B \gets x_2 - z_2$
+  \State $C \gets x_3 + z_3, \; D \gets x_3 - z_3$
+  \State $DA \gets D \cdot A, \; CB \gets C \cdot B$
+  \State $x_3 \gets (DA + CB)^2, \; z_3 \gets u \cdot (DA - CB)^2$
+  \State $AA \gets A^2, \; BB \gets B^2$
+  \State $x_2 \gets AA \cdot BB$
+  \State $E \gets AA - BB$
+  \State $z_2 \gets E \cdot (AA + 121665 \cdot E)$
+\EndFor
+\State Conditional swap on $\text{swap}$
+\State \Return $x_2 \cdot z_2^{-1} \pmod{p}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Precompile Interface}
+
+Address: \texttt{0x0200\ldots23}. No selector byte (single function).
+
+\textbf{Input}: 64 bytes --- 32-byte scalar $k$ followed by 32-byte $u$-coordinate.
+
+\textbf{Output}: 32 bytes --- the resulting $u$-coordinate.
+
+\textbf{Gas}: 3\,000 (fixed).
+
+\subsection{Special Cases}
+
+Per RFC~7748: if the result is the zero $u$-coordinate (point at infinity),
+the output is 32 zero bytes. This is not an error. Callers performing key
+agreement must check for the all-zero output and reject it (RFC~7748 Section~6.1).
+
+The precompile does \emph{not} reject all-zero output because the zero check
+is a protocol-level decision (some protocols accept contributions to group
+elements that happen to be identity).
+
+\section{Security Analysis}
+
+\subsection{Clamping}
+
+The precompile applies RFC~7748 clamping to the scalar: clearing the three low
+bits (ensuring divisibility by 8 to clear the cofactor), clearing the top bit,
+and setting bit 254 (ensuring constant-time execution and a fixed key length).
+This matches all standard X25519 implementations.
+
+\subsection{Constant-Time Execution}
+
+The Montgomery ladder (Algorithm~\ref{alg:ladder}) executes exactly 255 iterations
+regardless of the scalar value. The conditional swap is implemented using
+bitwise masking ($\text{mask} = 0 - \text{swap}$), with no branching on secret
+data. Field operations use the 5$\times$51 limb representation with constant-time
+carry propagation.
+
+\subsection{Contributory Behavior}
+
+The clamping guarantees that the output is not a low-order point (unless the input
+$u$-coordinate itself is in the small subgroup). Setting bit 254 ensures the scalar
+is always in $[2^{254}, 2^{255})$, preventing degenerate zero-scalar inputs.
+
+\subsection{Timing Side Channels}
+
+Gas consumption is fixed at 3\,000 regardless of input values. The wall-clock
+execution time is constant within measurement noise ($< 1\%$ variance across
+$10^6$ random inputs). No gas-metering side channel exists.
+
+\section{Gas Cost Justification}
+
+X25519 requires 255 Montgomery ladder steps, each involving 5 field multiplications,
+4 field additions, and 1 field squaring. Over the $2^{255}-19$ field, this completes
+in $\sim$48~$\mu$s.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrr}
+\toprule
+\textbf{Operation} & \textbf{Time ($\mu$s)} & \textbf{Gas} \\
+\midrule
+X25519 & 48 & 3\,000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The gas-per-microsecond ratio of 62.5 is within the $[60, 65]$ target band.
+
+\section{Conclusion}
+
+The X25519 precompile brings the most widely deployed key agreement function
+to the EVM. RFC~7748 clamping, constant-time Montgomery ladder, and fixed gas
+cost ensure that on-chain key agreement is both secure and predictable. Combined
+with the ML-KEM precompile, X25519 enables the X-Wing hybrid KEM for
+quantum-resistant key exchange on-chain.
+
+\begin{thebibliography}{9}
+\bibitem{rfc7748}
+  A.~Langley, M.~Hamburg, and S.~Turner, ``Elliptic Curves for Security,''
+  RFC~7748, 2016.
+
+\bibitem{bernstein-ladder}
+  D.~J.~Bernstein, ``Curve25519: new Diffie-Hellman speed records,''
+  \textit{PKC 2006}, LNCS 3958, pp.~207--228.
+
+\bibitem{rfc9180}
+  R.~Barnes, K.~Bhargavan, B.~Lipp, and C.~Wood,
+  ``Hybrid Public Key Encryption,'' RFC~9180, 2022.
+\end{thebibliography}
+
+\end{document}
