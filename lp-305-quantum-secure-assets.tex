@@ -1,0 +1,327 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{enumitem}
+\usepackage{xcolor}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{remark}{Remark}[section]
+
+\title{LP-305: Quantum Secure Assets\\[4pt]
+\large A Post-Quantum Methodology for Protecting Digital Assets\\
+on the Lux Network}
+
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+
+\date{Original: August 2022\quad|\quad Revised: April 2026}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+We present the cryptographic architecture underlying Lux Network's
+post-quantum asset protection layer. The design combines lattice-based
+threshold cryptography (TFHE over RLWE), post-quantum signature schemes
+(ML-DSA, Ringtail), fully homomorphic encryption for privacy-preserving
+computation, and multimodal biometric authentication---providing
+comprehensive security against adversaries with access to fault-tolerant
+quantum computers.
+
+This paper consolidates and updates the 2022 ``Quantum Secure Assets''
+internal design document. Where the original described aspirational
+architecture, this revision maps each component to its production
+implementation, cites the formal verification where available, and
+identifies the remaining open problems.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{Introduction}
+
+\subsection{Background}
+
+Shor's algorithm~\cite{shor1999} renders RSA, ECDSA, and all
+discrete-logarithm-based signature schemes insecure on a sufficiently
+powerful quantum computer. NIST's Post-Quantum Cryptography
+standardization process~\cite{nist-pqc} selected ML-KEM (Kyber),
+ML-DSA (Dilithium), and SLH-DSA (SPHINCS+) as the primary
+replacements. Lux Network adopted these standards at the consensus
+layer and extended them with ring-signature privacy (Ringtail) and
+fully homomorphic encryption (TFHE) for computation over ciphertexts.
+
+\subsection{Scope}
+
+This paper covers five layers of Lux's post-quantum stack:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Consensus signatures}: BLS-381 + ML-DSA-65 + Ringtail
+        (Quasar protocol, LP-105).
+  \item \textbf{Threshold key management}: TFHE key generation via
+        Shamir LSSS over a 2048-bit safe prime, with Feldman VSS
+        commitments.
+  \item \textbf{Fully homomorphic encryption}: TFHE boolean-gate
+        circuits for encrypted CRDT merge, encrypted search, and
+        private smart contracts.
+  \item \textbf{Non-custodial wallets}: 2-of-3 MPC (CGGMP21 for
+        secp256k1, FROST for Ed25519) with HSM co-signing.
+  \item \textbf{Regulatory disclosure}: viewing keys, threshold
+        disclosure, and ZK attestation anchoring.
+\end{enumerate}
+
+\subsection{Evolution from the 2022 Design}
+
+The 2022 internal document proposed Lamport one-time signatures for
+vault protection and an OTP-based information-theoretic signing layer.
+Both were superseded:
+
+\begin{itemize}[nosep]
+  \item Lamport signatures $\rightarrow$ ML-DSA-65 (FIPS~204): multi-use,
+        smaller signatures (2.4\,KB vs 16\,KB per Lamport instance),
+        NIST-standardized.
+  \item Network-layer OTP signing $\rightarrow$ dropped. The throughput
+        cost of per-transaction OTP generation was incompatible with
+        sub-second finality. ML-DSA provides computational (not
+        information-theoretic) PQ security, which is sufficient given
+        current lattice-hardness estimates~\cite{nist-pqc-report}.
+\end{itemize}
+
+%% ============================================================
+\section{Lattice-Based Threshold Cryptography}
+
+\subsection{Mathematical Foundation}
+
+Security rests on the hardness of the Ring Learning With Errors
+(RLWE) problem. Let $R_q = \mathbb{Z}_q[X]/(X^n + 1)$ be a
+cyclotomic polynomial ring. The decisional RLWE problem asks to
+distinguish $(a_i, a_i \cdot s + e_i)$ from uniform, where
+$s \in R_q$ is secret and $e_i$ are drawn from a discrete Gaussian
+$\chi_\sigma$.
+
+\begin{definition}[RLWE Hardness Assumption]
+For security parameter $\lambda$, ring dimension $n$, modulus $q$,
+and error distribution $\chi_\sigma$, no probabilistic
+polynomial-time (or bounded quantum polynomial-time) algorithm can
+distinguish RLWE samples from uniform with advantage better than
+$\mathrm{negl}(\lambda)$.
+\end{definition}
+
+\subsection{Implementation: \texttt{luxfi/fhe}}
+
+Lux's TFHE library (\texttt{github.com/luxfi/fhe}) implements:
+
+\begin{itemize}[nosep]
+  \item \textbf{Parameter sets}: PN10QP27 ($N{=}1024$, $Q{=}134215681$,
+        $\sim$128-bit classical), PN11QP54 ($N{=}2048$, higher precision),
+        and OpenFHE-compatible STD128Q (post-quantum 128-bit).
+  \item \textbf{Boolean gates}: AND, OR, XOR, NOT, NAND, NOR, XNOR,
+        MUX, MAJORITY---each with programmable bootstrapping.
+  \item \textbf{Integer arithmetic}: FheUint8/16/32/64 with
+        Add, Sub, Mul (schoolbook), comparison chains (Lt, Gt, Eq).
+  \item \textbf{Threshold key management}: Shamir secret sharing over
+        the 2048-bit RFC~3526 Group~14 safe prime, with Feldman VSS
+        commitments in the order-$q$ subgroup ($g = 2^2 \bmod p$).
+  \item \textbf{Proactive reshare}: additive sub-sharing via Lagrange
+        coefficients---no party materializes the full secret during
+        reshare.
+\end{itemize}
+
+\subsection{Threshold FHE Protocol}
+
+Key generation follows a $t$-of-$n$ Shamir scheme. Each party $i$
+receives a share $s_i = f(i)$ where $f$ is a random degree-$(t{-}1)$
+polynomial with $f(0) = \mathit{sk}$. Reconstruction uses Lagrange
+interpolation:
+
+\[
+\mathit{sk} = \sum_{i \in S} s_i \cdot \lambda_i(0),
+\qquad
+\lambda_i(x) = \prod_{j \in S \setminus \{i\}} \frac{x - j}{i - j}
+\]
+
+Reshare without secret materialization: each old party $i$ picks a
+random polynomial $g_i$ of degree $(t'{-}1)$ with constant term
+$\lambda_i \cdot s_i$. New share $s'_j = \sum_i g_i(j)$. Since
+$\sum_i g_i(0) = \sum_i \lambda_i \cdot s_i = \mathit{sk}$, the new
+shares reconstruct the same secret. No single party ever holds
+$\mathit{sk}$ in cleartext.
+
+%% ============================================================
+\section{Fully Homomorphic Encryption}
+
+\subsection{TFHE Gate-by-Gate Bootstrapping}
+
+Each boolean gate $G \in \{\text{AND}, \text{OR}, \text{XOR}, \ldots\}$
+is evaluated via a single bootstrapping operation that simultaneously
+computes the gate and refreshes the noise:
+
+\[
+\text{Bootstrap}(c, G) = \text{BlindRotate}(c) \cdot G_{\text{LUT}}
+\]
+
+where $G_{\text{LUT}}$ encodes the gate's truth table as a test
+polynomial in $R_q$.
+
+\subsection{Encrypted CRDT Merge}
+
+CRDT merge under FHE enables conflict-free replication without
+decryption. The LWW-Register merge circuit compares encrypted
+timestamps MSB-to-LSB:
+
+\begin{algorithmic}[1]
+\State $\mathit{bGtA} \gets \bot$; $\mathit{eqSoFar} \gets \top$
+\For{$i = \text{MSB}$ \textbf{downto} $0$}
+  \State $\mathit{bitGt} \gets \text{ANDNY}(a_i, b_i)$
+  \State $\mathit{bitEq} \gets \text{XNOR}(a_i, b_i)$
+  \State $\mathit{bGtA} \gets \text{OR}(\mathit{bGtA},
+         \text{AND}(\mathit{eqSoFar}, \mathit{bitGt}))$
+  \State $\mathit{eqSoFar} \gets \text{AND}(\mathit{eqSoFar},
+         \mathit{bitEq})$
+\EndFor
+\For{each bit $i$}
+  \State $\mathit{result}_i \gets \text{MUX}(\mathit{bGtA}, b_i, a_i)$
+\EndFor
+\end{algorithmic}
+
+Gate count: $O(\text{bitsTS})$ comparisons + $O(\text{bitsVal} +
+\text{bitsTS})$ MUX selections. At PN10QP27 with 8-bit timestamps
+and 8-bit values: $\sim$40 bootstraps $\approx$ 4 seconds.
+
+\subsection{Performance Budget}
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Operation} & \textbf{Gates} & \textbf{Time (PN10QP27)} & \textbf{Ciphertext} \\
+\midrule
+LWW Merge (8+8 bit) & 40 & 4\,s & 136\,KB \\
+GCounter Max (32 bit/node) & 128 & 13\,s & 544\,KB \\
+OR-Set Merge & 0 (tag union) & $<$1\,ms & tags only \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%% ============================================================
+\section{Non-Custodial Wallet Architecture}
+
+Every user receives a 2-of-3 MPC wallet on the Lux EVM:
+
+\begin{enumerate}[nosep]
+  \item \textbf{User device} --- key share derived from WebAuthn PRF.
+  \item \textbf{ATS co-signer} --- auto-signs after compliance checks.
+  \item \textbf{Backup (cold)} --- Shamir recovery via
+        \texttt{luxfi/age} (X25519 + ML-KEM-768 X-Wing hybrid).
+\end{enumerate}
+
+Protocols: CGGMP21~\cite{cggmp21} for ECDSA (secp256k1), FROST for
+EdDSA (Ed25519). HSM co-signing for settlement intents
+(AWS KMS, GCP, Zymbit).
+
+%% ============================================================
+\section{Regulatory Disclosure}
+
+Three composable modes, implemented in \texttt{Disclosure.sol}:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Viewing keys} (Zcash-style): owner registers a
+        per-viewer wrapped decryption key. Revocable on-chain; actual
+        key revocation requires off-chain rekey.
+  \item \textbf{Threshold disclosure} ($M$-of-$N$, regulator is one
+        party): uses the existing \texttt{lsss.go} Shamir infrastructure.
+        On-chain share submission with per-party dedup. Combination
+        happens off-chain.
+  \item \textbf{ZK attestation anchor}: accepts opaque proof bytes
+        with a \texttt{claimType} tag. On-chain verifier registry
+        (owner-gated) routes to Groth16/PlonK verifier contracts when
+        deployed.
+\end{enumerate}
+
+%% ============================================================
+\section{Open Problems}
+
+\begin{enumerate}[nosep]
+  \item \textbf{Deterministic keygen from seed}: \texttt{luxfi/lattice}
+        v7 does not expose a \texttt{KeyGenerator.WithPRNG} constructor.
+        Consensus validators need identical FHE keys from the same seed.
+        Tracked as \texttt{luxfi/lattice\#42}.
+  \item \textbf{FHE throughput}: 0.24 ops/sec at production parameters
+        limits FHE CRDT to low-frequency use cases (sealed auctions,
+        threshold aggregation). GPU acceleration via NTT transforms
+        (see LP-203) is the primary mitigation path.
+  \item \textbf{Biometric + FHE fusion}: WebAuthn PRF provides
+        passkey-derived keys; Partner provides biometric KYC. The
+        missing piece is encrypting the biometric template under TFHE
+        so the server can \emph{match} without seeing the template.
+\end{enumerate}
+
+%% ============================================================
+\section{Conclusion}
+
+Lux Network's post-quantum asset protection stack spans five layers:
+consensus (Quasar), threshold key management (Shamir/Feldman over
+TFHE), homomorphic computation (encrypted CRDT merge), non-custodial
+wallets (CGGMP21/FROST MPC), and regulatory disclosure (viewing keys,
+threshold, ZK attestations). The 2022 design aspirations have been
+realized in production code across \texttt{luxfi/fhe},
+\texttt{luxfi/standard}, \texttt{hanzoai/base}, and \texttt{luxfi/mpc},
+with 107+ tests, three rounds of adversarial review, and formal
+verification of the core consensus protocol.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{99}
+
+\bibitem{shor1999}
+P.~W.~Shor, ``Polynomial-time algorithms for prime factorization and
+discrete logarithms on a quantum computer,'' \textit{SIAM Review},
+vol.~41, no.~2, pp.~303--332, 1999.
+
+\bibitem{nist-pqc}
+NIST, ``Post-Quantum Cryptography Standardization,''
+\url{https://csrc.nist.gov/projects/post-quantum-cryptography}, 2024.
+
+\bibitem{nist-pqc-report}
+NIST, ``Status Report on the Third Round of the NIST Post-Quantum
+Cryptography Standardization Process,'' NISTIR~8413, 2022.
+
+\bibitem{cggmp21}
+R.~Canetti, R.~Gennaro, S.~Goldfeder, N.~Makriyannis, and U.~Peled,
+``UC Non-Interactive, Proactive, Threshold ECDSA with Identifiable
+Aborts,'' \textit{ACM CCS}, 2020.
+
+\bibitem{regev2005}
+O.~Regev, ``On lattices, learning with errors, random linear codes,
+and cryptography,'' \textit{STOC}, pp.~84--93, 2005.
+
+\bibitem{gentry2009}
+C.~Gentry, ``A fully homomorphic encryption scheme,'' Ph.D.
+dissertation, Stanford University, 2009.
+
+\bibitem{lamport1979}
+L.~Lamport, ``Constructing digital signatures from a one-way
+function,'' Technical Report SRI-CSL-98, 1979.
+
+\bibitem{rfc3526}
+T.~Kivinen and M.~Kojo, ``More Modular Exponential (MODP)
+Diffie-Hellman groups for Internet Key Exchange (IKE),'' RFC~3526,
+2003.
+
+\end{thebibliography}
+
+\end{document}
