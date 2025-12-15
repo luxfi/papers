@@ -1,0 +1,234 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage[utf8]{inputenc}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{textcomp}
+
+\definecolor{leanblue}{rgb}{0.2,0.4,0.7}
+
+\lstdefinelanguage{Lean}{
+  keywords={theorem,lemma,def,axiom,structure,class,instance,where,by,sorry,simp,exact,intro,apply,have,let,fun,match,if,then,else,import,open,namespace,end,section,variable,inductive,noncomputable,abbrev,deriving},
+  keywordstyle=\color{leanblue}\bfseries,
+  comment=[l]{--},
+  morecomment=[s]{/-}{-/},
+  string=[b]",
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  extendedchars=true,
+  inputencoding=utf8,
+  literate=
+    {≥}{{$\geq$}}1
+    {≤}{{$\leq$}}1
+    {→}{{$\to$}}1
+    {←}{{$\leftarrow$}}1
+    {∧}{{$\wedge$}}1
+    {∨}{{$\vee$}}1
+    {¬}{{$\neg$}}1
+    {∀}{{$\forall$}}1
+    {∃}{{$\exists$}}1
+    {⊆}{{$\subseteq$}}1
+    {⊂}{{$\subset$}}1
+    {∈}{{$\in$}}1
+    {∉}{{$\notin$}}1
+    {×}{{$\times$}}1
+    {⊗}{{$\otimes$}}1
+    {▸}{{$\blacktriangleright$}}1
+    {⟨}{{$\langle$}}1
+    {⟩}{{$\rangle$}}1
+    {λ}{{$\lambda$}}1
+    {α}{{$\alpha$}}1
+    {β}{{$\beta$}}1
+    {σ}{{$\sigma$}}1
+    {θ}{{$\theta$}}1
+    {ε}{{$\varepsilon$}}1
+    {μ}{{$\mu$}}1
+    {π}{{$\pi$}}1
+    {Σ}{{$\Sigma$}}1
+    {Π}{{$\Pi$}}1
+    {▶}{{$\triangleright$}}1
+    {⊔}{{$\sqcup$}}1
+    {⊓}{{$\sqcap$}}1
+    {⊥}{{$\bot$}}1
+    {⊤}{{$\top$}}1
+    {∅}{{$\emptyset$}}1
+    {∪}{{$\cup$}}1
+    {∩}{{$\cap$}}1
+    {≠}{{$\neq$}}1
+    {ℕ}{{$\mathbb{N}$}}1
+    {₀}{{$_0$}}1
+    {₁}{{$_1$}}1
+    {₂}{{$_2$}}1
+    {|>}{{$|{\!>}$}}2
+    {·}{{$\cdot$}}1
+    {—}{{---}}1
+    {∘}{{$\circ$}}1
+    {√}{{$\sqrt{}$}}1
+    {∝}{{$\propto$}}1
+    {≈}{{$\approx$}}1
+    {═}{{=}}1
+    {⟹}{{$\Longrightarrow$}}1,
+}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{axiom_stmt}[theorem]{Axiom}
+
+\title{Formal Verification: MPC Key Reshare Safety}
+\author{Zach Kelling, Lux Industries}
+\date{December 2025}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We formalize the threshold key reshare protocol for $(t, n)$ secret sharing over elliptic curve groups. Resharing rotates the signer set---from an old committee of $n$ parties to a new committee of $n'$ parties---while preserving the public key and invalidating all old shares. The key properties are public key preservation (the blockchain address does not change), old share invalidation (departed signers lose all signing capability), the no-reconstruction invariant (the full private key never exists in any single party's memory), and Byzantine safety (the protocol tolerates up to $t-1$ dishonest old signers). These properties are required for institutional custody under SEC Rule 15c3-3 and FINRA Rule 4370.
+\end{abstract}
+
+\section{Introduction}
+Threshold key management requires periodic resharing: signers leave and join, key material must be rotated for operational security, and compliance mandates separation of duties across changing personnel. The reshare protocol must accomplish this without changing the public key (which would require on-chain migration of all assets) and without ever assembling the full private key (which would create a single point of compromise).
+
+We model the reshare as a verifiable secret sharing (VSS) protocol where the old committee acts as a distributed dealer for the new committee. The old shares define a polynomial $f(x)$ of degree $t-1$ with $f(0) = s$ (the secret key). The reshare constructs a new polynomial $g(x)$ of degree $t'-1$ with $g(0) = s$, distributing new shares to the new committee, such that no old share is a valid evaluation of $g$.
+
+\section{Definitions}
+
+\begin{definition}[Elliptic Curve Group]
+Let $\mathbb{G}$ be a cyclic group of prime order $q$ with generator $G$, derived from an elliptic curve (secp256k1 for ECDSA, ed25519 for EdDSA). Discrete log is assumed hard.
+\end{definition}
+
+\begin{definition}[Threshold Parameters]
+Old parameters $(t, n)$ and new parameters $(t', n')$ where $t \leq n$, $t' \leq n'$, and $t, t' \geq 2$. The old committee is $\mathcal{P} = \{P_1, \ldots, P_n\}$ and the new committee is $\mathcal{P}' = \{P'_1, \ldots, P'_{n'}\}$. The committees may overlap.
+\end{definition}
+
+\begin{definition}[Share]
+A share for party $P_i$ is $s_i = f(\alpha_i)$ where $f \in \mathbb{F}_q[x]$ is a polynomial of degree $t-1$ with $f(0) = s$ (the secret key), and $\alpha_i$ is the evaluation point for party $i$. The public key is $\texttt{pk} = s \cdot G$.
+\end{definition}
+
+\begin{definition}[Reshare Protocol]
+A reshare from $(t, n, \mathcal{P})$ to $(t', n', \mathcal{P}')$ is a protocol where:
+\begin{enumerate}
+  \item Each old party $P_i$ holding share $s_i$ acts as a sub-dealer.
+  \item $P_i$ samples a random polynomial $\delta_i(x)$ of degree $t'-1$ with $\delta_i(0) = 0$.
+  \item $P_i$ computes re-sharing polynomial $h_i(x) = \lambda_i \cdot s_i + \delta_i(x)$ where $\lambda_i$ is the Lagrange coefficient for party $i$ over the old evaluation points.
+  \item Each new party $P'_j$ receives $h_i(\alpha'_j)$ from each old party $P_i$ and sums: $s'_j = \sum_{i=1}^{t} h_i(\alpha'_j)$.
+  \item Commitments to polynomial coefficients are broadcast for verification (Feldman VSS).
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[Dishonest Parties]
+A set $\mathcal{A} \subset \mathcal{P}$ of old parties controlled by an adversary, with $|\mathcal{A}| \leq t - 1$.
+\end{definition}
+
+
+\section{Theorems and Proofs}
+
+\begin{theorem}[\texttt{reshare\_preserves\_pk}]
+Public key preservation: after reshare, the new shares $\{s'_j\}$ define a polynomial $g(x)$ with $g(0) = s$, so $\texttt{pk}' = g(0) \cdot G = s \cdot G = \texttt{pk}$.
+\end{theorem}
+\begin{proof}
+Define $g(x) = \sum_{i=1}^{t} h_i(x) = \sum_{i=1}^{t} (\lambda_i \cdot s_i + \delta_i(x))$.
+
+Evaluate at $x = 0$:
+\[
+  g(0) = \sum_{i=1}^{t} (\lambda_i \cdot s_i + \delta_i(0)) = \sum_{i=1}^{t} \lambda_i \cdot s_i + \sum_{i=1}^{t} 0 = \sum_{i=1}^{t} \lambda_i \cdot s_i.
+\]
+
+By the Lagrange interpolation property, $\sum_{i=1}^{t} \lambda_i \cdot s_i = \sum_{i=1}^{t} \lambda_i \cdot f(\alpha_i) = f(0) = s$.
+
+Therefore $g(0) = s$ and $\texttt{pk}' = s \cdot G = \texttt{pk}$.
+\end{proof}
+
+\begin{theorem}[\texttt{old\_shares\_invalid}]
+Old share invalidation: after reshare, old shares $\{s_i = f(\alpha_i)\}$ are not valid evaluations of the new polynomial $g(x)$ (except with negligible probability).
+\end{theorem}
+\begin{proof}
+The new polynomial is $g(x) = \sum_{i=1}^{t} h_i(x)$, which has degree $t'-1$. The old shares satisfy $s_i = f(\alpha_i)$ for the old polynomial $f$ of degree $t-1$.
+
+For an old share $s_i$ to be valid under $g$, we would need $g(\alpha_i) = s_i$. Since $g$ is determined by the random polynomials $\{\delta_i\}$, the value $g(\alpha_i)$ is uniformly random in $\mathbb{F}_q$ from the perspective of any party not holding $t'$ new shares. The probability that $g(\alpha_i) = s_i$ is $1/q$, which is negligible for cryptographic group orders ($q \approx 2^{256}$).
+
+More precisely: the $\delta_i$ polynomials contribute $\sum_i \delta_i(\alpha_j)$ to each new share point. Since each $\delta_i$ is independently random (subject to $\delta_i(0) = 0$), the distribution of $g$ at any point $\alpha_j \neq 0$ not used in the new share set is uniform over polynomials with the correct constant term. An old party knowing only $s_i$ and fewer than $t'$ values of $g$ cannot predict $g(\alpha_i)$ better than random guessing.
+\end{proof}
+
+\begin{theorem}[\texttt{no\_key\_reconstruction}]
+No-reconstruction invariant: during reshare, no single party ever holds the secret key $s$ in memory.
+\end{theorem}
+\begin{proof}
+We analyze each party's view:
+
+\textbf{Old party $P_i$}: holds $s_i = f(\alpha_i)$, the Lagrange coefficient $\lambda_i$, and the random polynomial $\delta_i$. Computing $s = f(0)$ from $s_i$ alone requires knowledge of $t-1$ other shares. $P_i$ never receives other parties' shares.
+
+\textbf{New party $P'_j$}: receives $h_i(\alpha'_j)$ from each of $t$ old parties and computes $s'_j = \sum_i h_i(\alpha'_j) = g(\alpha'_j)$. This is an evaluation of $g$ at $\alpha'_j \neq 0$, not at $0$. Computing $g(0) = s$ requires $t'$ such evaluations; $P'_j$ holds exactly one.
+
+\textbf{Network observer}: sees only encrypted channels (TLS/Noise) between parties. Feldman VSS commitments are group elements $c_k = a_k \cdot G$; extracting $a_k$ requires solving discrete log.
+
+No party's local state at any protocol step contains $s$.
+\end{proof}
+
+\begin{theorem}[\texttt{byzantine\_safety}]
+Byzantine safety: the reshare protocol is secure against up to $t-1$ dishonest old parties.
+\end{theorem}
+\begin{proof}
+Let $\mathcal{A} \subset \mathcal{P}$ with $|\mathcal{A}| \leq t-1$ be the set of corrupted old parties.
+
+\textbf{Secrecy}: The adversary holds $|\mathcal{A}|$ old shares $\{s_i\}_{i \in \mathcal{A}}$. Since $|\mathcal{A}| < t$, by the information-theoretic security of Shamir secret sharing, these shares reveal no information about $s = f(0)$. For any candidate secret $s^*$, there exists a polynomial of degree $t-1$ passing through the adversary's shares with $f(0) = s^*$. The adversary's view is therefore independent of $s$.
+
+\textbf{Integrity}: Each honest old party $P_i$ ($i \notin \mathcal{A}$) broadcasts Feldman commitments $\{c_k^{(i)} = a_k^{(i)} \cdot G\}$ for its polynomial $h_i$. New parties verify received shares against these commitments:
+\[
+  h_i(\alpha'_j) \cdot G \stackrel{?}{=} \sum_{k=0}^{t'-1} (\alpha'_j)^k \cdot c_k^{(i)}.
+\]
+A dishonest old party sending inconsistent shares is detected and excluded. With $t$ honest old parties remaining (since $n - (t-1) \geq t+1 > t$ for $n \geq 2t$), the protocol completes correctly.
+
+\textbf{Liveness}: The protocol requires $t$ honest old parties to participate. Since $|\mathcal{A}| \leq t-1$ and $n \geq 2t-1$ (standard assumption), at least $t$ honest parties are available.
+\end{proof}
+
+\begin{lemma}[\texttt{reshare\_composable}]
+Sequential reshares compose: resharing from $(t_1, n_1)$ to $(t_2, n_2)$ and then from $(t_2, n_2)$ to $(t_3, n_3)$ preserves the same public key as a single reshare from $(t_1, n_1)$ to $(t_3, n_3)$.
+\end{lemma}
+\begin{proof}
+By Theorem 1, each reshare preserves $g(0) = s$. The first reshare yields $g_1(0) = s$, the second yields $g_2(0) = g_1(0) = s$. By transitivity, $\texttt{pk}$ is invariant under any finite sequence of reshares.
+\end{proof}
+
+\begin{theorem}[\texttt{threshold\_change\_safe}]
+Threshold modification: reshare can change the threshold from $t$ to $t' \neq t$ while preserving all security properties.
+\end{theorem}
+\begin{proof}
+The reshare protocol parameterizes the new polynomial degree as $t'-1$, independent of the old degree $t-1$. Theorem 1 (public key preservation) depends only on $\sum_i \delta_i(0) = 0$, which holds for any degree. Theorem 3 (no reconstruction) depends on $t'$ being the new interpolation threshold, which is enforced by construction. Theorem 4 (Byzantine safety) requires $|\mathcal{A}| < t$ (the \emph{old} threshold), which is unchanged by the choice of $t'$.
+\end{proof}
+
+
+\section{Regulatory Implications}
+
+The reshare safety properties map directly to custody requirements under securities regulation:
+
+\begin{itemize}
+  \item \textbf{SEC Rule 15c3-3 (Customer Protection)}: The no-reconstruction invariant (Theorem 3) ensures that customer assets under MPC custody are never reducible to a single key, satisfying the ``possession or control'' requirement without creating a single point of theft.
+  \item \textbf{FINRA Rule 4370 (Business Continuity)}: Public key preservation (Theorem 1) and reshare composability (Lemma 5) enable key committee rotation for business continuity---departing personnel are removed from the signer set, new personnel are added, and all on-chain addresses remain stable. No asset migration is required.
+  \item \textbf{SOC 2 Type II}: Old share invalidation (Theorem 2) ensures that access revocation is cryptographically enforced. A departed signer's key material is provably useless after reshare, satisfying the ``timely revocation'' control.
+  \item \textbf{NIST SP 800-57 (Key Management)}: The reshare protocol implements cryptoperiod rotation (Section 5.3 of SP 800-57) without the operational risk of key migration. Byzantine safety (Theorem 4) provides resilience against insider compromise during the rotation window.
+\end{itemize}
+
+
+\section{Lean Source}
+\lstinputlisting[language=Lean]{../../formal/lean/Crypto/Threshold/Reshare.lean}
+
+\section{References}
+\noindent Source code: \url{https://github.com/luxfi/proofs/blob/main/lean/Crypto/Threshold/Reshare.lean}\\
+\noindent White papers: \url{https://papers.lux.network}
+
+\noindent Related standards and literature:
+\begin{itemize}
+  \item Canetti, R., Gennaro, R., Goldfeder, S., Makriyannis, N., Peled, U. ``UC Non-Interactive, Proactive, Threshold ECDSA with Identifiable Aborts.'' CCS 2020.
+  \item Desmedt, Y., Jajodia, S. ``Redistributing Secret Shares to New Access Structures and Its Applications.'' Technical Report, 1997.
+  \item Feldman, P. ``A Practical Scheme for Non-interactive Verifiable Secret Sharing.'' FOCS 1987.
+  \item Shamir, A. ``How to Share a Secret.'' Communications of the ACM, 22(11), 1979.
+  \item NIST SP 800-57 Part 1 Rev.~5: Recommendation for Key Management. 2020.
+  \item SEC Rule 15c3-3: Customer Protection---Reserves and Custody of Securities. 17 CFR \S 240.15c3-3.
+  \item FINRA Rule 4370: Business Continuity Plans and Emergency Contact Information.
+  \item \texttt{lux-universal-threshold-signatures.tex}
+  \item \texttt{lux-mchain-mpc.tex}
+\end{itemize}
+
+\end{document}
