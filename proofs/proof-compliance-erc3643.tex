@@ -1,0 +1,233 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage[utf8]{inputenc}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{textcomp}
+
+\definecolor{leanblue}{rgb}{0.2,0.4,0.7}
+
+\lstdefinelanguage{Lean}{
+  keywords={theorem,lemma,def,axiom,structure,class,instance,where,by,sorry,simp,exact,intro,apply,have,let,fun,match,if,then,else,import,open,namespace,end,section,variable,inductive,noncomputable,abbrev,deriving},
+  keywordstyle=\color{leanblue}\bfseries,
+  comment=[l]{--},
+  morecomment=[s]{/-}{-/},
+  string=[b]",
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  extendedchars=true,
+  inputencoding=utf8,
+  literate=
+    {≥}{{$\geq$}}1
+    {≤}{{$\leq$}}1
+    {→}{{$\to$}}1
+    {←}{{$\leftarrow$}}1
+    {∧}{{$\wedge$}}1
+    {∨}{{$\vee$}}1
+    {¬}{{$\neg$}}1
+    {∀}{{$\forall$}}1
+    {∃}{{$\exists$}}1
+    {⊆}{{$\subseteq$}}1
+    {⊂}{{$\subset$}}1
+    {∈}{{$\in$}}1
+    {∉}{{$\notin$}}1
+    {×}{{$\times$}}1
+    {⊗}{{$\otimes$}}1
+    {▸}{{$\blacktriangleright$}}1
+    {⟨}{{$\langle$}}1
+    {⟩}{{$\rangle$}}1
+    {λ}{{$\lambda$}}1
+    {α}{{$\alpha$}}1
+    {β}{{$\beta$}}1
+    {σ}{{$\sigma$}}1
+    {θ}{{$\theta$}}1
+    {ε}{{$\varepsilon$}}1
+    {μ}{{$\mu$}}1
+    {π}{{$\pi$}}1
+    {Σ}{{$\Sigma$}}1
+    {Π}{{$\Pi$}}1
+    {▶}{{$\triangleright$}}1
+    {⊔}{{$\sqcup$}}1
+    {⊓}{{$\sqcap$}}1
+    {⊥}{{$\bot$}}1
+    {⊤}{{$\top$}}1
+    {∅}{{$\emptyset$}}1
+    {∪}{{$\cup$}}1
+    {∩}{{$\cap$}}1
+    {≠}{{$\neq$}}1
+    {ℕ}{{$\mathbb{N}$}}1
+    {₀}{{$_0$}}1
+    {₁}{{$_1$}}1
+    {₂}{{$_2$}}1
+    {|>}{{$|{\!>}$}}2
+    {·}{{$\cdot$}}1
+    {—}{{---}}1
+    {∘}{{$\circ$}}1
+    {√}{{$\sqrt{}$}}1
+    {∝}{{$\propto$}}1
+    {≈}{{$\approx$}}1
+    {═}{{=}}1
+    {⟹}{{$\Longrightarrow$}}1,
+}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{axiom_stmt}[theorem]{Axiom}
+
+\title{Formal Verification: ERC-3643 Compliance Enforcement Correctness}
+\author{Zach Kelling, Lux Industries}
+\date{December 2025}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We formalize the compliance enforcement layer of the ERC-3643 (T-REX) standard for permissioned security tokens. The key properties are soundness (a transfer approved by \texttt{canTransfer} satisfies all regulatory conditions), completeness (any transfer satisfying all conditions is approved), blacklist dominance (blacklisting overrides all other conditions), and lockup enforcement (active lockups block transfers regardless of whitelist status). These properties are necessary for SEC Rule 144 compliance and FINRA audit requirements on regulated securities.
+\end{abstract}
+
+\section{Introduction}
+ERC-3643 defines an on-chain compliance framework for security tokens subject to securities regulation. The \texttt{canTransfer} function is the sole transfer gate: every \texttt{transfer} and \texttt{transferFrom} call passes through it. Correctness of this gate is the foundation of on-chain regulatory enforcement---if the gate is unsound, illegal transfers execute; if incomplete, legal transfers are blocked.
+
+We model the compliance state as a tuple of six conditions and prove that \texttt{canTransfer} is their exact conjunction. We further prove structural properties---blacklist dominance and lockup enforcement---that auditors require for SEC/FINRA compliance certification.
+
+\section{Definitions}
+
+\begin{definition}[Identity Registry]
+A mapping $\mathcal{I} : \texttt{Address} \to \texttt{Identity}$ where each identity carries a country code $j \in \mathcal{J}$ (ISO 3166-1) and a set of claim topics verified by trusted claim issuers.
+\end{definition}
+
+\begin{definition}[Compliance State]
+A compliance state $\mathcal{C}$ is a tuple:
+\begin{itemize}
+  \item $W \subseteq \texttt{Address}$: whitelist (addresses with verified on-chain identity)
+  \item $B \subseteq \texttt{Address}$: blacklist (frozen addresses)
+  \item $L : \texttt{Address} \to \mathbb{N}$: lockup expiry timestamp per address
+  \item $J_{\text{allow}} \subseteq \mathcal{J}$: set of permitted jurisdictions
+  \item $\texttt{maxHolders} \in \mathbb{N}$: maximum number of token holders
+  \item $\texttt{holderCount} \in \mathbb{N}$: current number of distinct holders
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Transfer Request]
+A transfer request is a triple $(\texttt{from}, \texttt{to}, \texttt{amount})$ where $\texttt{from}, \texttt{to} \in \texttt{Address}$ and $\texttt{amount} \in \mathbb{N}$.
+\end{definition}
+
+\begin{definition}[Compliance Conditions]
+For a transfer $(\texttt{from}, \texttt{to}, \texttt{amount})$ with compliance state $\mathcal{C}$ and current time $\tau$, define six conditions:
+\begin{enumerate}
+  \item $C_1$: $\texttt{from} \in W$ (sender is whitelisted / identity-verified)
+  \item $C_2$: $\texttt{to} \in W$ (receiver is whitelisted / identity-verified)
+  \item $C_3$: $\texttt{from} \notin B$ (sender is not blacklisted / frozen)
+  \item $C_4$: $\texttt{to} \notin B$ (receiver is not blacklisted / frozen)
+  \item $C_5$: $L(\texttt{from}) \leq \tau$ (sender lockup has expired)
+  \item $C_6$: $\texttt{jurisdiction}(\texttt{to}) \in J_{\text{allow}} \;\wedge\; (\texttt{holderCount} < \texttt{maxHolders} \;\vee\; \texttt{balance}(\texttt{to}) > 0)$ (receiver jurisdiction is permitted and holder cap is not exceeded, unless receiver already holds tokens)
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[\texttt{canTransfer}]
+\[
+  \texttt{canTransfer}(\texttt{from}, \texttt{to}, \texttt{amount}) \;:=\; C_1 \wedge C_2 \wedge C_3 \wedge C_4 \wedge C_5 \wedge C_6
+\]
+\end{definition}
+
+
+\section{Theorems and Proofs}
+
+\begin{theorem}[\texttt{compliance\_soundness}]
+Soundness: if $\texttt{canTransfer}(\texttt{from}, \texttt{to}, \texttt{amount}) = \texttt{true}$, then all six conditions $C_1 \wedge C_2 \wedge C_3 \wedge C_4 \wedge C_5 \wedge C_6$ hold.
+\end{theorem}
+\begin{proof}
+By definition, $\texttt{canTransfer}$ is the conjunction $C_1 \wedge \cdots \wedge C_6$. If $\texttt{canTransfer} = \texttt{true}$, then each conjunct is true. By $\wedge$-elimination on the result, each $C_i$ holds individually.
+\end{proof}
+
+\begin{theorem}[\texttt{compliance\_completeness}]
+Completeness: if all six conditions $C_1, \ldots, C_6$ hold, then $\texttt{canTransfer}(\texttt{from}, \texttt{to}, \texttt{amount}) = \texttt{true}$.
+\end{theorem}
+\begin{proof}
+Given $C_1, \ldots, C_6$ all true, by $\wedge$-introduction we have $C_1 \wedge \cdots \wedge C_6 = \texttt{true}$, which is exactly $\texttt{canTransfer}$.
+\end{proof}
+
+\begin{lemma}[\texttt{canTransfer\_iff\_all\_conditions}]
+$\texttt{canTransfer}(\texttt{from}, \texttt{to}, \texttt{amount}) = \texttt{true} \iff C_1 \wedge C_2 \wedge C_3 \wedge C_4 \wedge C_5 \wedge C_6$.
+\end{lemma}
+\begin{proof}
+Immediate from Theorems 1 (soundness) and 2 (completeness).
+\end{proof}
+
+\begin{theorem}[\texttt{blacklist\_dominance}]
+Blacklist dominance: if $\texttt{from} \in B$ or $\texttt{to} \in B$, then $\texttt{canTransfer} = \texttt{false}$, regardless of all other conditions.
+\end{theorem}
+\begin{proof}
+Suppose $\texttt{from} \in B$. Then $C_3 = (\texttt{from} \notin B) = \texttt{false}$. Since $\texttt{canTransfer}$ requires $C_3$, the conjunction is false. The case $\texttt{to} \in B$ is symmetric via $C_4$.
+
+Crucially, this holds even when $\texttt{from} \in W$ (or $\texttt{to} \in W$). Blacklist membership falsifies $C_3$ (or $C_4$) independently of whitelist membership $C_1$ (or $C_2$). The conjunction structure ensures no positive condition can override a negative one.
+\end{proof}
+
+\begin{theorem}[\texttt{lockup\_enforcement}]
+Lockup enforcement: if $L(\texttt{from}) > \tau$ (active lockup), then $\texttt{canTransfer} = \texttt{false}$, regardless of whitelist or jurisdiction status.
+\end{theorem}
+\begin{proof}
+$L(\texttt{from}) > \tau$ implies $\neg(L(\texttt{from}) \leq \tau)$, so $C_5 = \texttt{false}$. Since $\texttt{canTransfer}$ requires $C_5$, the conjunction is false. The values of $C_1, C_2, C_3, C_4, C_6$ are irrelevant.
+\end{proof}
+
+\begin{theorem}[\texttt{jurisdiction\_enforcement}]
+Jurisdiction enforcement: if $\texttt{jurisdiction}(\texttt{to}) \notin J_{\text{allow}}$, then $\texttt{canTransfer} = \texttt{false}$.
+\end{theorem}
+\begin{proof}
+$\texttt{jurisdiction}(\texttt{to}) \notin J_{\text{allow}}$ falsifies the first conjunct of $C_6$, so $C_6 = \texttt{false}$, and the full conjunction is false.
+\end{proof}
+
+\begin{theorem}[\texttt{holder\_cap\_enforcement}]
+Holder cap enforcement: if $\texttt{holderCount} \geq \texttt{maxHolders}$ and $\texttt{balance}(\texttt{to}) = 0$ (new holder), then $\texttt{canTransfer} = \texttt{false}$, even if all identity and jurisdiction checks pass.
+\end{theorem}
+\begin{proof}
+When $\texttt{balance}(\texttt{to}) = 0$, the disjunct $\texttt{balance}(\texttt{to}) > 0$ in $C_6$ is false. Combined with $\texttt{holderCount} \geq \texttt{maxHolders}$, the remaining disjunct $\texttt{holderCount} < \texttt{maxHolders}$ is also false. Thus $C_6 = \texttt{false}$.
+\end{proof}
+
+\begin{theorem}[\texttt{compliance\_monotone\_blacklist}]
+Monotonicity of blacklisting: adding an address to $B$ can only reduce the set of approved transfers, never increase it.
+\end{theorem}
+\begin{proof}
+Let $B' = B \cup \{a\}$. For any transfer $(\texttt{from}, \texttt{to}, \texttt{amount})$:
+\begin{itemize}
+  \item If $\texttt{from} \neq a$ and $\texttt{to} \neq a$: $C_3$ and $C_4$ are unchanged, so $\texttt{canTransfer}$ is unchanged.
+  \item If $\texttt{from} = a$ or $\texttt{to} = a$: $C_3$ or $C_4$ becomes false under $B'$, so $\texttt{canTransfer}$ under $B'$ is false.
+\end{itemize}
+In no case does an address entering $B$ cause a previously-rejected transfer to become approved.
+\end{proof}
+
+
+\section{Regulatory Implications}
+
+The soundness and completeness results establish that \texttt{canTransfer} is a \emph{decision procedure} for transfer legality under the encoded compliance rules. This has direct consequences for regulatory audit:
+
+\begin{itemize}
+  \item \textbf{SEC Rule 144}: Lockup enforcement (Theorem 4) guarantees that restricted securities cannot be transferred before the holding period expires. The on-chain lockup timestamp $L(\texttt{from})$ maps directly to the Rule 144 holding period.
+  \item \textbf{Regulation D / Regulation S}: Jurisdiction enforcement (Theorem 5) and holder cap enforcement (Theorem 6) implement the investor qualification and numerical limits required under Reg D (506(b): 35 non-accredited investors) and Reg S (offshore transaction restrictions).
+  \item \textbf{FINRA Rule 6490}: Blacklist dominance (Theorem 3) ensures that frozen accounts cannot transact, supporting corporate action freezes and regulatory holds.
+  \item \textbf{Audit trail}: Since \texttt{canTransfer} is deterministic and its inputs are on-chain state, every transfer decision is reproducible from chain data. Auditors can replay any historical transfer and verify the compliance decision.
+\end{itemize}
+
+The monotonicity result (Theorem 7) is particularly important for compliance officers: adding a freeze (blacklist entry) is a safe operation that cannot have unintended side effects on other transfers.
+
+
+\section{Lean Source}
+\lstinputlisting[language=Lean]{../../formal/lean/Compliance/ERC3643.lean}
+
+\section{References}
+\noindent Source code: \url{https://github.com/luxfi/proofs/blob/main/lean/Compliance/ERC3643.lean}\\
+\noindent White papers: \url{https://papers.lux.network}
+
+\noindent Related standards and literature:
+\begin{itemize}
+  \item EIP-3643: T-REX --- Token for Regulated EXchanges. \url{https://eips.ethereum.org/EIPS/eip-3643}
+  \item SEC Rule 144: Selling Restricted and Control Securities. 17 CFR \S 230.144.
+  \item FINRA Rule 6490: Processing of Corporate Action-Related Transfers.
+  \item NIST SP 800-53 Rev.~5: Security and Privacy Controls, AC-3 (Access Enforcement).
+  \item Polymath, ``ERC-1400: Security Token Standard,'' 2018.
+\end{itemize}
+
+\end{document}
