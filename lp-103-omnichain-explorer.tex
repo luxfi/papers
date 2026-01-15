@@ -1,0 +1,309 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{array}
+\usepackage{tabularx}
+\input{shared/lstlang}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,calc}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  keywordstyle=\color{blue!70!black}\bfseries,
+  commentstyle=\color{green!50!black}\itshape,
+  stringstyle=\color{red!60!black},
+  showstringspaces=false,
+}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{remark}{Remark}[section]
+\newtheorem{invariant}{Invariant}[section]
+
+\title{LP-103: Omni-Chain Explorer\\Single-Binary Block Explorer with E2E PQ Encrypted Streaming}
+\author{Lux Architecture Team}
+\date{March 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present the Lux Explorer, a single-binary omni-chain block explorer that replaces the
+traditional multi-service EVM explorer architecture with a unified Go implementation. The
+explorer indexes an arbitrary number of heterogeneous blockchains concurrently---including
+EVM, DAG, linear, DEX, FHE/threshold, post-quantum, and zero-knowledge chain types---with
+per-chain SQLite storage isolation and end-to-end post-quantum encrypted streaming backups
+to S3 via the Replicate protocol. We demonstrate that a single statically-linked binary
+implements the \texttt{/v1/explorer/} API while reducing operational complexity from six
+containers and three languages (Elixir, Rust, JavaScript) to one, eliminating the need for
+managed PostgreSQL, Redis, or any external services. The system scales from a single
+development chain to 200+ concurrent chains for white-label platform deployments.
+\end{abstract}
+
+\tableofcontents
+
+\section{Introduction}
+
+Block explorers are critical infrastructure for any blockchain network, providing transaction
+transparency, contract verification, and developer tooling. The dominant open-source explorer,
+the traditional multi-service EVM explorer stack, requires multiple services, PostgreSQL,
+Redis, and typically six Docker containers for a production deployment. This operational
+complexity is a significant barrier for new chains and white-label deployments.
+
+We present a clean-room reimplementation that achieves full EVM explorer coverage while fundamentally simplifying the architecture:
+
+\begin{itemize}
+  \item \textbf{Single binary}: One statically-linked Go executable replaces all prior explorer services
+  \item \textbf{Embedded storage}: SQLite WAL mode with per-chain isolation (no PostgreSQL)
+  \item \textbf{Embedded frontend}: Next.js static export served via \texttt{go:embed}
+  \item \textbf{PQ encrypted backups}: Continuous WAL streaming to S3 with ML-KEM-768 + X25519
+  \item \textbf{Omni-chain}: Native support for 9 chain types and 100+ external chains
+  \item \textbf{White-label}: Zero branding in code, runtime-configurable
+\end{itemize}
+
+\section{Architecture}
+
+\subsection{Single Binary Design}
+
+The explorer binary contains three major subsystems running concurrently:
+
+\begin{enumerate}
+  \item \textbf{Indexer goroutines}: One per chain, each writing to its own SQLite database
+  \item \textbf{API server}: HTTP server (Base) reading from all chain databases, serving
+        \texttt{/v1/explorer/\{chain\}/*} endpoints
+  \item \textbf{Replication}: Per-chain WAL streaming to S3 with PQ encryption
+\end{enumerate}
+
+The frontend (Next.js static export) is embedded in the binary via Go's \texttt{embed}
+directive and served at the root path.
+
+\subsection{Per-Chain Storage Isolation}
+
+Each chain receives an independent directory containing a SQLite database (WAL mode) and
+a BadgerDB key-value store:
+
+\begin{lstlisting}[language=bash]
+{data_dir}/{chain_slug}/
+  query/indexer.db    # SQLite: blocks, txs, tokens, contracts
+  kv/                 # BadgerDB: hash->data, height->block
+\end{lstlisting}
+
+\textbf{Properties}:
+\begin{itemize}
+  \item Zero write contention between chains (each is sole writer to its SQLite)
+  \item 8 concurrent readers per chain (API layer, WAL mode)
+  \item Independent backup and restore per chain
+  \item Drop a chain by deleting its directory
+\end{itemize}
+
+\subsection{Dual-Layer Storage}
+
+\begin{definition}[Unified Store]
+The storage layer combines two complementary backends:
+\begin{itemize}
+  \item \textbf{KV Layer} (BadgerDB): $O(1)$ lookups by hash, height, or composite key.
+        Prefix-isolated namespaces: \texttt{blk:}, \texttt{vtx:}, \texttt{edg:}, \texttt{tx:},
+        \texttt{st:}, \texttt{meta:}, \texttt{idx:}.
+  \item \textbf{Query Layer} (SQLite): Complex queries with SQL, joins, aggregations,
+        full-text search. WAL mode for concurrent reads.
+\end{itemize}
+\end{definition}
+
+The indexer performs dual-writes to both layers. Reads prefer the KV layer for direct
+lookups and fall back to the Query layer for filtered/sorted/aggregated queries.
+
+\section{Chain Support}
+
+\subsection{Native Chain Types}
+
+The explorer natively indexes nine Lux chain types:
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+\textbf{Chain} & \textbf{Consensus} & \textbf{Indexed Data} \\
+\midrule
+C-Chain (EVM) & Linear & Blocks, transactions (type 0--3), internal traces, tokens (ERC-20/721/1155), smart contracts, DeFi protocols, NFT marketplaces \\
+P-Chain & Linear & Validators, delegators, staking rewards, subnet management \\
+X-Chain & DAG & UTXOs, atomic swaps, multi-asset transfers, vertices, edges \\
+D-Chain (DEX) & EVM & CLOB orderbook, perpetuals, AMM pools, liquidations \\
+A-Chain (AI) & DAG & Attestations, model registration, inference results \\
+B-Chain (Bridge) & DAG & Cross-chain transfers, proof validation, MPC custody \\
+Q-Chain (PQ) & DAG & Post-quantum finality proofs, lattice signatures \\
+T-Chain (FHE) & DAG & Threshold FHE operations, MPC key shares, decryption proofs \\
+Z-Chain (ZK) & DAG & Zero-knowledge proofs, shielded transfers, nullifier tracking \\
+K-Chain (KMS) & DAG & PQ key material, certificate lifecycle, HSM bridge operations \\
+\bottomrule
+\end{tabularx}
+\caption{Native chain indexing capabilities}
+\end{table}
+
+\subsection{External Chain Support}
+
+For bridge, MPC, and threshold operations, the explorer indexes 100+ external chains:
+
+\begin{itemize}
+  \item \textbf{EVM}: Ethereum, Polygon, Arbitrum, Optimism, Base, BSC, Avalanche, +30 more
+  \item \textbf{Solana}: Mainnet, Devnet (Metaplex, Magic Eden, Raydium, Jupiter protocols)
+  \item \textbf{Bitcoin}: Ordinals, Runes, BRC-20, Stamps, Atomicals
+  \item \textbf{Cosmos}: Hub, Osmosis, Injective, dYdX, Celestia, Sei
+  \item \textbf{Move}: Aptos, Sui
+  \item \textbf{Other}: NEAR, Tron, TON, Substrate/Polkadot
+\end{itemize}
+
+\section{E2E Post-Quantum Encrypted Streaming Backups}
+
+\subsection{Threat Model}
+
+Traditional database backups (pg\_dump, WAL-G) produce plaintext or GPG-encrypted archives.
+GPG relies on RSA or classical ECDH, both vulnerable to quantum computers running Shor's
+algorithm. A harvest-now-decrypt-later adversary could capture today's encrypted backups
+and decrypt them when quantum computers become available.
+
+\subsection{Cryptographic Construction}
+
+We employ a hybrid post-quantum encryption scheme using the \texttt{age} file encryption
+format~\cite{age} with the ML-KEM-768 extension:
+
+\begin{definition}[Hybrid PQ Encryption]
+For each WAL segment, the encryption proceeds as follows:
+\begin{enumerate}
+  \item Generate ephemeral keypair $(ek_{ml}, dk_{ml}) \leftarrow \text{ML-KEM-768.KeyGen}()$
+  \item Generate ephemeral keypair $(ek_{x}, dk_{x}) \leftarrow \text{X25519.KeyGen}()$
+  \item Encapsulate: $(c_{ml}, ss_{ml}) \leftarrow \text{ML-KEM-768.Encaps}(pk_{recipient})$
+  \item Key agree: $ss_{x} \leftarrow \text{X25519}(dk_{x}, pk_{recipient})$
+  \item Derive file key: $k \leftarrow \text{HKDF-SHA256}(ss_{ml} \| ss_{x}, \text{info})$
+  \item Encrypt payload: STREAM construction with ChaCha20-Poly1305, 64\,KB chunks
+  \item Zero ephemeral keys: $dk_{ml} \leftarrow 0, dk_{x} \leftarrow 0$
+\end{enumerate}
+\end{definition}
+
+\begin{proposition}[Security]
+The hybrid scheme is IND-CCA2 secure if either ML-KEM-768 or X25519 is secure. Formally,
+an adversary must break \emph{both} algorithms to recover plaintext. This provides
+defense-in-depth: classical security from X25519 and quantum resistance from ML-KEM-768.
+\end{proposition}
+
+\subsection{Streaming Protocol}
+
+\begin{enumerate}
+  \item SQLite writes produce WAL frames on disk
+  \item Replicate monitors the WAL file via \texttt{fsnotify}
+  \item New frames are packaged into immutable LTX (Log Transaction) segments
+  \item Each LTX segment is encrypted with a fresh ephemeral keypair
+  \item Encrypted segments are uploaded to S3 with per-chain path isolation
+  \item Replicate manages checkpointing to ensure all data is streamed before flush
+\end{enumerate}
+
+\begin{invariant}[Completeness]
+No WAL frame is checkpointed (flushed to main SQLite file) before it has been successfully
+streamed to S3. This is enforced by disabling SQLite auto-checkpoint
+(\texttt{\_auto\_checkpoint=0}) when Replicate is active.
+\end{invariant}
+
+\subsection{Point-in-Time Restore}
+
+Each LTX segment is identified by a monotonic transaction ID (TXID). Restore proceeds by:
+
+\begin{enumerate}
+  \item Downloading LTX segments from S3 up to the target TXID
+  \item Decrypting each segment with the recipient's private key
+  \item Replaying LTX frames onto a fresh SQLite database
+  \item Resulting database is byte-identical to the original at that TXID
+\end{enumerate}
+
+\section{Comparison with Prior Art}
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Dimension} & \textbf{Traditional} & \textbf{Explorer (this work)} \\
+\midrule
+Runtime & Elixir BEAM + 4 Rust services & Single Go binary \\
+Database & PostgreSQL (managed) & SQLite WAL (embedded, per-chain) \\
+Cache & Redis & BadgerDB (embedded) \\
+Containers & 6 & 1 \\
+Languages & Elixir + Rust + JavaScript & Go (+ optional Rust staticlib) \\
+Backup encryption & None / GPG (RSA) & E2E PQ (ML-KEM-768 + X25519) \\
+Restore granularity & Full dump & Point-in-time (any TXID) \\
+Multi-chain & EVM only & 9 native types + 100+ external \\
+GraphQL & Graph Node + subgraphs & G-Chain native + embedded schema \\
+Dev setup & Docker Compose + PostgreSQL + Redis & \texttt{go run ./cmd/explorer} \\
+Min memory & 4--8 GB & 256 MB \\
+White-label & Env vars + code forks & Runtime flags only \\
+\bottomrule
+\end{tabularx}
+\caption{Comparison with traditional multi-service explorer architecture}
+\end{table}
+
+\section{Scalability}
+
+Each chain runs as an independent goroutine with its own storage. Resource usage scales
+linearly:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{rrrr}
+\toprule
+\textbf{Chains} & \textbf{RAM} & \textbf{CPU} & \textbf{Use Case} \\
+\midrule
+1 & 256\,MB & 1 core & Single-chain dev \\
+15 & 1\,GB & 4 cores & Full Lux native ecosystem \\
+30 & 3\,GB & 8 cores & Lux + major bridge chains \\
+100+ & 10\,GB & 16 cores & Exchange / aggregator \\
+200+ & 20\,GB & 32 cores & White-label platform \\
+\bottomrule
+\end{tabular}
+\caption{Scaling characteristics}
+\end{table}
+
+\section{Implementation}
+
+The implementation comprises approximately 20,000 lines of Go across 22 packages, with
+431+ unit tests achieving full EVM explorer coverage. The Elixir test factory
+(1,931 lines) has been ported to Go for regression testing.
+
+Key packages:
+\begin{itemize}
+  \item \texttt{evm/}: Full EVM indexer (2,330 lines) with all EVM explorer features
+  \item \texttt{explorer/}: API layer with 30 explorer endpoints + 35 tests
+  \item \texttt{storage/}: Dual-layer SQLite + BadgerDB with build-tag backends
+  \item \texttt{\{x,a,b,q,t,z,k\}chain/}: Native DAG chain adapters
+  \item \texttt{multichain/}: 100+ external chain parallel indexer
+  \item \texttt{rustffi/}: Optional CGO bindings to Rust smart-contract-verifier
+\end{itemize}
+
+\section{Related Work}
+
+LP-102~\cite{lp102} defines the encrypted SQLite replication standard used by the backup
+system. The G-Chain (GraphVM) provides native cross-chain GraphQL queries as described in
+the Lux node architecture. The ZAP wire protocol~\cite{zap} is used for high-performance
+node-to-indexer communication.
+
+\begin{thebibliography}{9}
+\bibitem{priorexplorers} ``Open-source EVM block explorers: a survey of multi-service architectures,'' 2024.
+\bibitem{age} F.~Valsorda, ``age: a simple, modern and secure file encryption tool,'' \url{https://age-encryption.org}
+\bibitem{lp102} Lux Architecture Team, ``LP-102: Encrypted SQLite Replication Standard (age + Replicate),'' 2026.
+\bibitem{zap} Lux Architecture Team, ``ZAP: Zero-Copy Application Protocol,'' 2025.
+\end{thebibliography}
+
+\end{document}
