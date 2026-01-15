@@ -1,0 +1,1053 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{mathtools}
+
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,calc}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{remark}{Remark}[section]
+\newtheorem{invariant}{Invariant}[section]
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{\textbf{The Capsule: A Sovereign Encrypted Process\\for Web5 Computing}}
+
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries}\\
+\texttt{research@lux.network}
+}
+
+\date{2025}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+A Capsule is the fundamental unit of Web5 computing: a sovereign encrypted process
+that binds an identity to a local data vault, a capability system, a sync topology,
+and a compute policy. Every user, organization, AI agent, workspace, and device
+gets one. The vault is an encrypted SQLite database (AES-256-CBC via SQLCipher),
+synchronized offline-first through CRDTs, anchored to Lux for trust---identity
+roots, key policy, threshold controls, and audit receipts. This paper gives the
+formal definition of a Capsule, proves its security properties under standard
+cryptographic assumptions, classifies the three application classes it enables
+(local-first private, threshold-controlled, and confidential compute), and
+specifies the trust kernel that Lux provides. The thesis: Base owns state, Lux
+owns trust, providers own service quality, users own keys and exit rights. The
+Capsule is not a decentralized database. It is the personal computer of Web5.
+\end{abstract}
+
+% ============================================================================
+\section{Introduction}\label{sec:intro}
+% ============================================================================
+
+The dominant crypto thesis of 2017--2023 treated the blockchain as a universal
+substrate: database, server, and compute engine collapsed into one replicated
+state machine. Every document, every message, every user action was supposed to
+live on-chain. The result was systems that were simultaneously too slow for
+applications, too expensive for storage, and too public for privacy.
+
+The failure was architectural. Blockchains are excellent trust planes---they
+produce globally verifiable proofs about who controls what keys, what policies
+govern those keys, and which state transitions have been authorized. They are
+terrible data planes. Storing a user's notes, messages, or collaborative documents
+on a replicated ledger is the wrong abstraction at every level: cost per byte,
+latency per read, privacy per query.
+
+The local-first software movement~\cite{kleppmann2019} identified the correct
+alternative: applications that work offline, store data locally, and synchronize
+through conflict-free replicated data types (CRDTs). But local-first software
+without a trust layer has no answer for identity, key recovery, capability
+delegation, or auditability. It produces isolated islands of encrypted state
+with no shared coordination.
+
+Web5 is the synthesis. The data plane is local: encrypted SQLite vaults per
+principal, synchronized as ciphertext via CRDTs, decrypted only on the owner's
+device. The trust plane is Lux: identity roots on I-Chain, key policies on
+K-Chain, threshold reveals on T-Chain, MPC signing on M-Chain, and audit anchors
+on the primary network. Providers---relay operators, storage hosts, recovery
+agents, compute markets---are optional, replaceable, and never data owners.
+
+The Capsule is the unit that makes this concrete. This paper defines it formally,
+proves its properties, and specifies the three classes of applications it enables.
+
+\paragraph{Contributions.}
+\begin{enumerate}[label=(\roman*),nosep]
+  \item Formal definition of the Capsule as a seven-tuple (Section~\ref{sec:model}).
+  \item Classification of three application classes with distinct trust requirements
+        (Section~\ref{sec:apps}).
+  \item Specification of the Lux trust kernel across four purpose-built chains
+        (Section~\ref{sec:trust}).
+  \item Security analysis under the post-quantum threat model with tiered
+        cryptographic guarantees (Section~\ref{sec:pq}).
+  \item Design of agent capsules---AI agents as sovereign processes with auditable
+        memory and bounded capabilities (Section~\ref{sec:agents}).
+  \item Honest accounting of unsolved problems (Section~\ref{sec:unsolved}).
+\end{enumerate}
+
+% ============================================================================
+\section{The Capsule Model}\label{sec:model}
+% ============================================================================
+
+\begin{definition}[Capsule]\label{def:capsule}
+A \textbf{Capsule} is a seven-tuple
+\[
+  \mathcal{C} = (V, \mathcal{I}, \Gamma, \Sigma, \Pi, \mathcal{A}, \mathcal{P})
+\]
+where:
+\begin{itemize}[nosep]
+  \item $V$ is the \textbf{vault}: an encrypted SQLite database with a CRDT-based
+        write-ahead log.
+  \item $\mathcal{I}$ is the \textbf{identity}: a DID document anchored on I-Chain,
+        binding the capsule to one or more public keys.
+  \item $\Gamma$ is the \textbf{capability set}: a lattice of UCAN-style
+        capability tokens governing read, write, sync, delegate, and revoke
+        operations.
+  \item $\Sigma$ is the \textbf{sync topology}: the set of peers, relays,
+        and chain anchors through which the vault replicates.
+  \item $\Pi$ is the \textbf{compute policy}: a specification of where computation
+        may execute---local, provider-hosted, or confidential (FHE/TEE).
+  \item $\mathcal{A}$ is the \textbf{audit chain}: an append-only sequence of
+        anchored receipts on Lux recording policy changes, capability grants,
+        and sync checkpoints.
+  \item $\mathcal{P}$ is the \textbf{key policy}: the set of threshold, rotation,
+        and recovery rules governing the capsule's cryptographic material,
+        enforced on K-Chain.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Principal]\label{def:principal}
+A \textbf{principal} is any entity that owns a capsule: a human user, an
+organization, an AI agent, a device, or a shared workspace. Each principal
+has exactly one root capsule. Derived capsules (e.g., per-app or per-workspace
+vaults) inherit capabilities from the root through delegation chains in $\Gamma$.
+\end{definition}
+
+\begin{definition}[Vault]\label{def:vault}
+The vault $V = (\mathsf{DB}, \mathsf{WAL}, k_{\mathsf{enc}})$ consists of:
+\begin{itemize}[nosep]
+  \item $\mathsf{DB}$: a SQLite database encrypted with SQLCipher using AES-256-CBC
+        with HMAC-SHA512 page authentication.
+  \item $\mathsf{WAL}$: a CRDT-based write-ahead log where each entry is a
+        $(\mathsf{hlc}, \mathsf{op}, \mathsf{sig})$ triple---hybrid logical clock
+        timestamp, operation, and signature from the writing principal.
+  \item $k_{\mathsf{enc}}$: the vault encryption key, derived from the principal's
+        root key material via HKDF-SHA256, optionally wrapped under ML-KEM for
+        post-quantum protection.
+\end{itemize}
+\end{definition}
+
+\subsection{Ownership Invariants}
+
+The Capsule model enforces four invariants that distinguish it from both
+traditional cloud architectures and fully on-chain systems.
+
+\begin{invariant}[Key Sovereignty]\label{inv:keys}
+The vault encryption key $k_{\mathsf{enc}}$ is never transmitted in plaintext
+to any party other than the owning principal. Providers receive only ciphertext.
+Recovery requires threshold reconstruction on T-Chain, not provider cooperation.
+\end{invariant}
+
+\begin{invariant}[Data Locality]\label{inv:locality}
+The authoritative copy of the vault state is the local replica. Remote replicas
+(provider-hosted, peer-hosted) hold only encrypted snapshots and CRDT operation
+logs. A principal can reconstruct the full vault from any replica plus the
+encryption key.
+\end{invariant}
+
+\begin{invariant}[Provider Replaceability]\label{inv:provider}
+No provider holds state that the principal cannot obtain elsewhere. Sync
+topology $\Sigma$ can be reconfigured to exclude any provider at any time
+without data loss. The protocol guarantees that switching providers requires
+only re-pointing the sync target---no data migration, no key re-wrapping
+(unless the principal chooses to rotate).
+\end{invariant}
+
+\begin{invariant}[Audit Completeness]\label{inv:audit}
+Every policy change, capability grant, capability revocation, and key rotation
+produces a receipt anchored in $\mathcal{A}$. The audit chain is append-only
+and anchored to Lux. A third party can verify the complete history of a
+capsule's trust configuration without access to the vault contents.
+\end{invariant}
+
+\begin{theorem}[Capsule Sovereignty]\label{thm:sovereignty}
+Under Invariants~\ref{inv:keys}--\ref{inv:audit}, a capsule $\mathcal{C}$ is
+\textbf{sovereign}: the owning principal can, at any time, (a) decrypt and read
+all vault contents, (b) revoke all delegated capabilities, (c) migrate to a
+new provider set, and (d) verify the complete trust history---without cooperation
+from any provider or peer.
+\end{theorem}
+
+\begin{proof}
+By Invariant~\ref{inv:keys}, the principal holds $k_{\mathsf{enc}}$ (or can
+reconstruct it via T-Chain threshold recovery without provider participation),
+so (a) holds. By Invariant~\ref{inv:locality}, at least one encrypted replica
+is locally held, so the principal has data availability independent of providers.
+Capability revocation (b) is a K-Chain transaction signed by the principal's root
+key---no provider co-signature is required because $\Gamma$ is a unilateral
+delegation lattice. Migration (c) follows from Invariant~\ref{inv:provider}:
+the principal re-points $\Sigma$ and the new provider receives the encrypted
+snapshot. Trust history verification (d) follows from Invariant~\ref{inv:audit}:
+$\mathcal{A}$ is on Lux, readable by any party.
+\end{proof}
+
+\subsection{Capsule Lifecycle}
+
+A capsule transitions through four phases:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Genesis}: The principal generates root key material, derives
+        $k_{\mathsf{enc}}$, creates the initial encrypted vault, registers the
+        DID on I-Chain, and publishes the initial key policy to K-Chain.
+  \item \textbf{Active}: The vault accepts local writes, syncs via $\Sigma$,
+        and anchors checkpoints to $\mathcal{A}$. Capabilities in $\Gamma$
+        may be delegated and revoked.
+  \item \textbf{Recovery}: If the principal loses access to $k_{\mathsf{enc}}$,
+        threshold reconstruction on T-Chain produces a new key share set.
+        The vault is re-encrypted under the new key. The recovery event is
+        recorded in $\mathcal{A}$.
+  \item \textbf{Termination}: The principal publishes a revocation of all
+        capabilities and a tombstone DID document. Provider replicas are
+        garbage-collected. The audit chain remains on Lux permanently.
+\end{enumerate}
+
+% ============================================================================
+\section{Three Classes of Applications}\label{sec:apps}
+% ============================================================================
+
+The Capsule model supports three distinct application classes, each with
+different trust assumptions and cryptographic requirements.
+
+\subsection{Class I: Local-First Private Applications}\label{sec:class1}
+
+The simplest class. The vault is the entire application backend. All reads and
+writes happen locally. Sync is peer-to-peer or through an encrypted relay.
+The chain is used only for identity and audit anchors.
+
+\paragraph{Examples.} Note-taking apps, personal finance trackers, password
+managers, local AI assistants, private journals, health records.
+
+\paragraph{Trust model.} The principal trusts only their own device and key
+material. Providers see ciphertext. The chain sees only anchor hashes and
+capability metadata.
+
+\begin{definition}[Class I Application]\label{def:class1}
+A Class I application is a pair $(f, \mathcal{C})$ where $f$ is a deterministic
+function $f: V \times \mathsf{Input} \to V \times \mathsf{Output}$ that executes
+entirely on the principal's device, reading from and writing to the local vault $V$.
+Sync propagates encrypted CRDT operations; no provider or peer sees plaintext.
+\end{definition}
+
+\paragraph{Provider portability.} A Class I app can switch sync providers by
+updating $\Sigma$. The new provider receives the encrypted CRDT log. No
+re-encryption is necessary because providers never held the key.
+
+\subsection{Class II: Threshold Applications}\label{sec:class2}
+
+Applications requiring multi-party authorization. The vault may be shared across
+principals, with operations gated by threshold policies on K-Chain and secret
+reveals on T-Chain.
+
+\paragraph{Examples.} Treasury management (3-of-5 approval for transfers),
+organizational admin recovery, secrets management (reveal API key to authorized
+member), multi-party document signing, escrow release.
+
+\paragraph{Trust model.} No single principal controls the operation. A quorum
+of $t$-of-$n$ participants must authorize via T-Chain. The chain enforces the
+threshold---providers cannot bypass it.
+
+\begin{definition}[Class II Application]\label{def:class2}
+A Class II application is a triple $(g, \mathcal{C}_1, \ldots, \mathcal{C}_n)$
+where $g$ is a function that executes only when $t$-of-$n$ capsule owners
+produce valid authorization proofs on T-Chain. The function $g$ may read from
+multiple vaults (with delegated capabilities) and write results back to
+designated vaults.
+\end{definition}
+
+\paragraph{Threshold mechanics.} The authorization proof is a threshold signature
+aggregated on T-Chain using the protocol specified in~\cite{lux-mchain-mpc}.
+Each participant signs a \textit{proposal hash} containing the operation
+description, target vault identifiers, and an expiration timestamp. The chain
+verifies the threshold and emits an authorization receipt before $g$ executes.
+
+\subsection{Class III: Confidential Compute Applications}\label{sec:class3}
+
+Applications where computation must occur on encrypted data without any party
+(including the compute provider) seeing plaintext. This class uses fully
+homomorphic encryption (FHE) or trusted execution environments (TEEs).
+
+\paragraph{Examples.} Private AI inference (run a model on encrypted user data),
+encrypted analytics (aggregate statistics without seeing individual records),
+sealed-bid auctions, private credit scoring, confidential voting.
+
+\paragraph{Trust model.} The compute provider executes on ciphertext. Results
+are encrypted under the requesting principal's key. For FHE, trust is purely
+cryptographic. For TEE, trust additionally assumes hardware attestation
+integrity.
+
+\begin{definition}[Class III Application]\label{def:class3}
+A Class III application is a tuple $(h, \mathcal{C}, \mathsf{CP})$ where
+$h$ is a function compiled to an FHE circuit or TEE enclave, $\mathcal{C}$ is
+the requesting capsule, and $\mathsf{CP}$ is a confidential compute provider.
+The provider evaluates $h$ on $\mathsf{Enc}(x)$ where $x$ is extracted from $V$
+and encrypted under a scheme supporting homomorphic evaluation. The result
+$\mathsf{Enc}(h(x))$ is returned to the principal for local decryption.
+\end{definition}
+
+\paragraph{FHE integration.} Class III applications use the TFHE scheme specified
+in~\cite{lux-tfhe} for boolean circuits and CKKS for approximate arithmetic.
+Key generation and decryption happen inside the capsule. The FHE evaluation key
+(public) is sent to the compute provider. The secret key never leaves the vault.
+
+\subsection{Application Class Summary}
+
+\begin{table}[H]
+\centering
+\caption{Comparison of application classes.}
+\label{tab:classes}
+\begin{tabular}{@{}llll@{}}
+\toprule
+& \textbf{Class I} & \textbf{Class II} & \textbf{Class III} \\
+\midrule
+Compute location & Local device & Local + chain & Provider (encrypted) \\
+Chain usage & Anchor, identity & Threshold enforce & Compute verification \\
+Provider sees & Ciphertext only & Ciphertext only & Ciphertext + eval key \\
+Crypto required & AES + ML-KEM & + threshold sigs & + FHE or TEE \\
+Latency & Sub-ms & Seconds (chain) & Seconds--minutes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================================
+\section{The Trust Kernel}\label{sec:trust}
+% ============================================================================
+
+Lux serves as the trust kernel for all capsules. Trust is factored across four
+purpose-built chains, each optimized for a specific class of trust operation.
+
+\subsection{Architecture}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  chain/.style={draw, rounded corners, minimum width=2.8cm, minimum height=0.9cm,
+                font=\small\bfseries, align=center},
+  arr/.style={-{Stealth[length=2mm]}, thick},
+  every node/.style={font=\small}
+]
+  % Chains
+  \node[chain] (ichain) at (0,0) {I-Chain\\{\footnotesize Identity}};
+  \node[chain] (kchain) at (3.5,0) {K-Chain\\{\footnotesize Key Policy}};
+  \node[chain] (tchain) at (7,0) {T-Chain\\{\footnotesize Threshold}};
+  \node[chain] (mchain) at (10.5,0) {M-Chain\\{\footnotesize MPC Signing}};
+
+  % Primary network
+  \node[chain, minimum width=11.8cm, fill=black!5] (primary)
+    at (5.25,-2) {Lux Primary Network --- Audit Anchors};
+
+  % Capsule
+  \node[chain, dashed, minimum width=3cm] (capsule) at (5.25,2) {Capsule};
+
+  % Arrows
+  \draw[arr] (capsule) -- (ichain) node[midway,left,font=\footnotesize] {DID};
+  \draw[arr] (capsule) -- (kchain) node[midway,left,font=\footnotesize] {policy};
+  \draw[arr] (capsule) -- (tchain) node[midway,right,font=\footnotesize] {reveal};
+  \draw[arr] (capsule) -- (mchain) node[midway,right,font=\footnotesize] {sign};
+  \draw[arr] (ichain) -- (primary);
+  \draw[arr] (kchain) -- (primary);
+  \draw[arr] (tchain) -- (primary);
+  \draw[arr] (mchain) -- (primary);
+\end{tikzpicture}
+\caption{Trust kernel architecture. Four purpose-built chains anchor to the Lux
+primary network.}
+\label{fig:trust}
+\end{figure}
+
+\subsection{I-Chain: Identity}\label{sec:ichain}
+
+I-Chain stores DID documents conforming to the W3C DID Core specification.
+Each capsule has exactly one DID anchored on I-Chain. The DID document contains:
+
+\begin{itemize}[nosep]
+  \item Public keys (verification methods) for authentication and capability
+        invocation.
+  \item Service endpoints for sync relay discovery.
+  \item Controller relationships for organizational hierarchies.
+  \item Post-quantum key material (ML-DSA public keys) alongside classical
+        Ed25519 keys for hybrid verification.
+\end{itemize}
+
+DID resolution is a read from I-Chain state. DID updates require a transaction
+signed by the current controller key. The full specification is
+in~\cite{lux-id-did}.
+
+\subsection{K-Chain: Key Policy}\label{sec:kchain}
+
+K-Chain stores and enforces key lifecycle policies:
+
+\begin{itemize}[nosep]
+  \item \textbf{Rotation schedules}: mandatory key rotation intervals, grace
+        periods, and automatic revocation on expiry.
+  \item \textbf{Threshold definitions}: $(t, n)$ parameters for recovery,
+        delegation, and administrative actions.
+  \item \textbf{Wrapping policy}: which keys may wrap which other keys,
+        preventing unauthorized key export.
+  \item \textbf{Capability constraints}: maximum delegation depth, time-bounded
+        grants, resource-scoped permissions.
+\end{itemize}
+
+K-Chain validators enforce policy at the transaction level. A key rotation
+transaction that violates the capsule's policy (e.g., rotating before the
+minimum interval) is rejected at consensus.
+
+\subsection{T-Chain: Threshold Reveal}\label{sec:tchain}
+
+T-Chain coordinates threshold operations: secret sharing, reconstruction, and
+time-locked reveals. The protocol:
+
+\begin{enumerate}[nosep]
+  \item A proposer submits a \textit{reveal request} specifying the secret
+        identifier, the threshold $(t, n)$, and an expiration block height.
+  \item Each share holder submits their share as an encrypted payload
+        (encrypted to the proposer's public key) within the expiration window.
+  \item Once $t$ shares are submitted, T-Chain verifies the Feldman VSS
+        commitments and emits a \textit{reveal receipt}.
+  \item The proposer reconstructs the secret locally.
+\end{enumerate}
+
+The chain never sees the secret in plaintext. It verifies share validity
+through commitment schemes and enforces the threshold policy defined on K-Chain.
+
+\subsection{M-Chain: MPC Signing}\label{sec:mchain}
+
+M-Chain provides decentralized multi-party computation for cross-chain signing,
+as specified in~\cite{lux-mchain-mpc}. Capsules interact with M-Chain when they
+need to authorize operations on external chains (Bitcoin, Ethereum, etc.) without
+exposing a single private key.
+
+The signing flow: the capsule submits a signing request to M-Chain. Validators
+holding key shares execute the threshold signature protocol (CGG21 for ECDSA,
+FROST for EdDSA, Ringtail for post-quantum). The aggregated signature is
+returned to the capsule and broadcast to the target chain.
+
+% ============================================================================
+\section{The Data Plane}\label{sec:data}
+% ============================================================================
+
+The data plane is Base: an encrypted SQLite runtime with CRDT sync, realtime
+subscriptions, and a plugin architecture.
+
+\subsection{Encrypted SQLite}
+
+Each vault is a single SQLite database file encrypted by SQLCipher. The
+encryption parameters:
+
+\begin{itemize}[nosep]
+  \item Algorithm: AES-256-CBC with per-page HMAC-SHA512.
+  \item Key derivation: PBKDF2-HMAC-SHA512, 256,000 iterations for
+        passphrase-derived keys. Direct key mode for HKDF-derived keys.
+  \item Page size: 4096 bytes (matching OS page size for mmap efficiency).
+  \item Reserve bytes: 80 (IV + HMAC per page).
+\end{itemize}
+
+The vault key $k_{\mathsf{enc}}$ is derived from the capsule's root key material:
+\[
+  k_{\mathsf{enc}} = \mathsf{HKDF\text{-}SHA256}(k_{\mathsf{root}},
+    \texttt{"vault"} \| \mathsf{capsule\_id}, 32)
+\]
+
+For post-quantum key wrapping, $k_{\mathsf{enc}}$ is additionally encapsulated
+under ML-KEM-768:
+\[
+  (c, k_{\mathsf{shared}}) \leftarrow \mathsf{ML\text{-}KEM.Encaps}(pk_{\mathsf{pq}})
+\]
+\[
+  k_{\mathsf{wrapped}} = \mathsf{AES\text{-}256\text{-}GCM.Enc}(k_{\mathsf{shared}},
+    k_{\mathsf{enc}})
+\]
+
+\subsection{CRDT Sync Protocol}
+
+The sync protocol operates on the write-ahead log, not the database file.
+Each write produces a CRDT operation:
+
+\begin{definition}[Sync Operation]\label{def:syncop}
+A sync operation is a tuple $(\mathsf{hlc}, \mathsf{table}, \mathsf{row\_id},
+\mathsf{col}, \mathsf{value}, \mathsf{tombstone}, \sigma)$ where $\mathsf{hlc}$
+is a hybrid logical clock timestamp, and $\sigma$ is an Ed25519 signature over
+the preceding fields by the writing principal.
+\end{definition}
+
+Conflict resolution uses last-writer-wins (LWW) semantics ordered by HLC.
+For columns requiring richer merge semantics (e.g., collaborative text), the
+application may register custom CRDT types (RGA for sequences, OR-Set for
+collections).
+
+The sync protocol:
+
+\begin{enumerate}[nosep]
+  \item The local vault writes an operation to the WAL and increments the HLC.
+  \item The operation is encrypted with $k_{\mathsf{sync}}$ (derived from
+        $k_{\mathsf{root}}$ via a separate HKDF context) and sent to peers
+        in $\Sigma$.
+  \item Receiving peers decrypt, verify $\sigma$, check capability authorization
+        in $\Gamma$, and merge into their local WAL.
+  \item Periodically, the vault compacts the WAL into the SQLite database and
+        publishes a checkpoint hash to $\mathcal{A}$.
+\end{enumerate}
+
+\subsection{Realtime API}
+
+Base exposes a realtime subscription API over the vault. Clients subscribe to
+table/row/column changes. The subscription is local---it observes the CRDT merge
+stream. When a remote peer's operation merges into the local WAL, subscribed
+clients receive the change event. No server is in the loop.
+
+\subsection{Plugin Runtime}
+
+Base supports server-side plugins for operations that cannot run purely
+client-side: scheduled tasks, webhook handlers, schema migrations, and
+background sync jobs. Plugins execute in a sandboxed runtime (V8 isolate or
+WASM) with read/write access scoped by $\Gamma$. A plugin cannot access vault
+data outside its granted capabilities.
+
+% ============================================================================
+\section{The Post-Quantum Security Stack}\label{sec:pq}
+% ============================================================================
+
+The Capsule security stack is tiered by application class, with increasing
+cryptographic complexity as trust requirements grow.
+
+\subsection{Tier 1: Default (Class I)}
+
+All capsules use this tier. It protects vault data and sync traffic.
+
+\begin{itemize}[nosep]
+  \item \textbf{Vault encryption}: AES-256-CBC (SQLCipher) with HMAC-SHA512
+        page authentication.
+  \item \textbf{Key encapsulation}: ML-KEM-768 (NIST FIPS 203) for wrapping
+        vault keys, providing IND-CCA2 security against quantum adversaries.
+  \item \textbf{Signatures}: Ed25519 for real-time operations (performance),
+        ML-DSA-65 (FIPS 204) for policy transactions on-chain (quantum
+        resistance).
+  \item \textbf{Sync encryption}: AES-256-GCM for operation payloads in transit.
+  \item \textbf{Key derivation}: HKDF-SHA256 from root key material.
+\end{itemize}
+
+\begin{theorem}[Tier 1 IND-CPA Security]\label{thm:tier1}
+Under the Module-LWE assumption with parameters $(n=768, q=3329, \eta=2)$
+and the assumption that AES-256 is a secure pseudorandom permutation, a
+Tier~1 capsule vault is IND-CPA secure against a quantum polynomial-time
+adversary with access to encrypted vault snapshots and sync traffic.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+The vault key $k_{\mathsf{enc}}$ is wrapped under ML-KEM-768, which is
+IND-CCA2 secure under Module-LWE~\cite{lux-pq-crypto}. An adversary with
+access to the ciphertext vault file and encrypted sync operations sees only
+AES-256-CBC ciphertext (vault) and AES-256-GCM ciphertext (sync). Without
+$k_{\mathsf{enc}}$ or $k_{\mathsf{sync}}$ (both derived from $k_{\mathsf{root}}$
+and protected by ML-KEM), the adversary cannot distinguish vault contents from
+random, giving IND-CPA. The HMAC-SHA512 page authentication additionally provides
+integrity (IND-CCA under the encrypt-then-MAC composition theorem).
+\end{proof}
+
+\subsection{Tier 2: Threshold Control (Class II)}
+
+Adds threshold cryptographic protocols for multi-party authorization.
+
+\begin{itemize}[nosep]
+  \item \textbf{Secret sharing}: Feldman VSS over a prime-order group for
+        verifiable share distribution.
+  \item \textbf{Threshold signatures}: FROST (EdDSA), CGG21 (ECDSA), Ringtail
+        (post-quantum) as specified in~\cite{lux-mchain-mpc}.
+  \item \textbf{Time-locks}: Verifiable delay functions (VDFs) for time-bounded
+        secret reveals.
+\end{itemize}
+
+\subsection{Tier 3: Confidential Compute (Class III)}
+
+Adds homomorphic encryption for computation on encrypted data.
+
+\begin{itemize}[nosep]
+  \item \textbf{Boolean circuits}: TFHE with bootstrapping for arbitrary boolean
+        function evaluation~\cite{lux-tfhe}.
+  \item \textbf{Approximate arithmetic}: CKKS for floating-point operations
+        (ML inference, statistical aggregation).
+  \item \textbf{Hybrid FHE-MPC}: Combine FHE evaluation with MPC for
+        multi-input confidential computation, as described
+        in~\cite{lux-fhe-mpc-hybrid}.
+  \item \textbf{TEE fallback}: Intel TDX or ARM CCA for workloads where FHE
+        latency is prohibitive, with remote attestation verified on-chain.
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\caption{Post-quantum security tiers.}
+\label{tab:pq}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Tier} & \textbf{Primitives} & \textbf{PQ Safe} & \textbf{Overhead} \\
+\midrule
+1 (Default) & AES-256, ML-KEM, ML-DSA & Yes & Negligible \\
+2 (Threshold) & + Feldman VSS, FROST, Ringtail & Yes & Seconds \\
+3 (Confidential) & + TFHE, CKKS & Yes (FHE) & 10--1000$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================================
+\section{Provider Model}\label{sec:providers}
+% ============================================================================
+
+Providers are participants in the Web5 ecosystem that offer services to capsule
+owners. They are not data owners. They never hold decryption keys. They are
+replaceable.
+
+\subsection{Provider Roles}
+
+\begin{definition}[Provider]\label{def:provider}
+A provider is a registered entity on I-Chain offering one or more services from
+the set $\{\mathsf{relay}, \mathsf{storage}, \mathsf{gateway}, \mathsf{recovery},
+\mathsf{compute}, \mathsf{index}\}$, with service quality commitments published
+on-chain and enforced by staking.
+\end{definition}
+
+\begin{itemize}[nosep]
+  \item \textbf{Relay}: Forwards encrypted CRDT operations between peers.
+        Sees ciphertext. Provides availability, not confidentiality.
+  \item \textbf{Storage}: Hosts encrypted vault snapshots and WAL segments.
+        Provides durability. Subject to proof-of-storage challenges.
+  \item \textbf{Gateway}: HTTP/WebSocket endpoint for client applications.
+        Handles authentication (DID-based), rate limiting, and protocol
+        translation. Does not decrypt.
+  \item \textbf{Recovery}: Holds encrypted key shares for threshold recovery.
+        Cannot reconstruct alone (requires $t$-of-$n$ on T-Chain).
+  \item \textbf{Compute}: Executes FHE circuits or TEE enclaves for Class III
+        applications. Receives evaluation keys and ciphertext. Returns encrypted
+        results.
+  \item \textbf{Index}: Maintains searchable indexes over encrypted metadata
+        (using techniques like order-preserving encryption or searchable
+        symmetric encryption) for query acceleration.
+\end{itemize}
+
+\subsection{Provider Economics}
+
+Providers stake LUX on the primary network. Capsule owners pay providers in LUX
+for services consumed. Payments are per-operation (relay fees), per-byte-month
+(storage fees), or per-circuit-evaluation (compute fees). Service level
+agreements are on-chain; slashing occurs for downtime or data loss verified
+by proof-of-storage audits.
+
+\subsection{Provider Switching}
+
+Switching providers is a four-step process:
+\begin{enumerate}[nosep]
+  \item Update $\Sigma$ to include the new provider.
+  \item The new provider receives the encrypted vault snapshot and catches up
+        on the CRDT log from an existing peer or the old provider.
+  \item Verify replication by comparing checkpoint hashes.
+  \item Update $\Sigma$ to exclude the old provider.
+\end{enumerate}
+
+No key rotation is required. No data re-encryption is required. The principal
+does not need to be online during the transfer---any peer in $\Sigma$ can serve
+the encrypted state.
+
+% ============================================================================
+\section{Agent Capsules}\label{sec:agents}
+% ============================================================================
+
+AI agents are first-class principals in the Capsule model. An agent gets its
+own capsule with its own vault, identity, capabilities, and audit chain.
+This is not a metaphor. An agent capsule has the same formal structure as a
+human capsule.
+
+\subsection{Agent as Sovereign Process}
+
+\begin{definition}[Agent Capsule]\label{def:agent}
+An \textbf{agent capsule} is a capsule $\mathcal{C}_a$ where the principal is
+an autonomous software process. The agent's vault stores its memory (conversation
+history, learned preferences, tool outputs), its capability set $\Gamma_a$
+defines what APIs, data sources, and actions it may access, and its key policy
+$\mathcal{P}_a$ defines who can inspect, modify, or terminate the agent.
+\end{definition}
+
+Key differences from human capsules:
+
+\begin{itemize}[nosep]
+  \item \textbf{Delegated authority}: An agent's root key is typically generated
+        by a human principal and delegated via $\Gamma$ with explicit scope
+        and time bounds. The agent cannot escalate its own capabilities.
+  \item \textbf{Budget constraints}: $\mathcal{P}_a$ includes spending limits---
+        maximum LUX per transaction, per day, and per provider interaction.
+        Exceeded budgets halt the agent until the delegating principal
+        re-authorizes.
+  \item \textbf{Auditable memory}: Every write to the agent's vault is signed
+        and anchored. A human principal can audit the complete history of what
+        the agent stored, when, and in response to what input.
+  \item \textbf{Private inference}: For Class III agent operations, inference
+        runs on encrypted data via FHE or inside a TEE. The compute provider
+        sees neither the model weights nor the user's input.
+\end{itemize}
+
+\subsection{Agent Capability Model}
+
+Agent capabilities are structured as a DAG of UCAN tokens:
+
+\begin{verbatim}
+  human-root
+    └── agent-root (time-bounded, budget-limited)
+          ├── read:vault/user-preferences
+          ├── write:vault/agent-memory
+          ├── call:api/weather (rate-limited)
+          ├── call:api/calendar (read-only)
+          └── spend:lux/0.1-per-tx
+\end{verbatim}
+
+Each capability token is a signed JWT with fields: \texttt{iss} (delegator DID),
+\texttt{aud} (agent DID), \texttt{att} (resource + action), \texttt{exp}
+(expiration), \texttt{prf} (proof chain back to root). Revocation is a K-Chain
+transaction.
+
+\subsection{Agent Lifecycle}
+
+\begin{enumerate}[nosep]
+  \item \textbf{Spawn}: Human principal creates agent capsule, generates agent
+        keys, delegates capabilities, sets budget.
+  \item \textbf{Execute}: Agent reads from its vault, invokes tools within
+        $\Gamma_a$, writes results to its vault, anchors receipts.
+  \item \textbf{Inspect}: Human principal reads agent vault (using delegated
+        read capability on $\mathcal{C}_a$) to review memory and actions.
+  \item \textbf{Revoke}: Human principal revokes $\Gamma_a$ on K-Chain.
+        Agent can no longer invoke tools or write to its vault. Vault contents
+        remain readable for audit.
+\end{enumerate}
+
+% ============================================================================
+\section{Migration Path}\label{sec:migration}
+% ============================================================================
+
+Existing applications built on Firebase, Supabase, Notion APIs, or similar
+centralized backends can migrate to capsule-based architectures incrementally.
+
+\subsection{Migration Mapping}
+
+\begin{table}[H]
+\centering
+\caption{Migration from centralized backends to capsule architecture.}
+\label{tab:migration}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Centralized} & \textbf{Capsule Equivalent} & \textbf{Trust Model} \\
+\midrule
+Firebase Auth & I-Chain DID + session tokens & Self-sovereign \\
+Firestore & Encrypted SQLite vault & Local-first \\
+Realtime DB & CRDT sync over $\Sigma$ & Peer-to-peer \\
+Cloud Storage & Encrypted blob at provider & Provider-blind \\
+Cloud Functions & Base plugins (WASM/V8) & Sandboxed \\
+Security Rules & $\Gamma$ capability lattice & Cryptographic \\
+Push notifications & Sync event subscriptions & Local observer \\
+Analytics & Aggregation via Class III FHE & Confidential \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Migration Strategy}
+
+\begin{enumerate}[nosep]
+  \item \textbf{Phase 1: Dual-write.} The application writes to both the
+        existing backend and a local capsule vault. Reads come from the
+        centralized backend. This validates data model compatibility.
+  \item \textbf{Phase 2: Local-read.} Reads switch to the local vault.
+        The centralized backend becomes a sync target (write-through).
+        The user experiences offline capability and reduced latency.
+  \item \textbf{Phase 3: Cut-over.} The centralized backend is removed from
+        $\Sigma$. The capsule's CRDT sync handles replication. Identity
+        migrates to I-Chain. The old backend is decommissioned.
+\end{enumerate}
+
+The key constraint: the application's data model must fit SQLite's relational
+schema. Document databases (Firestore, MongoDB) require schema normalization.
+Key-value stores map directly. Graph data requires an adjacency-list
+representation or a dedicated CRDT type.
+
+% ============================================================================
+\section{Hardest Unsolved Problems}\label{sec:unsolved}
+% ============================================================================
+
+Honesty demands listing what we have not solved. These are open research
+problems, not engineering tasks.
+
+\subsection{Key Rotation UX}
+
+Rotating a capsule's root key requires re-wrapping $k_{\mathsf{enc}}$ and
+updating the DID document. For a single-device user, this is straightforward.
+For a user with 10 devices, 5 shared workspaces, and 3 agent capsules, key
+rotation becomes a coordination problem. Every derived key must be re-derived.
+Every peer in $\Sigma$ must receive the new sync key. Every agent's delegated
+capabilities must be re-issued.
+
+The current protocol handles this through a rotation transaction on K-Chain that
+emits a rotation event, triggering re-keying across all derived capsules. The
+UX problem: if any device is offline during rotation, it holds stale keys
+and cannot sync until it comes online and processes the rotation event. We do
+not have a satisfying solution for the offline-device-during-rotation case
+beyond ``queue the rotation and apply on reconnect,'' which creates a window
+where the old key is still valid.
+
+\subsection{Partial Sharing}
+
+A principal wants to share rows 1--50 of a table but not rows 51--100. The
+current capability model operates at table granularity. Row-level sharing
+requires either: (a) splitting the table into separate vaults (one shared,
+one private), which fragments the schema; or (b) implementing row-level
+encryption with per-row keys, which multiplies key management complexity.
+
+Neither approach is clean. The fundamental tension: SQLite operates on pages,
+not rows. Encrypting at row granularity means abandoning SQLCipher's
+page-level encryption for a custom scheme with worse performance
+characteristics.
+
+\subsection{Sync Metadata Leakage}
+
+Even with encrypted payloads, the sync protocol leaks metadata: which capsules
+sync with which peers, how often, and how much data flows. A traffic analysis
+adversary can infer social graphs and activity patterns from sync metadata
+alone.
+
+Mitigations include constant-rate padding (expensive), mix networks for relay
+traffic (high latency), and PIR for checkpoint retrieval (computationally
+expensive). None are satisfactory for real-time sync workloads.
+
+\subsection{Private Search and Indexing}
+
+Searching encrypted vault data is an open problem. Searchable symmetric
+encryption (SSE) leaks access patterns. Oblivious RAM (ORAM) has
+$O(\log n)$ overhead per access. FHE-based search is orders of magnitude
+slower than plaintext search.
+
+For Class I applications, search is local and fast (plaintext after
+decryption). The problem arises for Class II and III applications where a
+provider must search on behalf of a principal without seeing plaintext.
+Practical private search at scale remains unsolved.
+
+\subsection{Agent Memory Permissions}
+
+An agent's vault accumulates memory over time: conversation history, learned
+preferences, tool outputs. The principal who spawned the agent should be able
+to: (a) read all agent memory, (b) selectively delete memories, (c) prevent
+the agent from remembering certain interactions.
+
+The challenge: if the agent has write access to its own vault (necessary for
+it to function), it can write anything, including data the principal wishes
+it would not retain. Enforcing ``do not remember this'' requires either
+trusted hardware (TEE for the agent runtime) or a formal verification
+framework for agent write policies. Neither is production-ready.
+
+\subsection{Cross-Application Composition}
+
+A user wants Application A's data to feed into Application B's computation.
+Both applications use separate capsules. The composition requires: (a) a
+capability delegation from Capsule A to Capsule B, (b) a data format
+agreement, and (c) a sync path between the two vaults.
+
+The protocol supports this mechanically (delegate a read capability, establish
+a sync link), but the UX is unresolved. Users should not need to understand
+capability lattices and CRDT topologies to connect two apps. The equivalent
+of ``Sign in with Google'' for cross-app data sharing in Web5 does not
+exist yet.
+
+% ============================================================================
+\section{Related Work}\label{sec:related}
+% ============================================================================
+
+\paragraph{Solid (Berners-Lee).}
+Solid~\cite{solid2016} proposed personal data pods where users store their data
+and grant applications access. The Capsule model shares Solid's vision of data
+sovereignty but differs in three ways: (1) Capsule vaults are encrypted at rest
+(Solid pods are not); (2) sync is CRDT-based rather than LDP-based; (3) trust
+is anchored to a blockchain rather than relying on WebID-TLS.
+
+\paragraph{Fission (UCAN).}
+Fission~\cite{fission2021} introduced UCAN (User Controlled Authorization
+Networks) for decentralized capability delegation. The Capsule capability set
+$\Gamma$ builds directly on UCAN semantics. The difference: Capsule capabilities
+are enforced on K-Chain, providing revocation guarantees that pure UCAN
+(off-chain) cannot offer.
+
+\paragraph{Ceramic.}
+Ceramic~\cite{ceramic2020} provides mutable data streams anchored to a
+blockchain. Capsules differ by storing data locally (not on IPFS), using
+SQLite (not JSON streams), and supporting offline-first operation without
+network access.
+
+\paragraph{DXOS.}
+DXOS~\cite{dxos2023} builds local-first collaborative applications with ECHO
+(Eventually Consistent Hierarchical Objects). The Capsule CRDT sync model is
+closest to DXOS in spirit. The distinction: Capsules add a formal trust kernel
+(Lux) for identity, key policy, and threshold operations that DXOS handles
+through simpler peer-to-peer key exchange.
+
+\paragraph{Local-First Software.}
+Kleppmann et al.~\cite{kleppmann2019} articulated seven ideals for local-first
+software: fast, multi-device, offline, collaborative, long-lived, private,
+and user-owned. The Capsule model is a concrete architecture that satisfies
+all seven, adding the trust kernel that the original manifesto identified
+as missing.
+
+\paragraph{Evervault.}
+Evervault~\cite{evervault2022} provides encryption-as-a-service with relay
+proxies that encrypt data before it reaches application servers. Capsules
+subsume this pattern: the vault is always encrypted, and providers never see
+plaintext. The difference is architectural---Evervault is a middlebox;
+Capsules are a runtime.
+
+% ============================================================================
+\section{Conclusion}\label{sec:conclusion}
+% ============================================================================
+
+The Capsule is not a decentralized database. It is not a blockchain wallet.
+It is not a privacy layer bolted onto an existing system.
+
+The Capsule is a sovereign encrypted process. It is the unit of tenancy, the
+unit of privacy, the unit of collaboration, and the unit of computation in
+Web5. Every principal---human, organizational, algorithmic---gets one. The
+vault holds state. The identity anchors trust. The capability set governs
+access. The sync topology handles replication. The compute policy determines
+where code runs. The audit chain proves what happened.
+
+Base owns state: encrypted SQLite, CRDT sync, realtime APIs, plugin runtime.
+Lux owns trust: identity on I-Chain, key policy on K-Chain, threshold reveals
+on T-Chain, MPC signing on M-Chain, audit anchors on the primary network.
+Providers own service quality: relay throughput, storage durability, compute
+availability. Users own keys and exit rights: they can decrypt, revoke,
+migrate, and audit at any time, without permission from any provider.
+
+This is what it means for the personal computer to return---not as a device
+on a desk, but as a cryptographic process that follows you across every device,
+every application, and every provider. The Capsule is the personal computer
+of Web5.
+
+The hard problems remain hard. Key rotation UX is unsolved for multi-device
+principals. Partial sharing requires schema-level compromises. Sync metadata
+leaks to traffic analysis. Private search at scale is open. Agent memory
+governance needs formal verification. Cross-app composition lacks a usable
+consent flow.
+
+We have listed these problems explicitly because solving them is the work
+that matters. The architecture is sound. The cryptography is proven. The
+chains are specified. What remains is the engineering and UX research to
+make sovereignty invisible---to make it so natural that users never think
+about keys, capabilities, or sync topologies, and yet own everything.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{99}
+
+\bibitem{kleppmann2019}
+M.~Kleppmann, A.~Wiggins, P.~van Hardenberg, and M.~McGranaghan,
+``Local-First Software: You Own Your Data, in Spite of the Cloud,''
+\textit{Onward! 2019}, ACM, 2019.
+
+\bibitem{solid2016}
+T.~Berners-Lee and D.~Sambra,
+``Solid: A Platform for Decentralized Social Applications Based on Linked Data,''
+MIT CSAIL Technical Report, 2016.
+
+\bibitem{fission2021}
+B.~Holmgren and P.~Chiusano,
+``UCAN: User Controlled Authorization Networks,''
+Fission Specification, 2021.
+
+\bibitem{ceramic2020}
+M.~Zargham, J.~Clark, and D.~Buchner,
+``Ceramic: A Decentralized Data Network for Web3 Applications,''
+3Box Labs, 2020.
+
+\bibitem{dxos2023}
+R.~Brinkman et al.,
+``DXOS: A Framework for Local-First Collaborative Applications,''
+DXOS Technical Report, 2023.
+
+\bibitem{evervault2022}
+S.~Agarwal and C.~Sheridan,
+``Evervault: Encryption as Infrastructure,''
+Evervault Whitepaper, 2022.
+
+\bibitem{lux-mchain-mpc}
+Z.~Kelling and V.~Seesahai,
+``M-Chain: Decentralized Multi-Party Computation Custody with Quantum-Safe Threshold Signatures,''
+Lux Industries, 2023.
+
+\bibitem{lux-tfhe}
+Z.~Kelling,
+``Torus Threshold Fully Homomorphic Encryption: Boolean Circuits on Encrypted Data with Distributed Decryption,''
+Lux Industries, 2025.
+
+\bibitem{lux-pq-crypto}
+Z.~Kelling,
+``Post-Quantum Cryptographic Suite for EVM: ML-KEM, ML-DSA, and SLH-DSA as Native Precompiles,''
+Lux Industries, 2024.
+
+\bibitem{lux-fhe-mpc-hybrid}
+Z.~Kelling,
+``Hybrid FHE-MPC Protocols for Multi-Input Confidential Computation on Lux,''
+Lux Industries, 2025.
+
+\bibitem{lux-id-did}
+Z.~Kelling,
+``Lux ID: Decentralized Identifier Specification for Multi-Chain Identity,''
+Lux Industries, 2024.
+
+\bibitem{lux-tokenomics}
+Z.~Kelling,
+``Lux Tokenomics: Economic Design for Multi-Chain Consensus Networks,''
+Lux Industries, 2023.
+
+\bibitem{shapiro2011}
+M.~Shapiro, N.~Pregui\c{c}a, C.~Baquero, and M.~Zawirski,
+``Conflict-Free Replicated Data Types,''
+\textit{SSS 2011}, LNCS 6976, Springer, 2011.
+
+\bibitem{nist-mlkem}
+{National Institute of Standards and Technology},
+``Module-Lattice-Based Key-Encapsulation Mechanism Standard,''
+FIPS 203, 2024.
+
+\bibitem{nist-mldsa}
+{National Institute of Standards and Technology},
+``Module-Lattice-Based Digital Signature Standard,''
+FIPS 204, 2024.
+
+\bibitem{sqlite2022}
+R.~Hipp,
+``SQLite: Past, Present, and Future,''
+\textit{Proc. VLDB Endow.}, 15(12), 2022.
+
+\end{thebibliography}
+
+\end{document}
