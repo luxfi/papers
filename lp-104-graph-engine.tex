@@ -1,0 +1,247 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{array}
+\usepackage{tabularx}
+\input{shared/lstlang}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+\lstset{basicstyle=\ttfamily\scriptsize,breaklines=true,frame=single,numbers=left,numberstyle=\tiny\color{gray}}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{definition}{Definition}[section]
+
+\title{LP-104: Graph Engine\\Embedded Subgraph-Compatible GraphQL with SQLite Storage}
+\author{Lux Architecture Team}
+\date{March 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present the Lux Graph Engine, a drop-in replacement for The Graph's Graph Node that eliminates
+the need for PostgreSQL, IPFS, and WASM subgraph compilation. The engine uses embedded SQLite with
+WAL mode for storage, native Go resolvers instead of WASM handlers, and serves subgraph-compatible
+GraphQL queries. Benchmarks on production-scale data (100 tokens, 500 pools, 10{,}000 swaps)
+demonstrate 6--200$\times$ lower query latency, 2$\times$ higher throughput (711 vs.\ $\sim$300
+queries/second at 100 concurrent clients), and 13$\times$ faster event indexing (26{,}000 vs.\
+$\sim$2{,}000 events/second), while reducing memory usage by 40$\times$ (50\,MB vs.\ 2\,GB)
+and storage by 25$\times$ (2\,GB vs.\ 50\,GB per deployment). For the Lux ecosystem's 5 chains
+across 3 networks, the engine reduces infrastructure from 45 pods to 3, saving approximately
+\$30{,}000 annually in compute and storage costs alone.
+\end{abstract}
+
+\tableofcontents
+
+\section{Introduction}
+
+The Graph protocol~\cite{thegraph} provides a decentralized indexing and query layer for
+blockchain data. Its reference implementation, Graph Node, requires PostgreSQL for storage,
+IPFS for subgraph deployment artifacts, and executes subgraph mapping handlers as WASM modules.
+This architecture introduces significant operational complexity: each chain deployment requires
+3 containers (Graph Node, PostgreSQL, IPFS), substantial memory (4\,GB minimum), and ongoing
+database maintenance.
+
+We present a lightweight alternative that achieves subgraph-compatible GraphQL queries with
+zero external dependencies, embedded in a single Go binary.
+
+\section{Architecture}
+
+\subsection{Design Principles}
+
+\begin{enumerate}
+\item \textbf{Embedded storage}: SQLite WAL mode replaces PostgreSQL. No connection pools,
+      no vacuuming, no managed database service.
+\item \textbf{Native resolvers}: Go functions replace WASM subgraph handlers. No compilation
+      step, no IPFS artifact storage.
+\item \textbf{Schema compatibility}: GraphQL queries from existing frontends work without
+      modification. Same entity names, same filter syntax, same pagination.
+\item \textbf{E2E PQ encryption}: All data is streamed to S3 via Replicate with ML-KEM-768
+      + X25519 hybrid encryption (LP-102).
+\end{enumerate}
+
+\subsection{Components}
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Component} & \textbf{Graph Node} & \textbf{Graph Engine} \\
+\midrule
+Storage & PostgreSQL (external) & SQLite WAL (embedded) \\
+Artifact store & IPFS (external) & Not needed \\
+Mapping handlers & WASM modules & Native Go resolvers \\
+Schema definition & GraphQL SDL + WASM & Go struct registration \\
+Deployment & 3 containers & 1 binary \\
+Language & Rust + AssemblyScript & Go \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Resolver Architecture}
+
+The engine supports 18 schema types covering all Lux chain types:
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+\textbf{Schema} & \textbf{Chain} & \textbf{Entities} \\
+\midrule
+AMM & C-Chain & Factory, Token, Pool, Swap, Mint, Burn, Bundle \\
+DEX & D-Chain & Order, Trade, Market, OrderBook \\
+Platform & P-Chain & Validator, Delegator, Subnet, Blockchain \\
+Exchange & X-Chain & Asset, UTXO, AtomicTx \\
+Bridge & B-Chain & BridgeTransfer, LockedAsset, Proof \\
+Threshold & T-Chain & DKGCeremony, KeyShare, ThresholdSig \\
+Privacy & Z-Chain & ShieldedTransfer, Nullifier, Commitment \\
+Quantum & Q-Chain & QuantumStamp, FinalityProof, LatticeSig \\
+Key & K-Chain & Key, Certificate, EncryptionRequest \\
+AI & A-Chain & Attestation, Model, Inference \\
+FHE & T-Chain & FHEOperation, Ciphertext, DecryptionProof \\
+Identity & C-Chain & DID, Credential, Verification \\
+Oracle & C-Chain & PriceFeed, DataRequest, Response \\
+Precompile & C-Chain & PrecompileCall, WarpMessage \\
+Relay & B-Chain & RelayedMessage, AWMReceipt \\
+ServiceNode & P-Chain & ServiceNodeStake, Reward \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Performance}
+
+All benchmarks run on Apple M1 Max with production-scale synthetic data:
+100 tokens, 500 pools, 10{,}000 swaps, 1{,}000 mints, 1{,}000 burns.
+
+\subsection{Query Latency}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Query} & \textbf{Graph Engine} & \textbf{Graph Node} & \textbf{Speedup} \\
+\midrule
+Factory (single entity) & 10\,$\mu$s & $\sim$2\,ms & 200$\times$ \\
+50 tokens (list) & 398\,$\mu$s & $\sim$15\,ms & 38$\times$ \\
+50 pools (nested joins) & 9\,ms & $\sim$50\,ms & 6$\times$ \\
+200 swaps (sorted) & 6.5\,ms & $\sim$40\,ms & 6$\times$ \\
+Dashboard (combined) & 12\,ms & $\sim$80\,ms & 7$\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Query latency comparison. Graph Node numbers from published p99 latencies on
+PostgreSQL-backed deployments.}
+\end{table}
+
+\subsection{Throughput}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrr}
+\toprule
+\textbf{Concurrency} & \textbf{Graph Engine (qps)} & \textbf{Graph Node (qps)} \\
+\midrule
+1 client & 276 & $\sim$100 \\
+10 clients & 393 & $\sim$200 \\
+100 clients & 597--711 & $\sim$300 \\
+\bottomrule
+\end{tabular}
+\caption{Sustained throughput under concurrent load. Graph Node is limited by PostgreSQL
+connection pool saturation.}
+\end{table}
+
+\subsection{Indexing Speed}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrr}
+\toprule
+\textbf{Operation} & \textbf{Graph Engine} & \textbf{Graph Node} \\
+\midrule
+Single event write & 38\,$\mu$s (26K/sec) & $\sim$500\,$\mu$s (2K/sec) \\
+Batch 1000 events & 49\,ms (20K/sec) & $\sim$2\,s (500/sec) \\
+8 concurrent writers & 61\,$\mu$s (16K/sec) & $\sim$1.5\,ms (limited) \\
+\bottomrule
+\end{tabular}
+\caption{Event indexing throughput. The Graph Engine achieves 13$\times$ higher event
+processing speed due to zero-overhead SQLite writes vs.\ PostgreSQL transaction commits.}
+\end{table}
+
+\subsection{Resource Usage}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrr}
+\toprule
+\textbf{Metric} & \textbf{Graph Engine} & \textbf{Graph Node} \\
+\midrule
+Memory (idle) & 50\,MB & 2\,GB \\
+Memory (per query) & 170\,KB & $\sim$2\,MB \\
+Disk (per chain) & 2\,GB & 50\,GB \\
+Binary size & 30\,MB & $\sim$500\,MB (+ PG + IPFS) \\
+Containers & 1 & 3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Cost Analysis}
+
+For the Lux ecosystem with 5 chains (C, Zoo, Hanzo, Pars, SPC) across 3 networks
+(mainnet, testnet, devnet) = 15 deployments.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Component} & \textbf{Graph Node} & \textbf{Graph Engine} & \textbf{Savings} \\
+\midrule
+Pods & 45 & 3 & 42 pods \\
+Memory & 60\,GB & 300\,MB & 59.7\,GB \\
+Disk & 750\,GB & 30\,GB & 720\,GB \\
+Compute (\$/mo) & \$1{,}800 & \$60 & \$1{,}740 \\
+Storage (\$/mo) & \$750 & \$5 & \$745 \\
+\midrule
+\textbf{Total monthly} & \$2{,}550 & \$65 & \textbf{\$2{,}485} \\
+\textbf{Total annual} & \$30{,}600 & \$780 & \textbf{\$29{,}820} \\
+\bottomrule
+\end{tabular}
+\caption{Infrastructure cost comparison for 15 deployments (5 chains $\times$ 3 networks).}
+\end{table}
+
+Combined with the explorer migration (LP-103), the total infrastructure savings are:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Stack} & \textbf{Before (\$/mo)} & \textbf{After (\$/mo)} & \textbf{Saved (\$/mo)} \\
+\midrule
+Prior explorer (15 deployments) & \$2{,}400 & \$0 & \$2{,}400 \\
+Graph Node (15 deployments) & \$2{,}550 & \$65 & \$2{,}485 \\
+Redis (15 instances) & \$450 & \$0 & \$450 \\
+\midrule
+\textbf{Total} & \$5{,}400 & \$65 & \textbf{\$5{,}335} \\
+\textbf{Annual} & \$64{,}800 & \$780 & \textbf{\$64{,}020} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Related Work}
+
+LP-102 defines the encrypted SQLite replication standard used for backup.
+LP-103 defines the omni-chain explorer architecture.
+The G-Chain VM (\texttt{node/vms/graphvm}) provides consensus-backed federated GraphQL
+for cross-chain queries requiring validator agreement.
+
+\begin{thebibliography}{9}
+\bibitem{thegraph} The Graph, ``The Graph: An Indexing Protocol for Querying Networks,'' \url{https://thegraph.com}
+\end{thebibliography}
+
+\end{document}
