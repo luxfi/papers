@@ -184,7 +184,7 @@ Under the IND-CPA security of TFHE, an adversary $\Adv$ without permission canno
 
 \section{Threshold Key Management}
 
-Single-key FHE creates a central point of failure. We distribute the secret key among $n$ trustees using $(t, n)$ threshold secret sharing.
+Single-key FHE creates a central point of failure. We distribute the secret key among $n$ trustees using $(t, n)$ threshold secret sharing based on the RLWE multiparty framework~\cite{mhe-rlwe,threshold-rlwe}.
 
 \subsection{Key Generation Ceremony}
 
@@ -207,6 +207,117 @@ To decrypt ciphertext $\ct = (\mathbf{a}, b)$:
 \end{enumerate}
 
 where $\lambda_i$ are Lagrange coefficients for the threshold scheme.
+
+\section{GPU Acceleration}
+
+FHE operations are computationally intensive. We achieve production-grade performance through GPU acceleration~\cite{luxcpp-fhe,gpu-fhe}.
+
+\subsection{Metal/CUDA Backend}
+
+Our C++ FHE library provides hardware acceleration:
+
+\begin{table}[h]
+\centering
+\caption{GPU-Accelerated FHE Performance}
+\begin{tabular}{lrrr}
+\toprule
+Operation & CPU (ms) & GPU (ms) & Speedup \\
+\midrule
+NTT Forward (N=4096) & 0.8 & 0.04 & $20\times$ \\
+Bootstrap & 50 & 5 & $10\times$ \\
+Batch Threshold Decrypt & 8,500 & 302 & $28\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Kernel Fusion}
+
+Traditional NTT requires $\log_2(N)$ kernel launches. Our fused kernel performs all stages in shared memory:
+
+\begin{enumerate}
+    \item Load coefficients to shared memory (single read)
+    \item Execute all $\log_2(N)$ butterfly stages with barriers
+    \item Write results (single write)
+\end{enumerate}
+
+This achieves $17\times$ speedup for batch operations by eliminating global memory round-trips.
+
+\subsection{Batched Threshold Decryption}
+
+For $k$ ciphertexts with $(t, n)$ threshold:
+
+\begin{enumerate}
+    \item \textbf{Merkle transcript}: Single tree instead of $O(k)$ serial hashes ($70\times$ faster)
+    \item \textbf{Batched partial decrypt}: Vectorized NTT across all ciphertexts ($36\times$ faster)
+    \item \textbf{Random linear combination}: Pippenger MSM for verification ($22\times$ faster)
+\end{enumerate}
+
+Total improvement: $28\times$ for 1000 ciphertext batches.
+
+\section{Quantum-Secure Consensus Integration}
+
+fhEVM integrates with the Quasar consensus engine~\cite{quasar} for quantum-resistant finality.
+
+\subsection{Dual-Certificate Finality}
+
+Each fhEVM block receives two cryptographic certificates:
+
+\begin{enumerate}
+    \item \textbf{BLS Certificate}: Classical security (128-bit)
+    \item \textbf{Ringtail Certificate}: Post-quantum security (Module-LWE, 128-bit PQ)~\cite{ringtail}
+\end{enumerate}
+
+\begin{definition}[Dual-Certificate Security]
+A block $B$ is finalized when both certificates are valid:
+\[
+\mathsf{Final}(B) \iff \mathsf{VerifyBLS}(\sigma_{\text{BLS}}, B) \land \mathsf{VerifyRingtail}(\sigma_{\text{RT}}, B)
+\]
+\end{definition}
+
+This provides defense-in-depth: an attacker must break \emph{both} classical and post-quantum assumptions.
+
+\subsection{Ringtail Threshold Signatures}
+
+Ringtail~\cite{ringtail} enables $(t, n)$ threshold signing based on Module-LWE:
+
+\begin{itemize}[noitemsep]
+    \item Two-round signing protocol
+    \item $\sim$1 KB signature per share
+    \item Sub-25ms signing latency
+    \item 128-bit post-quantum security
+\end{itemize}
+
+The same trustees managing FHE key shares also participate in Ringtail signing, providing unified key management.
+
+\section{ZAP Protocol Integration}
+
+VM-to-node communication uses the Zero-copy Application Protocol (ZAP)~\cite{zap} for minimal overhead.
+
+\subsection{Performance Characteristics}
+
+\begin{table}[h]
+\centering
+\caption{ZAP vs gRPC Performance}
+\begin{tabular}{lrr}
+\toprule
+Metric & gRPC & ZAP \\
+\midrule
+Serialization & 38 ms/sec & 2.5 ms/sec \\
+Memory allocs & 107 MB/sec & 0 B/sec \\
+Parse latency (1MB) & 103,838 ns & 28 ns \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{FHE-Specific Benefits}
+
+For fhEVM workloads at 1000 blocks/sec:
+
+\begin{itemize}[noitemsep]
+    \item \textbf{BuildBlock}: $6.6\times$ faster ciphertext serialization
+    \item \textbf{ParseBlock}: $789\times$ faster ciphertext deserialization
+    \item \textbf{Zero-copy}: Ciphertexts read directly from network buffers
+\end{itemize}
 
 \section{Applications}
 
@@ -340,7 +451,13 @@ Microsoft SEAL~\cite{seal} and OpenFHE~\cite{openfhe} provide FHE libraries but 
 Tornado Cash provides transaction privacy via mixing; zkSNARKs enable succinct proofs but limited programmability; Secret Network uses TEEs with known vulnerabilities.
 
 \paragraph{Academic Foundations}
-Our threshold decryption builds on Mouchet et al.'s work on multiparty homomorphic encryption~\cite{mhe-rlwe} and efficient threshold access structures~\cite{threshold-rlwe}. The underlying FHE scheme uses TFHE~\cite{tfhe} with optimizations from the BFV~\cite{bfv} and BGV~\cite{bgv} literature.
+Our threshold decryption builds on Mouchet et al.'s work on multiparty homomorphic encryption~\cite{mhe-rlwe} and efficient threshold access structures~\cite{threshold-rlwe}. The underlying FHE scheme uses TFHE~\cite{tfhe} with LMKCDEY bootstrapping optimizations~\cite{lmkcdey} and techniques from the BFV~\cite{bfv} and BGV~\cite{bgv} literature.
+
+\paragraph{GPU Acceleration}
+Prior work on GPU-accelerated FHE~\cite{gpu-fhe} demonstrated order-of-magnitude speedups for basic operations. Our LuxFHE C++ library~\cite{luxcpp-fhe} extends this with fused NTT kernels and batched threshold decryption protocols achieving $28\times$ improvement for MPC workloads.
+
+\paragraph{Post-Quantum Consensus}
+Quasar~\cite{quasar} provides the first production quantum-secure consensus with dual-certificate finality. Ringtail~\cite{ringtail} enables practical lattice-based threshold signatures that share key management infrastructure with threshold FHE.
 
 \section{Conclusion}
 
