@@ -2,7 +2,6 @@
 # Build FHE research papers using tectonic
 
 LATEX = tectonic
-BUILD_DIR = ../pdfs
 PAPERS = fhevm fhecrdt voting ml-privacy
 
 .PHONY: all clean $(PAPERS)
@@ -12,28 +11,33 @@ all: $(PAPERS)
 
 fhevm:
 	@echo "Compiling fhEVM paper..."
-	@cd fhevm && $(LATEX) main.tex --outdir=$(BUILD_DIR)
-	@mv $(BUILD_DIR)/main.pdf $(BUILD_DIR)/luxfhe-fhevm.pdf
-	@echo "Generated $(BUILD_DIR)/luxfhe-fhevm.pdf"
+	@mkdir -p build
+	@cd fhevm && $(LATEX) main.tex --outdir=../build
+	@mv build/main.pdf ../pdfs/luxfhe-fhevm.pdf
+	@echo "Generated pdfs/luxfhe-fhevm.pdf"
 
 fhecrdt:
 	@echo "Compiling fheCRDT paper..."
-	@cd fhecrdt && $(LATEX) main.tex --outdir=$(BUILD_DIR)
-	@mv $(BUILD_DIR)/main.pdf $(BUILD_DIR)/luxfhe-fhecrdt.pdf
-	@echo "Generated $(BUILD_DIR)/luxfhe-fhecrdt.pdf"
+	@mkdir -p build
+	@cd fhecrdt && $(LATEX) main.tex --outdir=../build
+	@mv build/main.pdf ../pdfs/luxfhe-fhecrdt.pdf
+	@echo "Generated pdfs/luxfhe-fhecrdt.pdf"
 
 voting:
 	@echo "Compiling Voting paper..."
-	@cd voting && $(LATEX) main.tex --outdir=$(BUILD_DIR)
-	@mv $(BUILD_DIR)/main.pdf $(BUILD_DIR)/luxfhe-voting.pdf
-	@echo "Generated $(BUILD_DIR)/luxfhe-voting.pdf"
+	@mkdir -p build
+	@cd voting && $(LATEX) main.tex --outdir=../build
+	@mv build/main.pdf ../pdfs/luxfhe-voting.pdf
+	@echo "Generated pdfs/luxfhe-voting.pdf"
 
 ml-privacy:
 	@echo "Compiling ML Privacy paper..."
-	@cd ml-privacy && $(LATEX) main.tex --outdir=$(BUILD_DIR)
-	@mv $(BUILD_DIR)/main.pdf $(BUILD_DIR)/luxfhe-ml-privacy.pdf
-	@echo "Generated $(BUILD_DIR)/luxfhe-ml-privacy.pdf"
+	@mkdir -p build
+	@cd ml-privacy && $(LATEX) main.tex --outdir=../build
+	@mv build/main.pdf ../pdfs/luxfhe-ml-privacy.pdf
+	@echo "Generated pdfs/luxfhe-ml-privacy.pdf"
 
 clean:
-	@rm -f $(BUILD_DIR)/luxfhe-*.pdf
+	@rm -rf build
+	@rm -f ../pdfs/luxfhe-*.pdf
 	@echo "Cleaned FHE PDFs"
