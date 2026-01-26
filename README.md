@@ -1,7 +1,7 @@
 # Lux Blockchain Research Papers
 
 [![Compile Papers](https://github.com/luxfi/papers/actions/workflows/compile-papers.yml/badge.svg)](https://github.com/luxfi/papers/actions/workflows/compile-papers.yml)
-[![Papers](https://img.shields.io/badge/papers-24-blue)](https://github.com/luxfi/papers)
+[![Papers](https://img.shields.io/badge/papers-28-blue)](https://github.com/luxfi/papers)
 [![License](https://img.shields.io/badge/license-CC--BY--4.0-green)](LICENSE)
 
 **Post-Quantum Secure, High-Performance Blockchain Infrastructure**
@@ -13,7 +13,7 @@
 
 ## 📚 Overview
 
-This repository contains **24 comprehensive research papers** for the **Lux blockchain platform**, the foundational Layer-0 supporting **Hanzo** (AI Compute) and **Zoo** (AI/ML Specialization) networks. Coverage includes consensus protocols, post-quantum cryptography, DeFi innovations, cross-chain interoperability, privacy-preserving smart contracts, NFT marketplaces, identity management, and multi-chain AI integration.
+This repository contains **28 comprehensive research papers** for the **Lux blockchain platform**, the foundational Layer-0 supporting **Hanzo** (AI Compute) and **Zoo** (AI/ML Specialization) networks. Coverage includes consensus protocols, post-quantum cryptography, DeFi innovations, cross-chain interoperability, privacy-preserving smart contracts, NFT marketplaces, identity management, and multi-chain AI integration.
 
 All papers are written in LaTeX and automatically compiled to PDF via GitHub Actions.
 
@@ -90,6 +90,15 @@ All papers are written in LaTeX and automatically compiled to PDF via GitHub Act
 |---|-------|------|-----|-------------|
 | 24 | **TEE Computing Mesh** | [`lux-tee-computing-mesh.tex`](lux-tee-computing-mesh.tex) | [📄](pdfs/lux-tee-computing-mesh.pdf) | Distributed TEE network for confidential computing (SGX, SEV-SNP, TDX, CCA) |
 
+### Fully Homomorphic Encryption (4 Papers)
+
+| # | Paper | File | PDF | Description |
+|---|-------|------|-----|-------------|
+| 25 | **fhEVM** | [`fhe/fhevm/main.tex`](fhe/fhevm/main.tex) | [📄](pdfs/luxfhe-fhevm.pdf) | Fully Homomorphic Ethereum Virtual Machine with encrypted types (euint8, ebool) |
+| 26 | **fheCRDT** | [`fhe/fhecrdt/main.tex`](fhe/fhecrdt/main.tex) | [📄](pdfs/luxfhe-fhecrdt.pdf) | CRDTs over Encrypted State with lattice preservation proofs |
+| 27 | **Voting** | [`fhe/voting/main.tex`](fhe/voting/main.tex) | [📄](pdfs/luxfhe-voting.pdf) | Verifiable Encrypted Voting with deniable encryption & coercion resistance |
+| 28 | **ML Privacy** | [`fhe/ml-privacy/main.tex`](fhe/ml-privacy/main.tex) | [📄](pdfs/luxfhe-ml-privacy.pdf) | Privacy-Preserving ML at Scale with FHE-friendly neural networks |
+
 ---
 
 ## 🌐 Cross-Ecosystem Research
@@ -150,7 +159,7 @@ The Lux-Hanzo-Zoo-Zen ecosystem has published **58 comprehensive research papers
 git clone https://github.com/luxfi/papers.git
 cd papers
 
-# Compile all 24 papers
+# Compile all 28 papers
 make all
 
 # Compile by category
@@ -163,6 +172,8 @@ make lux-governance lux-dao-governance                               # DAO (2)
 make lux-ntt lux-ethfalcon lux-universal-threshold-signatures        # Post-quantum (3)
 make lux-verkle lux-fraud                                            # Layer 2 (2)
 make lux-tee-computing-mesh                                          # Advanced (1)
+make fhe                                                              # FHE papers (4)
+make fhe-fhevm fhe-fhecrdt fhe-voting fhe-ml-privacy                  # Individual FHE
 
 # View PDFs (macOS)
 make view
@@ -202,8 +213,8 @@ make clean
 
 ---
 
-**Last Updated**: January 28, 2025
-**Total Papers**: 24
+**Last Updated**: January 26, 2025
+**Total Papers**: 28
 **Status**: Active Development
 
 *Building the quantum-resistant, AI-integrated, multi-chain future of decentralized finance.*

@@ -106,6 +106,24 @@ lux-verkle: pdfs/lux-verkle-trees.pdf
 .PHONY: lux-fraud
 lux-fraud: pdfs/lux-fraud-proofs.pdf
 
+# FHE Papers (in fhe/ subdirectory, use tectonic)
+.PHONY: fhe fhe-fhevm fhe-fhecrdt fhe-voting fhe-ml-privacy
+
+fhe:
+	@$(MAKE) -C fhe all
+
+fhe-fhevm:
+	@$(MAKE) -C fhe fhevm
+
+fhe-fhecrdt:
+	@$(MAKE) -C fhe fhecrdt
+
+fhe-voting:
+	@$(MAKE) -C fhe voting
+
+fhe-ml-privacy:
+	@$(MAKE) -C fhe ml-privacy
+
 # Help target
 .PHONY: help
 help:
