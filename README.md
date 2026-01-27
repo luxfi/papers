@@ -107,7 +107,7 @@ The Lux-Hanzo-Zoo-Zen ecosystem has published **58 comprehensive research papers
 
 - **[Lux](https://github.com/luxfi/papers)** (L0): **24 papers** on consensus, post-quantum crypto, DeFi, cross-chain
 - **[Hanzo](https://github.com/hanzoai/papers)** (L1): **5 papers** on compute infrastructure, ASO/DSO, HMM
-- **[Zoo](https://github.com/zooai/gym/tree/main/papers)** (L2): **7 papers** on AI training, tokenomics, HLLM
+- **[Zoo](https://github.com/zooai/papers)** (L2): **7 papers** on AI training, tokenomics, HLLM
 - **[Zen](https://github.com/zenlm/papers)**: **22 papers** on efficient LLMs with spatial reasoning
 
 ### Cross-Layer Innovations
@@ -135,13 +135,13 @@ The Lux-Hanzo-Zoo-Zen ecosystem has published **58 comprehensive research papers
 - [**Network Whitepaper**](https://github.com/hanzoai/papers/blob/main/hanzo-network-whitepaper.tex): Economic model & tokenomics
 
 ### Zoo Network (AI/ML Specialization - L2)
-- [**Foundation Mission**](https://github.com/zooai/gym/blob/main/papers/zoo-foundation-mission.tex): 501(c)(3) non-profit charter
-- [**Network Architecture**](https://github.com/zooai/gym/blob/main/papers/zoo-network-architecture.tex): Layered AI infrastructure
-- [**Tokenomics**](https://github.com/zooai/gym/blob/main/papers/zoo-tokenomics.tex): $AI token economics & governance
-- [**Gym Platform**](https://github.com/zooai/gym/blob/main/papers/gym-training-platform.tex): AI training infrastructure
-- [**HLLM Training-Free GRPO**](https://github.com/zooai/gym/blob/main/papers/hllm-training-free-grpo.tex): Hamiltonian LLM framework
-- [**Experience Ledger DSO**](https://github.com/zooai/gym/blob/main/papers/dso_whitepaper/main.tex): Semantic memory system
-- [**ZIP-002 Zen Reranker**](https://github.com/zooai/gym/blob/main/papers/zip-002-zen-reranker.tex): Cross-model ranking system
+- [**Foundation Mission**](https://github.com/zooai/papers/blob/main/zoo-foundation-mission.tex): 501(c)(3) non-profit charter
+- [**Network Architecture**](https://github.com/zooai/papers/blob/main/zoo-network-architecture.tex): Layered AI infrastructure
+- [**Tokenomics**](https://github.com/zooai/papers/blob/main/zoo-tokenomics.tex): $AI token economics & governance
+- [**Gym Platform**](https://github.com/zooai/papers/blob/main/gym-training-platform.tex): AI training infrastructure
+- [**HLLM Training-Free GRPO**](https://github.com/zooai/papers/blob/main/hllm-training-free-grpo.tex): Hamiltonian LLM framework
+- [**Experience Ledger DSO**](https://github.com/zooai/papers/blob/main/dso_whitepaper/main.tex): Semantic memory system
+- [**ZIP-002 Zen Reranker**](https://github.com/zooai/papers/blob/main/zip-002-zen-reranker.tex): Cross-model ranking system
 
 ### Zen Language Models (Base Frontier Models)
 - [**Family Overview**](https://github.com/zenlm/papers/blob/main/zen_family_overview.tex): Complete Zen ecosystem (600M-480B params)
@@ -198,7 +198,7 @@ make clean
 
 **Cross-ecosystem citations**:
 - Hanzo: https://github.com/hanzoai/papers (ASO, DSO, HMM)
-- Zoo: https://github.com/zooai/gym/tree/main/papers (HLLM, DSO, Tokenomics)
+- Zoo: https://github.com/zooai/papers (HLLM, DSO, Tokenomics)
 - Zen: https://github.com/zenlm/papers (Efficient LLMs)
 
 ---
