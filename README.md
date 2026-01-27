@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/license-CC--BY--4.0-green)](LICENSE)
 
 **Post-Quantum Secure, High-Performance Blockchain Infrastructure**
-*By Lux Partners*
+*By Zach Kelling — Hanzo Industries | Lux Industries | Zoo Labs Foundation*
 
 📥 **[Download All PDFs](https://github.com/luxfi/papers/releases/latest)**
 
@@ -189,7 +189,7 @@ make clean
 ```bibtex
 @article{lux_papers_2025,
   title = {Lux Network: Comprehensive Research Papers Collection},
-  author = {Lux Partners},
+  author = {Kelling, Zach and {Hanzo Industries} and {Lux Industries} and {Zoo Labs Foundation}},
   journal = {arXiv preprint},
   year = {2025},
   url = {https://github.com/luxfi/papers}
@@ -205,11 +205,11 @@ make clean
 
 ## 📧 Contact
 
-- **Website**: https://lux.network
-- **Research**: research@lux.partners
-- **Security**: security@lux.partners
-- **Discord**: https://discord.gg/luxnetwork
-- **GitHub**: https://github.com/luxfi
+- **Lead Author**: Zach Kelling ([zach@lux.network](mailto:zach@lux.network))
+- **Organizations**: [Hanzo Industries](https://hanzo.ai) | [Lux Industries](https://lux.network) | [Zoo Labs Foundation](https://zoo.dev)
+- **Research**: [research@lux.network](mailto:research@lux.network)
+- **Security**: [security@lux.network](mailto:security@lux.network)
+- **GitHub**: [luxfi](https://github.com/luxfi) | [hanzoai](https://github.com/hanzoai) | [zooai](https://github.com/zooai)
 
 ---
 
