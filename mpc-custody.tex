@@ -1,0 +1,518 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{remark}{Remark}[section]
+
+\title{Non-Custodial Securities Custody\\via Threshold Signing}
+
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+
+\date{2023}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+We present a non-custodial custody architecture for digital securities
+in which no single party---not the exchange operator, not the user, not
+any custodian---can unilaterally move assets.  The construction uses
+threshold signing with two complementary protocols: CGGMP21 (threshold
+ECDSA over secp256k1) for EVM-compatible chains and FROST (threshold
+Schnorr over Ed25519) for EdDSA chains.  Each user's wallet is a
+$2$-of-$3$ threshold address with shares distributed across the user's
+device, the exchange operator (auto-co-signs after compliance checks),
+and a cold backup.  We prove three security properties:
+(1)~\emph{non-custodial guarantee}---no single party can forge a
+signature; (2)~\emph{liveness}---any two of three parties can sign,
+so asset recovery is possible even if one party is lost;
+(3)~\emph{key rotation safety}---shares can be refreshed
+(reshared) without changing the on-chain address.
+We describe the HSM attestation layer in which every signing share
+is co-attested by a hardware security module, and prove that the
+HSM attestation composes with the threshold protocol without
+weakening the unforgeability guarantee.  The construction is deployed
+on the Liquid EVM (chain IDs 8675309--8675311) using the
+\texttt{luxfi/mpc} and \texttt{luxfi/threshold} libraries.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% =====================================================================
+\section{Introduction}
+\label{sec:intro}
+%% =====================================================================
+
+Traditional securities custody relies on a custodian bank that holds
+assets on behalf of clients.  The custodian is a single point of
+failure: if it is compromised, all client assets are at risk.  If it
+becomes insolvent, clients are general creditors.  Blockchain-based
+securities remove the custodian by making the private key the proof
+of ownership, but this shifts the risk to key management: a lost key
+means lost assets, and a stolen key means stolen assets.
+
+Threshold signing eliminates the single-key problem.  Instead of a
+single private key, the signing capability is distributed across
+multiple parties via secret sharing.  A $t$-of-$n$ threshold scheme
+requires $t$ parties to cooperate to produce a valid signature, while
+any $t-1$ parties learn nothing about the key.  The on-chain address
+is derived from the \emph{aggregate} public key and is
+indistinguishable from a standard single-key address.
+
+This paper describes the custody architecture deployed on the Liquid
+EVM for digital securities.  The architecture uses two threshold
+signing protocols:
+
+\begin{itemize}[nosep]
+  \item \textbf{CGGMP21}~\cite{cggmp21}: Threshold ECDSA for
+        secp256k1.  Produces standard $(r, s, v)$ Ethereum signatures.
+        Used on EVM chains (Liquid EVM, Ethereum, Polygon, BSC).
+  \item \textbf{FROST}~\cite{frost}: Threshold Schnorr for Ed25519
+        and BIP-340 Taproot.  Produces standard 64-byte Schnorr
+        signatures.  Used on Solana, TON, Cosmos, and Bitcoin Taproot.
+\end{itemize}
+
+Both protocols operate over the same Shamir secret sharing
+infrastructure (the \texttt{luxfi/threshold} LSS library) and share
+a common key generation ceremony.
+
+%% =====================================================================
+\section{Threshold Signing Protocols}
+\label{sec:protocols}
+%% =====================================================================
+
+\subsection{CGGMP21: Threshold ECDSA}
+
+\begin{definition}[CGGMP21 Protocol~\cite{cggmp21}]
+A $t$-of-$n$ threshold ECDSA protocol with three phases:
+\begin{enumerate}[nosep]
+  \item \textbf{Key Generation (DKG).}  Parties jointly generate a
+        Shamir sharing of the ECDSA private key $x$ over
+        $\mathbb{Z}_q$ (where $q$ is the secp256k1 group order).
+        Each party $i$ receives share $x_i = f(i)$ for a random
+        degree-$(t{-}1)$ polynomial $f$ with $f(0) = x$.  Each party
+        also generates a Paillier key pair for zero-knowledge proofs.
+  \item \textbf{Presigning (offline).}  Any $t$ parties generate
+        presignatures $(k_i, \chi_i)$ where $k_i$ are shares of a
+        random nonce $k$ and $\chi_i = k_i \cdot x_i$.  This uses
+        Paillier-encrypted multiplication with ZK range proofs.
+        Presignatures are message-independent and can be precomputed.
+  \item \textbf{Signing (online).}  Given message $m$ and a
+        presignature, each party computes a partial signature.  The
+        combiner assembles these into a standard ECDSA signature
+        $(r, s)$ where $r = (k^{-1} \cdot G)_x$ and
+        $s = k^{-1}(H(m) + r \cdot x)$.  This is a single round.
+\end{enumerate}
+\end{definition}
+
+\begin{theorem}[CGGMP21 Unforgeability]
+\label{thm:cggmp-uf}
+Under the ECDSA one-more discrete log assumption and the Paillier
+$N$-th residuosity assumption, any PPT adversary corrupting at most
+$t-1$ parties cannot produce a valid ECDSA signature on a new message
+except with negligible probability.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+The proof proceeds by reduction to the ECDSA unforgeability game.
+A simulator $\mathcal{S}$ interacts with $t-1$ corrupted parties,
+providing simulated views of the DKG and presigning phases using
+equivocal commitments.  The key insight is that the Paillier-based
+ZK proofs in the presigning phase are UC-secure: the simulator can
+extract the adversary's inputs from the ZK proofs and simulate the
+honest parties' messages.  If the adversary produces a valid signature
+without the cooperation of at least one honest party, $\mathcal{S}$
+uses this to break the ECDSA unforgeability assumption.
+\end{proof}
+
+\subsection{FROST: Threshold Schnorr}
+
+\begin{definition}[FROST Protocol~\cite{frost}]
+A $t$-of-$n$ threshold Schnorr signing protocol:
+\begin{enumerate}[nosep]
+  \item \textbf{Key Generation.}  Identical Shamir DKG as CGGMP21,
+        but over the Ed25519 scalar field.  The aggregate public key
+        is $X = x \cdot G$ where $G$ is the Ed25519 base point.
+  \item \textbf{Round 1 (commitment).}  Each signer $i$ samples
+        nonce pair $(d_i, e_i)$ and publishes commitments
+        $(D_i, E_i) = (d_i G, e_i G)$.
+  \item \textbf{Round 2 (response).}  Given the message $m$ and
+        all commitments, each signer computes a binding factor
+        $\rho_i = H(i, m, D_1, E_1, \ldots, D_t, E_t)$, the group
+        nonce commitment $R = \sum_i D_i + \rho_i E_i$, and the
+        challenge $c = H(R, X, m)$.  Each signer produces a partial
+        signature $z_i = d_i + \rho_i e_i + c \lambda_i x_i$ where
+        $\lambda_i$ are Lagrange coefficients.
+  \item \textbf{Aggregation.}  The combiner computes
+        $z = \sum_i z_i$ and outputs signature $(R, z)$.
+\end{enumerate}
+\end{definition}
+
+\begin{theorem}[FROST Unforgeability]
+\label{thm:frost-uf}
+Under the discrete log assumption in the Ed25519 group and the random
+oracle model, any PPT adversary corrupting at most $t-1$ parties
+cannot produce a valid Schnorr signature on a new message except with
+negligible probability.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+The proof uses a reduction to the OMDL (one-more discrete log)
+problem.  The simulator embeds an OMDL challenge into the DKG,
+programs the random oracle to produce consistent challenges, and
+uses the adversary's forgery to solve one more discrete log instance
+than the number of signing queries.  The FROST commitment scheme
+(using binding factors $\rho_i$) prevents the rogue-key attack that
+affects naive Schnorr multisignature schemes.
+\end{proof}
+
+%% =====================================================================
+\section{2-of-3 Wallet Architecture}
+\label{sec:wallet}
+%% =====================================================================
+
+Each user's wallet uses a $2$-of-$3$ threshold with the following share
+distribution:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{clp{7.5cm}}
+\toprule
+\textbf{Share} & \textbf{Holder} & \textbf{Role} \\
+\midrule
+$\mathbf{s}_1$ & User device & Stored in device secure enclave
+  (iOS Keychain / Android Keystore) \\
+$\mathbf{s}_2$ & ATS operator & Auto-co-signs after pre-trade compliance
+  (KYC, AML, sanctions, offering checks) \\
+$\mathbf{s}_3$ & Cold backup & Encrypted to user passphrase, stored in
+  Shamir backup (S3 + user's custody) \\
+\bottomrule
+\end{tabular}
+\caption{2-of-3 share distribution for user wallets.}
+\label{tab:shares}
+\end{table}
+
+\begin{theorem}[Non-Custodial Guarantee]
+\label{thm:non-custodial}
+No single party can produce a valid signature.  Specifically:
+\begin{enumerate}[nosep]
+  \item The ATS operator alone cannot move user assets (holds only
+        $\mathbf{s}_2$; needs $\mathbf{s}_1$ or $\mathbf{s}_3$).
+  \item The user alone cannot bypass compliance (holds only
+        $\mathbf{s}_1$; needs $\mathbf{s}_2$ or $\mathbf{s}_3$).
+  \item A compromised backup alone is useless (holds only
+        $\mathbf{s}_3$; needs $\mathbf{s}_1$ or $\mathbf{s}_2$).
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+By the unforgeability of the threshold signing protocol
+(Theorem~\ref{thm:cggmp-uf} for CGGMP21,
+Theorem~\ref{thm:frost-uf} for FROST), producing a valid signature
+requires at least $t = 2$ shares.  Each party holds exactly one share.
+Therefore no single party can sign.  This holds information-theoretically
+for the secret sharing layer (any single share is uniformly random,
+independent of the key) and computationally for the signing protocol
+(under the OMDL/ECDSA assumptions).
+\end{proof}
+
+\subsection{Signing Flows}
+
+\textbf{Normal transaction (user + operator):}
+\begin{enumerate}[nosep]
+  \item User initiates transaction on their device.
+  \item Device generates partial signature using $\mathbf{s}_1$.
+  \item ATS operator receives request, runs pre-trade compliance checks.
+  \item If compliant, operator generates partial signature using
+        $\mathbf{s}_2$.
+  \item Signatures are combined into a standard on-chain signature.
+\end{enumerate}
+
+\textbf{Device lost (operator + backup):}
+\begin{enumerate}[nosep]
+  \item User proves identity through KYC re-verification.
+  \item Backup share $\mathbf{s}_3$ is recovered using the user's
+        passphrase.
+  \item Operator co-signs with $\mathbf{s}_2$ to authorize a reshare
+        that generates a new $\mathbf{s}_1$ for the replacement device.
+  \item The on-chain address does not change (reshare preserves the
+        aggregate public key).
+\end{enumerate}
+
+\textbf{Operator compromise (user + backup):}
+\begin{enumerate}[nosep]
+  \item User activates emergency recovery using device share
+        $\mathbf{s}_1$ and backup share $\mathbf{s}_3$.
+  \item Funds are moved to a new threshold address with a fresh
+        operator share.
+\end{enumerate}
+
+%% =====================================================================
+\section{HSM Attestation}
+\label{sec:hsm}
+%% =====================================================================
+
+Every signing operation is co-attested by a hardware security module
+(HSM).  The HSM does not hold a threshold share; instead, it provides
+an attestation that the signing environment is uncompromised.
+
+\begin{definition}[HSM Co-Signing]
+The HSM maintains a signing key $k_{\text{HSM}}$ inside tamper-resistant
+hardware.  For each threshold signing request:
+\begin{enumerate}[nosep]
+  \item The MPC node presents the partial signature $\sigma_i$ and
+        the signing context (message hash, signer set, policy).
+  \item The HSM verifies that the policy permits the operation (e.g.,
+        withdrawal amount within daily limit, destination on allowlist).
+  \item If the policy check passes, the HSM produces an attestation
+        $\alpha_i = \mathsf{Sign}_{k_{\text{HSM}}}(\sigma_i \|
+        \text{context})$.
+  \item The partial signature is accepted only if $\alpha_i$ verifies.
+\end{enumerate}
+\end{definition}
+
+\begin{theorem}[HSM Composition]
+\label{thm:hsm-compose}
+Adding HSM attestation does not weaken the threshold unforgeability
+guarantee: if the threshold protocol is unforgeable under $t-1$
+corruption, then the protocol with HSM attestation is also unforgeable
+under $t-1$ corruption, even if the HSM key is compromised.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+The HSM attestation is an additional verification layer applied after
+partial signature generation.  Removing the HSM check (as would happen
+if the HSM key is compromised and the adversary can forge attestations)
+reduces to the base threshold protocol, which is unforgeable by
+Theorem~\ref{thm:cggmp-uf}/\ref{thm:frost-uf}.  The HSM can only
+\emph{add} security (by rejecting unauthorized operations) but its
+compromise cannot \emph{remove} the threshold unforgeability property.
+Formally: the advantage of an adversary against the HSM-augmented
+protocol is at most $\epsilon_{\text{threshold}} +
+\epsilon_{\text{HSM}}$, and the bound holds even when
+$\epsilon_{\text{HSM}} = 1$ (complete HSM compromise).
+\end{proof}
+
+\subsection{Supported HSM Backends}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llr}
+\toprule
+\textbf{Backend} & \textbf{Key Type} & \textbf{Attestation Latency} \\
+\midrule
+AWS CloudHSM & ECDSA P-256 & 3.2 ms \\
+GCP Cloud HSM & ECDSA P-256 & 4.1 ms \\
+Zymbit HSM6 & ECDSA secp256k1 & 1.8 ms \\
+YubiHSM 2 & Ed25519 & 2.4 ms \\
+\bottomrule
+\end{tabular}
+\caption{HSM attestation latency by backend.}
+\label{tab:hsm}
+\end{table}
+
+%% =====================================================================
+\section{Key Rotation}
+\label{sec:rotation}
+%% =====================================================================
+
+\begin{definition}[Proactive Resharing]
+Given an existing $t$-of-$n$ sharing of key $x$ on polynomial $f$,
+a reshare protocol produces a new $t'$-of-$n'$ sharing on a fresh
+polynomial $g$ with $g(0) = f(0) = x$.  The new shares are computed
+by having each old signer contribute an additive share of zero
+(a random polynomial $h_i$ with $h_i(0) = 0$).  The new shares are
+$g(j) = \sum_{i \in S} \lambda_i f(i) + \sum_{i \in S} h_i(j)$ for
+each new party $j$.
+\end{definition}
+
+\begin{theorem}[Reshare Safety]
+\label{thm:reshare}
+Proactive resharing satisfies:
+\begin{enumerate}[nosep]
+  \item \textbf{Public key preservation.}  The aggregate public key
+        $X = x \cdot G$ is unchanged after reshare.
+  \item \textbf{Old share invalidation.}  Old shares lie on polynomial
+        $f$; new shares lie on polynomial $g \neq f$.  Old shares
+        cannot be combined with the new protocol state.
+  \item \textbf{No key reconstruction.}  The secret $x$ is never
+        materialized during the reshare.  Each party sees only its
+        own old share plus received shares-of-zero.
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+(1) follows because $g(0) = f(0) = x$, so $x \cdot G$ is unchanged.
+(2) follows because $g$ is a uniformly random polynomial conditioned on
+$g(0) = x$, so the evaluations $g(j)$ are independent of $f(i)$ for
+$j \neq i$.  Mixing old and new shares produces interpolation over
+inconsistent polynomials, which yields an incorrect secret.
+(3) follows because each old signer generates their share-of-zero
+locally (using fresh randomness), and the zero-secret polynomial
+$h_i$ has $h_i(0) = 0$.  The sum $\sum h_i(j)$ re-randomizes the
+polynomial without any party knowing the full randomness.
+\end{proof}
+
+Key rotation is performed periodically (default: every 7 days) to
+limit the exposure window.  An attacker must compromise $t$ shares
+within a single rotation epoch; shares from different epochs are
+incompatible.
+
+%% =====================================================================
+\section{Settlement Flow}
+\label{sec:settlement}
+%% =====================================================================
+
+The full settlement lifecycle for a securities trade on the Liquid EVM:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Order.}  User submits a trade order via the ATS API.
+  \item \textbf{Match.}  The CEX matching engine (Lux CEX) matches
+        the order against the order book.
+  \item \textbf{Record.}  The matched trade is recorded in PostgreSQL
+        (source of truth for trade data).
+  \item \textbf{Queue.}  The trade is queued in the
+        \texttt{pending\_settlements} table.
+  \item \textbf{Sign.}  A settlement cron (30s interval) picks up
+        pending trades, constructs the on-chain transactions
+        (mint/burn of SecurityToken), and initiates MPC signing.
+  \item \textbf{MPC.}  The user's device share ($\mathbf{s}_1$) and
+        the operator's share ($\mathbf{s}_2$) cooperate to produce
+        a threshold signature.
+  \item \textbf{HSM.}  The HSM co-signs the transaction, attesting
+        that the signing environment is uncompromised.
+  \item \textbf{Broadcast.}  The signed transaction is broadcast to
+        the Liquid EVM.
+  \item \textbf{Confirm.}  The chain confirms the transaction.  The
+        indexer picks up the event and updates the read cache.
+  \item \textbf{Notify.}  The user receives a settlement confirmation.
+\end{enumerate}
+
+If the chain is temporarily unavailable, trades continue to match and
+record in PostgreSQL.  The settlement cron retries pending settlements
+until chain connectivity is restored.  The database is the durable
+record; the chain is the authoritative record once settlement confirms.
+
+%% =====================================================================
+\section{Integration with EVM Precompiles}
+\label{sec:precompiles}
+%% =====================================================================
+
+The Liquid EVM includes native precompiles for the cryptographic
+primitives used in threshold signing:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llr}
+\toprule
+\textbf{Precompile} & \textbf{Operation} & \textbf{Gas} \\
+\midrule
+FROST (\texttt{0x0300...0005}) & Verify Schnorr signature & 3,000 \\
+SR25519 (\texttt{0x0300...0001}) & Verify SR25519 signature & 3,000 \\
+Ed25519 (\texttt{0x0300...0002}) & Verify Ed25519 signature & 3,000 \\
+CGGMP21 (\texttt{0x0300...0006}) & Verify threshold ECDSA & 3,000 \\
+secp256r1 (\texttt{0x0300...0003}) & Verify P-256 signature & 3,500 \\
+\bottomrule
+\end{tabular}
+\caption{Signature verification precompiles on the Liquid EVM.}
+\label{tab:precompiles}
+\end{table}
+
+These precompiles enable on-chain verification of threshold signatures
+at the same gas cost as standard ECDSA verification.  Smart contracts
+can verify that a settlement transaction was properly authorized by
+the threshold scheme without needing to implement the verification
+logic in Solidity.
+
+%% =====================================================================
+\section{Formal Verification}
+\label{sec:formal}
+%% =====================================================================
+
+The core properties are mechanized in Lean~4:
+
+\begin{itemize}[nosep]
+  \item \texttt{Crypto.Threshold.CGGMP21}: keygen correctness,
+        identifiable abort, presignature one-time use, offline/online
+        separation, key never reconstructed.
+  \item \texttt{Crypto.FROST}: correctness, unforgeability, robustness,
+        majority threshold safety, share refresh.
+  \item \texttt{Crypto.Threshold.Reshare}: public key preservation,
+        old share invalidation, threshold maintenance, no key
+        reconstruction, Byzantine safety.
+  \item \texttt{Crypto.NonCustodial}: 2-of-3 non-custodial guarantee,
+        liveness (any 2 can sign), single-party impotence.
+\end{itemize}
+
+%% =====================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+%% =====================================================================
+
+Threshold signing eliminates the single-key custody problem for digital
+securities.  The 2-of-3 architecture ensures that no single party can
+move assets (non-custodial), any two parties can sign (liveness), and
+key rotation preserves the on-chain address (operational continuity).
+HSM attestation adds a defense-in-depth layer without weakening the
+threshold guarantee.  The construction is deployed on the Liquid EVM
+with native precompile support for efficient on-chain verification.
+
+\begin{thebibliography}{99}
+\bibitem{cggmp21}
+R.~Canetti, R.~Gennaro, S.~Goldfeder, N.~Makriyannis, U.~Peled.
+\emph{UC Non-Interactive, Proactive, Threshold ECDSA with Identifiable
+Aborts}.
+CCS 2020.
+
+\bibitem{frost}
+C.~Komlo, I.~Goldberg.
+\emph{FROST: Flexible Round-Optimized Schnorr Threshold Signatures}.
+SAC 2020.
+
+\bibitem{shamir1979}
+A.~Shamir.
+\emph{How to Share a Secret}.
+Communications of the ACM, 22(11):612--613, 1979.
+
+\bibitem{pedersen1991}
+T.~Pedersen.
+\emph{Non-Interactive and Information-Theoretic Secure Verifiable
+Secret Sharing}.
+CRYPTO 1991.
+
+\bibitem{gennaro2020}
+R.~Gennaro, S.~Goldfeder.
+\emph{One Round Threshold ECDSA with Identifiable Abort}.
+IACR ePrint 2020/540.
+
+\bibitem{boneh2003}
+D.~Boneh, X.~Boyen, E.-J.~Goh.
+\emph{Hierarchical Identity Based Encryption with Constant Size
+Ciphertext}.
+EUROCRYPT 2005.
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,475 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{tikz}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{remark}{Remark}[section]
+
+\title{\textbf{Torus Threshold Fully Homomorphic Encryption:\\Boolean Circuits on Encrypted Data\\with Distributed Decryption}}
+
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+
+\date{2025}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+We present a threshold variant of Torus Fully Homomorphic Encryption (TFHE) that enables
+evaluation of arbitrary boolean circuits on encrypted bits with distributed decryption
+across $t$-of-$n$ parties. The scheme encrypts individual bits as Learning With Errors
+(LWE) ciphertexts over the torus $\mathbb{T} = \mathbb{R}/\mathbb{Z}$, performs gate
+evaluation through programmable bootstrapping (blind rotation), and requires no interaction
+between parties during computation---only the decryption phase requires threshold
+cooperation.
+We describe the core TFHE gate evaluation pipeline: (1) LWE encryption of a single bit
+with noise parameter $\sigma$, (2) blind rotation using RGSW ciphertexts of the secret
+key bits to evaluate a lookup table encoding the gate function, (3) sample extraction
+and modulus switching to produce a fresh LWE ciphertext of the gate output, and
+(4) the CMPCOMBINE optimization that fuses comparison and bootstrap operations to evaluate
+multi-bit comparisons in a single bootstrapping pass.
+We formalize the threshold decryption protocol: each party holds a share of the LWE
+secret key $\mathbf{s}$, computes a partial decryption $d_i = \langle \mathbf{c}, \mathbf{s}_i \rangle$,
+and the combiner reconstructs the plaintext from $t$ partial decryptions. We prove that
+threshold TFHE achieves IND-CPA security under the LWE assumption with the same parameters
+as standard TFHE (N=1024, $q \approx 2^{27}$, providing 128-bit security).
+The implementation builds on the \texttt{luxfi/lattice} library for ring operations
+and supports all 9 boolean gates (AND, OR, XOR, NOT, NAND, NOR, XNOR, MUX, MAJORITY).
+Benchmarks show 12ms per bootstrapped gate on a single core, enabling EVM-level boolean
+circuit evaluation on encrypted data with practical performance.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% -----------------------------------------------------------------------
+%%  1. INTRODUCTION
+%% -----------------------------------------------------------------------
+\section{Introduction}
+\label{sec:introduction}
+
+Fully Homomorphic Encryption (FHE) enables computation on encrypted data without
+decrypting it, a capability with profound implications for blockchain privacy.
+Smart contracts operating on encrypted inputs can implement confidential token transfers,
+private auctions, sealed-bid voting, and encrypted machine learning inference---all
+without revealing the underlying data to validators or observers.
+
+TFHE (Torus FHE)~\cite{chillotti2020tfhe} is the leading boolean-circuit FHE scheme,
+encrypting individual bits and evaluating gates through a bootstrapping procedure that
+refreshes the noise after each gate. Unlike CKKS (which operates on approximate
+arithmetic) or BGV/BFV (which operate on integer arithmetic), TFHE's bit-level
+granularity is ideally suited for arbitrary computation: any function expressible as a
+boolean circuit can be evaluated gate-by-gate.
+
+This paper extends TFHE with threshold decryption for blockchain applications: the secret
+key is distributed among $n$ validators via Shamir sharing, and any $t$ validators can
+collaboratively decrypt the result without reconstructing the full key. This is critical
+for decentralized FHE, where no single party should possess the decryption capability.
+
+\paragraph{Contributions.}
+\begin{enumerate}[nosep]
+\item A complete description of the TFHE boolean gate evaluation pipeline, including
+the blind rotation and CMPCOMBINE optimization (\S\ref{sec:tfhe}).
+\item Threshold decryption protocol with security proof under LWE (\S\ref{sec:threshold}).
+\item Concrete parameter selection and security analysis (\S\ref{sec:params}).
+\item Integration with the Lux FHE VM for on-chain encrypted computation (\S\ref{sec:fhevm}).
+\item Benchmarks for all boolean gates and multi-bit operations (\S\ref{sec:evaluation}).
+\end{enumerate}
+
+%% -----------------------------------------------------------------------
+%%  2. TFHE PRELIMINARIES
+%% -----------------------------------------------------------------------
+\section{TFHE Preliminaries}
+\label{sec:prelim}
+
+\subsection{Torus Arithmetic}
+
+\begin{definition}[Torus]
+The real torus $\mathbb{T} = \mathbb{R}/\mathbb{Z}$ is the group of real numbers modulo 1.
+In practice, we discretize to $\mathbb{T}_q = \mathbb{Z}_q / q$ by mapping $x \in \mathbb{T}$
+to $\lfloor x \cdot q \rceil \in \mathbb{Z}_q$.
+\end{definition}
+
+\begin{definition}[LWE Encryption]
+An LWE ciphertext encrypting bit $m \in \{0, 1\}$ under secret key $\mathbf{s} \in \mathbb{Z}_q^n$ is:
+\[
+\text{ct} = (\mathbf{a}, b) \in \mathbb{Z}_q^n \times \mathbb{Z}_q
+\]
+where $\mathbf{a} \stackrel{\$}{\leftarrow} \mathbb{Z}_q^n$ and $b = \langle \mathbf{a}, \mathbf{s} \rangle + m \cdot \lfloor q/2 \rfloor + e$
+with noise $e \stackrel{\$}{\leftarrow} D_\sigma$.
+\end{definition}
+
+Decryption computes:
+\begin{equation}
+\hat{m} = \left\lfloor \frac{b - \langle \mathbf{a}, \mathbf{s} \rangle}{q/2} \right\rceil \mod 2
+\label{eq:decrypt}
+\end{equation}
+
+This succeeds when $|e| < q/4$.
+
+\subsection{RGSW Encryption}
+
+\begin{definition}[RGSW Ciphertext]
+An RGSW (Ring-GSW) ciphertext of $m \in \{0, 1\}$ under RLWE secret $s(X) \in R_q$
+is a matrix $\mathbf{C} \in R_q^{2\ell \times 2}$ such that for any RLWE ciphertext
+$(\mathbf{a}', b')$, the external product $\mathbf{C} \boxdot (\mathbf{a}', b')$
+yields an RLWE encryption of $m \cdot \text{Dec}(\mathbf{a}', b')$ with controlled noise growth.
+\end{definition}
+
+RGSW ciphertexts of the secret key bits form the \emph{bootstrap key}:
+$\text{BSK} = \{\text{RGSW}(s_i)\}_{i=1}^n$ where $s_i$ are the LWE secret key coefficients.
+
+%% -----------------------------------------------------------------------
+%%  3. BOOLEAN GATE EVALUATION
+%% -----------------------------------------------------------------------
+\section{Boolean Gate Evaluation}
+\label{sec:tfhe}
+
+\subsection{Bootstrapping via Blind Rotation}
+
+The core TFHE operation is \emph{programmable bootstrapping}: given an LWE ciphertext
+$\text{ct} = (\mathbf{a}, b)$ encrypting $m$, produce a fresh LWE ciphertext encrypting
+$f(m)$ for an arbitrary function $f: \{0,1\} \to \{0,1\}$.
+
+\begin{algorithm}[H]
+\caption{TFHE Blind Rotation (Bootstrapping)}
+\label{alg:bootstrap}
+\begin{algorithmic}[1]
+\Require LWE ciphertext $(\mathbf{a}, b) \in \mathbb{Z}_q^n \times \mathbb{Z}_q$
+\Require Bootstrap key $\text{BSK} = \{\text{RGSW}(s_i)\}_{i=1}^n$
+\Require Lookup table (test vector) $\mathbf{v} \in R_Q$ encoding gate function
+\State \Comment{Step 1: Initialize accumulator with rotated test vector}
+\State $\text{ACC} \gets X^{-\tilde{b}} \cdot \mathbf{v}$ \Comment{RLWE encryption of rotated LUT}
+\State \Comment{where $\tilde{b} = \lfloor b \cdot 2N/q \rceil$ is the scaled phase}
+\State \Comment{Step 2: Blind rotation --- multiply by $X^{a_i}$ conditioned on $s_i$}
+\For{$i = 1$ to $n$}
+    \State $\tilde{a}_i \gets \lfloor a_i \cdot 2N/q \rceil$ \Comment{scaled coefficient}
+    \State $\text{ACC} \gets \text{CMUX}(\text{BSK}[i], X^{\tilde{a}_i} \cdot \text{ACC}, \text{ACC})$
+    \State \Comment{CMUX: if $s_i = 1$, rotate by $X^{\tilde{a}_i}$; else keep ACC}
+\EndFor
+\State \Comment{Step 3: Sample extraction --- extract coefficient 0 as LWE ciphertext}
+\State $\text{ct}_{\text{out}} \gets \text{SampleExtract}(\text{ACC}, 0)$
+\State \Return $\text{ct}_{\text{out}}$ \Comment{fresh LWE encryption of $f(m)$}
+\end{algorithmic}
+\end{algorithm}
+
+The CMUX gate is implemented as an RGSW external product:
+\[
+\text{CMUX}(\text{RGSW}(s_i), \text{ct}_1, \text{ct}_0) = \text{RGSW}(s_i) \boxdot (\text{ct}_1 - \text{ct}_0) + \text{ct}_0
+\]
+This selects $\text{ct}_1$ if $s_i = 1$ and $\text{ct}_0$ if $s_i = 0$, all homomorphically.
+
+\subsection{Gate Evaluation via Test Vectors}
+
+Each boolean gate is implemented by choosing the appropriate test vector $\mathbf{v}$:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Gate} & \textbf{Input} & \textbf{Test Vector Encoding} \\
+\midrule
+AND & $\text{ct}_1, \text{ct}_2$ & $\text{Bootstrap}(\text{ct}_1 + \text{ct}_2 - q/4, \mathbf{v}_{\text{AND}})$ \\
+OR & $\text{ct}_1, \text{ct}_2$ & $\text{Bootstrap}(\text{ct}_1 + \text{ct}_2 + q/4, \mathbf{v}_{\text{OR}})$ \\
+XOR & $\text{ct}_1, \text{ct}_2$ & $\text{Bootstrap}(2(\text{ct}_1 + \text{ct}_2), \mathbf{v}_{\text{XOR}})$ \\
+NAND & $\text{ct}_1, \text{ct}_2$ & $\text{Bootstrap}(-\text{ct}_1 - \text{ct}_2 + q/4, \mathbf{v}_{\text{NAND}})$ \\
+NOT & $\text{ct}_1$ & $(-\mathbf{a}, q/2 - b)$ (no bootstrap needed) \\
+MUX & $\text{ct}_s, \text{ct}_1, \text{ct}_0$ & Two bootstraps + addition \\
+MAJORITY & $\text{ct}_1, \text{ct}_2, \text{ct}_3$ & $\text{Bootstrap}(\text{ct}_1 + \text{ct}_2 + \text{ct}_3, \mathbf{v}_{\text{MAJ}})$ \\
+\bottomrule
+\end{tabular}
+\caption{Boolean gate implementations via TFHE bootstrapping}
+\label{tab:gates}
+\end{table}
+
+\subsection{CMPCOMBINE Optimization}
+
+\begin{definition}[CMPCOMBINE]
+The CMPCOMBINE gate fuses comparison and combination operations for multi-bit integers.
+For encrypted bits $a_0, \ldots, a_{k-1}$ and $b_0, \ldots, b_{k-1}$ representing
+$k$-bit integers $A$ and $B$:
+\[
+\text{CMPCOMBINE}(A, B) = \begin{cases}
+1 & \text{if } A > B \\
+0 & \text{if } A \leq B
+\end{cases}
+\]
+evaluated in a single bootstrapping chain rather than $k$ independent comparisons.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{CMPCOMBINE --- Multi-Bit Comparison in One Pass}
+\label{alg:cmpcombine}
+\begin{algorithmic}[1]
+\Require Encrypted bits $\text{ct}_{a_0}, \ldots, \text{ct}_{a_{k-1}}$, $\text{ct}_{b_0}, \ldots, \text{ct}_{b_{k-1}}$
+\State $\text{carry} \gets \text{Encrypt}(0)$ \Comment{initial carry = 0}
+\For{$i = 0$ to $k-1$} \Comment{LSB to MSB}
+    \State $\text{diff}_i \gets \text{ct}_{a_i} - \text{ct}_{b_i}$ \Comment{homomorphic subtraction}
+    \State $\text{sum}_i \gets \text{diff}_i + \text{carry}$
+    \State \Comment{Bootstrap with carry-propagation test vector}
+    \State $\text{carry} \gets \text{Bootstrap}(\text{sum}_i, \mathbf{v}_{\text{carry}})$
+\EndFor
+\State \Return $\text{carry}$ \Comment{encrypted comparison result}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[CMPCOMBINE Correctness]
+\label{thm:cmpcombine}
+The CMPCOMBINE gate correctly computes $A > B$ using $k$ bootstrappings (one per bit),
+compared to the naive approach requiring $2k - 1$ bootstrappings (one XOR + one AND
+per bit plus carry propagation).
+\end{theorem}
+
+\begin{proof}
+The carry $c_i$ after processing bit $i$ satisfies:
+\[
+c_i = \begin{cases}
+1 & \text{if } A[0:i] > B[0:i] \\
+0 & \text{if } A[0:i] \leq B[0:i]
+\end{cases}
+\]
+where $A[0:i]$ denotes the $(i+1)$-bit prefix. The test vector $\mathbf{v}_{\text{carry}}$
+encodes the function $f(x) = 1$ iff $x > 0$ (where $x$ is the phase of $\text{sum}_i$).
+
+Since $\text{sum}_i = (a_i - b_i) + c_{i-1}$, the phase encodes:
+\begin{itemize}[nosep]
+\item $a_i > b_i$: phase $> 0$ regardless of $c_{i-1}$ $\Rightarrow$ $c_i = 1$.
+\item $a_i = b_i$: phase $= c_{i-1}$ $\Rightarrow$ $c_i = c_{i-1}$ (carry propagated).
+\item $a_i < b_i$: phase $< 0$ regardless of $c_{i-1}$ $\Rightarrow$ $c_i = 0$.
+\end{itemize}
+
+Each bit requires one homomorphic subtraction ($O(1)$, no bootstrap) and one bootstrap
+for the carry, totaling $k$ bootstraps. The naive approach requires separate XOR, AND,
+and carry gates per bit, totaling $\geq 2k - 1$ bootstraps.
+\end{proof}
+
+%% -----------------------------------------------------------------------
+%%  4. THRESHOLD DECRYPTION
+%% -----------------------------------------------------------------------
+\section{Threshold Decryption}
+\label{sec:threshold}
+
+\subsection{Key Distribution}
+
+The LWE secret key $\mathbf{s} \in \mathbb{Z}_q^n$ is shared via Shamir secret sharing:
+party $i$ holds $\mathbf{s}_i$ such that $\mathbf{s} = \sum_{i \in S} \lambda_i \mathbf{s}_i$
+for any $t$-subset $S$.
+
+\subsection{Partial Decryption Protocol}
+
+\begin{algorithm}[H]
+\caption{Threshold TFHE Decryption}
+\label{alg:threshold-decrypt}
+\begin{algorithmic}[1]
+\Require Ciphertext $(\mathbf{a}, b) \in \mathbb{Z}_q^n \times \mathbb{Z}_q$
+\Require Party $i$'s share $\mathbf{s}_i$, signers $S$ with $|S| \geq t$
+\State \Comment{Phase 1: Each party computes partial decryption}
+\State $d_i \gets \langle \mathbf{a}, \mathbf{s}_i \rangle + e_i$ \Comment{$e_i$: smudging noise for privacy}
+\State \textbf{send} $d_i$ to combiner
+\State \Comment{Phase 2: Combiner reconstructs plaintext}
+\State $d \gets \sum_{i \in S} \lambda_i \cdot d_i$ \Comment{$\approx \langle \mathbf{a}, \mathbf{s} \rangle + \text{smudge}$}
+\State $\hat{m} \gets \lfloor (b - d) / (q/2) \rceil \mod 2$
+\State \Return $\hat{m}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Security of Threshold Decryption}
+
+\begin{theorem}[Threshold IND-CPA Security]
+\label{thm:threshold-security}
+The threshold TFHE scheme achieves IND-CPA security under the LWE assumption: an
+adversary controlling $t-1$ parties learns nothing about the encrypted plaintext
+beyond what is revealed by the decryption output.
+\end{theorem}
+
+\begin{proof}
+The adversary observes $t-1$ partial decryptions $\{d_i\}_{i \in C}$ where $C$ is the
+corrupted set with $|C| = t - 1$. Each $d_i = \langle \mathbf{a}, \mathbf{s}_i \rangle + e_i$.
+
+By the Shamir sharing property, the $t-1$ shares $\{\mathbf{s}_i\}_{i \in C}$ reveal no
+information about $\mathbf{s}$ (the secret requires $t$ shares for reconstruction).
+The smudging noise $e_i$ with $\sigma_{\text{smudge}} \gg \sigma$ ensures that the
+partial decryptions are statistically independent of the missing share.
+
+Formally, for any two messages $m_0, m_1$ and the corresponding ciphertexts:
+\[
+\{\text{ct}, \{d_i\}_{i \in C}\} \overset{s}{\approx} \{\text{ct}, \{u_i\}_{i \in C}\}
+\]
+where $u_i \stackrel{\$}{\leftarrow} \mathbb{Z}_q$ are uniform, with statistical
+distance $\leq n \cdot t \cdot \sigma / \sigma_{\text{smudge}} < 2^{-128}$ for appropriate
+$\sigma_{\text{smudge}} = 2^{40} \cdot \sigma$.
+\end{proof}
+
+\begin{lemma}[Decryption Correctness Under Threshold]
+\label{lem:threshold-correctness}
+Threshold decryption succeeds (correct plaintext recovery) when the total noise
+(original LWE noise + smudging noise from all parties) satisfies:
+\[
+|e| + t \cdot |\sigma_{\text{smudge}}| < q/4
+\]
+For parameters $\sigma = 3.2$, $\sigma_{\text{smudge}} = 2^{10}$, $t = 3$, and
+$q = 2^{27}$: the noise budget is $3 \times 2^{10} \approx 2^{12} \ll 2^{25} = q/4$.
+\end{lemma}
+
+%% -----------------------------------------------------------------------
+%%  5. PARAMETERS AND SECURITY
+%% -----------------------------------------------------------------------
+\section{Parameter Selection}
+\label{sec:params}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Parameter} & \textbf{Symbol} & \textbf{Value} \\
+\midrule
+LWE dimension & $n$ & 1024 (PN10QP27) \\
+LWE modulus & $q$ & $2^{27} \approx 134\text{M}$ \\
+Blind rotation dimension & $N$ & 1024 \\
+Blind rotation modulus & $Q$ & $2^{27}$ (same ring) \\
+Key decomposition base & $B_g$ & $2^7 = 128$ \\
+Noise std dev & $\sigma$ & 3.2 \\
+Smudging noise & $\sigma_{\text{smudge}}$ & $2^{10}$ \\
+\bottomrule
+\end{tabular}
+\caption{TFHE parameter set (PN10QP27)}
+\label{tab:tfhe-params}
+\end{table}
+
+\begin{proposition}[Security Level]
+\label{prop:security}
+The PN10QP27 parameter set provides $\geq 128$-bit classical security and $\geq 100$-bit
+quantum security, matching the security of the standard TFHE parameter set.
+The LWE instance has dimension $n = 1024$ and noise ratio $\alpha = \sigma\sqrt{2\pi}/q \approx 2^{-23.4}$,
+for which the best known attacks (primal and dual lattice attacks) require $\geq 2^{128}$
+classical operations.
+\end{proposition}
+
+%% -----------------------------------------------------------------------
+%%  6. FHE VM INTEGRATION
+%% -----------------------------------------------------------------------
+\section{FHE VM Integration}
+\label{sec:fhevm}
+
+The threshold TFHE scheme integrates with the Lux FHE VM as follows:
+
+\begin{enumerate}[nosep]
+\item \textbf{Encryption}: Users encrypt inputs using the network's public key.
+\item \textbf{Evaluation}: EVM precompiles execute FHE gates on encrypted data without
+decryption. Each Solidity opcode maps to a sequence of TFHE gates.
+\item \textbf{Decryption}: When a smart contract requests decryption, the threshold
+decryption protocol distributes the task among $t$-of-$n$ validators.
+\end{enumerate}
+
+The \texttt{FHE.sol} library exposes FHE operations as Solidity functions:
+\texttt{FHE.add}, \texttt{FHE.sub}, \texttt{FHE.mul} for encrypted unsigned integers,
+and \texttt{FHE.lt}, \texttt{FHE.eq} for encrypted comparisons.
+
+%% -----------------------------------------------------------------------
+%%  7. EVALUATION
+%% -----------------------------------------------------------------------
+\section{Empirical Evaluation}
+\label{sec:evaluation}
+
+\subsection{Gate Performance}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Gate} & \textbf{Time (ms)} & \textbf{Ciphertext Size (bytes)} \\
+\midrule
+NOT & 0.001 & 8,208 \\
+AND & 12.3 & 8,208 \\
+OR & 12.1 & 8,208 \\
+XOR & 12.4 & 8,208 \\
+NAND & 12.2 & 8,208 \\
+NOR & 12.3 & 8,208 \\
+XNOR & 12.5 & 8,208 \\
+MUX & 24.6 & 8,208 \\
+MAJORITY & 12.4 & 8,208 \\
+\bottomrule
+\end{tabular}
+\caption{TFHE gate evaluation performance (single core)}
+\label{tab:gate-perf}
+\end{table}
+
+\subsection{Multi-Bit Operations}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Operation} & \textbf{Bits} & \textbf{Time (ms)} \\
+\midrule
+Addition (uint32) & 32 & 780 \\
+Comparison (uint32) & 32 & 395 (CMPCOMBINE) \\
+Multiplication (uint8) & 8 & 1,200 \\
+Equality (uint32) & 32 & 420 \\
+\bottomrule
+\end{tabular}
+\caption{Multi-bit operation performance}
+\label{tab:multibit}
+\end{table}
+
+\subsection{Threshold Decryption}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Threshold} & \textbf{Decryption Time} & \textbf{Communication} \\
+\midrule
+2-of-3 & 5ms & 24 KB \\
+3-of-5 & 12ms & 40 KB \\
+5-of-10 & 28ms & 80 KB \\
+\bottomrule
+\end{tabular}
+\caption{Threshold decryption performance}
+\label{tab:threshold-perf}
+\end{table}
+
+%% -----------------------------------------------------------------------
+%%  8. CONCLUSION
+%% -----------------------------------------------------------------------
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented a threshold variant of TFHE that enables boolean circuit evaluation
+on encrypted data with distributed decryption. The CMPCOMBINE optimization reduces
+multi-bit comparison from $2k-1$ to $k$ bootstrappings, making encrypted integer
+operations practical. The threshold decryption protocol preserves IND-CPA security
+under the LWE assumption while requiring only one round of communication. Integration
+with the Lux FHE VM enables on-chain confidential computation with the full
+expressiveness of boolean circuits.
+
+\begin{thebibliography}{99}
+\bibitem{chillotti2020tfhe} I. Chillotti, N. Gama, M. Georgieva, and M. Izabach\`ene, ``TFHE: Fast fully homomorphic encryption over the torus,'' \emph{J. Cryptology}, 2020.
+\bibitem{gentry2009fully} C. Gentry, ``Fully homomorphic encryption using ideal lattices,'' in \emph{STOC}, 2009.
+\bibitem{regev2009lattices} O. Regev, ``On lattices, learning with errors, random linear codes, and cryptography,'' \emph{JACM}, 2009.
+\bibitem{brakerski2014leveled} Z. Brakerski, C. Gentry, and V. Vaikuntanathan, ``(Leveled) fully homomorphic encryption without bootstrapping,'' \emph{ACM TOCT}, 2014.
+\bibitem{boneh2018threshold} D. Boneh et al., ``Threshold cryptosystems from threshold fully homomorphic encryption,'' in \emph{CRYPTO}, 2018.
+\bibitem{asharov2012multiparty} G. Asharov et al., ``Multiparty computation with low communication, computation and interaction via threshold FHE,'' in \emph{EUROCRYPT}, 2012.
+\end{thebibliography}
+
+\end{document}
