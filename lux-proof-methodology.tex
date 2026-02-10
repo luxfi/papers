@@ -1,0 +1,285 @@
+\documentclass[11pt]{article}
+\usepackage{shared/luxcover}
+\usepackage{amsmath, amssymb, algpseudocode, graphicx, hyperref, booktabs}
+
+\title{Security Proof Obligations, Red-Team Methodology, and Verification Strategy}
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+\date{2025}
+
+\usepackage{amsthm}
+\newtheorem{definition}{Definition}
+\newtheorem{theorem}{Theorem}
+\begin{document}
+\luxcoverpage
+
+\begin{abstract}
+Security claims without verification are marketing. This paper specifies Lux Network's proof obligations: what must be mechanically proved (Lean4), what must be symbolically verified (Halmos, Tamarin), what must be fuzzed (Forge, go-fuzz), what must be model-checked (TLA+), and what must be adversarially reviewed before any security claim is made in a Lux research paper. We define five verification tiers, assign every protocol component to a tier, and describe the toolchain, coverage requirements, and sign-off process. The methodology applies to consensus protocols (Quasar), cryptographic primitives (Corona, FHE), bridge protocols (Teleport), and smart contract systems. Artifacts from this process are maintained in \texttt{luxfi/formal} and \texttt{luxfi/proofs}.
+\end{abstract}
+
+\section{Introduction}
+
+Lux Network makes specific security claims: Quasar provides safety under $f < n/3$ Byzantine validators \cite{quasar}, Corona provides 128-bit post-quantum security \cite{corona}, FHE provides IND-CPA security under LWE hardness \cite{tfhe}. Each of these claims carries a proof obligation---a verification artifact that demonstrates the claim holds, not just a prose argument in a paper.
+
+This document defines what constitutes adequate verification for each category of claim, the tools used to produce verification artifacts, and the process by which claims are promoted from ``stated'' to ``verified.''
+
+\section{Verification Tiers}
+
+\begin{definition}[Verification Tier]
+A verification tier $\tau$ specifies the minimum verification rigor required before a claim of type $\tau$ may be published.
+\end{definition}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Tier} & \textbf{Claim Type} & \textbf{Verification} & \textbf{Tool} \\
+\midrule
+T1 & Mathematical proof & Machine-checked proof & Lean4 \\
+T2 & Protocol security & Symbolic verification & Tamarin, ProVerif \\
+T3 & Smart contract correctness & Formal verification + fuzzing & Halmos, Forge \\
+T4 & Implementation correctness & Property-based testing + fuzzing & go-fuzz, Hypothesis \\
+T5 & Operational security & Red-team exercise + audit & Manual + automated \\
+\bottomrule
+\end{tabular}
+\caption{Verification tiers. Higher tiers (T1) provide stronger guarantees.}
+\label{tab:tiers}
+\end{table}
+
+\subsection{Tier Assignment}
+
+Every protocol component is assigned a tier based on its security criticality:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Component} & \textbf{Tier} & \textbf{Rationale} \\
+\midrule
+Quasar safety/liveness & T1 & Consensus failure = chain death \\
+BLS aggregation correctness & T1 & Signature forgery = fund theft \\
+Corona threshold scheme & T1+T2 & Novel construction, PQ claims \\
+FHE bootstrapping correctness & T1 & Decryption failure = data loss \\
+FROST-BLS protocol & T2 & Multi-party, network adversary \\
+Teleport bridge messages & T2+T3 & Cross-chain, fund custody \\
+EVM precompiles (FHE) & T3 & Gas metering, state correctness \\
+FHE Go implementation & T4 & Performance-critical code \\
+NTT SIMD engine & T4 & Numerical correctness \\
+Validator deployment & T5 & Operational procedures \\
+Key rotation procedures & T5 & Human-in-the-loop \\
+\bottomrule
+\end{tabular}
+\caption{Component-to-tier assignment.}
+\label{tab:assignment}
+\end{table}
+
+\section{Tier 1: Machine-Checked Proofs (Lean4)}
+
+\subsection{Scope}
+
+Tier 1 proofs are mechanically verified mathematical statements. They prove properties of abstract protocols, not of specific implementations. The gap between the abstract model and the implementation is covered by lower tiers.
+
+\subsection{Current Proof Obligations}
+
+\begin{enumerate}
+\item \textbf{Quasar Safety}: No two honest validators finalize conflicting blocks under $f < n/3$ and bounded network delay.
+\item \textbf{Quasar Liveness}: All valid transactions eventually finalize under the same assumptions.
+\item \textbf{BLS Aggregate Unforgeability}: An adversary who does not control $\geq t$ signing keys cannot forge a valid aggregate signature.
+\item \textbf{FHE Correctness}: Decryption of a bootstrapped ciphertext returns the correct plaintext with probability $\geq 1 - 2^{-\lambda}$ for security parameter $\lambda$.
+\end{enumerate}
+
+Proofs are maintained in \texttt{luxfi/formal/lean4/} and are checked by CI on every commit.
+
+\subsection{Lean4 Proof Structure}
+
+\begin{verbatim}
+formal/lean4/
+  Quasar/
+    Safety.lean          -- No conflicting finalization
+    Liveness.lean        -- Eventual finalization
+    ByzantineModel.lean  -- f < n/3 adversary model
+  BLS/
+    Aggregation.lean     -- Aggregate unforgeability
+    ProofOfPossession.lean
+  FHE/
+    Bootstrapping.lean   -- Correctness after blind rotation
+    NoiseGrowth.lean     -- Noise budget sufficient
+\end{verbatim}
+
+\section{Tier 2: Symbolic Protocol Verification (Tamarin)}
+
+\subsection{Scope}
+
+Tier 2 verification models multi-party protocols under a Dolev-Yao adversary (active network attacker). Tamarin Prover is used for protocols involving key exchange, signing, and cross-chain messaging.
+
+\subsection{Current Models}
+
+\begin{enumerate}
+\item \textbf{FROST-BLS Key Generation}: Verify that the DKG protocol produces consistent shares even if $< t$ parties are malicious.
+\item \textbf{Teleport Bridge}: Verify that a cross-chain transfer completes if and only if $\geq t$ MPC nodes attest, and that no double-spend is possible.
+\item \textbf{Corona Threshold Signing}: Verify unforgeability under concurrent sessions with a network adversary.
+\end{enumerate}
+
+Models are maintained in \texttt{luxfi/proofs/tamarin/} and checked by CI with a 30-minute timeout per lemma.
+
+\subsection{Tamarin Model Example}
+
+\begin{verbatim}
+// Teleport bridge: no double-spend
+lemma no_double_spend:
+  "All src dst amt #i #j.
+    Transfer(src, dst, amt) @ #i &
+    Transfer(src, dst, amt) @ #j
+    ==> #i = #j"
+\end{verbatim}
+
+\section{Tier 3: Smart Contract Verification (Halmos + Forge)}
+
+\subsection{Scope}
+
+Tier 3 covers Solidity smart contracts and EVM precompiles. Halmos provides symbolic execution (proving properties hold for all possible inputs); Forge provides concrete fuzzing.
+
+\subsection{Verification Targets}
+
+\begin{enumerate}
+\item \textbf{FHE Precompiles}: Gas metering is correct (no underpriced operations that enable DoS). State transitions preserve ciphertext validity.
+\item \textbf{Teleport Contracts}: Token mint/burn balance invariant. Signature verification matches Tamarin model.
+\item \textbf{Governance}: Vote weight calculation, proposal execution conditions.
+\end{enumerate}
+
+\subsection{Coverage Requirements}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}llr@{}}
+\toprule
+\textbf{Verification Method} & \textbf{Target} & \textbf{Minimum} \\
+\midrule
+Halmos symbolic execution & All public functions & 100\% \\
+Forge fuzzing & All state-changing functions & 10K runs \\
+Forge invariant testing & All storage invariants & 10K runs \\
+Slither static analysis & All contracts & Zero high findings \\
+\bottomrule
+\end{tabular}
+\caption{Smart contract verification coverage requirements.}
+\label{tab:coverage}
+\end{table}
+
+\section{Tier 4: Implementation Testing (go-fuzz, Hypothesis)}
+
+\subsection{Scope}
+
+Tier 4 covers the Go and Rust implementations of cryptographic primitives. Property-based testing and fuzzing catch implementation bugs that formal proofs of the abstract protocol do not cover.
+
+\subsection{Properties Tested}
+
+\begin{enumerate}
+\item \textbf{NTT Roundtrip}: For all polynomials $p$, $\text{INTT}(\text{NTT}(p)) = p$.
+\item \textbf{Encrypt-Decrypt Roundtrip}: For all parameters, keys, and messages, $\text{Dec}(\text{Enc}(m)) = m$.
+\item \textbf{Homomorphic Correctness}: For all $a, b$, $\text{Dec}(\text{Add}(\text{Enc}(a), \text{Enc}(b))) = a + b$.
+\item \textbf{Serialization Roundtrip}: For all keys and ciphertexts, $\text{Unmarshal}(\text{Marshal}(x)) = x$.
+\item \textbf{Error Propagation}: Invalid inputs produce explicit errors, never panics.
+\end{enumerate}
+
+Fuzzing targets are maintained in \texttt{luxfi/fhe/fuzz/} and \texttt{luxfi/lattice/fuzz/}. CI runs fuzz campaigns for 10 minutes per target per commit.
+
+\section{Tier 5: Red-Team and Adversarial Review}
+
+\subsection{Scope}
+
+Tier 5 covers operational security: deployment procedures, key management workflows, incident response, and human-in-the-loop processes that cannot be fully automated.
+
+\subsection{Red-Team Protocol}
+
+\begin{enumerate}
+\item \textbf{Scope}: The red team receives a deployment-identical testnet environment with real validator keys (testnet-only).
+\item \textbf{Objective}: Compromise a validator's signing key, forge a block, double-spend across chains, or halt consensus.
+\item \textbf{Duration}: 2 weeks per engagement.
+\item \textbf{Reporting}: Findings are classified as Critical/High/Medium/Low. Critical and High findings block mainnet deployment.
+\item \textbf{Remediation}: Each finding is addressed with a code change and a regression test (Tier 3 or 4).
+\end{enumerate}
+
+\subsection{External Audit Requirements}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Component} & \textbf{Audit Requirement} \\
+\midrule
+Consensus (Quasar) & 2 independent audits \\
+Cryptography (Corona, FHE) & 1 audit + 1 academic review \\
+Bridge (Teleport) & 2 independent audits \\
+Smart contracts & 1 audit per major release \\
+\bottomrule
+\end{tabular}
+\caption{External audit requirements by component.}
+\label{tab:audits}
+\end{table}
+
+\section{TLA+ Model Checking}
+
+For distributed protocol properties that are expensive to prove in Lean4 but amenable to bounded model checking, TLA+ specifications are used:
+
+\begin{enumerate}
+\item \textbf{Quasar Leader Election}: Verify absence of livelock in the leader rotation mechanism.
+\item \textbf{Threshold DKG}: Verify that key shares are consistent even under $< t$ Byzantine parties within bounded rounds.
+\item \textbf{Key Rotation}: Verify that the cryptographic agility migration \cite{crypto-agility} maintains the invariant that at least one valid key schedule is active at all times.
+\end{enumerate}
+
+TLA+ specifications are maintained in \texttt{luxfi/formal/tla/} and model-checked by TLC with bounded state spaces.
+
+\section{Conclusion}
+
+Every security claim in a Lux research paper carries a verification obligation. The obligation is discharged by the appropriate tool at the appropriate tier: Lean4 for mathematical proofs, Tamarin for protocol security, Halmos and Forge for smart contracts, go-fuzz for implementations, and red-team exercises for operational security. A claim without a corresponding verification artifact is a hypothesis, not a result. The artifacts are maintained in \texttt{luxfi/formal} and \texttt{luxfi/proofs}, checked by CI, and referenced from the papers that make the claims.
+
+\begin{thebibliography}{99}
+
+\bibitem{quasar}
+Kelling, Z. (2025).
+\textit{Quasar: Quantum-Secure Multi-Engine Consensus with Triple-Proof Quantum Finality}.
+Lux Industries Research.
+
+\bibitem{corona}
+Kelling, Z. (2024).
+\textit{Corona: Lattice-Based Threshold Signatures for Validator Networks}.
+Lux Industries Research.
+
+\bibitem{tfhe}
+Kelling, Z. (2025).
+\textit{Threshold Fully Homomorphic Encryption for Confidential DeFi}.
+Lux Industries Research.
+
+\bibitem{crypto-agility}
+Kelling, Z. (2024).
+\textit{Cryptographic Agility Architecture for Long-Lived Blockchain Systems}.
+Lux Industries Research.
+
+\bibitem{tamarin}
+Meier, S. et al. (2013).
+\textit{The TAMARIN Prover for the Symbolic Analysis of Security Protocols}.
+25th International Conference on Computer Aided Verification (CAV).
+
+\bibitem{lean4}
+de Moura, L. \& Ullrich, S. (2021).
+\textit{The Lean 4 Theorem Prover and Programming Language}.
+CADE-28.
+
+\bibitem{halmos}
+Halmos Contributors (2024).
+\textit{Halmos: Symbolic Bounded Model Checker for EVM}.
+a]16z Research.
+
+\bibitem{tlaplus}
+Lamport, L. (2002).
+\textit{Specifying Systems: The TLA+ Language and Tools for Hardware and Software Engineers}.
+Addison-Wesley.
+
+\end{thebibliography}
+
+\end{document}
