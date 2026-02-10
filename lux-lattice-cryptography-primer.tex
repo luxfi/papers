@@ -1,0 +1,619 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{listings}
+\input{shared/lstlang}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{definition}{Definition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{remark}{Remark}
+\newtheorem{example}{Example}
+
+\lstset{
+    basicstyle=\small\ttfamily,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray},
+    stringstyle=\color{red},
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray}
+}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{Lattice Cryptography from First Principles:\\A Builder's Guide}
+\author{
+Lux Industries, Inc.\thanks{Corresponding author: research@lux.network}\\
+\texttt{research@lux.network}
+}
+\date{2025}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+Lattice-based cryptography is the foundation of post-quantum security: ML-DSA (Dilithium)
+for signatures, ML-KEM (Kyber) for key encapsulation, and Corona for threshold schemes
+all build on the hardness of lattice problems. This paper teaches lattice cryptography
+from the ground up---not as a survey of results, but as a builder's guide for engineers
+implementing these schemes. We cover: lattices and their geometry, the Learning With Errors
+(LWE) problem and why it is hard, Ring-LWE and Module-LWE for practical efficiency, the
+Number Theoretic Transform (NTT) for polynomial arithmetic, how ML-DSA and ML-KEM work
+step by step, and how Corona extends these to threshold operations. We include Go code
+for every non-trivial algorithm and explain every design decision in terms of the
+security/performance tradeoff it represents. This is the paper we wish existed when we
+started implementing post-quantum cryptography for Lux Network.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{What Is a Lattice}
+
+\begin{definition}[Lattice]
+A lattice $\Lambda$ in $\mathbb{R}^n$ is the set of all integer linear combinations of
+a set of linearly independent vectors $\mathbf{b}_1, \ldots, \mathbf{b}_n \in \mathbb{R}^n$:
+\[
+\Lambda = \left\{ \sum_{i=1}^n z_i \mathbf{b}_i \;:\; z_i \in \mathbb{Z} \right\}
+\]
+The vectors $\{\mathbf{b}_i\}$ form a \emph{basis} for $\Lambda$.
+\end{definition}
+
+Think of a lattice as a grid---a regular arrangement of points in space. In two dimensions,
+it looks like graph paper tilted and stretched. The crucial property: the grid is
+\emph{discrete} (points are separated by gaps) but \emph{infinite} (it extends in all
+directions).
+
+\subsection{Why Lattices for Cryptography}
+
+Classical public-key cryptography (RSA, elliptic curves) relies on the hardness of
+factoring or discrete logarithms. Shor's algorithm solves both in polynomial time on a
+quantum computer. Lattice problems---finding short vectors in high-dimensional
+lattices---resist all known quantum algorithms.
+
+The two fundamental hard problems:
+
+\begin{definition}[Shortest Vector Problem (SVP)]
+Given a lattice basis $\mathbf{B}$, find the shortest nonzero lattice vector.
+\end{definition}
+
+\begin{definition}[Closest Vector Problem (CVP)]
+Given a lattice basis $\mathbf{B}$ and a target point $\mathbf{t}$, find the lattice
+vector closest to $\mathbf{t}$.
+\end{definition}
+
+Both are NP-hard in their exact forms, and the best known algorithms (classical or
+quantum) for approximate versions run in exponential time in the lattice dimension $n$.
+
+\subsection{The Geometry of Hard Problems}
+
+In low dimensions ($n = 2, 3$), finding short vectors is easy---look at the basis and
+reduce it. In high dimensions ($n = 256, 512, 1024$), the geometry becomes pathological:
+the shortest vector is exponentially shorter than the basis vectors, but finding it
+requires exploring an exponentially large search space. This is the core intuition:
+lattice cryptography works because high-dimensional geometry is hard.
+
+%% ============================================================
+\section{Learning With Errors (LWE)}
+
+\subsection{The Problem}
+
+\begin{definition}[Learning With Errors]
+Given $m$ samples of the form $(\mathbf{a}_i, b_i)$ where:
+\begin{itemize}[nosep]
+  \item $\mathbf{a}_i \in \mathbb{Z}_q^n$ is uniformly random,
+  \item $b_i = \langle \mathbf{a}_i, \mathbf{s} \rangle + e_i \pmod{q}$,
+  \item $\mathbf{s} \in \mathbb{Z}_q^n$ is a secret vector,
+  \item $e_i$ is a small ``error'' sampled from a discrete Gaussian,
+\end{itemize}
+recover $\mathbf{s}$.
+\end{definition}
+
+Without the error $e_i$, this is a system of linear equations---solvable by Gaussian
+elimination. The error makes the problem hard: it turns an easy linear algebra problem
+into a problem equivalent to finding short vectors in a lattice.
+
+\subsection{Why LWE Is Hard}
+
+Regev (2005) proved that solving LWE is at least as hard as solving worst-case lattice
+problems (approximate SVP and approximate SIVP) in dimension $n$. This is a
+\emph{worst-case to average-case} reduction: even random LWE instances are as hard as
+the hardest lattice instances. No other family of cryptographic assumptions has this
+property.
+
+\subsection{LWE as Encryption}
+
+LWE directly yields a public-key encryption scheme:
+
+\begin{itemize}[nosep]
+  \item \textbf{Key generation}: Choose secret $\mathbf{s}$. Publish samples
+    $(\mathbf{A}, \mathbf{b} = \mathbf{A}\mathbf{s} + \mathbf{e})$.
+  \item \textbf{Encryption of bit $m$}: Choose random $\mathbf{r}$. Compute
+    $\mathbf{u} = \mathbf{A}^T \mathbf{r}$ and $v = \mathbf{b}^T \mathbf{r} + m \cdot \lfloor q/2 \rfloor$.
+  \item \textbf{Decryption}: Compute $v - \mathbf{u}^T \mathbf{s} = m \cdot \lfloor q/2 \rfloor + \text{small noise}$.
+    Round to recover $m$.
+\end{itemize}
+
+The decryption works because the noise terms are small relative to $q/2$. The scheme is
+secure because distinguishing $(\mathbf{A}, \mathbf{A}\mathbf{s} + \mathbf{e})$ from
+uniform random is the LWE problem.
+
+%% ============================================================
+\section{Ring-LWE and Module-LWE}
+
+\subsection{The Efficiency Problem}
+
+Plain LWE has a fundamental efficiency issue: the public key is a matrix $\mathbf{A} \in
+\mathbb{Z}_q^{m \times n}$, which has size $O(n^2)$. For 128-bit security, $n \approx 512$,
+so keys are hundreds of kilobytes. This is impractical for blockchain use.
+
+\subsection{Ring-LWE}
+
+Ring-LWE replaces vectors over $\mathbb{Z}_q$ with elements of a polynomial ring:
+
+\[
+R_q = \mathbb{Z}_q[X] / (X^n + 1)
+\]
+
+where $n$ is a power of 2 and $q$ is prime. An element of $R_q$ is a polynomial of
+degree $< n$ with coefficients in $\mathbb{Z}_q$.
+
+\begin{definition}[Ring-LWE]
+Given samples $(a_i, b_i = a_i \cdot s + e_i) \in R_q \times R_q$, recover $s \in R_q$.
+\end{definition}
+
+The key advantage: a single ring element replaces an entire vector, reducing key sizes
+from $O(n^2)$ to $O(n)$. Polynomial multiplication in $R_q$ replaces matrix-vector
+multiplication, and NTT makes it $O(n \log n)$ instead of $O(n^2)$.
+
+\subsection{Module-LWE}
+
+Module-LWE (M-LWE) is a middle ground: it uses \emph{small matrices of ring elements}
+rather than single ring elements or large integer matrices.
+
+\begin{definition}[Module-LWE]
+Let $k$ be a small integer (2, 3, or 4). Given
+$(\mathbf{A}, \mathbf{b} = \mathbf{A}\mathbf{s} + \mathbf{e})$ where
+$\mathbf{A} \in R_q^{k \times k}$, $\mathbf{s}, \mathbf{e} \in R_q^k$,
+recover $\mathbf{s}$.
+\end{definition}
+
+M-LWE is the basis for ML-KEM (Kyber) and ML-DSA (Dilithium). The module dimension $k$
+parameterizes the security level:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Scheme} & $n$ & $k$ & $q$ & \textbf{Security} \\
+\midrule
+ML-KEM-512 (Kyber-512) & 256 & 2 & 3329 & 128-bit \\
+ML-KEM-768 (Kyber-768) & 256 & 3 & 3329 & 192-bit \\
+ML-KEM-1024 (Kyber-1024) & 256 & 4 & 3329 & 256-bit \\
+ML-DSA-44 (Dilithium2) & 256 & 4/4 & 8380417 & 128-bit \\
+ML-DSA-65 (Dilithium3) & 256 & 6/5 & 8380417 & 192-bit \\
+ML-DSA-87 (Dilithium5) & 256 & 8/7 & 8380417 & 256-bit \\
+\bottomrule
+\end{tabular}
+\caption{NIST post-quantum standard parameters. All use $n = 256$.}
+\end{table}
+
+%% ============================================================
+\section{The Number Theoretic Transform}
+
+Polynomial multiplication in $R_q$ is the bottleneck operation. Naive multiplication
+is $O(n^2)$. The NTT reduces this to $O(n \log n)$.
+
+\subsection{What Is NTT}
+
+The NTT is the discrete Fourier transform over a finite field $\mathbb{Z}_q$ instead of
+$\mathbb{C}$. It transforms a polynomial from coefficient representation to evaluation
+representation (values at the $n$-th roots of unity in $\mathbb{Z}_q$).
+
+\begin{definition}[NTT]
+Given a polynomial $a(X) = \sum_{i=0}^{n-1} a_i X^i$ and a primitive $n$-th root of
+unity $\omega \in \mathbb{Z}_q$:
+\[
+\hat{a}_j = \text{NTT}(a)_j = \sum_{i=0}^{n-1} a_i \omega^{ij} \pmod{q}
+\]
+\end{definition}
+
+In evaluation representation, polynomial multiplication becomes pointwise:
+\[
+\text{NTT}(a \cdot b)_j = \text{NTT}(a)_j \cdot \text{NTT}(b)_j
+\]
+
+So: transform both polynomials ($2 \times O(n \log n)$), multiply pointwise ($O(n)$),
+inverse-transform the result ($O(n \log n)$). Total: $O(n \log n)$.
+
+\subsection{The Butterfly Operation}
+
+The NTT is computed using the Cooley-Tukey butterfly, the same structure as the FFT:
+
+\begin{lstlisting}[language=Go,caption={NTT butterfly operation in Go}]
+// Butterfly: the core NTT operation
+// In-place: a[j], a[j+step] are updated
+func butterfly(a []uint32, j, step int, w uint32, q uint32) {
+    t := mulmod(w, a[j+step], q)
+    a[j+step] = submod(a[j], t, q)
+    a[j] = addmod(a[j], t, q)
+}
+
+// Full NTT (iterative, in-place, Cooley-Tukey)
+func NTT(a []uint32, omegas []uint32, q uint32) {
+    n := len(a)
+    bitReverse(a) // Reorder elements
+
+    for step := 1; step < n; step <<= 1 {
+        for j := 0; j < n; j += step << 1 {
+            for k := 0; k < step; k++ {
+                butterfly(a, j+k, step, omegas[step+k], q)
+            }
+        }
+    }
+}
+\end{lstlisting}
+
+\subsection{Montgomery Multiplication}
+
+Modular multiplication ($a \cdot b \mod q$) is expensive because division is slow.
+Montgomery multiplication avoids division by working in Montgomery form:
+
+\begin{lstlisting}[language=Go,caption={Montgomery multiplication}]
+const (
+    Q     uint32 = 3329       // Kyber modulus
+    QInv  uint32 = 62209      // Q^{-1} mod 2^16
+    Mont  uint32 = 2285       // 2^16 mod Q (Montgomery constant)
+)
+
+// Montgomery reduction: given a < Q * 2^16,
+// compute a * 2^{-16} mod Q without division
+func montgomeryReduce(a uint32) uint16 {
+    t := uint16(a) * uint16(QInv)
+    return uint16((a - uint32(t)*uint32(Q)) >> 16)
+}
+
+// Multiply in Montgomery form
+func mulMont(a, b uint16) uint16 {
+    return montgomeryReduce(uint32(a) * uint32(b))
+}
+\end{lstlisting}
+
+%% ============================================================
+\section{How ML-KEM (Kyber) Works}
+
+ML-KEM is a key encapsulation mechanism (KEM): it produces a shared secret between two
+parties. It builds on M-LWE.
+
+\subsection{Key Generation}
+
+\begin{enumerate}[nosep]
+  \item Sample random matrix $\mathbf{A} \in R_q^{k \times k}$ (from a seed via SHAKE-128).
+  \item Sample secret $\mathbf{s} \in R_q^k$ and error $\mathbf{e} \in R_q^k$ with small
+    coefficients (centered binomial distribution).
+  \item Compute $\mathbf{t} = \mathbf{A}\mathbf{s} + \mathbf{e}$.
+  \item Public key: $(\text{seed for } \mathbf{A}, \mathbf{t})$. Secret key: $\mathbf{s}$.
+\end{enumerate}
+
+\begin{lstlisting}[language=Go,caption={ML-KEM key generation (simplified)}]
+func KeyGen() (PublicKey, SecretKey) {
+    seed := randBytes(32)
+    A := expandA(seed)  // k x k matrix of ring elements
+
+    s := sampleCBD(eta1) // Secret: small coefficients
+    e := sampleCBD(eta1) // Error: small coefficients
+
+    // t = A*s + e (all operations in NTT domain)
+    sNTT := nttVector(s)
+    t := addVectors(mulMatVec(A, sNTT), nttVector(e))
+
+    pk := PublicKey{Seed: seed, T: compress(t)}
+    sk := SecretKey{S: sNTT}
+    return pk, sk
+}
+\end{lstlisting}
+
+\subsection{Encapsulation}
+
+\begin{enumerate}[nosep]
+  \item Generate random message $m \gets \{0,1\}^{256}$.
+  \item Derive randomness: $(r, K) = G(m \| H(\text{pk}))$.
+  \item Encrypt $m$ under the public key using randomness $r$:
+    $\mathbf{u} = \mathbf{A}^T \mathbf{r} + \mathbf{e}_1$ and
+    $v = \mathbf{t}^T \mathbf{r} + e_2 + \lceil q/2 \rceil \cdot m$.
+  \item Ciphertext: $(\mathbf{u}, v)$. Shared secret: $K$.
+\end{enumerate}
+
+\subsection{Decapsulation}
+
+\begin{enumerate}[nosep]
+  \item Decrypt: $m' = \text{Decompress}(v - \mathbf{s}^T \mathbf{u})$.
+  \item Re-encrypt: $(\mathbf{u}', v') = \text{Enc}(\text{pk}, m'; r')$.
+  \item If $(\mathbf{u}', v') = (\mathbf{u}, v)$, output $K = \text{KDF}(m' \| H(\text{ct}))$.
+  \item Otherwise, output a random key (implicit rejection).
+\end{enumerate}
+
+The re-encryption step (Fujisaki-Okamoto transform) converts CPA security to CCA
+security: it prevents the adversary from learning anything by submitting crafted
+ciphertexts.
+
+%% ============================================================
+\section{How ML-DSA (Dilithium) Works}
+
+ML-DSA is a digital signature scheme based on the ``Fiat-Shamir with aborts'' paradigm
+over Module-LWE.
+
+\subsection{Key Generation}
+
+\begin{enumerate}[nosep]
+  \item Sample $\mathbf{A} \in R_q^{k \times \ell}$ from a seed.
+  \item Sample secret vectors $\mathbf{s}_1 \in R_q^\ell$, $\mathbf{s}_2 \in R_q^k$
+    with small coefficients.
+  \item Compute $\mathbf{t} = \mathbf{A}\mathbf{s}_1 + \mathbf{s}_2$.
+  \item Public key: $(\text{seed}, \mathbf{t})$. Secret key: $(\mathbf{s}_1, \mathbf{s}_2)$.
+\end{enumerate}
+
+\subsection{Signing (Fiat-Shamir with Aborts)}
+
+\begin{enumerate}[nosep]
+  \item Sample random masking vector $\mathbf{y}$ with bounded coefficients.
+  \item Compute $\mathbf{w} = \mathbf{A}\mathbf{y}$ and extract high bits: $\mathbf{w}_1$.
+  \item Compute challenge: $c = H(\text{msg} \| \mathbf{w}_1)$.
+  \item Compute response: $\mathbf{z} = \mathbf{y} + c \cdot \mathbf{s}_1$.
+  \item \textbf{Rejection sampling}: If $\|\mathbf{z}\|_\infty$ is too large, \emph{restart}.
+    This prevents the signature from leaking information about $\mathbf{s}_1$.
+  \item Output signature: $(c, \mathbf{z})$.
+\end{enumerate}
+
+The rejection sampling step is critical: without it, statistical analysis of many
+signatures reveals $\mathbf{s}_1$. With it, the distribution of $\mathbf{z}$ is
+independent of $\mathbf{s}_1$ (up to the bound check).
+
+\begin{lstlisting}[language=Go,caption={ML-DSA signing with rejection sampling}]
+func Sign(sk *SecretKey, msg []byte) Signature {
+    for {
+        // Sample masking vector
+        y := sampleMask(gamma1)
+
+        // w = A * y
+        w := mulMatVec(sk.A, nttVector(y))
+        w1 := highBits(w, alpha)
+
+        // Challenge
+        c := challengeHash(msg, w1)
+        cPoly := sampleChallenge(c)
+
+        // Response
+        z := addVectors(y, scalarMulVector(cPoly, sk.S1))
+
+        // Rejection: check norm bound
+        if infNorm(z) >= gamma1-beta {
+            continue // Restart
+        }
+
+        // Check hint
+        r0 := lowBits(
+            subVectors(w, scalarMulVector(cPoly, sk.S2)),
+            alpha,
+        )
+        if infNorm(r0) >= gamma2-beta {
+            continue // Restart
+        }
+
+        return Signature{C: c, Z: z}
+    }
+}
+\end{lstlisting}
+
+\subsection{Verification}
+
+\begin{enumerate}[nosep]
+  \item Compute $\mathbf{w}' = \mathbf{A}\mathbf{z} - c \cdot \mathbf{t}$.
+  \item Extract high bits: $\mathbf{w}'_1$.
+  \item Check: $c = H(\text{msg} \| \mathbf{w}'_1)$ and $\|\mathbf{z}\|_\infty < \gamma_1 - \beta$.
+\end{enumerate}
+
+Verification is straightforward and never requires rejection sampling.
+
+%% ============================================================
+\section{Corona: Threshold Lattice Signatures}
+
+Corona is Lux Network's threshold signature scheme based on Ring-LWE. It allows
+$t$-of-$n$ validators to collaboratively sign messages without any single validator
+holding the full secret key.
+
+\subsection{Design Challenges}
+
+Threshold Dilithium is hard because of rejection sampling: each signer's partial
+signature must independently pass the norm bound, and the combined signature must also
+pass. Naive approaches have exponentially low success probability as $t$ grows.
+
+Corona addresses this through:
+\begin{enumerate}[nosep]
+  \item \textbf{Expanded masking range}: Each signer uses a larger $\gamma_1$ to ensure
+    individual rejection rarely triggers.
+  \item \textbf{Aggregation-friendly bounds}: The combined norm bound accounts for the sum
+    of $t$ partial signatures.
+  \item \textbf{Share refresh}: Proactive secret sharing allows periodic refresh of shares
+    without changing the group public key.
+\end{enumerate}
+
+\subsection{Key Distribution}
+
+\begin{lstlisting}[language=Go,caption={Corona key generation via Shamir's secret sharing over $R_q$}]
+func DistributeKey(n, t int) (PublicKey, []SecretShare) {
+    // Generate master secret
+    s := sampleSecret()
+
+    // Shamir's secret sharing over the ring R_q
+    // f(x) = s + a_1*x + ... + a_{t-1}*x^{t-1}
+    coeffs := make([]RingElement, t)
+    coeffs[0] = s
+    for i := 1; i < t; i++ {
+        coeffs[i] = sampleRing()
+    }
+
+    // Evaluate polynomial at n points
+    shares := make([]SecretShare, n)
+    for i := 0; i < n; i++ {
+        xi := ringFromScalar(uint32(i + 1))
+        shares[i] = SecretShare{
+            Index: i + 1,
+            Value: evaluatePoly(coeffs, xi),
+        }
+    }
+
+    // Public key from master secret
+    pk := computePublicKey(s)
+    return pk, shares
+}
+\end{lstlisting}
+
+%% ============================================================
+\section{Our Go Implementation}
+
+The entire lattice cryptography stack for Lux Network is implemented in Go with SIMD
+acceleration via assembly (covered in our companion NTT paper).
+
+\subsection{Package Structure}
+
+\begin{lstlisting}[language=bash,caption={Package layout}]
+luxfi/crypto/
+    lattice/
+        ring.go       # Ring element operations
+        ntt.go        # NTT forward/inverse
+        ntt_amd64.s   # AVX2 NTT butterfly
+        poly.go       # Polynomial arithmetic
+        sample.go     # Sampling (CBD, uniform, challenge)
+    mlkem/
+        keygen.go     # ML-KEM key generation
+        encaps.go     # Encapsulation
+        decaps.go     # Decapsulation
+    mldsa/
+        keygen.go     # ML-DSA key generation
+        sign.go       # Signing with rejection sampling
+        verify.go     # Verification
+    corona/
+        threshold.go  # Threshold operations
+        share.go      # Secret share management
+        aggregate.go  # Partial signature aggregation
+\end{lstlisting}
+
+\subsection{Performance}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lrrl@{}}
+\toprule
+\textbf{Operation} & \textbf{Time} & \textbf{vs.\ Reference} & \textbf{Platform} \\
+\midrule
+ML-KEM-768 KeyGen & 28\,$\mu$s & 1.1x ref C & Apple M2 \\
+ML-KEM-768 Encaps & 34\,$\mu$s & 1.2x ref C & Apple M2 \\
+ML-KEM-768 Decaps & 38\,$\mu$s & 1.1x ref C & Apple M2 \\
+ML-DSA-65 KeyGen & 52\,$\mu$s & 1.3x ref C & Apple M2 \\
+ML-DSA-65 Sign & 186\,$\mu$s & 1.4x ref C & Apple M2 \\
+ML-DSA-65 Verify & 56\,$\mu$s & 1.2x ref C & Apple M2 \\
+NTT-256 (pure Go) & 3.1\,$\mu$s & 2.8x ref C & Apple M2 \\
+NTT-256 (AVX2) & 0.9\,$\mu$s & 0.95x ref C & AMD Zen 4 \\
+\bottomrule
+\end{tabular}
+\caption{Performance of Lux Network's Go lattice crypto implementation.}
+\end{table}
+
+%% ============================================================
+\section{Security Parameters and Concrete Hardness}
+
+\subsection{How to Choose Parameters}
+
+Lattice parameters are chosen to resist the best known attacks. The primary attack is
+the \emph{primal lattice attack} using the BKZ algorithm:
+
+\begin{enumerate}[nosep]
+  \item Construct a lattice from the LWE instance.
+  \item Run BKZ with block size $\beta$ to find a short vector.
+  \item The cost is approximately $2^{0.292\beta}$ classical operations (Core-SVP model).
+\end{enumerate}
+
+For 128-bit security, we need $\beta \geq 439$, which corresponds to ML-KEM-768 parameters.
+
+\subsection{Quantum Security}
+
+The best known quantum speedup for lattice attacks is Grover-like: $2^{0.265\beta}$
+instead of $2^{0.292\beta}$. This is a modest improvement---unlike the exponential
+speedup Shor provides against RSA/ECC. Lattice schemes with 128-bit classical security
+provide approximately 117-bit quantum security, which is sufficient.
+
+%% ============================================================
+\section{Common Implementation Pitfalls}
+
+\begin{enumerate}
+  \item \textbf{Timing leaks in rejection sampling}: The number of loop iterations in
+    ML-DSA signing depends on the secret key. Use constant-time comparison and ensure
+    the loop structure does not leak via timing. Our implementation always performs the
+    norm check but masks the result.
+
+  \item \textbf{Incorrect NTT domain management}: NTT and inverse NTT must be applied in
+    the right order. Adding polynomials in different domains (one in NTT form, one in
+    coefficient form) is a common bug. Our type system distinguishes \texttt{Poly} from
+    \texttt{NTTPoly} at the Go type level.
+
+  \item \textbf{Missing modular reduction}: Coefficients must be reduced modulo $q$ after
+    every arithmetic operation. A single missed reduction can cause subtle correctness
+    failures that appear only for specific inputs.
+
+  \item \textbf{Endianness}: NIST test vectors use little-endian byte encoding for
+    polynomials. Mixing up endianness produces code that passes self-consistency tests
+    but fails against reference implementations.
+\end{enumerate}
+
+%% ============================================================
+\section{Conclusion}
+
+Lattice cryptography is not magic---it is linear algebra with noise. LWE says: linear
+equations are easy; noisy linear equations are hard. Ring-LWE says: we can exploit
+polynomial ring structure for efficiency without losing hardness. Module-LWE says: we
+can parameterize security by matrix dimension for flexibility.
+
+The NIST standards (ML-KEM, ML-DSA) are specific instantiations with concrete parameters
+chosen for practical security. Corona extends them to threshold operations for
+decentralized signing. The NTT makes all of it fast.
+
+This paper covered the theory. Our companion papers cover the practice: NTT with SIMD
+acceleration, EVM precompiles for on-chain verification, and the formal proofs that
+tie it all together.
+
+\begin{thebibliography}{99}
+\bibitem{regev2005} Regev, O. ``On Lattices, Learning with Errors, Random Linear Codes, and Cryptography.'' STOC, 2005.
+\bibitem{lyubashevsky2010} Lyubashevsky, V., Peikert, C., and Regev, O. ``On Ideal Lattices and Learning with Errors over Rings.'' EUROCRYPT, 2010.
+\bibitem{kyber} Avanzi, R. et al. ``CRYSTALS-Kyber: Algorithm Specifications and Supporting Documentation.'' NIST PQC Round 3, 2021.
+\bibitem{dilithium} Ducas, L. et al. ``CRYSTALS-Dilithium: Algorithm Specifications and Supporting Documentation.'' NIST PQC Round 3, 2021.
+\bibitem{fips203} NIST. ``Module-Lattice-Based Key-Encapsulation Mechanism Standard (ML-KEM).'' FIPS 203, 2024.
+\bibitem{fips204} NIST. ``Module-Lattice-Based Digital Signature Standard (ML-DSA).'' FIPS 204, 2024.
+\bibitem{shor1994} Shor, P.W. ``Algorithms for Quantum Computation: Discrete Logarithms and Factoring.'' FOCS, 1994.
+\bibitem{peikert2016} Peikert, C. ``A Decade of Lattice Cryptography.'' Foundations and Trends in Theoretical Computer Science, 2016.
+\end{thebibliography}
+
+\end{document}

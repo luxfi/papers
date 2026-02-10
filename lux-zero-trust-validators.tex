@@ -1,0 +1,229 @@
+\documentclass[11pt]{article}
+\usepackage{shared/luxcover}
+\usepackage{amsmath, amssymb, algpseudocode, graphicx, hyperref, booktabs}
+
+\title{Zero-Trust Validator Operations and Service Identity for Blockchain Infrastructure}
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+\date{2025}
+
+\usepackage{amsthm}
+\newtheorem{definition}{Definition}
+\newtheorem{theorem}{Theorem}
+\begin{document}
+\luxcoverpage
+
+\begin{abstract}
+Traditional blockchain validator deployments grant implicit trust based on network position: if a process can reach the signing key and the P2P port, it is assumed to be the validator. This assumption fails in shared infrastructure, containerized environments, and multi-tenant Kubernetes clusters. We present Lux Network's zero-trust validator architecture, where every service interaction---signing requests, key access, peer connections, RPC calls---is authenticated via cryptographic workload identity, authorized by policy, and continuously verified. No component trusts another based on network adjacency. We describe the identity model (SPIFFE-compatible workload identifiers bound to Q-Chain NodeIDs), the authorization framework (capability-based access to signer services), and the continuous authorization protocol that re-validates identity on every signing request. The architecture is deployed on Lux's Kubernetes-based validator infrastructure across mainnet, testnet, and devnet.
+\end{abstract}
+
+\section{Introduction}
+
+A Lux validator consists of multiple cooperating components: the \texttt{luxd} node process, EVM plugin processes, signer services (for BLS and Corona keys), metrics exporters, and operational tooling. In a traditional deployment, these components trust each other implicitly---they share a filesystem, a network namespace, or a pod boundary. This implicit trust creates lateral movement opportunities: a compromised metrics exporter can access the signing key, a bug in an RPC handler can reach the consensus engine.
+
+Zero-trust architecture eliminates implicit trust. Every interaction between components is:
+\begin{enumerate}
+\item \textbf{Authenticated}: The caller proves its identity cryptographically.
+\item \textbf{Authorized}: The caller's identity is checked against a policy that specifies what actions it may perform.
+\item \textbf{Continuously verified}: Authorization is re-evaluated on every request, not cached from a prior session.
+\end{enumerate}
+
+This paper describes how these principles are applied to Lux validator operations, with particular focus on the signer service---the component that holds the validator's BLS and Corona private keys and must be protected above all else.
+
+\section{Workload Identity Model}
+
+\subsection{Identity Structure}
+
+Each validator component receives a SPIFFE-compatible workload identity:
+
+\begin{verbatim}
+spiffe://lux.network/ns/<namespace>/sa/<service-account>
+\end{verbatim}
+
+Examples:
+\begin{itemize}
+\item \texttt{spiffe://lux.network/ns/lux-mainnet/sa/luxd-0} --- Node process
+\item \texttt{spiffe://lux.network/ns/lux-mainnet/sa/signer-0} --- Signer service
+\item \texttt{spiffe://lux.network/ns/lux-mainnet/sa/evm-plugin} --- EVM plugin
+\end{itemize}
+
+These identities are issued by the cluster's SPIRE server and bound to Kubernetes service accounts. The SVID (SPIFFE Verifiable Identity Document) is a short-lived X.509 certificate rotated every 60 seconds.
+
+\subsection{Binding to Q-Chain NodeID}
+
+The workload identity is bound to the validator's Q-Chain NodeID through an attestation:
+
+\begin{definition}[NodeID Binding]
+A NodeID binding $\mathcal{B} = (\text{SPIFFE\_ID}, \text{NodeID}, \sigma_{\text{BLS}}, \sigma_{\text{MLDSA}})$ proves that the workload identified by SPIFFE\_ID is authorized to act on behalf of the validator with the given NodeID. The signatures are produced by the validator's registered keys.
+\end{definition}
+
+This binding is registered on Q-Chain as part of validator enrollment and verified by any component that receives a request claiming to act on behalf of a specific NodeID.
+
+\section{Signer Service Architecture}
+
+\subsection{Isolation}
+
+The signer service is the sole component with access to private key material. It runs as a separate process (or container) with:
+\begin{itemize}
+\item No network access except a Unix domain socket (or mTLS-authenticated gRPC).
+\item No filesystem access except the key material directory (read-only after initialization).
+\item No capability to make outbound connections.
+\item Memory encryption via SEV-SNP or equivalent (where available).
+\end{itemize}
+
+\subsection{Request Authentication}
+
+Every signing request must present a valid SVID and a request-specific nonce:
+
+\begin{algorithmic}[1]
+\State \textbf{function} \textsc{HandleSignRequest}(req)
+\State $svid \gets \text{ExtractSVID}(req.\text{tlsContext})$
+\If{$\neg\text{ValidateSVID}(svid)$}
+    \State \Return $\text{UNAUTHENTICATED}$
+\EndIf
+\If{$\neg\text{AuthorizeSignRequest}(svid.\text{spiffeID}, req.\text{operation})$}
+    \State \Return $\text{UNAUTHORIZED}$
+\EndIf
+\State $\text{AuditLog}(svid.\text{spiffeID}, req.\text{operation}, req.\text{digest})$
+\State \Return $\text{Sign}(req.\text{digest})$
+\State \textbf{end function}
+\end{algorithmic}
+
+\subsection{Authorization Policy}
+
+Signing authorization is defined by a capability matrix:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Caller Identity} & \textbf{Operation} & \textbf{Allowed} & \textbf{Rate Limit} \\
+\midrule
+luxd-0 & SignBlock & Yes & 1000/s \\
+luxd-0 & SignWarp & Yes & 100/s \\
+evm-plugin & SignBlock & No & --- \\
+evm-plugin & SignTx & No & --- \\
+signer-0 & KeyExport & No & --- \\
+admin-tool & RotateKey & Yes & 1/day \\
+\bottomrule
+\end{tabular}
+\caption{Signer service authorization policy excerpt.}
+\label{tab:signer-policy}
+\end{table}
+
+The policy is declarative and stored as a Kubernetes ConfigMap. Changes require a signed commit and a rolling restart of the signer service.
+
+\section{Continuous Authorization}
+
+Unlike session-based authentication, zero-trust demands that every request is independently authorized. This is implemented through:
+
+\begin{enumerate}
+\item \textbf{Short-lived SVIDs}: 60-second lifetime. A compromised credential is usable for at most one minute.
+\item \textbf{Per-request policy evaluation}: The signer service evaluates the authorization policy on every signing request, not once per connection.
+\item \textbf{Anomaly detection}: Signing rate, message entropy, and request timing are monitored. Deviations trigger automatic signer lockout pending manual review.
+\end{enumerate}
+
+\begin{algorithmic}[1]
+\State \textbf{function} \textsc{ContinuousAuth}(req, history)
+\State $rate \gets \text{RequestRate}(req.\text{callerID}, history)$
+\If{$rate > \text{RateLimit}(req.\text{callerID}, req.\text{operation})$}
+    \State $\text{LockSigner}()$
+    \State $\text{Alert}(\text{``Rate limit exceeded''})$
+    \State \Return $\text{DENIED}$
+\EndIf
+\State $entropy \gets \text{MessageEntropy}(req.\text{digest})$
+\If{$entropy < \text{MinEntropy}$}
+    \State $\text{Alert}(\text{``Low entropy signing request''})$
+\EndIf
+\State \Return $\text{ALLOWED}$
+\State \textbf{end function}
+\end{algorithmic}
+
+\section{Peer Connection Authentication}
+
+Validator-to-validator connections use mTLS with hybrid certificates \cite{hybrid-certs}. The zero-trust layer adds:
+
+\begin{enumerate}
+\item \textbf{NodeID verification}: The connecting peer's TLS certificate must contain a NodeID that is currently registered and staked on Q-Chain.
+\item \textbf{Epoch binding}: The certificate must be valid for the current epoch. Certificates from future or expired epochs are rejected.
+\item \textbf{IP binding} (optional): For validators that opt in, the certificate is bound to a specific IP range registered on Q-Chain. Connections from unexpected IPs are rejected.
+\end{enumerate}
+
+\section{Kubernetes Deployment Model}
+
+Lux validators run on Kubernetes (DOKS clusters: lux-k8s for mainnet, lux-test-k8s for testnet, lux-dev-k8s for devnet). The zero-trust architecture maps to Kubernetes primitives:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Zero-Trust Concept} & \textbf{K8s Implementation} \\
+\midrule
+Workload identity & SPIRE + K8s service accounts \\
+Network isolation & NetworkPolicy (deny-all default) \\
+Signer isolation & Separate pod, no network egress \\
+Secret management & KMS (kms.hanzo.ai) $\to$ KMSSecret CRDs \\
+Policy enforcement & OPA Gatekeeper admission controller \\
+Audit logging & Structured logs $\to$ Loki \\
+\bottomrule
+\end{tabular}
+\caption{Zero-trust to Kubernetes mapping.}
+\label{tab:k8s-mapping}
+\end{table}
+
+All secrets are managed through KMS (kms.hanzo.ai), never stored in Kubernetes Secrets directly. The KMSSecret CRD syncs encrypted secrets from KMS and mounts them as volumes.
+
+\section{Security Analysis}
+
+\begin{theorem}[Lateral Movement Containment]
+Compromise of any single component (other than the signer) does not provide access to signing key material.
+\end{theorem}
+
+\begin{proof}
+The signer service accepts requests only from authenticated callers with valid SVIDs and matching authorization policy. A compromised luxd process cannot sign arbitrary messages beyond its authorized operations. A compromised EVM plugin has no signing authorization at all. The signer's network policy allows inbound connections only from the luxd pod's service account. No component can reach the key material filesystem.
+\end{proof}
+
+\section{Conclusion}
+
+Zero-trust validator operations eliminate the largest class of infrastructure attacks: those that exploit implicit trust between co-located components. By requiring cryptographic authentication and continuous authorization for every interaction---especially signing requests---Lux's architecture ensures that compromising one component does not cascade into a full validator compromise. The signer service, as the holder of key material, is protected by multiple independent controls: workload identity, authorization policy, rate limiting, anomaly detection, and network isolation.
+
+\begin{thebibliography}{99}
+
+\bibitem{hybrid-certs}
+Kelling, Z. (2024).
+\textit{Hybrid Certificate Chains and Post-Quantum Trust Anchors for Validator Networks}.
+Lux Industries Research.
+
+\bibitem{quasar}
+Kelling, Z. (2025).
+\textit{Quasar: Quantum-Secure Multi-Engine Consensus with Triple-Proof Quantum Finality}.
+Lux Industries Research.
+
+\bibitem{hsm-boundary}
+Kelling, Z. (2025).
+\textit{Secure Enclave, HSM, and Threshold Boundary Design}.
+Lux Industries Research.
+
+\bibitem{spiffe}
+SPIFFE Authors (2024).
+\textit{Secure Production Identity Framework for Everyone (SPIFFE)}.
+CNCF.
+
+\bibitem{nist-zerotrust}
+Rose, S. et al. (2020).
+\textit{Zero Trust Architecture}.
+NIST SP 800-207.
+
+\bibitem{crypto-agility}
+Kelling, Z. (2024).
+\textit{Cryptographic Agility Architecture for Long-Lived Blockchain Systems}.
+Lux Industries Research.
+
+\end{thebibliography}
+
+\end{document}
