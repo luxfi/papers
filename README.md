@@ -25,7 +25,7 @@ All papers are written in LaTeX and automatically compiled to PDF via GitHub Act
 
 | # | Paper | File | PDF | Description |
 |---|-------|------|-----|-------------|
-| 1 | **Lux Consensus** | [`lux-consensus.tex`](lux-consensus.tex) | - | Multi-consensus architecture (Snowman, Avalanche, Snow*) |
+| 1 | **Lux Consensus** | [`lux-consensus.tex`](lux-consensus.tex) | - | Multi-consensus architecture (Wave, Focus, Quasar) |
 | 2 | **Quantum Consensus** | [`lux-quantum-consensus.tex`](lux-quantum-consensus.tex) | [📄](pdfs/lux-quantum-consensus.pdf) | Post-quantum cryptography with Dilithium signatures |
 | 3 | **Quasar Consensus** | [`lux-quasar-consensus.tex`](lux-quasar-consensus.tex) | [📄](pdfs/lux-quasar-consensus.pdf) | Dual-certificate quantum-secure finality (BLS + Ringtail) |
 | 4 | **FPC Consensus** | [`lux-fpc-consensus.tex`](lux-fpc-consensus.tex) | [📄](pdfs/lux-fpc-consensus.pdf) | Fast Probabilistic Consensus with adaptive thresholds |
