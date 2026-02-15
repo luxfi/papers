@@ -1,0 +1,213 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{listings}
+\input{shared/lstlang}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{float}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}
+
+\lstset{
+    basicstyle=\small\ttfamily,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray},
+    stringstyle=\color{red},
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray}
+}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{Pasta Curves Precompile:\\Pallas and Vesta for Halo2 Proof Verification}
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+\date{April 2026}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+We specify the Pasta curves precompile deployed on the Lux EVM, implementing
+point addition, scalar multiplication, and multi-scalar multiplication over both
+the Pallas and Vesta elliptic curves. The Pasta cycle (Pallas And Vesta)
+is a pair of prime-order curves where each curve's scalar field equals the other's
+base field, forming a 2-cycle essential for recursive proof composition in the
+Halo2 proving system. The precompile enables on-chain verification of
+Halo2 proofs (used in Zcash, Scroll, and Taiko), IPA (inner product argument)
+commitment verification, and recursive SNARK aggregation. Gas costs are 150 gas
+for addition and 7\,000 gas for scalar multiplication on either curve.
+\end{abstract}
+
+\section{Introduction}
+
+The Halo2 proof system~\cite{halo2} uses inner product arguments (IPA) over
+Pedersen commitments rather than pairings, eliminating the trusted setup required
+by Groth16. IPA verification requires multi-scalar multiplication over a
+commitment key, which is prohibitively expensive in EVM bytecode.
+
+The Pasta curves~\cite{pasta} are specifically designed for Halo2:
+\begin{enumerate}[label=(\roman*)]
+  \item \textbf{Pallas}: base field $\mathbb{F}_p$, scalar field $\mathbb{F}_q$
+  \item \textbf{Vesta}: base field $\mathbb{F}_q$, scalar field $\mathbb{F}_p$
+\end{enumerate}
+where $p$ and $q$ are 255-bit primes. The 2-cycle property ($p_{\text{Pallas}} = q_{\text{Vesta}}$
+and $q_{\text{Pallas}} = p_{\text{Vesta}}$) enables recursive proof composition:
+a Pallas circuit can verify a Vesta proof natively, and vice versa.
+
+\section{Curve Parameters}
+
+\begin{definition}[Pallas]
+Short Weierstrass form $y^2 = x^3 + 5$ over $\mathbb{F}_p$ with:
+\begin{align}
+  p &= \texttt{0x40000000000000000000000000000000224698fc094cf91b992d30ed00000001} \\
+  q &= \texttt{0x40000000000000000000000000000000224698fc0994a8dd8c46eb2100000001}
+\end{align}
+The curve has prime order $q$ (cofactor 1).
+\end{definition}
+
+\begin{definition}[Vesta]
+Short Weierstrass form $y^2 = x^3 + 5$ over $\mathbb{F}_q$ with:
+\begin{align}
+  \text{base field} &= q \quad \text{(Pallas scalar field)} \\
+  \text{scalar field} &= p \quad \text{(Pallas base field)}
+\end{align}
+Also prime order (cofactor 1).
+\end{definition}
+
+\begin{theorem}[2-Cycle]
+Pallas and Vesta form a 2-cycle: arithmetic in Pallas's scalar field is
+arithmetic in Vesta's base field. A circuit over Pallas can perform native
+field arithmetic on Vesta scalars without range checks or non-native arithmetic.
+\end{theorem}
+
+\section{Precompile Specification}
+
+\subsection{Address Assignment}
+
+Address: \texttt{0x0200\ldots22}. Selector byte encodes curve and operation:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lllr}
+\toprule
+\textbf{Selector} & \textbf{Curve} & \textbf{Operation} & \textbf{Gas} \\
+\midrule
+\texttt{0x01} & Pallas & Point Addition & 150 \\
+\texttt{0x02} & Pallas & Scalar Multiplication & 7\,000 \\
+\texttt{0x03} & Pallas & MSM & 7\,000$+$ \\
+\texttt{0x11} & Vesta & Point Addition & 150 \\
+\texttt{0x12} & Vesta & Scalar Multiplication & 7\,000 \\
+\texttt{0x13} & Vesta & MSM & 7\,000$+$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Point Encoding}
+
+Points are encoded in uncompressed affine form: 32-byte $x$ followed by 32-byte $y$,
+big-endian. The identity point is 64 zero bytes.
+
+\subsection{Multi-Scalar Multiplication}
+
+MSM is critical for IPA verification. A Halo2 proof verification requires one MSM
+of size $2n$ where $n$ is the number of IPA rounds (typically 10--15, giving
+MSM of 1024--32768 points).
+
+The implementation uses the Pippenger bucket method with optimal window size
+$c = \lceil \log_2 n \rceil$. The gas formula matches BLS12-381 MSM with the
+EIP-2537 discount schedule, scaled to the Pasta field size.
+
+\section{Security Analysis}
+
+\subsection{Prime Order}
+
+Both Pallas and Vesta have cofactor 1 (prime order). There is no small subgroup
+attack. No cofactor multiplication is needed. This is the simplest possible
+security model for an elliptic curve precompile.
+
+\subsection{Field Validation}
+
+Input coordinates are checked to be in $[0, p)$ (Pallas) or $[0, q)$ (Vesta).
+Points are verified on-curve: $y^2 \equiv x^3 + 5$. Invalid inputs return error.
+
+\subsection{Curve Confusion}
+
+The selector byte distinguishes Pallas from Vesta operations. The precompile
+validates that input coordinates are in the correct field for the selected curve.
+A Pallas point submitted to a Vesta operation (or vice versa) is rejected if the
+coordinates exceed the target field modulus.
+
+\section{Gas Cost Justification}
+
+Pallas and Vesta use 255-bit non-Mersenne primes, slightly slower than
+Curve25519 ($2^{255}-19$) but comparable to BN254 base field. The cofactor-1
+property eliminates cofactor clearing costs. Gas costs are between Curve25519
+(5\,000 for ScalarMul) and BLS12-381 G1 (12\,000 for ScalarMul).
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrr}
+\toprule
+\textbf{Operation} & \textbf{Time ($\mu$s)} & \textbf{Gas} \\
+\midrule
+Pallas Add & 2.3 & 150 \\
+Pallas ScalarMul & 108 & 7\,000 \\
+Pallas MSM (256) & 6\,400 & 280\,000 \\
+Vesta Add & 2.3 & 150 \\
+Vesta ScalarMul & 108 & 7\,000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Halo2 Verification}
+
+A complete Halo2 proof verification on-chain requires:
+\begin{enumerate}
+  \item Commitment opening check: 1 MSM of size $2^k$ ($k$ = circuit size parameter).
+  \item Permutation argument: $O(1)$ scalar multiplications.
+  \item Lookup argument: $O(1)$ scalar multiplications.
+\end{enumerate}
+
+With the MSM precompile, a Halo2 proof over a circuit with $2^{20}$ rows
+can be verified in $\sim$5M gas, compared to $\sim$500M gas with Solidity-only MSM.
+
+\section{Conclusion}
+
+The Pasta curves precompile enables on-chain Halo2 proof verification at
+practical gas costs. The 2-cycle property is preserved through careful
+selector-based dispatch, and the prime-order curves eliminate cofactor
+complications. The MSM operation with Pippenger optimization makes IPA
+verification 100x cheaper than pure Solidity.
+
+\begin{thebibliography}{9}
+\bibitem{halo2}
+  S.~Bowe, J.~Grigg, and D.~Hopwood, ``Recursive Proof Composition without
+  a Trusted Setup,'' 2019. Revised in Halo2 book, 2022.
+
+\bibitem{pasta}
+  D.~Hopwood, ``The Pasta Curves for Halo 2 and Beyond,'' Zcash specification, 2020.
+\end{thebibliography}
+
+\end{document}

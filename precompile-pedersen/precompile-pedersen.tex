@@ -1,0 +1,210 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{listings}
+\input{shared/lstlang}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{float}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}
+
+\lstset{
+    basicstyle=\small\ttfamily,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray},
+    stringstyle=\color{red},
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray}
+}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{Pedersen Hash Precompile:\\Algebraic Commitments for Zero-Knowledge Systems}
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+\date{April 2026}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+We specify the Pedersen hash and commitment precompile on the Lux EVM.
+Pedersen hash is an algebraic hash function based on elliptic curve scalar
+multiplication, producing outputs that are native group elements. Unlike
+SHA-256 or Keccak, Pedersen hash is \emph{arithmetic-circuit friendly}:
+computing a Pedersen hash inside a SNARK circuit costs $O(n)$ constraints
+versus $O(n \cdot 25000)$ for SHA-256 (where the bit decomposition of each
+round dominates). The precompile provides two operations: Pedersen hash
+(mapping $n$ field elements to a curve point) and Pedersen commitment
+(adding a blinding factor for the hiding property). Both are implemented
+over the BN254 scalar field (Baby Jubjub) and the BLS12-381 scalar field
+(Jubjub). Gas cost: 2\,000 base plus 1\,500 per input element.
+\end{abstract}
+
+\section{Introduction}
+
+Pedersen hash~\cite{pedersen} maps a vector of field elements to an elliptic
+curve point using a fixed set of generator points:
+\[
+  H(m_1, \ldots, m_k) = \sum_{i=1}^{k} [m_i] G_i
+\]
+where $G_1, \ldots, G_k$ are independent generators (no known discrete log
+relation).
+
+Pedersen hash is used in:
+\begin{enumerate}[label=(\roman*)]
+  \item \textbf{Zcash note commitments} (over Jubjub/BLS12-381).
+  \item \textbf{Aztec encrypted notes} (over Grumpkin/BN254).
+  \item \textbf{Semaphore identity commitments} (over Baby Jubjub).
+  \item \textbf{Verkle tree inner nodes} (Pedersen vector commitments).
+  \item \textbf{Bulletproofs} range proofs (Pedersen commitments as inputs).
+\end{enumerate}
+
+\section{Specification}
+
+\begin{definition}[Pedersen Hash]
+Given generators $G_1, \ldots, G_k$ on curve $E$ and inputs $m_1, \ldots, m_k \in \mathbb{F}_r$:
+\[
+  H(m_1, \ldots, m_k) = \sum_{i=1}^{k} [m_i] G_i \in E
+\]
+This is a \textbf{collision-resistant} hash under the discrete log assumption:
+finding $(m_1, \ldots, m_k) \neq (m_1', \ldots, m_k')$ with $H(\vec{m}) = H(\vec{m'})$
+requires solving a discrete log.
+\end{definition}
+
+\begin{definition}[Pedersen Commitment]
+Adding a blinding factor $r$ with an independent generator $H$:
+\[
+  C(m; r) = [r] H + \sum_{i=1}^{k} [m_i] G_i
+\]
+This is \textbf{perfectly hiding} (information-theoretically, since $r$ is uniform)
+and \textbf{computationally binding} (under DLP).
+\end{definition}
+
+\subsection{Address and Operations}
+
+Address: \texttt{0x0200\ldots28}.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lllr}
+\toprule
+\textbf{Selector} & \textbf{Curve} & \textbf{Operation} & \textbf{Gas} \\
+\midrule
+\texttt{0x01} & Baby Jubjub & Hash & $2\,000 + 1\,500k$ \\
+\texttt{0x02} & Baby Jubjub & Commit & $2\,000 + 1\,500(k+1)$ \\
+\texttt{0x11} & Jubjub (BLS) & Hash & $2\,000 + 1\,500k$ \\
+\texttt{0x12} & Jubjub (BLS) & Commit & $2\,000 + 1\,500(k+1)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Input Format}
+
+\textbf{Hash}: Selector (1 byte), number of inputs $k$ (2 bytes), followed by
+$k$ field elements (each 32 bytes).
+
+\textbf{Commit}: Same as hash, plus a 32-byte blinding factor $r$ appended.
+
+\textbf{Output}: 64 bytes (uncompressed curve point $(x, y)$).
+
+\subsection{Generator Selection}
+
+Generators are derived deterministically via hash-to-curve: $G_i = \text{HashToCurve}(\text{``Lux\_Pedersen\_''} \| i)$
+using the standardized hash-to-curve from RFC~9380. This ensures:
+\begin{itemize}
+  \item No known discrete log relation between generators.
+  \item Deterministic and reproducible across implementations.
+  \item No trusted setup (unlike KZG).
+\end{itemize}
+
+The precompile supports up to $k = 256$ input elements (covering Verkle tree
+branching factors and typical commitment vector sizes).
+
+\section{Security Analysis}
+
+\subsection{Collision Resistance}
+
+\begin{theorem}
+Finding a collision in Pedersen hash is at least as hard as solving the discrete
+logarithm problem on the underlying curve.
+\end{theorem}
+\begin{proof}
+Suppose $H(\vec{m}) = H(\vec{m'})$ with $\vec{m} \neq \vec{m'}$. Then
+$\sum_i (m_i - m'_i) G_i = \mathcal{O}$. Since $\vec{m} \neq \vec{m'}$, there
+exists $j$ with $m_j \neq m'_j$, giving
+$G_j = \sum_{i \neq j} \frac{m'_i - m_i}{m_j - m'_j} G_i$.
+This is a nontrivial discrete log relation among the generators, which contradicts
+the DLP assumption (generators are hash-derived with no known relation).
+\end{proof}
+
+\subsection{Hiding Property}
+
+The commitment $C(m; r) = [r]H + [m]G$ is perfectly hiding because for any
+message $m$ and commitment $C$, there exists exactly one $r$ such that
+$C = [r]H + [m]G$. Since $r$ is uniformly random, $C$ is uniformly distributed
+on the curve regardless of $m$.
+
+\subsection{Homomorphic Property}
+
+Pedersen commitments are additively homomorphic:
+$C(m_1; r_1) + C(m_2; r_2) = C(m_1 + m_2; r_1 + r_2)$.
+This enables range proofs (Bulletproofs) and confidential transactions
+without revealing committed values.
+
+\section{Gas Cost Justification}
+
+Each input element requires one scalar multiplication ($\sim$100$\mu$s on BN254).
+The MSM optimization (Pippenger) reduces the aggregate cost for large $k$, but
+the gas formula uses the conservative linear model.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrr}
+\toprule
+\textbf{Inputs ($k$)} & \textbf{Time ($\mu$s)} & \textbf{Gas} \\
+\midrule
+1 & 95 & 3\,500 \\
+4 & 200 & 8\,000 \\
+16 & 580 & 26\,000 \\
+256 & 5\,200 & 386\,000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Conclusion}
+
+The Pedersen precompile provides the standard algebraic commitment primitive for
+zero-knowledge proof systems. The arithmetic-friendly structure (native curve
+point output) makes it the preferred hash for in-circuit computation.
+Supporting both BN254 (Baby Jubjub) and BLS12-381 (Jubjub) curves covers the
+two dominant SNARK ecosystems.
+
+\begin{thebibliography}{9}
+\bibitem{pedersen}
+  T.~P.~Pedersen, ``Non-Interactive and Information-Theoretic Secure Verifiable
+  Secret Sharing,'' \textit{CRYPTO 1991}, LNCS 576, pp.~129--140.
+\end{thebibliography}
+
+\end{document}

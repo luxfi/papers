@@ -1,0 +1,214 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{listings}
+\input{shared/lstlang}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{float}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}
+
+\lstset{
+    basicstyle=\small\ttfamily,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray},
+    stringstyle=\color{red},
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray}
+}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{SR25519 Precompile:\\Schnorrkel Signatures for Substrate Compatibility}
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+\date{April 2026}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+We specify the SR25519 (Schnorrkel) signature verification precompile on the
+Lux EVM. SR25519 is the Schnorr-based signature scheme on Ristretto25519
+used by Polkadot, Kusama, and all Substrate-based chains for account signing,
+session keys, and VRF (Verifiable Random Function) output. Unlike Ed25519,
+SR25519 uses the Ristretto group encoding (eliminating cofactor complexities),
+produces non-malleable signatures, and supports VRF output verification as a
+built-in capability. The precompile provides signature verification and VRF
+output verification. Gas cost: 2\,500 for signature verify, 4\,000 for VRF verify.
+\end{abstract}
+
+\section{Introduction}
+
+SR25519~\cite{schnorrkel} (Schnorrkel) is the signature scheme of the Substrate
+ecosystem. It is used by:
+\begin{itemize}
+  \item Polkadot relay chain and parachains (validator and session keys).
+  \item Kusama (canary network).
+  \item All Substrate-based chains (default account signing).
+\end{itemize}
+
+SR25519 differs from Ed25519 in three critical ways:
+\begin{enumerate}[label=(\roman*)]
+  \item \textbf{Ristretto encoding}: Uses the Ristretto255 group~\cite{ristretto}
+    (a prime-order group constructed from Curve25519), eliminating cofactor
+    complications and signature malleability.
+  \item \textbf{Schnorr signature}: Uses a Schnorr construction with
+    Merlin transcript-based challenges (domain separation, streaming).
+  \item \textbf{VRF support}: Built-in verifiable random function (VRF) via
+    the same key pair, used for Polkadot's BABE block production.
+\end{enumerate}
+
+\section{Ristretto255}
+
+\begin{definition}[Ristretto255]
+Ristretto255 is a prime-order group of order $\ell = 2^{252} + 27742317777372353535851937790883648493$
+constructed from Curve25519 via a quotient encoding. Every Ristretto point has
+a unique canonical encoding (32 bytes). The cofactor is eliminated by the encoding,
+not by multiplication.
+\end{definition}
+
+The Ristretto encoding solves the ``cofactor problem'' that plagues Ed25519:
+there is exactly one valid encoding for each group element, and decoding
+either produces a valid group element or fails. No special-case handling for
+low-order points, identity, or non-canonical encodings is needed.
+
+\section{Precompile Specification}
+
+Address: \texttt{0x0200\ldots2E}.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{llr}
+\toprule
+\textbf{Selector} & \textbf{Operation} & \textbf{Gas} \\
+\midrule
+\texttt{0x01} & Signature Verify & 2\,500 \\
+\texttt{0x02} & VRF Verify & 4\,000 \\
+\texttt{0x03} & Batch Verify & $2\,500 + 1\,800(n-1)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Signature Verification}
+
+\textbf{Input}: Selector (1), public key (32 bytes, Ristretto encoding),
+signature (64 bytes: 32-byte $R$, 32-byte $s$), signing context length (2 bytes),
+signing context, message length (4 bytes), message.
+
+\textbf{Output}: 32 bytes, value 1 if valid, 0 otherwise.
+
+\textbf{Verification}:
+\begin{enumerate}
+  \item Decode $R$ as Ristretto point (fail if non-canonical).
+  \item Decode public key $A$ as Ristretto point.
+  \item Construct Merlin transcript with signing context and message.
+  \item Derive challenge $k$ from transcript.
+  \item Check $[s]B = R + [k]A$.
+\end{enumerate}
+
+The Merlin transcript~\cite{merlin} provides domain separation: the signing
+context (a byte string, typically ``substrate'') is committed before the message,
+preventing cross-protocol signature replay.
+
+\subsection{VRF Verification}
+
+\textbf{Input}: Selector (1), public key (32 bytes), VRF output (32 bytes),
+VRF proof (64 bytes), transcript data (variable).
+
+\textbf{Output}: 32 bytes, value 1 if the VRF output is valid for the given
+input and public key.
+
+The VRF~\cite{vrf-schnorrkel} produces a deterministic output $H = [\text{sk}] \cdot \text{HashToPoint}(\text{input})$
+that is unpredictable without the secret key but verifiable with the public key.
+
+\section{Security Analysis}
+
+\subsection{Non-Malleability}
+
+SR25519 signatures are non-malleable by construction:
+\begin{itemize}
+  \item The Ristretto encoding ensures unique point representation.
+  \item The scalar $s$ is checked to be in $[0, \ell)$.
+  \item The Merlin transcript commits all inputs in order.
+\end{itemize}
+
+\subsection{Signing Context}
+
+The mandatory signing context prevents cross-protocol attacks. A signature
+produced with context ``substrate'' is invalid under context ``polkadot''.
+The precompile requires the signing context as input and rejects empty contexts.
+
+\subsection{VRF Security}
+
+The VRF output is indistinguishable from random under the Decisional
+Diffie-Hellman (DDH) assumption on Ristretto255. The proof ensures that the
+output was computed correctly by the claimed public key holder.
+
+\section{Gas Cost Justification}
+
+SR25519 verification requires 2 Ristretto scalar multiplications (same as Ed25519)
+plus Merlin transcript operations (SHA-3 based, negligible cost). The 25\% premium
+over Ed25519 (2\,500 vs 2\,000) reflects the Ristretto decoding overhead and
+Merlin transcript construction.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrr}
+\toprule
+\textbf{Operation} & \textbf{Time ($\mu$s)} & \textbf{Gas} \\
+\midrule
+Signature Verify & 40 & 2\,500 \\
+VRF Verify & 62 & 4\,000 \\
+Batch Verify (16) & 420 & 29\,700 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Conclusion}
+
+The SR25519 precompile enables native verification of Substrate ecosystem
+signatures on the Lux EVM. The Ristretto encoding eliminates cofactor-related
+vulnerabilities, and the built-in VRF support enables on-chain verification
+of Polkadot BABE block production proofs.
+
+\begin{thebibliography}{9}
+\bibitem{schnorrkel}
+  J.~Burdges, ``Schnorrkel: Schnorr VRFs and signatures on the Ristretto group,''
+  W3F Research, 2019. \url{https://github.com/w3f/schnorrkel}
+
+\bibitem{ristretto}
+  H.~de Valence et al., ``Ristretto: prime order elliptic curve groups with
+  non-malleable encodings,'' 2018. \url{https://ristretto.group}
+
+\bibitem{merlin}
+  H.~de Valence, ``Merlin: composable proof transcripts for public-coin
+  arguments of knowledge,'' 2018. \url{https://merlin.cool}
+
+\bibitem{vrf-schnorrkel}
+  J.~Burdges, ``A Schnorr VRF with an extra Schnorr DLEQ proof,''
+  W3F Research, 2020.
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,203 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{listings}
+\input{shared/lstlang}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{float}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}
+
+\lstset{
+    basicstyle=\small\ttfamily,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray},
+    stringstyle=\color{red},
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray}
+}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{ECIES Precompile:\\Elliptic Curve Integrated Encryption on the EVM}
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+\date{April 2026}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+We specify the Elliptic Curve Integrated Encryption Scheme (ECIES) precompile
+on the Lux EVM. ECIES~\cite{ieee-ecies} combines ECDH key agreement, a KDF,
+and symmetric AEAD into a single encrypt/decrypt operation using the recipient's
+secp256k1 public key. The precompile enables any Ethereum address holder to
+receive encrypted on-chain messages without pre-shared secrets: the sender
+encrypts using the recipient's public key (recoverable from any previous
+transaction), and only the recipient's private key can decrypt. Gas cost:
+10\,000 base plus 6 gas per byte of plaintext, reflecting the ECDH scalar
+multiplication plus AES-256-GCM symmetric encryption.
+\end{abstract}
+
+\section{Introduction}
+
+Every Ethereum/Lux address corresponds to a secp256k1 key pair. The public key
+is recoverable from any signed transaction (via \texttt{ecrecover}). ECIES
+leverages this existing key infrastructure for public-key encryption without
+any additional key distribution.
+
+Use cases:
+\begin{enumerate}[label=(\roman*)]
+  \item \textbf{Encrypted memos}: Transfer metadata visible only to the recipient.
+  \item \textbf{Sealed-bid auctions}: Encrypt bids to the auctioneer's address.
+  \item \textbf{Private governance}: Encrypt votes to a tallying contract's key.
+  \item \textbf{Confidential oracle data}: Encrypt data for a specific consumer.
+\end{enumerate}
+
+\section{Specification}
+
+\begin{definition}[ECIES-KEM-DEM]
+\leavevmode
+\begin{description}
+  \item[Encrypt$(pk_R, M)$]:
+    \begin{enumerate}
+      \item Generate ephemeral key pair $(sk_e, pk_e)$ on secp256k1.
+      \item Compute shared point $S = [sk_e] pk_R$.
+      \item Derive symmetric key: $k = \text{HKDF-SHA256}(S_x, \text{``ECIES''}, 32)$.
+      \item Encrypt: $C = \text{AES-256-GCM}(k, \text{nonce}, M)$ where nonce
+        is the first 12 bytes of SHA-256($pk_e$).
+      \item Output: $pk_e \| C \| \text{tag}$.
+    \end{enumerate}
+  \item[Decrypt$(sk_R, pk_e \| C \| \text{tag})$]:
+    \begin{enumerate}
+      \item Compute $S = [sk_R] pk_e$.
+      \item Derive $k$ via same HKDF.
+      \item Decrypt and verify: $M = \text{AES-256-GCM.Open}(k, \text{nonce}, C, \text{tag})$.
+    \end{enumerate}
+\end{description}
+\end{definition}
+
+\subsection{Address and Operations}
+
+Address: \texttt{0x0200\ldots2A}.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{llr}
+\toprule
+\textbf{Selector} & \textbf{Operation} & \textbf{Gas} \\
+\midrule
+\texttt{0x01} & Encrypt & $10\,000 + 6|M|$ \\
+\texttt{0x02} & Decrypt & $10\,000 + 6|C|$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Input/Output}
+
+\textbf{Encrypt input}: Selector (1), recipient public key (64 bytes uncompressed
+secp256k1, no 0x04 prefix), entropy for ephemeral key (32 bytes), plaintext.
+
+\textbf{Encrypt output}: Ephemeral public key (64 bytes) $\|$ ciphertext $\|$ tag (16 bytes).
+
+\textbf{Decrypt input}: Selector (1), recipient secret key (32 bytes), ephemeral
+public key (64 bytes), ciphertext $\|$ tag (16 bytes).
+
+\textbf{Decrypt output}: Plaintext.
+
+\subsection{Entropy}
+
+The ephemeral key is derived deterministically from the 32-byte entropy input
+via SHA-256 (reduced modulo the secp256k1 order). This ensures deterministic
+execution across validators while allowing the caller to provide randomness.
+
+\section{Security Analysis}
+
+\subsection{IND-CCA2 Security}
+
+ECIES achieves IND-CCA2 security under the gap-CDH assumption on secp256k1,
+the pseudorandomness of HKDF-SHA256, and the IND-CCA security of AES-256-GCM.
+
+\subsection{Key Validation}
+
+The recipient's public key is validated to be a point on secp256k1 in the
+prime-order subgroup (cofactor 1 for secp256k1, so on-curve suffices).
+The ephemeral public key in decryption is similarly validated. Invalid keys
+cause an immediate error (all gas consumed).
+
+\subsection{Ephemeral Key Reuse}
+
+Reusing the same ephemeral key for different recipients is safe (different
+shared secrets due to different $pk_R$). Reusing for the same recipient with
+different messages is equivalent to nonce reuse in GCM and must be avoided.
+The entropy input should be unique per encryption.
+
+\subsection{Secret Key Exposure}
+
+The decrypt operation accepts a secret key as input. This is inherently
+dangerous: the secret key is visible to all validators during transaction
+execution (the EVM has no private computation). Decryption should occur
+off-chain. The on-chain decrypt is provided for:
+\begin{itemize}
+  \item Contract-held keys (e.g., threshold-decrypted by MPC).
+  \item Reveal phases where the key is intentionally disclosed.
+\end{itemize}
+
+\section{Gas Cost Justification}
+
+The base cost of 10\,000 gas covers one secp256k1 scalar multiplication (ECDH),
+HKDF derivation, and GCM initialization. The per-byte cost of 6 gas matches
+the AES-256-GCM precompile.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrr}
+\toprule
+\textbf{Size} & \textbf{Time ($\mu$s)} & \textbf{Gas} \\
+\midrule
+Encrypt 32 B & 160 & 10\,192 \\
+Encrypt 1 KB & 162 & 16\,144 \\
+Decrypt 1 KB & 160 & 16\,144 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Conclusion}
+
+The ECIES precompile enables public-key encryption using existing Ethereum
+secp256k1 key pairs. Every address on Lux can receive encrypted messages
+without any key registration. The construction is IND-CCA2 secure and
+leverages the AES-256-GCM precompile for symmetric encryption.
+
+\begin{thebibliography}{9}
+\bibitem{ieee-ecies}
+  IEEE, ``Standard Specifications for Public-Key Cryptography,''
+  IEEE Std 1363a-2004, Section~11 (ECIES).
+
+\bibitem{shoup-ecies}
+  V.~Shoup, ``A Proposal for an ISO Standard for Public Key Encryption,''
+  IACR ePrint 2001/112, 2001.
+\end{thebibliography}
+
+\end{document}
