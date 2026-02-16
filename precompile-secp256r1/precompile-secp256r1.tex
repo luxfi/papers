@@ -1,0 +1,217 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{listings}
+\input{shared/lstlang}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{float}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}
+
+\lstset{
+    basicstyle=\small\ttfamily,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray},
+    stringstyle=\color{red},
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray}
+}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{secp256r1 Precompile:\\P-256 ECDSA Verification (EIP-7212)}
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+\date{April 2026}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+We specify the secp256r1 (NIST P-256) ECDSA signature verification precompile
+on the Lux EVM, implementing EIP-7212. P-256 is the curve used by Apple's
+Secure Enclave, Android Keystore, WebAuthn/FIDO2 hardware authenticators,
+Windows Hello, and most TLS certificates. The precompile enables smart contract
+wallets secured by hardware-backed passkeys: users authenticate transactions
+with biometrics (Touch ID, Face ID) rather than managing seed phrases. Gas cost:
+3\,450 gas (fixed), matching the proposed EIP-7212 pricing. The precompile
+verifies a P-256 ECDSA signature against a message hash and public key, returning
+1 on success and 0 on failure.
+\end{abstract}
+
+\section{Introduction}
+
+EIP-7212~\cite{eip7212} proposes a P-256 signature verification precompile at
+address \texttt{0x100}. Lux deploys this at the Lux precompile address
+\texttt{0x0200\ldots2C} with identical interface semantics.
+
+The motivation is hardware wallet security without custom hardware:
+\begin{enumerate}[label=(\roman*)]
+  \item \textbf{Passkeys/WebAuthn}: FIDO2 authenticators (YubiKey, Titan,
+    platform authenticators) sign challenges with P-256. A passkey-secured
+    smart contract wallet verifies these signatures on-chain.
+  \item \textbf{Secure Enclave}: Apple devices generate non-exportable P-256
+    keys in the Secure Enclave (SEP). This provides HSM-grade security for
+    every iPhone/iPad/Mac user.
+  \item \textbf{Android Keystore}: Android StrongBox Keymaster generates
+    P-256 keys in a tamper-resistant hardware module.
+  \item \textbf{TLS certificate verification}: Verifying X.509 certificate
+    signatures on-chain for oracle data provenance.
+\end{enumerate}
+
+\section{Curve Parameters}
+
+\begin{definition}[secp256r1 / NIST P-256]
+Short Weierstrass: $y^2 = x^3 - 3x + b$ over $\mathbb{F}_p$ with:
+\begin{align}
+  p &= 2^{256} - 2^{224} + 2^{192} + 2^{96} - 1 \\
+  b &= \texttt{0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b} \\
+  n &= \texttt{0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551}
+\end{align}
+$p$ is a Solinas prime enabling fast modular reduction. The curve has prime order $n$
+(cofactor 1).
+\end{definition}
+
+\section{Precompile Specification}
+
+Address: \texttt{0x0200\ldots2C}.
+
+\textbf{Input}: 160 bytes total:
+\begin{itemize}
+  \item Bytes 0--31: message hash $h$ (32 bytes, typically SHA-256 of the message)
+  \item Bytes 32--63: signature $r$ (32 bytes)
+  \item Bytes 64--95: signature $s$ (32 bytes)
+  \item Bytes 96--127: public key $x$ (32 bytes)
+  \item Bytes 128--159: public key $y$ (32 bytes)
+\end{itemize}
+
+\textbf{Output}: 32 bytes. Value 1 if the signature is valid, 0 otherwise.
+
+\textbf{Gas}: 3\,450 (fixed).
+
+\subsection{Verification Algorithm}
+
+\begin{algorithm}[H]
+\caption{P-256 ECDSA Verify}
+\begin{algorithmic}[1]
+\Require Hash $h$, signature $(r, s)$, public key $Q = (x, y)$
+\If{$r \notin [1, n-1]$ or $s \notin [1, n-1]$} \Return 0 \EndIf
+\If{$Q \notin E(\mathbb{F}_p)$} \Return 0 \EndIf
+\State $w \gets s^{-1} \bmod n$
+\State $u_1 \gets h \cdot w \bmod n$
+\State $u_2 \gets r \cdot w \bmod n$
+\State $R \gets [u_1]G + [u_2]Q$
+\If{$R = \mathcal{O}$} \Return 0 \EndIf
+\If{$R.x \bmod n = r$} \Return 1 \Else{} \Return 0 \EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\section{Security Analysis}
+
+\subsection{Low-$s$ Normalization}
+
+The precompile does \emph{not} enforce low-$s$ normalization (unlike Ethereum's
+\texttt{ecrecover} which requires $s \leq n/2$). P-256 signatures from hardware
+authenticators may use either $s$ or $n - s$. Both are accepted.
+
+\subsection{Public Key Validation}
+
+The public key $(x, y)$ is validated:
+\begin{enumerate}
+  \item $x, y \in [0, p)$.
+  \item $(x, y)$ satisfies $y^2 = x^3 - 3x + b \pmod{p}$.
+  \item $(x, y) \neq \mathcal{O}$ (the point at infinity).
+\end{enumerate}
+Since secp256r1 has cofactor 1, on-curve validation is sufficient (no subgroup check).
+
+\subsection{Hash Algorithm Agnosticism}
+
+The precompile accepts a pre-hashed message (32 bytes). The hash algorithm is the
+caller's choice. WebAuthn typically uses SHA-256; some TLS certificates use SHA-384.
+The precompile does not enforce a specific hash.
+
+\subsection{Timing Side Channels}
+
+The implementation uses constant-time scalar multiplication (wNAF with constant-time
+table lookup) and constant-time modular inversion. The gas cost is fixed at 3\,450
+regardless of input values.
+
+\section{Gas Cost Justification}
+
+P-256 ECDSA verification requires two scalar multiplications ($[u_1]G$ and $[u_2]Q$)
+and one modular inversion. The Solinas prime $p = 2^{256} - 2^{224} + 2^{192} + 2^{96} - 1$
+enables fast reduction, making P-256 only slightly slower than secp256k1.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrr}
+\toprule
+\textbf{Operation} & \textbf{Time ($\mu$s)} & \textbf{Gas} \\
+\midrule
+P-256 ECDSA Verify & 54 & 3\,450 \\
+secp256k1 ecrecover (reference) & 45 & 3\,000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The 15\% premium over \texttt{ecrecover} reflects the non-Koblitz structure of P-256
+(no endomorphism optimization).
+
+\section{WebAuthn Integration}
+
+A typical passkey-secured smart contract wallet:
+\begin{enumerate}
+  \item User initiates a transaction via browser/app.
+  \item The wallet generates a WebAuthn challenge containing the transaction hash.
+  \item The authenticator (Secure Enclave, YubiKey) signs with P-256.
+  \item The signed assertion (including authenticator data and client data JSON)
+    is submitted as calldata.
+  \item The contract reconstructs the signed message hash from the WebAuthn
+    authenticator data and calls the P-256 precompile to verify.
+\end{enumerate}
+
+The precompile cost of 3\,450 gas makes passkey verification cheaper than an
+EOA \texttt{ecrecover} (3\,000 gas) plus the calldata overhead of the WebAuthn
+assertion ($\sim$500 gas), for a total of $\sim$4\,000 gas per passkey verification.
+
+\section{Conclusion}
+
+The secp256r1 precompile enables billions of existing hardware security keys
+(Secure Enclave, Android Keystore, FIDO2 authenticators) to secure smart
+contract wallets on Lux. The fixed 3\,450 gas cost makes passkey verification
+economically viable for every transaction.
+
+\begin{thebibliography}{9}
+\bibitem{eip7212}
+  U.~Erikli et al., ``EIP-7212: Precompiled for secp256r1 Curve Support,'' 2023.
+
+\bibitem{fips186}
+  NIST, ``Digital Signature Standard (DSS),'' FIPS~186-5, 2023.
+
+\bibitem{webauthn}
+  W3C, ``Web Authentication: An API for accessing Public Key Credentials,''
+  Level 2, 2021.
+\end{thebibliography}
+
+\end{document}

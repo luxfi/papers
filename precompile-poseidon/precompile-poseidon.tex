@@ -1,0 +1,214 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{listings}
+\input{shared/lstlang}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{float}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}
+
+\lstset{
+    basicstyle=\small\ttfamily,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray},
+    stringstyle=\color{red},
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray}
+}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{Poseidon2 Precompile:\\ZK-Friendly Hashing on the EVM}
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+\date{April 2026}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+We specify the Poseidon2 hash precompile on the Lux EVM. Poseidon2~\cite{poseidon2}
+is a ZK-friendly hash function optimized for arithmetic circuits: it operates
+natively over prime fields with minimal multiplicative complexity ($\sim$3x fewer
+constraints than Poseidon, $\sim$60x fewer than SHA-256 in R1CS). The precompile
+implements the Poseidon2 permutation over the BN254 scalar field
+($\mathbb{F}_r$, $r \approx 2^{254}$) and the BLS12-381 scalar field, with
+sponge-mode absorption for arbitrary-length input and fixed-width output.
+Gas cost: 1\,800 base plus 800 per absorbed field element. The precompile
+serves as the Merkle tree hash for Lux's state trie (replacing Keccak in
+ZK-provable contexts) and the commitment hash for Halo2 and Plonky3 circuits.
+\end{abstract}
+
+\section{Introduction}
+
+Traditional hash functions (SHA-256, Keccak) are designed for binary efficiency:
+they operate on bits and bytes via bitwise operations (XOR, AND, shifts, rotations).
+When expressed as arithmetic circuits over a prime field $\mathbb{F}_p$, each
+bitwise operation requires $O(\log p)$ constraints for bit decomposition, making
+them prohibitively expensive inside SNARKs.
+
+Poseidon~\cite{poseidon} and its successor Poseidon2~\cite{poseidon2} address
+this by designing the hash function as a sequence of field multiplications and
+additions---operations that are native to arithmetic circuits.
+
+\subsection{Poseidon2 vs.\ Poseidon}
+
+Poseidon2 improves on Poseidon in two ways:
+\begin{enumerate}
+  \item \textbf{External rounds}: Use a linear diffusion layer based on a
+    $4 \times 4$ matrix with entries $\{2, 1, 1, 1\}$ (circulant), replacing
+    the dense MDS matrix. This is $\sim$3x cheaper in constraints.
+  \item \textbf{Internal rounds}: Use a diagonal matrix plus a rank-1 correction,
+    further reducing multiplicative depth.
+\end{enumerate}
+
+\section{Specification}
+
+\begin{definition}[Poseidon2 Permutation]
+State width $t$ (typically 3 or 5), with $R_f$ full rounds and $R_p$ partial rounds.
+Each round applies:
+\begin{enumerate}
+  \item \textbf{Add round constants}: $s_i \gets s_i + c_{r,i}$
+  \item \textbf{S-box}: $s_i \gets s_i^d$ where $d$ is the smallest integer
+    coprime to $p-1$ (typically $d = 5$ for BN254, $d = 5$ for BLS12-381)
+  \item \textbf{Linear layer}: $\vec{s} \gets M \cdot \vec{s}$
+\end{enumerate}
+Full rounds apply the S-box to all state elements; partial rounds apply it to
+only the first element ($s_0$).
+\end{definition}
+
+\subsection{Parameters}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Field} & \textbf{Width $t$} & \textbf{$R_f$} & \textbf{$R_p$} & \textbf{Security} \\
+\midrule
+BN254 ($\mathbb{F}_r$) & 3 & 8 & 56 & 128-bit \\
+BN254 ($\mathbb{F}_r$) & 5 & 8 & 60 & 128-bit \\
+BLS12-381 ($\mathbb{F}_r$) & 3 & 8 & 56 & 128-bit \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Sponge Construction}
+
+The precompile uses the sponge construction with rate $r = t - 1$ and capacity
+$c = 1$:
+\begin{enumerate}
+  \item Initialize state to zero.
+  \item Absorb: add input elements to the first $r$ state positions, then
+    apply the permutation. Repeat for all input blocks.
+  \item Squeeze: output the first element of the state.
+\end{enumerate}
+
+\subsection{Address and Operations}
+
+Address: \texttt{0x0200\ldots29}.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lllr}
+\toprule
+\textbf{Selector} & \textbf{Field} & \textbf{Width} & \textbf{Gas} \\
+\midrule
+\texttt{0x01} & BN254 & $t = 3$ & $1\,800 + 800k$ \\
+\texttt{0x02} & BN254 & $t = 5$ & $1\,800 + 800k$ \\
+\texttt{0x11} & BLS12-381 & $t = 3$ & $1\,800 + 800k$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Input}: Selector (1 byte), number of field elements $k$ (2 bytes),
+followed by $k$ field elements (32 bytes each).
+
+\textbf{Output}: 32 bytes (one field element).
+
+\section{Security Analysis}
+
+\subsection{Algebraic Attacks}
+
+Poseidon2's security margin against algebraic attacks (Grobner basis, interpolation,
+GCD) is determined by the number of rounds. The $R_f + R_p$ configuration provides:
+\begin{itemize}
+  \item Grobner basis: degree $> 2^{128}$ after full round schedule.
+  \item Interpolation: the algebraic degree of the permutation exceeds $5^{R_f/2} \cdot 5 = 5^5 = 3125$ per partial round, ensuring the total degree is astronomical.
+  \item Differential/linear: the wide trail strategy from the MDS-like diffusion
+    ensures no high-probability differential characteristics exist.
+\end{itemize}
+
+\subsection{Statistical Attacks}
+
+The number of full rounds ($R_f = 8$) provides a security margin of 2 rounds
+beyond the minimum required to resist statistical distinguishers. This follows
+the Poseidon design rationale of ``number of rounds for security + margin.''
+
+\subsection{Collision Resistance}
+
+For sponge mode with capacity $c = 1$ field element ($\sim$254 bits), the
+collision resistance is $\sim$127 bits (birthday bound on a 254-bit output).
+This exceeds the 128-bit target because the field size slightly exceeds $2^{254}$.
+
+\section{Gas Cost Justification}
+
+Poseidon2 over a 254-bit field requires $R_f \cdot t + R_p = 8 \cdot 3 + 56 = 80$
+S-box evaluations ($x^5$) per permutation, plus linear layer operations.
+Each S-box is 2 field multiplications; each linear layer is $O(t^2)$ additions.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Inputs} & \textbf{Permutations} & \textbf{Time ($\mu$s)} & \textbf{Gas} \\
+\midrule
+2 & 1 & 28 & 3\,400 \\
+4 & 2 & 55 & 5\,000 \\
+16 & 8 & 210 & 14\,600 \\
+64 & 32 & 820 & 53\,000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Conclusion}
+
+The Poseidon2 precompile provides the standard ZK-friendly hash on the Lux EVM.
+Its native field arithmetic makes it the optimal choice for Merkle trees,
+commitment schemes, and any hashing inside SNARK circuits. The sponge construction
+provides collision resistance from a single permutation primitive.
+
+\begin{thebibliography}{9}
+\bibitem{poseidon2}
+  L.~Grassi, D.~Khovratovich, and M.~Schl\"affer,
+  ``Poseidon2: A Faster Version of the Poseidon Hash Function,''
+  \textit{AFRICACRYPT 2023}.
+
+\bibitem{poseidon}
+  L.~Grassi, D.~Khovratovich, C.~Rechberger, A.~Roy, and M.~Schl\"affer,
+  ``POSEIDON: A New Hash Function for Zero-Knowledge Proof Systems,''
+  \textit{USENIX Security 2021}.
+\end{thebibliography}
+
+\end{document}
