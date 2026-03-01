@@ -1,0 +1,123 @@
+\section{Empirical Results}
+
+\label{sec:empirical}
+%% ============================================================================
+
+This section consolidates the v0.23.0 measurements that other sections
+reference into a single table organised by backend and workload.
+Hardware: Apple M1 Max (32-core Metal GPU, 10-core CPU, 64\,GB unified
+memory), macOS 14.5, clang/llvm 17. CUDA figures are produced by the
+nightly H100 runner (\S\ref{sec:cuda:ci}); the EKS T4/A10G runners cover
+build correctness rather than headline performance.
+
+\subsection{What Each Number Measures}
+
+\begin{itemize}
+  \item \emph{TPS (transactions per second)} ---
+    end-to-end throughput including dispatch overhead. Measured on
+    real EVM bytecode, not microbenchmarks.
+  \item \emph{Mgas/s} --- aggregate gas processed per second. The EVM
+    spec attaches a fixed gas cost to every opcode, so this number is
+    the throughput a block builder cares about.
+  \item \emph{M ops/s} --- raw opcode dispatch rate from
+    \texttt{evm-bench-kernel}. Computed by counting bytecode opcodes
+    actually executed (not gas-weighted) per loop iteration. Used
+    primarily to compare GPU-V1 vs CPU evmone on the same compute-bound
+    workload.
+\end{itemize}
+
+\subsection{Headline Table}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{llrrr}
+\toprule
+\textbf{Workload} & \textbf{Backend} & \textbf{Throughput} & \textbf{Notes} & \textbf{Source} \\
+\midrule
+\multicolumn{5}{l}{\textit{Real EVM bytecode (50-iter ADD loop, 13 ops/iter)}} \\
+$N{=}2048$ txs   & GPU\_Metal V1 & \num{25327}\,TPS         & 1.14\,M EVM ops/s & \texttt{bench\_kernel.cpp} \\
+$N{=}2048$ txs   & GPU\_Metal V1 & 1.14\,M ops/s            & gas-match vs CPU  & \texttt{bench\_kernel.cpp} \\
+$N{=}2048$ txs   & CPU evmone    & 155\,M ops/s             & single thread     & \texttt{bench\_kernel.cpp} \\
+$N{=}2048$ txs   & GPU\_Metal V1 & 252\,M ops/s             & 1.62$\times$ vs CPU & \texttt{bench\_kernel.cpp} \\
+\midrule
+\multicolumn{5}{l}{\textit{Block-STM ETH transfers (21000 gas/tx, 10K txs/block)}} \\
+10K transfers   & CPU\_Sequential & \SI{534}{Ggas/s}         & evmone, 1 thread  & \texttt{bench\_block.cpp} \\
+10K transfers   & CPU\_Parallel (4T) & ---                   & 4-worker Block-STM & \texttt{bench\_block.cpp} \\
+10K transfers   & CPU\_Parallel (10T) & ---                  & saturated cores   & \texttt{bench\_block.cpp} \\
+\midrule
+\multicolumn{5}{l}{\textit{Cryptographic critical path}} \\
+47K ecrecover   & CPU            & \SI{1613}{\milli\second}  & evmone batch      & \texttt{bench\_keccak.cpp} \\
+47K ecrecover   & GPU\_Metal     & \SI{50}{\milli\second}    & 32.3$\times$      & \texttt{bench\_keccak.cpp} \\
+47K keccak256   & CPU            & \SI{127}{\milli\second}   & evmone keccak     & \texttt{bench\_keccak.cpp} \\
+47K keccak256   & GPU\_Metal     & \SI{18}{\milli\second}    & 7.1$\times$       & \texttt{bench\_keccak.cpp} \\
+\midrule
+\multicolumn{5}{l}{\textit{Unified pipeline (EVM + state hash + sig-verify)}} \\
+1000 blocks     & Serial Metal   & \SI{20}{\hertz}           & one stage at a time & \texttt{test\_unified\_pipeline.cpp} \\
+1000 blocks     & Pipelined Metal & \SI{19}{\hertz}          & 1.07$\times$ overlap & \texttt{test\_unified\_pipeline.cpp} \\
+\midrule
+\multicolumn{5}{l}{\textit{Parity \& correctness}} \\
+133 vectors     & 4 backends     & 100\% pass               & gas/status/output bit-exact & \texttt{parity\_test.cpp} \\
+147 vectors     & GPU\_Metal     & 100\% pass               & per-opcode coverage & \texttt{test\_opcodes.cpp} \\
+19 groups       & GPU dispatch   & 100\% pass               & 0x01--0x11 precompiles & \texttt{precompile\_test.cpp} \\
+7 scenarios     & EVMC bridge    & 100\% pass               & CALL/CREATE pre-resolve & \texttt{host\_bridge\_test.cpp} \\
+\bottomrule
+\end{tabular}
+\caption{Measured GPU EVM performance and correctness. All performance
+numbers are minimum-of-three runs to filter Metal device-coalescing
+warmup; correctness numbers are exact pass counts on the named test
+binaries. Source columns reference paths under
+\texttt{lib/evm/gpu/} and \texttt{test/unittests/} in the
+\texttt{luxcpp/evm} repository at tag \texttt{v0.23.0}.}
+\label{tab:empirical}
+\end{table}
+
+\subsection{Where the GPU Loses}
+
+The bytecode kernel does not yet beat CPU\_Parallel on every microkernel
+batch size. The detailed sweep
+(\texttt{lib/evm/gpu/results/speedup-with-buffer-cache-2026-02-28.txt})
+shows GPU/CPU\_Parallel ratios of $0.01\times$--$0.23\times$ across
+sweep cells $N \in \{32, 128, 512, 2048\}$ and 19 opcode workloads.
+The pattern is consistent: at $N \le 512$, dispatch overhead dominates
+($\sim$\SI{6}{\milli\second}--\SI{12}{\milli\second} of cold-buffer
+cost vs $\sim$\SI{0.1}{\milli\second}--\SI{1.2}{\milli\second} for
+the CPU side). The GPU wins on:
+
+\begin{itemize}
+  \item Workloads where \texttt{ecrecover} or large-input
+    \texttt{KECCAK256} dominate (i.e.\ real blocks containing many
+    transactions, not microkernels);
+  \item Compute-heavy bytecode at $N \ge 4096$ where the
+    \SI{6}{\milli\second} dispatch amortises over many transactions;
+  \item Pipelined workloads where consensus state-hashing and
+    sig-verify share the same Metal device with EVM execution.
+\end{itemize}
+
+The $1.62\times$ headline figure on \texttt{evm-bench-kernel} is
+representative: pure-compute ADD-loop bytecode at $N{=}2048$ with all
+ecrecover paths excluded, comparing GPU-V1 (one tx per thread) to CPU
+evmone single-threaded. The same workload through CPU-Parallel does
+better in absolute terms but is not the relevant comparison for an
+ecrecover-dominated production block.
+
+\subsection{Open Headline Numbers (v0.24+)}
+
+\begin{itemize}
+  \item \emph{H100 baseline.} The H100 self-hosted runner exists but the
+    headline table above is M1 Max only; H100 ops/s and TPS for the same
+    bench are pending the v0.24 publication of the
+    \texttt{cuda-bench-results} artefact.
+  \item \emph{End-to-end real-block TPS.} The numbers above are
+    microbenchmarks. A measurement that ingests a real Cancun-era block
+    from mainnet (with mixed precompile + storage + CALL workload) and
+    reports wall-clock through the full GPU dispatcher is the next
+    publication target.
+  \item \emph{CUDA Block-STM speedup.} CPU\_Parallel exists; GPU\_CUDA
+    runs single-tx-per-warp. Pipelining the multi-version memory
+    scheduler onto CUDA gives the obvious next $\sim 4\times$ on
+    Block-STM-bound workloads, but the integration is incomplete
+    (\S\ref{sec:cuda} limitations).
+\end{itemize}
+
+%% ============================================================================
