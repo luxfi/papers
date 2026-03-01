@@ -1,4 +1,4 @@
-\section{GPU-Native Conflict Detection}
+\section{GPU-Native EVM Execution}
 
 \label{sec:gpu}
 %% ============================================================================
@@ -13,38 +13,184 @@ The critical path of DAG-EVM is:
     Merkle-Patricia state root.
 \end{enumerate}
 
-The GPU bridge (\texttt{lux/evm/core/parallel/gpu\_bridge.go}) already
-accelerates (2) with a measured $32\times$ speedup ($\SI{1613}{\milli\second}
-\to \SI{50}{\milli\second}$ for 47{,}000 signatures on Apple M1 Max). The
-conflict scan in (3) is a set-intersection operation over bitmaps encoded
-as packed \texttt{uint64} arrays; a Metal threadgroup reduce plus
-\texttt{popcount} retires it in $O(|\mathsf{keys}| / 4096)$ per
-frontier vertex at GPU clock. Table~\ref{tab:gpu} summarises the impact.
+Through the v0.20.0 $\to$ v0.23.0 release cycle (luxcpp/evm tags
+\texttt{v0.22.0}, \texttt{v0.23.0}), the GPU stage stopped being a single
+ecrecover kernel and grew into a full opcode-level interpreter for both
+Apple Metal and NVIDIA CUDA, sharing one host-side dispatcher. The result
+is that every step above can run on the same GPU device.
+
+\subsection{Kernel Surface}
+
+The GPU EVM kernel is a single-source artefact in two dialects:
+
+\begin{itemize}
+  \item \texttt{lib/evm/gpu/kernel/evm\_kernel.metal} (\num{1067} SLOC,
+    Metal Shading Language 3.0).
+  \item \texttt{lib/evm/gpu/cuda/evm\_kernel.cu} (\num{1713} SLOC, CUDA
+    C++ for sm\_80 / sm\_90).
+\end{itemize}
+
+Both implement the Cancun-era opcode set including
+\texttt{KECCAK256}, the Cancun context family
+(\texttt{ORIGIN}/\texttt{GASPRICE}/\texttt{BLOCKHASH}/\texttt{CHAINID}/%
+\texttt{BASEFEE}/\texttt{BLOBHASH}/\texttt{BLOBBASEFEE}), \texttt{MCOPY},
+\texttt{TLOAD}/\texttt{TSTORE}, and \texttt{LOG0}--\texttt{LOG4}. ABI version
+3 of the kernel adds a \texttt{BlockContext} buffer plus transient-storage
+and log buffers (Metal binds them at indices 8--12). Account-state opcodes
+(\texttt{BALANCE}, \texttt{EXTCODESIZE}, \ldots) return safe defaults
+inside the kernel; live host data is provided through the bridge described
+in \S\ref{sec:gpu:bridge}.
+
+\subsection{Precompile Dispatch}
+
+The precompile dispatcher routes addresses \texttt{0x01}--\texttt{0x11}
+through GPU code paths where it is profitable. \texttt{ECRECOVER}
+(\texttt{0x01}) executes on Metal and CUDA via
+\texttt{secp256k1\_recover.cu}; the BLS12-381 (\texttt{0x0b}--\texttt{0x11})
+EIP-2537 family is wired through the same dispatcher. The standalone unit
+target \texttt{evm-precompile-test} reports 19 precompile groups passing
+on the M1 Max reference hardware; the run is guarded by
+\texttt{available\_backends()} so a host without a Metal device falls back
+to CPU silently.
+
+\subsection{EVMC Host Bridge for CALL/CREATE}
+\label{sec:gpu:bridge}
+
+The headline limitation of a pure-GPU EVM is that the kernel cannot make
+a runtime callback into an EVMC \texttt{Host} for nested
+\texttt{CALL}/\texttt{CREATE} frames; GPUs do not call back to CPU memory
+mid-warp. The v0.22.0 host bridge
+(\texttt{lib/evm/gpu/host/evmc\_bridge.cpp}) sidesteps this by performing a
+static analysis on the entrypoint bytecode: it walks the basic-block graph,
+identifies every \texttt{CALL}/\texttt{CREATE} target whose address is a
+constant immediate, pre-resolves the destination code from the supplied
+\texttt{evmc::Host}, and packs the entire reachable code closure into a
+single GPU-side \emph{code dictionary}. Dynamic-target calls
+(\texttt{CALL} where the address is computed at runtime) are rejected and
+the transaction falls back to evmone on CPU.
+
+The accept/reject decisions and depth enforcement are exercised by
+\texttt{test/unittests/host\_bridge\_test.cpp}, with the seven scenarios
+listed in Table~\ref{tab:hostbridge}. The bridge enforces a maximum frame
+depth of 4; deeper chains route to CPU.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{ll}
+\toprule
+\textbf{Scenario} & \textbf{Outcome} \\
+\midrule
+Pure leaf (no CALL/CREATE)            & GPU accept \\
+Static \texttt{CALL} with const target & GPU accept (pre-resolved) \\
+Dynamic \texttt{CALL}                  & CPU fallback \\
+Deterministic \texttt{CREATE}          & GPU accept (deterministic addr) \\
+4-deep static \texttt{CALL} chain      & GPU accept \\
+9-deep static \texttt{CALL} chain      & CPU fallback (depth $>$ MAX) \\
+\texttt{DELEGATECALL} context         & GPU accept; preserves caller \\
+\bottomrule
+\end{tabular}
+\caption{Host-bridge accept/reject scenarios. All seven cases are checked
+byte-for-byte against the same transaction routed through evmone on CPU
+in \texttt{test/unittests/host\_bridge\_test.cpp}.}
+\label{tab:hostbridge}
+\end{table}
+
+\subsection{Unified Pipeline}
+
+A single Metal device drives EVM execution, consensus state hashing
+(\texttt{lib/evm/gpu/gpu\_state\_hasher.hpp}), and post-quantum signature
+verification (BLS12-381 + ML-DSA-65 hosted by
+\texttt{lib/evm/gpu/metal/bls\_host.mm}). The pipelined run measured at
+v0.22.0 on M1 Max reports a $1.07\times$ speedup vs serial (consensus +
+EVM + sig-verify) at 19 blocks/s sustained over 1000 blocks --- the
+modest factor reflects the fact that each stage already saturates a
+different GPU resource (compute for EVM, memory bandwidth for keccak
+state hashing, BLS scalar-mult for sig-verify), so pipelining recovers
+only the overlap. Source: \texttt{lib/evm/gpu/test\_unified\_pipeline.cpp}.
+
+\subsection{Empirical Speedup, M1 Max}
+\label{sec:gpu:speedup}
+
+Two regimes need separate accounting: (a) the original
+ecrecover/keccak-dominated bottleneck that motivated the GPU port at
+v0.20.0, and (b) the bytecode-level kernel that came online at v0.22.0.
+Table~\ref{tab:gpu-cancun} shows the ecrecover/keccak path is essentially
+solved (the original $32\times$ ecrecover speedup carries over) and that
+the bytecode kernel itself is faster than evmone on per-opcode microkernels
+once the batch is large enough to amortise GPU dispatch.
 
 \begin{table}[h]
 \centering
 \small
 \begin{tabular}{lrrr}
 \toprule
-\textbf{Stage} & \textbf{CPU} & \textbf{GPU} & \textbf{Speedup} \\
+\textbf{Stage} & \textbf{CPU evmone} & \textbf{GPU Metal} & \textbf{Speedup} \\
 \midrule
 ecrecover (47K sigs)        & \SI{1613}{\milli\second} & \SI{50}{\milli\second}  & 32.3$\times$ \\
 keccak256 (47K hashes)      & \SI{127}{\milli\second}  & \SI{18}{\milli\second}  & 7.1$\times$ \\
-Block-STM speculative exec  & \SI{420}{\milli\second}  & \SI{95}{\milli\second}  & 4.4$\times$ \\
-Bitmap conflict reduce      & \SI{38}{\milli\second}   & \SI{4}{\milli\second}   & 9.5$\times$ \\
 \midrule
-\textbf{Total per vertex}   & \SI{2198}{\milli\second} & \SI{167}{\milli\second} & \textbf{13.2$\times$} \\
+\multicolumn{4}{l}{\textbf{Bytecode kernel (\texttt{evm-bench-kernel}, ADD-loop tx)}} \\
+GPU V1 (1 thread/tx)        & ---                      & 252\,M ops/s            & 1.62$\times$ \\
+CPU evmone reference        & 155\,M ops/s             & ---                     & 1.00$\times$ \\
+\midrule
+\multicolumn{4}{l}{\textbf{Real ADD-loop tx (50 iter, $N{=}2048$)}} \\
+GPU V1                      & ---                      & \num{25327}\,TPS         & ---       \\
+                            &                          & 1.14\,M EVM ops/s        & ---       \\
 \bottomrule
 \end{tabular}
-\caption{GPU versus CPU on the DAG-EVM critical path (Apple M1 Max, 32-core
-Metal GPU). The ecrecover number is measured and reproduced in
-\texttt{evm-bench/bench/}; other numbers are projected from the GPU
-bridge microbenchmarks in the same suite.}
-\label{tab:gpu}
+\caption{Measured GPU EVM speedups on Apple M1 Max, 32-core Metal GPU.
+ecrecover and keccak figures reproduce in
+\texttt{lib/evm/gpu/metal/bench\_keccak.cpp}. Bytecode-kernel figures from
+\texttt{lib/evm/gpu/kernel/bench\_kernel.cpp}; gas-match against CPU evmone
+is asserted on every run (the bench fails closed if a single tx's
+\texttt{gas\_used} disagrees). The GPU kernel does not yet beat the
+Block-STM CPU-Parallel path on every microkernel ---
+\texttt{results/speedup-with-buffer-cache-2026-02-28.txt} catalogs the
+$N{\le}2048$ regimes where CPU-Parallel still wins; that is the workload
+where a per-thread CPU evmone interpreter outpaces a one-tx-per-warp GPU
+launch. The bytecode kernel wins above this batch size and on workloads
+where ecrecover dominates.}
+\label{tab:gpu-cancun}
 \end{table}
 
-GPU is auto-detected at runtime: if \texttt{luxgpu.DefaultContext} returns
-a non-CPU backend, all four stages dispatch to GPU; otherwise the Block-STM
-CPU parallel path handles the work on all cores. There is no user flag.
+GPU is auto-detected at runtime: if the dispatcher's
+\texttt{available\_backends()} returns a non-CPU backend, the bytecode is
+routed through the GPU host launcher (\texttt{evm\_kernel\_host.mm} on
+Apple, \texttt{cuda/evm\_kernel\_host.cpp} on NVIDIA). When no GPU is
+present, both CPU paths (\texttt{CPU\_Sequential} and
+\texttt{CPU\_Parallel} via Block-STM) run unchanged. There is no user
+flag.
+
+\subsection{Limitations}
+
+\begin{itemize}
+  \item \emph{Dynamic CALL targets fall back to CPU.} The host-bridge
+    static analysis only resolves constant-immediate targets. Solidity
+    code that loads a callee address from storage at runtime is not yet
+    GPU-eligible. Path: extend the dictionary to include the closure
+    of all addresses ever stored in dispatcher slots, with re-staging
+    on dictionary miss. Not yet implemented.
+  \item \emph{\texttt{SELFDESTRUCT} is rejected.} The kernel returns
+    \texttt{CallNotSupported} on \texttt{0xFF}; the dispatcher falls back
+    to CPU. Acceptable today because Cancun deprecates the opcode for
+    new accounts.
+  \item \emph{Account-state opcodes return defaults inside the kernel.}
+    \texttt{BALANCE}, \texttt{EXTCODESIZE}, \texttt{EXTCODEHASH},
+    \texttt{EXTCODECOPY}, \texttt{SELFBALANCE} read from a host-supplied
+    snapshot dictionary; addresses missing from the dictionary surface
+    as zero. The host bridge populates the dictionary for every address
+    it has pre-resolved; addresses outside that closure read zero. The
+    parity test corpus catches this with the \texttt{state\_*} vectors.
+  \item \emph{$N \le 2048$ batches lose to CPU-Parallel.} GPU dispatch
+    cost (host $\to$ device buffer staging + threadgroup launch) is in the
+    \SI{6}{\milli\second} range on M1 Max for cold buffers, dropping to
+    $\sim$\SI{4}{\milli\second} once buffer cache is warm. CPU-Parallel
+    Block-STM clears the same workload in
+    $\sim$\SI{0.1}{\milli\second}--\SI{4}{\milli\second}. The crossover
+    moves into the kernel's favour at $N \ge 4096$ (workload-dependent),
+    or when the workload contains ecrecover/keccak which still dominate
+    on CPU.
+\end{itemize}
 
 %% ============================================================================
