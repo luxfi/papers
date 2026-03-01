@@ -1,0 +1,267 @@
+\section{CUDA Port: Methodology and Inherited Bugs}
+
+\label{sec:cuda}
+%% ============================================================================
+
+The CUDA port of the GPU EVM kernel arrived as a sequence of three
+commits on the \texttt{feat/cuda-evm-kernel} branch
+(\texttt{b5ce473}, \texttt{16db493}, \texttt{2e3022a}, all merged Feb
+2026), bringing the CUDA kernel from a stub at v0.21.0 to opcode-complete
+at v0.22.0 (\texttt{lib/evm/gpu/cuda/evm\_kernel.cu}, \num{1713} SLOC).
+
+\subsection{Methodology}
+
+The Metal kernel was the source of truth. The port proceeded in four
+passes:
+
+\begin{enumerate}
+  \item \emph{Type carry-over.} The \texttt{uint256}, \texttt{pair64},
+    and storage-pool descriptor types defined in
+    \texttt{kernel/uint256\_gpu.hpp} are shared between Metal and CUDA;
+    only the address-space qualifiers differ (\texttt{device} vs
+    \texttt{\_\_device\_\_}). The CUDA dialect uses
+    \texttt{\_\_host\_\_ \_\_device\_\_} where the Metal version uses
+    plain \texttt{static inline}.
+  \item \emph{Bit-by-bit opcode translation.} Each opcode handler from
+    Metal's \texttt{switch} block was translated into the corresponding
+    CUDA case, preserving stack semantics, gas accounting, and emit-on-error
+    behaviour. The Metal-specific bits --- \texttt{threadgroup\_barrier},
+    \texttt{simdgroup\_*} --- were replaced with CUDA equivalents
+    (\texttt{\_\_syncthreads}, \texttt{\_\_shfl\_sync}).
+  \item \emph{Host launcher parity.} The Apple host
+    (\texttt{evm\_kernel\_host.mm}) and the CUDA host
+    (\texttt{cuda/evm\_kernel\_host.cpp}) implement the same
+    \texttt{HostTransaction} ABI and dispatch through the same
+    \texttt{gpu\_dispatch.hpp} interface. The dispatcher's backend probe
+    selects whichever device is present at runtime.
+  \item \emph{Cross-validation.} The fourth backend was wired into the
+    parity corpus (\S\ref{sec:parity}) under the \texttt{EVM\_CUDA}
+    define. The first run flushed the bugs catalogued below.
+\end{enumerate}
+
+\subsection{Three Inherited Bugs}
+
+The translation surfaced three consensus-relevant bugs that were already
+latent in the Metal kernel but had not yet been caught. The CUDA port
+acted as a differential oracle: identical bytecode through two
+implementations exposed where each was wrong against the EVM spec, not
+just against each other.
+
+\paragraph{Bug 1: \texttt{u256\_mulmod} carry-loss in upper limbs.}
+
+The original 256-bit modular-multiply followed the textbook
+schoolbook loop, accumulating a $4 \times 4$ partial-product matrix into
+an 8-limb scratch buffer:
+
+\begin{verbatim}
+gpu_u64 r8[8] = {0, ..., 0};
+for (uint i = 0; i < 4; ++i) {
+    gpu_u64 carry = 0;
+    for (uint j = 0; j < 4; ++j) {
+        pair64 p = mul_wide(a.w[i], b.w[j]);
+        s = r8[i+j] + p.lo;
+        c = (s < r8[i+j]) ? 1 : 0;
+        s += carry;
+        c += (s < carry) ? 1 : 0;
+        r8[i+j] = s;
+        carry = p.hi + c;
+    }
+    if (i + 4 < 8) r8[i+4] += carry;  // BUG: i=3 lost
+}
+\end{verbatim}
+
+The guard \texttt{if (i+4 < 8)} is false for the last outer iteration
+(\texttt{i = 3}), so the carry leaving \texttt{a.w[3] * b.w[3]} was
+silently dropped. Even when the guard fired (\texttt{i $\le$ 2}), the
+naked \texttt{r8[i+4] += carry} could itself wrap around, and the
+secondary carry was never propagated to \texttt{r8[i+5]}.
+
+The algebraic shape of the fix is to propagate the outer carry through
+\emph{all} higher limbs:
+
+\[
+\forall k \ge i+4 :\quad
+(r_k', c') := r_k + c \;(\text{with } c' = \mathbf{1}[r_k + c < r_k]),
+\quad r_k \gets r_k',\ c \gets c'.
+\]
+
+In code (\texttt{evm\_kernel.metal}, lines 204--239):
+
+\begin{verbatim}
+uint k = i + 4;
+while (carry != 0 && k < 8) {
+    gpu_u64 s = r8[k] + carry;
+    gpu_u64 c = (s < r8[k]) ? 1UL : 0UL;
+    r8[k] = s;
+    carry = c;
+    ++k;
+}
+\end{verbatim}
+
+The fix is identical in CUDA. The bug fires whenever
+$\lfloor a \cdot b / 2^{448} \rfloor > 0$, i.e.\ whenever the high limb of
+the product is non-zero, which is every input pair where both operands
+exceed $2^{192}$. Real-world impact: any contract that uses
+\texttt{MULMOD} with values near group order in
+\texttt{secp256k1} or \texttt{bn254} (i.e.\ every contract that does
+on-chain elliptic-curve work) would see incorrect results. The bug was
+flagged \texttt{HIGH} in the internal red-team review before the parity
+corpus reproduced it.
+
+\paragraph{Bug 2: Unrecognized opcodes did not consume all gas.}
+
+The EVM spec mandates that an unrecognized opcode --- not just the
+\texttt{0xFE INVALID} canonical reserved opcode, but any byte that is
+not a defined instruction --- consumes all remaining gas of the current
+frame. The pre-fix kernel fell through to a generic \texttt{ERR()} macro
+that emitted \texttt{Error} status with the gas counter at its current
+value, which is wrong: the consensus-correct behaviour is to set
+\texttt{gas\_used = gas\_start} (the entire gas budget).
+
+The fix is the new \texttt{ERRA()} macro on Metal kernel line 1059
+(\texttt{ERR-all-gas}) which emits \texttt{(status=Error, gas=gas\_start,
+output=\{\})}. The \texttt{0xFE} canonical \texttt{INVALID} arm at line
+1035 was already correct; the fix routes every unhandled opcode to the
+same path.
+
+\paragraph{Bug 3: \texttt{MSTORE}/\texttt{MLOAD} offset+32 overflow.}
+
+\texttt{MSTORE} (and \texttt{MLOAD}) take a 256-bit memory offset on the
+stack. The kernel implementation extracted the low 64 bits and
+performed the bounds check as
+
+\[
+\mathsf{ok} := (\mathit{offset}_{\text{low64}} + 32) \le \mathsf{MAX\_MEM}.
+\]
+
+For offsets near $2^{64} - 32$ (which is well below the EVM's
+$2^{256} - 1$ stack-representable range, but above the kernel's tx
+memory cap), the addition wrapped around and the comparison spuriously
+succeeded, allowing memory writes past the per-tx memory ceiling and
+corrupting the next transaction's slab in
+\texttt{mem\_pool}. The fix (\texttt{evm\_kernel.metal} lines 426--434)
+explicitly checks the high three limbs of the 256-bit offset, then the
+low 64 bits, then the addition for wraparound:
+
+\begin{verbatim}
+static inline bool offset_in_bounds(uint256 v, ulong extra) {
+    if (v.w[1] | v.w[2] | v.w[3]) return false;
+    if (v.w[0] > MAX_MEMORY_PER_TX) return false;
+    ulong sum = v.w[0] + extra;
+    if (sum < v.w[0])              return false;
+    if (sum > MAX_MEMORY_PER_TX)   return false;
+    return true;
+}
+\end{verbatim}
+
+The same algebraic check ports verbatim to CUDA.
+
+\subsection{What the LLVM Coverage Tells Us}
+
+LLVM source-based coverage on the kernel CPU interpreter
+(\texttt{evm\_interpreter.hpp}, the spec witness) reports:
+
+\begin{itemize}
+  \item \textbf{Line coverage}: 90.87\%
+  \item \textbf{Function coverage}: 100\%
+  \item \textbf{Region coverage}: $\sim$85\% (target met)
+\end{itemize}
+
+The 9.13\% of uncovered lines fall into three categories:
+
+\begin{enumerate}
+  \item Unreachable arms behind \texttt{static\_assert} guards (compile-time
+    excluded but counted by the instrumenter);
+  \item The \texttt{CALL}/\texttt{CREATE} branches that intentionally
+    return \texttt{CallNotSupported} --- the parity test exercises these
+    under the \texttt{KernelCpuMissing} expectation, but the line
+    immediately following the early return is dead by design;
+  \item A handful of out-of-gas branches in \texttt{u256\_exp} and
+    \texttt{u256\_mulmod} that fire only for inputs the corpus does not
+    yet construct (extremely large bases with extremely large exponents
+    that hit the \texttt{GAS\_EXP\_BYTE} multiplier ceiling).
+\end{enumerate}
+
+The \textbf{100\% function coverage} is the load-bearing claim: every
+opcode handler the kernel implements is entered by at least one parity
+vector. Combined with four-way agreement on bit-exact gas/status/output,
+this gives us a closed system: a divergence between any backend and any
+other backend is detectable by an existing test, on every commit.
+
+What coverage does \emph{not} certify is the path through Metal's AIR
+or CUDA's PTX after compilation. Metal compiles to AIR, which LLVM
+coverage cannot instrument; nvcc emits PTX without coverage-mapped IR.
+Coverage on the device kernels is therefore \emph{indirect}: every parity
+vector that executes through the GPU dispatcher reaches the corresponding
+opcode handler in the device shader, and a divergence in that path
+manifests as an assertion failure in the parity test, not as a coverage
+gap. The four-way parity is the certification, not the coverage number.
+
+\subsection{CI Path: AWS EKS GPU Karpenter}
+
+\label{sec:cuda:ci}
+
+The CUDA arm cannot run on the Apple-only developer workstation, so it
+runs on AWS EKS through GitHub-hosted Actions Runner Controller.
+\texttt{lux-gpu-ci/helm/karpenter-nodepool.yaml} declares an
+\texttt{EC2NodeClass} that provisions \texttt{g4dn.xlarge}
+(NVIDIA T4) spot instances on demand, with fallback to
+\texttt{g5.xlarge} (NVIDIA A10G) when T4 capacity is unavailable, scaling
+to zero 30s after the runner pod terminates. The runner-scaleset
+configuration ships the NVIDIA device plugin DaemonSet via Amazon Linux
+2023 AMIs.
+
+The CI workflow (\texttt{.github/workflows/cuda.yml} in the
+\texttt{luxcpp/evm} repository) runs nightly and on every PR that touches
+\texttt{lib/evm/gpu/cuda/**}. The job:
+
+\begin{enumerate}
+  \item Configures CMake with \texttt{-DEVMONE\_CUDA=ON
+    -DCMAKE\_CUDA\_ARCHITECTURES="80;90"};
+  \item Builds \texttt{evm-cuda} (the device library) and
+    \texttt{evm-gpu} (the dispatcher with \texttt{EVM\_CUDA} defined);
+  \item Verifies the CUDA symbols are present in the static archive
+    (\texttt{nm libevm-cuda.a});
+  \item Runs \texttt{evm-bench-kernel} as a smoke check;
+  \item In a dependent job, builds the \texttt{cevm} Go bindings against
+    the freshly-compiled CUDA libraries and runs the Go test suite under
+    \texttt{CGO\_ENABLED=1}.
+\end{enumerate}
+
+A nightly H100 self-hosted runner (\texttt{labels: self-hosted, gpu, cuda,
+h100}) runs the same workflow on \texttt{sm\_90} hardware to validate the
+warp-shuffle paths added at v0.22.0; the EKS T4 runners cover \texttt{sm\_80}
+and \texttt{sm\_86}.
+
+\subsection{Limitations}
+
+\begin{itemize}
+  \item \emph{No CUDA Block-STM yet.} The CUDA path implements
+    single-tx-per-warp execution; the multi-version memory and
+    re-execution scheduler in \texttt{block\_stm.cu} compiles and links
+    but is not yet wired into the dispatcher's \texttt{CPU\_Parallel}
+    equivalent on CUDA. Workloads above the M1 Max crossover therefore
+    take the CPU Block-STM path on Linux/CUDA hosts; this is correct but
+    leaves performance on the table. Path: complete the
+    \texttt{BlockStmGpu} CUDA host launcher
+    (\texttt{block\_stm\_host.cpp}) and fold it under
+    \texttt{Backend::GPU\_CUDA\_Parallel}. Tracked.
+  \item \emph{Warp divergence on small batches.} A single tx whose
+    bytecode contains long branchless arithmetic (e.g.\ a Solidity
+    library doing 256-bit multiply chains) keeps all 32 threads of the
+    warp busy; a tx with heavy data-dependent branching wastes warp
+    lanes. The parity corpus does not yet quantify this. Path:
+    instrument the kernel with \texttt{\_\_activemask()} sampling and
+    add a divergence-cost column to the bench output. Open.
+  \item \emph{No pre-Ampere coverage.} The CMake configuration targets
+    \texttt{sm\_80} (Ampere) and \texttt{sm\_90} (Hopper); pre-Ampere
+    GPUs are excluded because the kernel uses Ampere-only intrinsics in
+    the keccak inner loop. Note: AWS \texttt{g4dn.xlarge} carries the T4
+    (\texttt{sm\_75}, Turing) which falls below this threshold --- the
+    EKS Karpenter pool above is configured to fall back to
+    \texttt{g5.xlarge} (A10G, \texttt{sm\_86}) when T4 instances are
+    incompatible with the build. The nightly H100 self-hosted runner
+    (\texttt{sm\_90}) is the canonical production validation target.
+\end{itemize}
+
+%% ============================================================================

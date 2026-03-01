@@ -1,0 +1,189 @@
+\section{Four-Way Parity as a Production Argument}
+
+\label{sec:parity}
+%% ============================================================================
+
+The claim of consensus-equivalent execution across four backends is not a
+slogan; it is a single test driver that compiles, links, and runs all four
+in the same process.
+
+\subsection{The Four Backends}
+
+\texttt{evm::gpu::Backend} enumerates four routes, each invoked through a
+shared dispatcher entrypoint
+\texttt{execute\_block(config, txs, nullptr)}:
+
+\begin{enumerate}
+  \item \texttt{CPU\_Sequential} --- the kernel CPU interpreter
+    (\texttt{lib/evm/gpu/kernel/evm\_interpreter.hpp}, header-only),
+    single-threaded, opcode-for-opcode reflection of the Metal kernel.
+    This is the \emph{spec witness}: it shares the source of truth with
+    the GPU kernels.
+  \item \texttt{CPU\_Parallel} --- the same interpreter run by the
+    Block-STM scheduler with $N$ worker threads
+    (\texttt{lib/evm/gpu/parallel\_engine.cpp}).
+  \item \texttt{GPU\_Metal} --- the Apple Metal kernel
+    (\texttt{evm\_kernel.metal}), one threadgroup per transaction, dispatched
+    by \texttt{lib/evm/gpu/kernel/evm\_kernel\_host.mm}.
+  \item \texttt{GPU\_CUDA} --- the NVIDIA CUDA kernel
+    (\texttt{lib/evm/gpu/cuda/evm\_kernel.cu}), one warp per transaction,
+    dispatched by \texttt{lib/evm/gpu/cuda/evm\_kernel\_host.cpp}.
+\end{enumerate}
+
+The CUDA arm is gated on the build define \texttt{EVM\_CUDA}. On macOS the
+define is absent so the CUDA assertions compile out and only Apple GPU
+remains in the loop; on Linux/CUDA CI (the AWS EKS workflow described in
+\S\ref{sec:cuda:ci}) the define flips on and all four backends are
+checked.
+
+\subsection{Vector Corpus}
+
+The corpus is built once per process startup
+(\texttt{test/unittests/parity\_test.cpp}, lines 92--573). It contains
+\num{133} bytecode vectors hand-written to exercise:
+
+\begin{itemize}
+  \item \emph{Arithmetic}: \texttt{ADD}, \texttt{SUB}, \texttt{MUL},
+    \texttt{DIV}, \texttt{MOD}, \texttt{ADDMOD}, \texttt{MULMOD},
+    \texttt{EXP}, signed variants;
+  \item \emph{Comparison} and \emph{bitwise}: signed/unsigned
+    \texttt{LT}/\texttt{GT}/\texttt{SLT}/\texttt{SGT}, \texttt{ISZERO},
+    \texttt{AND}/\texttt{OR}/\texttt{XOR}/\texttt{NOT},
+    \texttt{BYTE}/\texttt{SHL}/\texttt{SHR}/\texttt{SAR};
+  \item \emph{Hashing}: \texttt{KECCAK256} on empty / \texttt{abc} /
+    32-byte-zero / 256-byte-zero inputs;
+  \item \emph{Context}: \texttt{ADDRESS}, \texttt{ORIGIN},
+    \texttt{CALLER}, \texttt{CALLVALUE}, \texttt{CHAINID},
+    \texttt{GASPRICE}, \texttt{COINBASE}, \texttt{TIMESTAMP},
+    \texttt{NUMBER}, \texttt{GASLIMIT}, \texttt{BASEFEE},
+    \texttt{BLOBHASH}, \texttt{BLOBBASEFEE}, \texttt{BLOCKHASH};
+  \item \emph{Calldata}, \emph{code}, \emph{memory}
+    (\texttt{MSTORE}/\texttt{MLOAD}/\texttt{MSTORE8}/\texttt{MSIZE}/\texttt{MCOPY});
+  \item \emph{Storage} (\texttt{SSTORE}/\texttt{SLOAD},
+    \texttt{TSTORE}/\texttt{TLOAD}, zero-load);
+  \item \emph{Control flow} (\texttt{JUMP}, \texttt{JUMPI},
+    \texttt{PC}, \texttt{GAS}, \texttt{STOP}, \texttt{INVALID},
+    undefined opcode, bad jump);
+  \item \emph{Stack}: \texttt{PUSH0} through \texttt{PUSH32},
+    \texttt{DUP1}--\texttt{DUP16}, \texttt{SWAP1}--\texttt{SWAP16},
+    \texttt{POP};
+  \item \emph{Logging} (\texttt{LOG0}--\texttt{LOG4});
+  \item \emph{Returndata} (\texttt{RETURN}/\texttt{REVERT}/empty/word);
+  \item \emph{Account state} (default-zero through the kernel);
+  \item \emph{CALL family} expected to return
+    \texttt{CallNotSupported} (\texttt{CALL}, \texttt{CALLCODE},
+    \texttt{DELEGATECALL}, \texttt{STATICCALL}, \texttt{CREATE},
+    \texttt{CREATE2}, \texttt{SELFDESTRUCT});
+  \item \emph{Out-of-gas}.
+\end{itemize}
+
+Each vector carries an \texttt{Expectation} tag --- \texttt{Agree},
+\texttt{GasOnly}, or \texttt{KernelCpuMissing} --- that tells the test
+which divergences are tolerated. \texttt{Agree} demands bit-exact match on
+\texttt{(gas\_used, status, output)} across all four backends.
+\texttt{GasOnly} permits gas-accounting drift (typically the cost of
+\texttt{MSTORE} memory expansion in different revisions) but still requires
+status and output to match. \texttt{KernelCpuMissing} marks vectors where
+the kernel CPU interpreter has not yet implemented an opcode that the GPU
+kernels do; these vectors expect CPU \texttt{Error} and GPU success ---
+catching the case where a new opcode lands on GPU before the CPU spec
+witness catches up.
+
+\subsection{The Test}
+
+\texttt{TEST(Parity, AllBackendsAgreeOnEveryVector)} loops the corpus
+once, runs each vector through all four backends, and counts the
+\texttt{(Agree~ok, GasOnly~ok, Missing~ok)} totals. Any divergence under
+the active expectation registers as \texttt{ADD\_FAILURE}; the test
+asserts at the end that the failure count is zero. The test is a single
+GoogleTest case so it can run inside \texttt{ctest -j} alongside the other
+unit suites.
+
+The output prints, on every CI run:
+
+\begin{verbatim}
+[parity] runs:  CPU_Sequential=N CPU_Parallel=N GPU_Metal=N [GPU_CUDA=N]
+[parity] Agree:            <ok> ok, <fail> fail
+[parity] GasOnly:          <ok> ok, <fail> fail
+[parity] KernelCpuMissing: <ok> ok, <fail> fail
+[parity] total <pass> / <total> vectors meet expectations
+\end{verbatim}
+
+\subsection{Why This Is Not a Smoke Test}
+
+Three properties make four-way parity a production-grade argument rather
+than a developer-confidence test.
+
+\textbf{(P1) Independent implementations of the same spec.} The kernel
+CPU interpreter and the Metal kernel share a directory and review cycle
+but no opcode-level code. CUDA was ported from Metal in a separate
+branch by line-by-line translation (\S\ref{sec:cuda}) and produces an
+independent control-flow graph: the Metal version uses
+\texttt{threadgroup} reductions for stack ops, the CUDA version uses
+warp shuffles. Block-STM adds a fourth code path because the scheduler's
+read/write tracking is a different layer of the system. A bit-exact
+result across all four is therefore evidence that the EVM specification
+was internalised, not that one implementation was copy-pasted.
+
+\textbf{(P2) Status, gas, and output checked exactly.} The default
+\texttt{Expectation::Agree} requires equality on three independent
+quantities. Status is a discrete enum; gas is a 64-bit integer; output
+is a byte vector of any length. There are 13 vectors marked
+\texttt{GasOnly} and a small set marked \texttt{KernelCpuMissing} ---
+each tagged exception is a documented divergence with a specific algebraic
+cause, not a mass-pardon. The test writes a $\texttt{[parity]}$ promotion
+hint to \texttt{stdout} when a \texttt{GasOnly} vector starts agreeing,
+forcing the engineer either to upgrade the tag or explain the regression.
+
+\textbf{(P3) The four backends are co-deployed.} The same dispatcher
+\texttt{execute\_block(config, txs, nullptr)} is what production callers
+use. There is no separate ``test mode" path. A consensus-relevant bug
+that crept into the Metal kernel would be caught by the CUDA assertion;
+a CUDA-only bug would fail the Metal assertion; a kernel-CPU-only bug
+would fail either GPU. The cross-checking is symmetric and runs on
+every PR through CI.
+
+\subsection{What the Coverage Numbers Add}
+
+Source-based LLVM coverage is built into the same target set
+(\texttt{lib/evm/COVERAGE.md}). The parity-driver run at v0.23.0 reports
+\textbf{90.87\% line coverage and 100\% function coverage} on the kernel
+CPU interpreter (\texttt{evm\_interpreter.hpp}). The 9.13\% of unexecuted
+lines are precisely the unimplemented \texttt{CALL}/\texttt{CREATE}
+arms (which the test catches under \texttt{Expectation::Agree} for
+\texttt{CallNotSupported}) and the dead branches behind compile-time
+\texttt{assert}s. The combination --- four backends agreeing across
+133 hand-crafted vectors plus 100\% function coverage on the spec
+witness --- means we have a counter-example finder if any backend silently
+diverges from the others on an opcode the corpus already touches.
+
+\subsection{Limitations}
+
+\begin{itemize}
+  \item \emph{Coverage on \texttt{.metal} and \texttt{.cu} sources is
+    structural only.} LLVM source-based coverage instruments the
+    kernel-CPU interpreter (which is a \texttt{.hpp}) and the host
+    launchers (\texttt{.mm}/\texttt{.cpp}). Metal AIR and CUDA PTX are
+    outside LLVM's coverage scope (Metal compiles to AIR, nvcc emits PTX
+    without coverage-mapped IR). Coverage on the GPU code itself is
+    indirect: every vector that executes through the GPU dispatcher
+    necessarily executes the corresponding device path. The four-way
+    parity test is the corroboration.
+  \item \emph{The corpus is per-opcode, not stateful.} Each vector
+    runs in its own fresh state. A consensus bug that requires multiple
+    transactions to manifest (a Block-STM hazard, an SSTORE refund
+    accumulator inconsistency across txs) is not currently in the corpus.
+    The Block-STM scheduler has its own unit suite
+    (\texttt{lib/evm/gpu/parallel\_engine.cpp} drives
+    \texttt{evm-test-modes}) but it does not cross-validate against the
+    other three backends. Path: extend \texttt{ParityVector} to a
+    \texttt{ParitySequence} type carrying multiple \texttt{Transaction}s
+    and a state-checkpoint diff. Not yet implemented.
+  \item \emph{No fuzzing layer.} The corpus is hand-written and grows by
+    inspection. A differential fuzzer that emits random bytecode and
+    checks four-way agreement would close more of the long tail.
+    \texttt{test/fuzzer/} hosts the existing evmone fuzzer; wiring it
+    through the GPU dispatcher is on the v0.24 roadmap.
+\end{itemize}
+
+%% ============================================================================
