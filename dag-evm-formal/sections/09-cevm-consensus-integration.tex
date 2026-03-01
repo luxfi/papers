@@ -1,0 +1,439 @@
+\section{Plugging the GPU EVM into Quasar Consensus}
+
+\label{sec:cevm-consensus-integration}
+%% ============================================================================
+
+The previous section established that a single Metal/CUDA kernel can execute
+a Cancun-era block end-to-end. This section answers a separate question:
+\emph{where} in the Quasar consensus pipeline does that execution actually
+get invoked, against \emph{which} interface, and at \emph{what} batch sizes
+does the GPU win.
+
+\subsection{What Quasar Decomposes Into}
+\label{sec:cevm-quasar-recap}
+
+The consensus repository (\texttt{github.com/luxfi/consensus} at SHA
+\texttt{5bfc6ac}) is a pure-protocol library: it contains no execution
+logic and no state model. It exposes two engine modes wired from the same
+sub-protocols:
+
+\begin{itemize}
+  \item \textbf{Linear chain} (\texttt{protocol/nova}, driven by
+    \texttt{engine/chain}) --- Photon $\to$ Wave $\to$ Focus $\to$ Ray $\to$
+    Sink. Used by the C-Chain.
+  \item \textbf{DAG} (\texttt{protocol/nebula}, driven by \texttt{engine/dag}
+    and \texttt{protocol/field}) --- Photon $\to$ Wave (per frontier vertex)
+    $\to$ Flare (cert/skip) $\to$ Horizon (safe-prefix scan) $\to$ Field
+    (commit). This is the path described in \S\ref{sec:gpu} for the
+    DAG-EVM.
+\end{itemize}
+
+The components, with file references in
+\texttt{\textasciitilde/work/lux/consensus}:
+
+\begin{itemize}
+  \item \emph{DAG vertex production.} \texttt{protocol/field/field.go:30}
+    defines \texttt{Proposer[V].Propose(ctx, parents) (V, error)}. The
+    \emph{networking} layer pushes a payload into the proposer; the
+    proposer returns a vertex ID and ships it. No bytecode runs here ---
+    a vertex is just \texttt{(parents, author, round, payload bytes)}.
+  \item \emph{Wave-based ordering.} \texttt{protocol/wave/wave.go} (the
+    \texttt{Wave[T]} struct) drives threshold voting per frontier vertex.
+    The FPC selector (\texttt{protocol/wave/fpc/}) randomises the
+    threshold $\theta \in [\theta_{\min}, \theta_{\max}]$ from a PRF seed
+    to defeat adaptive adversaries. Wave alone returns
+    \texttt{(preferOK, confOK)} per round; it does not commit.
+  \item \emph{FPC final commitment.} \texttt{protocol/field/field.go:107}
+    \texttt{Driver[V].Tick} computes a \emph{safe prefix} via
+    \texttt{computeSafePrefix} (line~119), then calls
+    \texttt{Committer[V].Commit(ctx, ordered)}. The committer's
+    \texttt{Commit} call is the post-FPC hook: every vertex passed in is
+    finalised with all its causal ancestors finalised.
+  \item \emph{Quasar certificate.} \texttt{protocol/quasar/types.go:40}
+    \texttt{QuasarCert} carries the BLS aggregate, Ringtail share, and
+    Z-Chain Groth16-rolled-up ML-DSA proof. The cert is produced
+    \emph{after} \texttt{Commit} returns; it certifies the safe prefix,
+    not individual transactions.
+\end{itemize}
+
+\subsection{Where Bytecode Execution Lives}
+\label{sec:cevm-pipeline-position}
+
+The crucial point: \emph{Quasar does not call into the EVM}. Quasar orders
+opaque vertex IDs. The EVM call lives one layer above Quasar, in the VM
+that hosts the chain.
+
+\paragraph{Linear chain (Nova).}
+\texttt{engine/chain/block/block.go:88--130} defines \texttt{ChainVM},
+which the engine drives. The engine's call sequence
+(\texttt{engine/chain/engine.go:947--1019}, function
+\texttt{buildBlocksLocked}) is:
+
+\begin{enumerate}
+  \item \texttt{vm.BuildBlock(ctx)} returns a \texttt{block.Block} (an
+    interface, not bytes; line~94 of \texttt{block.go}).
+  \item \emph{Engine releases its mutex} (line~976) and calls
+    \texttt{vmBlock.Verify(ctx)} (line~977). \textbf{This is the EVM
+    execution hook.} \texttt{Verify} runs the bytecode and returns the
+    post-state. If \texttt{Verify} fails, the block is dropped and never
+    enters consensus.
+  \item Engine adds the block to consensus
+    (\texttt{t.consensus.AddBlock}, line~983) and self-votes.
+  \item On finalisation: \texttt{vmBlock.Accept(ctx)}
+    (line~1000 for K=1, line~877 for the multi-validator finaliser
+    \texttt{tryFinalizeBlock}, and line~924 for the engine's
+    \texttt{DrainAccepted} loop).
+\end{enumerate}
+
+So bytecode runs \emph{during vertex production}, before consensus voting.
+\texttt{Accept} is a state-commitment hook --- it persists what
+\texttt{Verify} already computed, it does not re-execute.
+
+\paragraph{DAG mode (Nebula).}
+The same split shifts one level: \texttt{Proposer.Propose} runs the
+bytecode for the proposed vertex's transactions and returns a vertex ID
+that already commits to the post-state root. \texttt{Field.Commit} then
+delivers an \emph{ordered} list of vertex IDs whose post-state was
+computed at proposal time. The committer's job is to \emph{apply} those
+state diffs against the now-canonical history --- not to re-run the EVM.
+
+This split is forced by the protocol shape: Quasar votes on vertex IDs,
+and a vertex's ID must commit to its post-state for the cert to be
+meaningful. We therefore execute speculatively at proposal, and apply
+deterministically at commit. The Block-STM scheduler in \texttt{cevm}
+(\texttt{lib/evm/gpu/parallel\_engine.cpp}) provides the speculative
+re-execution-on-conflict that this requires.
+
+\subsection{The Interface Quasar Calls}
+\label{sec:cevm-interface}
+
+The full \texttt{ChainVM} surface area Quasar's chain engine drives, from
+\texttt{engine/chain/block/block.go:88--130} (verbatim):
+
+\begin{lstlisting}[basicstyle=\ttfamily\footnotesize, language=go]
+type ChainVM interface {
+    Initialize(ctx context.Context, init Init) error
+    BuildBlock(context.Context) (Block, error)
+    ParseBlock(context.Context, []byte) (Block, error)
+    GetBlock(context.Context, ids.ID) (Block, error)
+    SetPreference(context.Context, ids.ID) error
+    LastAccepted(context.Context) (ids.ID, error)
+    GetBlockIDAtHeight(context.Context, uint64) (ids.ID, error)
+    SetState(context.Context, uint32) error
+    Shutdown(context.Context) error
+    Version(context.Context) (string, error)
+    Connected(context.Context, ids.NodeID, *version.Application) error
+    Disconnected(context.Context, ids.NodeID) error
+    HealthCheck(context.Context) (HealthCheckResult, error)
+    NewHTTPHandler(context.Context) (http.Handler, error)
+    WaitForEvent(context.Context) (Message, error)
+}
+
+type Block interface {
+    ID() ids.ID
+    Parent() ids.ID
+    ParentID() ids.ID
+    Height() uint64
+    Timestamp() time.Time
+    Status() uint8
+    Verify(context.Context) error   // <-- bytecode here
+    Accept(context.Context) error   // <-- commit state here
+    Reject(context.Context) error
+    Bytes() []byte
+}
+\end{lstlisting}
+
+For the DAG path, \texttt{engine/dag/vertex/vertex.go:11--28} adds:
+
+\begin{lstlisting}[basicstyle=\ttfamily\footnotesize, language=go]
+type Vertex interface {
+    ID() ids.ID
+    Bytes() []byte
+    Height() uint64
+    Epoch() uint32
+    Parents() []ids.ID
+    Txs() []ids.ID
+    Status() choices.Status
+    Verify(context.Context) error
+    Accept(context.Context) error
+    Reject(context.Context) error
+}
+type DAGVM interface {
+    ParseVertex(context.Context, []byte) (Vertex, error)
+    BuildVertex(context.Context) (Vertex, error)
+}
+\end{lstlisting}
+
+\textbf{Two hooks, both for the GPU EVM:} \texttt{Verify} for execution,
+\texttt{Accept} for state commit.
+
+\subsection{Concrete Integration Glue}
+\label{sec:cevm-glue}
+
+The \texttt{cevm} package
+(\texttt{\textasciitilde/work/lux/cevm/cevm.go} at SHA \texttt{4d652b2})
+already exports the C ABI:
+
+\begin{lstlisting}[basicstyle=\ttfamily\footnotesize, language=go]
+func ExecuteBlockV2(backend Backend, numThreads uint32,
+    txs []Transaction) (*BlockResultV2, error)
+\end{lstlisting}
+
+The integration component is a Go struct that satisfies \texttt{block.Block}
+and routes \texttt{Verify} into \texttt{cevm.ExecuteBlockV2}. The plumbing
+is direct because the consensus library already keeps execution and
+ordering decoupled --- the only state that flows from the cevm result
+into the consensus layer is the 32-byte state root (carried in
+\texttt{Block.Bytes()}) and the boolean \texttt{Verify} return.
+
+\begin{lstlisting}[basicstyle=\ttfamily\footnotesize, language=go]
+// cevmBlock satisfies engine/chain/block.Block and engine/dag/vertex.Vertex.
+type cevmBlock struct {
+    id        ids.ID
+    parent    ids.ID
+    height    uint64
+    ts        time.Time
+    txs       []cevm.Transaction
+    backend   cevm.Backend
+    threads   uint32
+    // populated by Verify, read by Accept:
+    result    *cevm.BlockResultV2
+    stateRoot [32]byte
+    raw       []byte
+    state     uint8 // choices.Processing / Accepted / Rejected
+    parent2   *cevmBlock // for state diff application at Accept
+    db        kvWriter
+}
+
+func (b *cevmBlock) ID() ids.ID         { return b.id }
+func (b *cevmBlock) Parent() ids.ID     { return b.parent }
+func (b *cevmBlock) ParentID() ids.ID   { return b.parent }
+func (b *cevmBlock) Height() uint64     { return b.height }
+func (b *cevmBlock) Timestamp() time.Time { return b.ts }
+func (b *cevmBlock) Status() uint8      { return b.state }
+func (b *cevmBlock) Bytes() []byte      { return b.raw }
+
+// Verify is the GPU EVM hook. Called by engine/chain/engine.go:977.
+func (b *cevmBlock) Verify(ctx context.Context) error {
+    if b.result != nil {
+        return nil // memoised
+    }
+    res, err := cevm.ExecuteBlockV2(b.backend, b.threads, b.txs)
+    if err != nil {
+        return fmt.Errorf("cevm verify height=%d: %w", b.height, err)
+    }
+    // Cross-check vs the proposer's claimed root in raw block bytes.
+    if !bytes.Equal(res.StateRoot[:], b.expectedRoot()) {
+        return errStateRootMismatch
+    }
+    // Reject any tx with TxError; TxRevert is a valid in-protocol failure.
+    for i, s := range res.Status {
+        if s == cevm.TxError {
+            return fmt.Errorf("tx %d returned TxError", i)
+        }
+    }
+    b.result = res
+    copy(b.stateRoot[:], res.StateRoot[:])
+    return nil
+}
+
+// Accept is the state-commit hook. Called by engine/chain/engine.go:877,
+// engine.go:924 (DrainAccepted), or engine.go:1000 (K=1 fast path).
+func (b *cevmBlock) Accept(ctx context.Context) error {
+    if b.result == nil {
+        return errVerifyNotRun
+    }
+    // Persist the diff produced by Verify. The cevm bridge surfaces gas
+    // and status; the underlying state diff is pulled from the host
+    // bridge's account-state dictionary.
+    if err := b.db.applyDiff(b.result, b.stateRoot); err != nil {
+        return err
+    }
+    b.state = choicesAccepted
+    return nil
+}
+
+func (b *cevmBlock) Reject(ctx context.Context) error {
+    b.state = choicesRejected
+    b.result = nil // free GPU result
+    return nil
+}
+\end{lstlisting}
+
+The VM-level \texttt{ChainVM.BuildBlock} constructs a \texttt{cevmBlock}
+from the mempool, picks the backend (\texttt{cevm.AutoDetect()} at boot,
+\texttt{cevm.Health()} verified), and returns it. The engine then drives
+\texttt{Verify}, votes, and on quorum calls \texttt{Accept}. No code in
+\texttt{consensus/} changes; the GPU EVM is a pure plug into
+\texttt{block.ChainVM}.
+
+\subsection{Where the Two Parallelisms Meet}
+\label{sec:cevm-parallelism}
+
+Quasar can finalise multiple DAG vertices concurrently --- specifically,
+any antichain of the conflict-free DAG (\S\ref{sec:dag-evm}). The GPU EVM
+can execute thousands of transactions concurrently within one launch.
+These are \emph{orthogonal} dimensions:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Source} & \textbf{Granularity} & \textbf{Limit} \\
+\midrule
+Quasar DAG width    & vertices per round  & antichain size of DAG \\
+GPU EVM batch size  & txs per dispatch    & GPU SIMD lane count \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The dimension that dominates is the one with the lower throughput floor.
+On M1 Max the GPU launch cost is \SI{6}{\milli\second} cold,
+\SI{4}{\milli\second} warm (\S\ref{sec:gpu:speedup}); the per-vertex
+proposer cost on the consensus side is dominated by the wave round-trip
+(\SI{250}{\milli\second} default \texttt{RoundTO},
+\texttt{protocol/field/field.go:67}). \emph{Consensus dominates by
+$\sim$40$\times$.} The GPU has plenty of slack to amortise launch cost
+across a vertex's transactions, but it cannot make the wave round
+shorter.
+
+Pipelining helps when the GPU launch on vertex $V_n$ overlaps with the
+wave round on $V_{n-1}$. In the linear chain mode, the engine signals
+\texttt{t.signalPipeline()} after every accept (\texttt{engine.go:894}),
+so a build/verify can begin while the previous block is still being
+gossiped. Pipelining hurts when the proposer must wait for the GPU
+launch to drain before issuing a fresh \texttt{Verify} --- the cevm
+\texttt{ExecuteBlockV2} is currently synchronous (the C bridge blocks
+on \texttt{[commandBuffer waitUntilCompleted]}). Async dispatch is
+listed as an open item in \texttt{lib/evm/gpu/PERF.md} (priority~2).
+
+\subsection{Saturation Math}
+\label{sec:cevm-saturation}
+
+The required regime, given the cevm dispatch crossover plot
+(\texttt{lib/evm/gpu/PERF.md}, ``Crossover analysis''):
+
+\begin{align*}
+T_{\text{launch}}^{\text{cold}} &= \SI{6}{\milli\second} \\
+T_{\text{launch}}^{\text{warm}} &= \SI{4}{\milli\second} \\
+T_{\text{op}}^{\text{GPU}} &= \frac{1}{339\text{M ops/s}} \approx \SI{2.95}{\nano\second/op} \\
+T_{\text{op}}^{\text{CPU}} &= \frac{1}{159\text{M ops/s}} \approx \SI{6.29}{\nano\second/op}
+\end{align*}
+
+Break-even (warm) for a generic workload of $W$ opcodes per dispatch:
+\[
+T_{\text{launch}}^{\text{warm}} + W \cdot T_{\text{op}}^{\text{GPU}}
+< W \cdot T_{\text{op}}^{\text{CPU}}
+\;\;\Rightarrow\;\;
+W > \frac{T_{\text{launch}}^{\text{warm}}}{T_{\text{op}}^{\text{CPU}} - T_{\text{op}}^{\text{GPU}}}
+\approx \frac{\SI{4}{\milli\second}}{\SI{3.34}{\nano\second}}
+\approx 1.2 \times 10^{6} \text{ opcodes}.
+\]
+
+So a single dispatch needs $\sim$\num{1.2}M opcodes for the GPU to win
+strictly on bytecode. The 100\,K txs/sec target translates as follows.
+A vertex of 100 txs at 50 EVM ops/tx delivers \num{5000} ops per
+dispatch --- well \emph{below} the break-even. A vertex of 100 txs at
+\num{600} ops/tx (loop-heavy contracts) delivers \num{60000} ops ---
+still below. The break-even at \num{1.2}M ops requires either:
+
+\begin{enumerate}
+  \item \emph{Fat workload per dispatch:} 100 txs $\times$ \num{12000}
+    ops/tx (heavy contract --- DEX swap, AMM compound), or
+  \item \emph{Bigger batch:} \num{12000} txs at \num{100} ops/tx, or
+  \item \emph{Pipelined dispatch} that amortises launch across multiple
+    blocks.
+\end{enumerate}
+
+The 100\,K txs/sec (\num{1000} vertices $\times$ \num{100} txs)
+\emph{aggregate} is more than enough --- if 1000 vertices/sec is
+emitted from a wave of 5--10 parallel proposers, each proposer dispatches
+to a separate cevm host (\texttt{cevm.ExecuteBlockV2} is
+goroutine-safe per \texttt{cevm.go:17}, with thread-local kernel
+hosts). Aggregating across proposers gives \num{200}--\num{1000} txs per
+dispatch on average, still below break-even at the \num{50}-op-per-tx
+floor.
+
+\textbf{The ecrecover and keccak paths are different.} Their break-even
+sits much lower because the per-op CPU cost is high
+(\SI{34}{\micro\second}/sig for ecrecover --- Table~\ref{tab:gpu-cancun}).
+At \num{47000} signatures per dispatch the GPU runs in \SI{50}{\milli
+\second} versus the CPU's \SI{1613}{\milli\second}. A 100-tx block with
+two signatures per tx (200 sigs) is below crypto break-even too; a
+\num{10000}-tx block (or \num{50} blocks of \num{200} sigs each
+batched together) is firmly above it. \emph{In production, signature
+verification is the path that justifies the GPU; opcode execution wins
+only on fat workloads or via pipelining.}
+
+\subsection{Limitations}
+\label{sec:cevm-limitations}
+
+\begin{itemize}
+  \item \emph{No host callback at vertex boundary.}
+    \texttt{cevm.ExecuteBlockV2} is a single C call that returns when the
+    full batch finishes. The GPU kernel cannot ask Quasar mid-dispatch
+    ``did this vertex finalise yet?'' because there is no host-callback
+    primitive in the bridge. Consequence: the EVM cannot observe
+    consensus state changes (e.g., a finalised cross-shard read) within
+    a single \texttt{Verify}. The host bridge handles
+    \texttt{CALL}/\texttt{CREATE} only via static analysis on the entry
+    bytecode (\S\ref{sec:gpu:bridge}); cross-vertex callbacks would
+    require either re-issuing a fresh dispatch or a CPU fallback path.
+  \item \emph{Synchronous dispatch.}
+    \texttt{[commandBuffer waitUntilCompleted]} blocks the calling
+    goroutine. While the consensus engine has a per-block goroutine
+    pool (\texttt{engine.go} \texttt{buildBlocksLocked}), a backed-up
+    GPU draining a fat dispatch will pile up subsequent \texttt{Verify}
+    calls. Async dispatch (priority~2 in PERF.md) is required for true
+    pipelining across vertices.
+  \item \emph{Account-state opcodes return defaults.}
+    \texttt{BALANCE}, \texttt{EXTCODESIZE}, \texttt{EXTCODEHASH},
+    \texttt{EXTCODECOPY}, \texttt{SELFBALANCE} read a host-supplied
+    snapshot dictionary. For a vertex that touches an address outside
+    the static-analysis closure, the kernel reads zero. The integration
+    glue (\texttt{cevmBlock.Verify}) does not detect this and would
+    accept a wrong-answer block; the parity-test corpus
+    (\S\ref{sec:parity}) is the only catch. A \emph{stricter}
+    integration would re-run on CPU when any opcode misses the
+    dictionary --- not yet wired.
+  \item \emph{Dynamic-target \texttt{CALL} forces CPU fallback.}
+    Per \S\ref{sec:gpu:bridge}, a runtime-computed callee address
+    routes the entire transaction to evmone on CPU. This is correct
+    but breaks the GPU-batch invariant: a block of 100 txs in which
+    one tx has a dynamic CALL splits into one CPU run plus a
+    99-tx GPU run, doubling the total wall-clock for that block.
+  \item \emph{Quasar does not vote on state roots, only vertex IDs.}
+    A vertex's payload bytes commit to the post-state root, but
+    Quasar itself never re-checks that root. If two honest validators
+    execute the same vertex on different cevm backends (e.g., one
+    Metal, one CPU-Parallel) and produce different roots due to a
+    parity bug, only the four-way parity test corpus
+    (\texttt{test/parity\_test.cpp}) catches it before deployment.
+    Run-time disagreement would surface as a vote split, not a
+    halt --- so divergent backends would silently lose finality on
+    the affected branch. The fix path is exactly the parity corpus
+    discipline: every backend must be byte-equivalent on every
+    consensus-critical vector.
+  \item \emph{No state-streaming for huge dispatches.} The cevm result
+    is materialised entirely in host RAM (the V2 ABI returns a single
+    \texttt{state\_root[32]} plus per-tx arrays). A 100\,K-tx dispatch
+    that needed to stream state diffs to a database during execution
+    cannot be expressed in the current ABI. Block-STM provides the
+    speculation; persistence is bulk-applied at \texttt{Accept}. For
+    bytecode that mutates millions of slots, this means the GPU result
+    sits in RAM until the consensus quorum lands, which is acceptable
+    at today's chain TPS but will need a streaming path before
+    a single GPU dispatch routinely exceeds available host RAM.
+\end{itemize}
+
+\paragraph{Net.} The integration is small --- a \texttt{block.Block}
+adapter, one C call per \texttt{Verify}, no consensus changes ---
+because the consensus library is intentionally execution-free. The
+hard work is on the GPU side (parity, host bridge, V2 kernel for
+SIMD-cooperative dispatch). The right way to read this section is
+that the seam is already correct; what remains is closing the
+break-even gap so that GPU dispatch wins at vertex sizes the network
+actually emits.
+
+%% ============================================================================
