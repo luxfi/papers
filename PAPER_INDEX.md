@@ -30,7 +30,7 @@ Distributed key management — no single point of trust.
 | Year | Paper | Formal Contribution |
 |------|-------|---------------------|
 | 2021 | `lux-universal-threshold-signatures` | Unified t-of-n framework (ECDSA, EdDSA, Schnorr) |
-| 2021 | `lux-threshold-mpc` *(revised 2025)* | FROST unforgeability + CGGMP21 UC-security + Taproot integration |
+| 2021 | `lux-threshold-mpc` *(revised 2025)* | FROST unforgeability + CGGMP21 UC-security + Taproot integration + MPC group address + LSS dynamic resharing |
 | 2023 | `lux-mchain-mpc` | MPC chain architecture, NATS transport, session lifecycle |
 | 2023 | `lux-warp-messaging` | BLS aggregate signature cross-chain messaging |
 
@@ -72,9 +72,9 @@ The omnichain liquidity layer — trustless, sovereign, yield-bearing.
 |------|-------|---------------------|
 | 2022 | `lux-teleport-protocol` | Original teleport: burn/mint with MPC attestation |
 | 2022 | `lux-verkle-trees` | Verkle tree state proofs for light clients |
-| 2022 | `lux-teleport-omnichain` *(revised 2025)* | **Full protocol: 20 VMs, 270 chains, sovereign governance** |
+| 2022 | `lux-teleport-omnichain` *(revised 2025)* | **Full protocol: 18 native bridge programs, 270 chain IDs, MPC group key, IBridgeToken, configurable rotation delay** |
 | 2023 | `lux-bridge` | Threshold-secured bridge with formal MPC analysis |
-| 2024 | `lux-omnichain-yield` *(revised 2025)* | **Yield-bearing bridge tokens, 29 strategies, xLUX flywheel** |
+| 2024 | `lux-omnichain-yield` *(revised 2025)* | **Yield-bearing bridge tokens, 29 strategies, xLUX flywheel, VIRTUAL\_SHARES 1e8, 54 security tests** |
 
 ## VI. DeFi Protocols (2019–2024)
 
@@ -99,7 +99,7 @@ Sovereign governance, Shariah compliance, securities law.
 
 | Year | Paper | Formal Contribution |
 |------|-------|---------------------|
-| 2022 | `lux-sovereign-defi` *(revised 2025)* | **Per-chain governance isolation theorem, exit guarantee, Shariah classification algebra, ERC-3643 securities compliance** |
+| 2022 | `lux-sovereign-defi` *(revised 2025)* | **Per-chain governance isolation theorem, exit guarantee, Shariah classification algebra (SAB-only membership), configurable rotation delay, ERC-3643 securities compliance** |
 | 2023 | `lux-dao-governance-framework` | DAO structure: Karma + DLUX + vLUX |
 | 2023 | `lux-governance-dao` | Governor contract, gauge weights |
 
