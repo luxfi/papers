@@ -1,0 +1,1027 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{array}
+\usepackage{tabularx}
+\input{shared/lstlang}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,calc}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  keywordstyle=\color{blue!70!black}\bfseries,
+  commentstyle=\color{green!50!black}\itshape,
+  stringstyle=\color{red!60!black},
+  showstringspaces=false,
+}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{remark}{Remark}[section]
+\newtheorem{invariant}{Invariant}[section]
+
+\title{LP-102: Encrypted SQLite Replication Standard\\(age + Replicate)}
+
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries}\\
+\texttt{research@lux.network}
+}
+
+\date{2026}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+We define the standard for durable, encrypted SQLite database replication
+across the Lux ecosystem using age (X25519) encryption and continuous
+WAL-based streaming to S3-compatible storage. Per-organization SQLite
+databases running on Hanzo Base are the canonical data model for
+application state in Lux services. Kubernetes pods are ephemeral.
+Persistent Volume Claims fail. This proposal specifies an encrypted
+replication layer---\texttt{hanzoai/replicate} (a Litestream fork with
+age end-to-end encryption)---that provides sub-second WAL shipping to
+S3-compatible object stores with per-principal key isolation derived
+through HKDF from a master key held in KMS. The chain remains the source
+of truth for securities and on-chain state; this standard addresses the
+complementary durability requirement for application state: sessions,
+preferences, audit logs, KYC documents, and compliance records. We
+specify the encryption scheme, the replication protocol, the sidecar
+deployment pattern, the key hierarchy, and the recovery procedure.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{Introduction}\label{sec:intro}
+%% ============================================================
+
+Lux ecosystem services---ATS, Broker, Transfer Agent, IAM, KMS---run
+on Hanzo Base, an embedded SQLite runtime. Each organization (tenant)
+gets its own SQLite database file, isolated by design. This per-org
+model eliminates multi-tenant query scoping bugs, simplifies backups,
+and enables true data sovereignty: an org's data is a single file that
+can be encrypted, moved, or deleted atomically.
+
+The problem is durability. SQLite databases live on local disk. In
+Kubernetes, local disk is either emptyDir (lost on pod restart) or a
+Persistent Volume Claim (PVC). PVCs on cloud providers fail: GCE
+persistent disks detach during node migrations, EBS volumes hit
+``attaching'' limbo during AZ failovers, and local SSDs on bare-metal
+nodes die without warning. A securities exchange cannot tolerate data
+loss of compliance records, audit trails, or KYC state.
+
+The solution is continuous WAL-based replication to durable object
+storage with end-to-end encryption. This proposal standardizes that
+solution.
+
+\subsection{Design Goals}
+
+\begin{enumerate}[nosep]
+  \item \textbf{Zero data loss}: Every committed WAL frame reaches
+    durable storage within the sync interval (default 1\,s).
+  \item \textbf{End-to-end encryption}: No plaintext database content
+    exists outside the pod boundary.
+  \item \textbf{Per-principal isolation}: Each org/user derives a unique
+    encryption keypair; compromise of one principal's key reveals
+    nothing about other principals.
+  \item \textbf{Transparent recovery}: A fresh pod restores from S3
+    automatically via init container; no operator intervention.
+  \item \textbf{No new dependencies}: Uses existing ecosystem
+    components---\texttt{hanzoai/replicate}, \texttt{hanzoai/age},
+    \texttt{hanzoai/s3}, \texttt{hanzoai/kms}.
+\end{enumerate}
+
+\subsection{Scope}
+
+This standard applies to all services in the Lux and Hanzo ecosystems
+that use SQLite as their primary data store. It does not apply to
+PostgreSQL-backed services (which use standard streaming replication)
+or to on-chain state (which is durable by construction).
+
+%% ============================================================
+\section{Motivation}\label{sec:motivation}
+%% ============================================================
+
+\subsection{Per-Org SQLite as the Data Model}
+
+Hanzo Base provisions one SQLite database per organization. A service
+with 500 tenants has 500 database files. This is deliberate:
+
+\begin{itemize}[nosep]
+  \item \textbf{Tenant isolation}: No query can accidentally cross org
+    boundaries. There is no \texttt{WHERE org\_id = ?} to forget.
+  \item \textbf{Atomic operations}: Backup, restore, migrate, and
+    delete are file operations, not multi-table transactions.
+  \item \textbf{Performance}: Each org's database fits in memory. No
+    shared lock contention across tenants.
+  \item \textbf{Portability}: An org can export its entire database as
+    a single encrypted file.
+\end{itemize}
+
+\subsection{Pod Ephemerality}
+
+Kubernetes pods restart for routine reasons: node upgrades, autoscaler
+rebalancing, OOM kills, deployment rollouts, spot instance preemption.
+A StatefulSet with a PVC survives restarts on the same node but fails
+on cross-node rescheduling if the volume cannot follow. Cloud provider
+PVCs have documented failure modes:
+
+\begin{table}[H]
+\centering
+\caption{PVC failure modes by provider.}
+\label{tab:pvc-failures}
+\begin{tabular}{@{}llp{6.5cm}@{}}
+\toprule
+\textbf{Provider} & \textbf{Volume Type} & \textbf{Failure Mode} \\
+\midrule
+GCP & PD-SSD & Detach hangs during live migration; pod stuck in
+  \texttt{ContainerCreating} for up to 6 minutes. \\
+AWS & gp3 / io2 & AZ-pinned; cross-AZ reschedule requires manual
+  snapshot + restore. \\
+DO & Block Storage & Single-attach; evicted pod blocks replacement pod
+  until force-detach timeout (5\,min default). \\
+Bare metal & Local SSD & Node failure = total loss. No reattach. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+For a regulated securities platform, a 6-minute outage is acceptable
+only if zero data is lost. PVCs alone do not guarantee this.
+
+\subsection{Why Not PostgreSQL?}
+
+PostgreSQL solves durability through streaming replication, but at the
+cost of:
+
+\begin{itemize}[nosep]
+  \item A shared database server that must be highly available itself.
+  \item Multi-tenant query scoping (\texttt{WHERE org\_id = ?}) on
+    every query, which is the \#1 source of data leaks.
+  \item Connection pool management, vacuum tuning, and schema migration
+    coordination across tenants.
+  \item Operational complexity disproportionate to the workload (most
+    org databases are under 100\,MB).
+\end{itemize}
+
+Per-org SQLite with encrypted replication provides the durability of
+PostgreSQL streaming replication with the isolation guarantees and
+operational simplicity of file-per-tenant.
+
+%% ============================================================
+\section{Specification}\label{sec:spec}
+%% ============================================================
+
+\subsection{Encryption: age (X25519)}\label{sec:age}
+
+All replicated data is encrypted using age~\cite{age}, a modern
+file encryption format designed by Filippo Valsorda. The Lux
+ecosystem vendors age as \texttt{luxfi/age} and \texttt{hanzoai/age}.
+
+\begin{definition}[age Encryption]\label{def:age}
+An age-encrypted file consists of:
+\begin{enumerate}[nosep]
+  \item A header containing one or more recipient stanzas, each
+    wrapping a symmetric file key for a specific recipient.
+  \item A payload encrypted with ChaCha20-Poly1305 using the file
+    key, with a random 16-byte nonce.
+\end{enumerate}
+The X25519 recipient type derives a shared secret via Diffie-Hellman
+on Curve25519, then wraps the file key using HKDF-SHA-256 +
+ChaCha20-Poly1305.
+\end{definition}
+
+\noindent\textbf{Why age over GPG or NaCl box:}
+
+\begin{itemize}[nosep]
+  \item No configuration. No key servers. No web of trust. One format.
+  \item Streaming encryption: large files encrypt without buffering
+    the entire plaintext.
+  \item Composable: multiple recipients per file (operator + org key).
+  \item Audited: formal security analysis by Valsorda et al.
+  \item Small: the Go implementation (\texttt{filippo.io/age}) is
+    \textasciitilde2000 lines.
+\end{itemize}
+
+\subsection{Replication: WAL Streaming}\label{sec:replication}
+
+Replication is performed by \texttt{hanzoai/replicate}, a fork of
+Litestream~\cite{litestream} extended with age end-to-end encryption.
+
+\begin{definition}[WAL Replication]\label{def:wal}
+The replicator operates as a sidecar process that:
+\begin{enumerate}[nosep]
+  \item Opens the SQLite database in WAL mode
+    (\texttt{PRAGMA journal\_mode=WAL}).
+  \item Monitors the WAL file for new frames via \texttt{inotify}
+    (Linux) or \texttt{kqueue} (macOS/BSD).
+  \item On each sync interval (default 1\,s), reads uncommitted WAL
+    frames, encrypts them with the principal's age public key, and
+    uploads the encrypted segment to S3.
+  \item On each snapshot interval (default 1\,h), creates a full
+    database snapshot, encrypts it, and uploads it to S3.
+  \item Maintains a generation index in S3 that maps WAL positions
+    to segment keys.
+\end{enumerate}
+\end{definition}
+
+\noindent\textbf{Sync interval.} The default is 1\,s. For
+high-throughput services (e.g., ATS during market hours), this can be
+reduced to 100\,ms. For low-write services (e.g., KMS audit logs),
+10\,s is acceptable. The interval is configurable per database.
+
+\noindent\textbf{Snapshot interval.} Full snapshots bound recovery
+time. With hourly snapshots and 1\,s WAL segments, worst-case recovery
+replays at most 1 hour of WAL segments on top of the snapshot. For
+services requiring faster recovery, the snapshot interval can be
+reduced to 15\,min.
+
+\subsection{Storage Backend}\label{sec:storage}
+
+Replicated data is stored on S3-compatible object storage:
+
+\begin{itemize}[nosep]
+  \item \textbf{Production}: MinIO via \texttt{hanzoai/s3}, deployed
+    per cluster.
+  \item \textbf{Cloud fallback}: AWS S3, GCS, Cloudflare R2.
+  \item \textbf{Development}: MinIO single-node or local filesystem.
+\end{itemize}
+
+\noindent\textbf{S3 path convention:}
+
+\begin{lstlisting}[language=YAML,caption={S3 path structure.}]
+# Pattern
+s3://{bucket}/{service}/{org-id}/{db-name}/generations/{gen}/
+
+# Example
+s3://lux-replicate/ats/org-abc123/data.db/generations/0001/
+  snapshots/000000000000.db.age
+  wal/000000000001.wal.age
+  wal/000000000002.wal.age
+\end{lstlisting}
+
+Files in S3 carry the \texttt{.age} suffix to indicate age encryption.
+No plaintext database content is ever written to S3.
+
+\subsection{Per-Principal Key Derivation}\label{sec:keys}
+
+Each organization derives a unique age keypair from the service's
+master key using HKDF~\cite{rfc5869}.
+
+\begin{definition}[Key Hierarchy]\label{def:keyhier}
+\begin{enumerate}[nosep]
+  \item \textbf{Master key}: A 256-bit secret stored in KMS
+    (\texttt{hanzoai/kms}), scoped to the service (e.g.,
+    \texttt{ats-replicate-master}).
+  \item \textbf{Org key material}: Derived via
+    $\mathrm{HKDF\text{-}SHA256}(\mathit{master}, \mathit{org\_id}, \texttt{"age-replicate-v1"})$
+    producing 32 bytes.
+  \item \textbf{age identity}: The 32-byte org key material is used
+    as the X25519 scalar to derive an age identity (private key) and
+    its corresponding recipient (public key).
+  \item \textbf{Operator recovery key}: A separate age identity held
+    by the operator (stored in KMS under
+    \texttt{replicate-recovery-key}), added as a second recipient to
+    every encrypted file.
+\end{enumerate}
+\end{definition}
+
+\begin{proposition}[Principal Isolation]\label{prop:isolation}
+Compromise of org $A$'s derived key material reveals no information
+about org $B$'s key material, provided the master key remains secret.
+This follows from the PRF security of HKDF: if the master key is
+uniformly random and the org IDs are distinct, the derived keys are
+computationally independent.
+\end{proposition}
+
+\noindent\textbf{Key rotation.} When a master key is rotated in KMS:
+
+\begin{enumerate}[nosep]
+  \item The service re-derives all org keypairs from the new master.
+  \item Existing S3 data remains readable via the old keypair (stored
+    as a ``retired key'' in KMS with an expiry).
+  \item New WAL segments and snapshots use the new keypair.
+  \item A background job re-encrypts old snapshots to the new key
+    within 24 hours, after which the old key is deleted.
+\end{enumerate}
+
+\subsection{Configuration}\label{sec:config}
+
+Each service declares replication targets in a \texttt{litestream.yml}
+file:
+
+\begin{lstlisting}[language=YAML,caption={Minimal litestream.yml for a Base service.}]
+dbs:
+  - path: /data/pb_data/data.db
+    replicas:
+      - type: s3
+        bucket: lux-replicate
+        path: ${SERVICE_NAME}/${ORG_ID}
+        endpoint: ${S3_ENDPOINT}
+        access-key-id: ${S3_ACCESS_KEY}
+        secret-access-key: ${S3_SECRET_KEY}
+        sync-interval: 1s
+        snapshot-interval: 1h
+        age:
+          recipients:
+            - ${ORG_AGE_RECIPIENT}
+            - ${RECOVERY_AGE_RECIPIENT}
+          identities:
+            - ${ORG_AGE_IDENTITY_PATH}
+\end{lstlisting}
+
+The \texttt{age} block is the extension added by
+\texttt{hanzoai/replicate}. Upstream Litestream does not support it.
+
+%% ============================================================
+\section{Architecture}\label{sec:arch}
+%% ============================================================
+
+\subsection{Sidecar Pattern}\label{sec:sidecar}
+
+Replication runs as a two-phase Kubernetes sidecar:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Init container} (\texttt{replicate-restore}): On pod
+    startup, downloads the latest snapshot + WAL segments from S3,
+    decrypts with the principal's age identity, and writes the
+    restored database to the shared volume.
+  \item \textbf{Sidecar container} (\texttt{replicate}): Runs
+    continuously alongside the application, replicating WAL changes
+    to S3 in real time.
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw, rounded corners=2pt, minimum width=2.8cm,
+    minimum height=1cm, font=\small},
+  storage/.style={draw, rounded corners=2pt, minimum width=2.2cm,
+    minimum height=0.8cm, font=\small, fill=black!5},
+  arr/.style={-{Stealth[length=5pt]}, thick},
+]
+  % Pod boundary
+  \node[draw, dashed, rounded corners=4pt, minimum width=10cm,
+    minimum height=4.5cm, label={[font=\footnotesize]above:Pod}] (pod) {};
+
+  % Init container
+  \node[box, fill=blue!8] (init) at (-2.5, 1.2)
+    {\texttt{init:restore}};
+
+  % App
+  \node[box, fill=green!8] (app) at (0, -0.5)
+    {Base (app)};
+
+  % Sidecar
+  \node[box, fill=orange!8] (sidecar) at (2.5, 1.2)
+    {\texttt{replicate}};
+
+  % Shared volume
+  \node[storage] (vol) at (0, -1.8)
+    {\texttt{/data} (emptyDir)};
+
+  % S3
+  \node[storage, fill=yellow!10] (s3) at (6, 0.3)
+    {S3 (age-encrypted)};
+
+  % KMS
+  \node[storage, fill=red!5] (kms) at (-5.5, 0.3)
+    {KMS};
+
+  % Arrows
+  \draw[arr] (init) -- (vol) node[midway, left, font=\scriptsize] {restore};
+  \draw[arr] (app) -- (vol) node[midway, right, font=\scriptsize] {read/write};
+  \draw[arr] (sidecar) -- (vol) node[midway, right, font=\scriptsize] {watch WAL};
+  \draw[arr, blue] (s3) -- (init) node[midway, above, font=\scriptsize] {download};
+  \draw[arr, orange] (sidecar) -- (s3) node[midway, above, font=\scriptsize] {upload};
+  \draw[arr, red] (kms) -- (init) node[midway, above, font=\scriptsize] {age key};
+  \draw[arr, red] (kms) -- (sidecar) node[midway, below, font=\scriptsize, sloped] {age key};
+
+\end{tikzpicture}
+\caption{Sidecar replication architecture. The init container restores
+  from S3 on startup. The sidecar ships WAL segments continuously.
+  Both fetch age keys from KMS. The shared volume uses emptyDir---no
+  PVC required.}
+\label{fig:sidecar}
+\end{figure}
+
+\noindent\textbf{No PVC required.} Because the init container restores
+the database from S3, the shared volume can be \texttt{emptyDir}
+(backed by node memory or local disk). The pod is fully reconstructable
+from S3 state. PVCs become optional performance optimizations, not
+durability requirements.
+
+\subsection{Kubernetes Patch}\label{sec:k8s-patch}
+
+Replication is applied to existing deployments via Kustomize strategic
+merge patches. A single patch adds both the init container and sidecar:
+
+\begin{lstlisting}[language=YAML,caption={Kustomize patch: replicate-sidecar.yaml}]
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ats
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: replicate-restore
+          image: ghcr.io/hanzoai/replicate:latest
+          args: ["restore", "-config", "/etc/litestream.yml"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: litestream-config
+              mountPath: /etc/litestream.yml
+              subPath: litestream.yml
+            - name: age-keys
+              mountPath: /etc/age
+              readOnly: true
+          env:
+            - name: LITESTREAM_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: s3-credentials
+                  key: access-key
+            - name: LITESTREAM_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: s3-credentials
+                  key: secret-key
+      containers:
+        - name: replicate
+          image: ghcr.io/hanzoai/replicate:latest
+          args: ["replicate", "-config", "/etc/litestream.yml"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: litestream-config
+              mountPath: /etc/litestream.yml
+              subPath: litestream.yml
+            - name: age-keys
+              mountPath: /etc/age
+              readOnly: true
+          env:
+            - name: LITESTREAM_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: s3-credentials
+                  key: access-key
+            - name: LITESTREAM_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: s3-credentials
+                  key: secret-key
+      volumes:
+        - name: litestream-config
+          configMap:
+            name: litestream-config
+        - name: age-keys
+          secret:
+            secretName: replicate-age-keys
+\end{lstlisting}
+
+Patch files live at \texttt{universe/k8s/patches/replicate-sidecar.yaml}
+and are referenced in each environment's \texttt{kustomization.yaml}.
+
+\subsection{Recovery Procedure}\label{sec:recovery}
+
+On pod startup, the init container executes:
+
+\begin{enumerate}[nosep]
+  \item Fetch the age identity from the mounted secret.
+  \item List generations in S3 for the target database path.
+  \item Download the latest snapshot (\texttt{.db.age}).
+  \item Decrypt the snapshot using the age identity.
+  \item Download all WAL segments after the snapshot.
+  \item Decrypt each WAL segment.
+  \item Apply WAL segments to the snapshot in order using SQLite's
+    WAL replay mechanism.
+  \item Write the restored database to \texttt{/data}.
+  \item Exit 0, allowing the application container to start.
+\end{enumerate}
+
+If no S3 data exists (first deployment), the init container exits 0
+with no database, and the application creates a fresh one.
+
+\subsection{Multi-Database Services}\label{sec:multidb}
+
+Services with per-org databases (e.g., ATS with 500 tenants) replicate
+each database independently. The \texttt{litestream.yml} supports
+glob patterns:
+
+\begin{lstlisting}[language=YAML,caption={Multi-database replication.}]
+dbs:
+  - path: /data/pb_data/orgs/*/data.db
+    replicas:
+      - type: s3
+        bucket: lux-replicate
+        path: ats/${DB_ORG_ID}
+        sync-interval: 1s
+        age:
+          recipients:
+            - ${ORG_AGE_RECIPIENT}
+            - ${RECOVERY_AGE_RECIPIENT}
+\end{lstlisting}
+
+The replicator resolves \texttt{\$\{DB\_ORG\_ID\}} from the directory
+name containing each matched database file.
+
+%% ============================================================
+\section{Security Considerations}\label{sec:security}
+%% ============================================================
+
+\subsection{Encryption Layers}
+
+The system provides defense in depth through three independent
+encryption layers:
+
+\begin{table}[H]
+\centering
+\caption{Encryption layers.}
+\label{tab:encryption}
+\begin{tabular}{@{}lllp{5cm}@{}}
+\toprule
+\textbf{Layer} & \textbf{Scope} & \textbf{Algorithm} & \textbf{Purpose} \\
+\midrule
+Application & On-disk DB & SQLCipher AES-256-CBC & Protects data at rest
+  on pod local disk. Key derived from KMS. \\
+Replication & S3 objects & age X25519 + ChaCha20-Poly1305 & Protects
+  data at rest in object storage. Per-org keys. \\
+Transport & Network & TLS 1.3 & Protects data in transit to S3. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+An attacker who compromises S3 sees only age-encrypted blobs. An
+attacker who compromises the pod filesystem sees only
+SQLCipher-encrypted databases. An attacker who compromises the network
+sees only TLS-encrypted traffic. All three layers must be breached
+simultaneously to access plaintext.
+
+\subsection{Key Hierarchy}\label{sec:key-hierarchy}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  key/.style={draw, rounded corners=2pt, minimum width=3cm,
+    minimum height=0.7cm, font=\small},
+  arr/.style={-{Stealth[length=4pt]}, thick},
+]
+  \node[key, fill=red!10] (master) at (0, 3)
+    {Master Key (KMS)};
+  \node[key, fill=blue!10] (orgA) at (-3, 1.5)
+    {Org A Key (HKDF)};
+  \node[key, fill=blue!10] (orgB) at (0, 1.5)
+    {Org B Key (HKDF)};
+  \node[key, fill=blue!10] (orgN) at (3, 1.5)
+    {Org N Key (HKDF)};
+  \node[key, fill=green!10] (ageA) at (-3, 0)
+    {age Identity A};
+  \node[key, fill=green!10] (ageB) at (0, 0)
+    {age Identity B};
+  \node[key, fill=green!10] (ageN) at (3, 0)
+    {age Identity N};
+  \node[key, fill=yellow!10] (recovery) at (5.5, 3)
+    {Recovery Key (KMS)};
+
+  \draw[arr] (master) -- (orgA);
+  \draw[arr] (master) -- (orgB);
+  \draw[arr] (master) -- (orgN);
+  \draw[arr] (orgA) -- (ageA);
+  \draw[arr] (orgB) -- (ageB);
+  \draw[arr] (orgN) -- (ageN);
+\end{tikzpicture}
+\caption{Key derivation hierarchy. The master key in KMS derives
+  per-org keys via HKDF. Each org key generates an age identity.
+  The recovery key is independent and added as a second recipient.}
+\label{fig:keyhier}
+\end{figure}
+
+\begin{invariant}[No Plaintext Egress]\label{inv:no-plaintext}
+No plaintext database content ever exists outside the pod boundary.
+WAL frames are encrypted before upload. Snapshots are encrypted before
+upload. The age identity (private key) exists only in the pod's
+memory, loaded from a K8s Secret mounted as a tmpfs volume.
+\end{invariant}
+
+\subsection{Threat Model}
+
+\begin{table}[H]
+\centering
+\caption{Threat model and mitigations.}
+\label{tab:threats}
+\begin{tabular}{@{}lp{4cm}p{5cm}@{}}
+\toprule
+\textbf{Threat} & \textbf{Attack Vector} & \textbf{Mitigation} \\
+\midrule
+S3 compromise & Attacker gains read access to S3 bucket &
+  All objects age-encrypted; no plaintext. \\
+Pod compromise & Attacker gains shell in pod &
+  SQLCipher encrypts on-disk DB; age identity in tmpfs. \\
+KMS compromise & Attacker reads master key &
+  All org keys derivable; requires KMS + S3 compromise
+  simultaneously for data access. \\
+Rogue operator & Operator uses recovery key &
+  Recovery key access is audited in KMS; dual-control
+  required for recovery key retrieval. \\
+WAL truncation & Attacker deletes S3 objects &
+  S3 versioning enabled; object lock (WORM) for
+  compliance-critical buckets. \\
+Replay attack & Attacker replays old WAL segments &
+  Generation index enforces monotonic WAL positions;
+  stale segments rejected. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{SQLCipher Interaction}
+
+When the application database uses SQLCipher (AES-256-CBC at rest),
+the replication layer encrypts already-encrypted data with age. This
+is deliberate double encryption:
+
+\begin{itemize}[nosep]
+  \item SQLCipher protects data at rest on local disk against pod
+    filesystem access.
+  \item age protects data at rest in S3 against object storage access.
+  \item The two keys are independent: SQLCipher key is derived from
+    KMS via a different path than the age key.
+  \item The replicator does not need the SQLCipher key. It treats the
+    database as an opaque byte stream.
+\end{itemize}
+
+%% ============================================================
+\section{Reference Implementation}\label{sec:impl}
+%% ============================================================
+
+\subsection{Components}
+
+\begin{table}[H]
+\centering
+\caption{Reference implementation components.}
+\label{tab:components}
+\begin{tabular}{@{}llp{6cm}@{}}
+\toprule
+\textbf{Component} & \textbf{Package} & \textbf{Description} \\
+\midrule
+Replicator & \texttt{hanzoai/replicate} & Litestream fork with age
+  encryption. Go binary. Ships as
+  \texttt{ghcr.io/hanzoai/replicate}. \\
+age library & \texttt{hanzoai/age}, \texttt{luxfi/age} &
+  \texttt{filippo.io/age} vendored. X25519 + scrypt recipients. \\
+Object storage & \texttt{hanzoai/s3} & MinIO deployment.
+  \texttt{ghcr.io/hanzoai/s3}. \\
+Key management & \texttt{hanzoai/kms} & Secrets and key lifecycle.
+  HKDF derivation endpoint. \\
+K8s patches & \texttt{universe/k8s/patches/} &
+  \texttt{replicate-sidecar.yaml},
+  \texttt{replicate-config.yaml},
+  \texttt{replicate-restore.yaml}. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Replicator CLI}
+
+The \texttt{hanzoai/replicate} binary provides two subcommands:
+
+\begin{lstlisting}[language={},caption={Replicator CLI usage.}]
+# Continuous replication (sidecar)
+replicate replicate -config /etc/litestream.yml
+
+# Restore from S3 (init container)
+replicate restore -config /etc/litestream.yml -o /data/pb_data/data.db
+
+# Verify backup integrity
+replicate verify -config /etc/litestream.yml
+\end{lstlisting}
+
+\subsection{Key Derivation Implementation}
+
+\begin{lstlisting}[language=Go,caption={Per-org age key derivation.}]
+func DeriveOrgAgeIdentity(masterKey []byte, orgID string) (
+    *age.X25519Identity, error,
+) {
+    // HKDF-SHA256: master -> org-scoped key material
+    hkdf := hkdf.New(sha256.New, masterKey,
+        []byte(orgID), []byte("age-replicate-v1"))
+
+    scalar := make([]byte, 32)
+    if _, err := io.ReadFull(hkdf, scalar); err != nil {
+        return nil, fmt.Errorf("hkdf derive: %w", err)
+    }
+
+    identity, err := age.X25519IdentityFromScalar(scalar)
+    if err != nil {
+        return nil, fmt.Errorf("age identity: %w", err)
+    }
+
+    // Zero the intermediate scalar
+    for i := range scalar {
+        scalar[i] = 0
+    }
+
+    return identity, nil
+}
+\end{lstlisting}
+
+\subsection{Compose Configuration}
+
+For local development, the replicator runs as a compose service:
+
+\begin{lstlisting}[language=YAML,caption={compose.yml excerpt for replicate sidecar.}]
+services:
+  ats:
+    image: ghcr.io/luxfi/ats:dev
+    volumes:
+      - ats-data:/data
+
+  replicate:
+    image: ghcr.io/hanzoai/replicate:latest
+    command: ["replicate", "-config", "/etc/litestream.yml"]
+    volumes:
+      - ats-data:/data:ro
+      - ./litestream.yml:/etc/litestream.yml:ro
+      - ./age-keys:/etc/age:ro
+    depends_on:
+      ats:
+        condition: service_started
+      s3:
+        condition: service_healthy
+
+  s3:
+    image: ghcr.io/hanzoai/s3:latest
+    ports: ["9000:9000"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - s3-data:/data
+
+volumes:
+  ats-data:
+  s3-data:
+\end{lstlisting}
+
+%% ============================================================
+\section{Post-Quantum Considerations}\label{sec:pq}
+%% ============================================================
+
+The age encryption layer (Layer~2) currently uses X25519 (Curve25519)
+key agreement, which is not post-quantum safe. A sufficiently powerful
+quantum computer running Shor's algorithm could recover X25519 private
+keys from public keys, retroactively decrypting all age-encrypted S3
+objects.
+
+\subsection{Harvest-Now-Decrypt-Later Threat}
+
+S3 replicas are long-lived. Snapshots are retained for 30 days by
+default; compliance-critical buckets may retain data for years.
+An adversary who captures encrypted S3 objects today could decrypt
+them once a cryptographically relevant quantum computer (CRQC) becomes
+available. This ``harvest-now-decrypt-later'' attack is the primary
+quantum threat to this replication standard.
+
+\subsection{Mitigation: X-Wing Hybrid KEM}
+
+The mitigation is a hybrid Key Encapsulation Mechanism (KEM) called
+X-Wing~\cite{xwing}, which combines X25519 with ML-KEM-768 (NIST FIPS
+203~\cite{fips203}). If quantum computers never materialize, the X25519
+component provides security. If they do, the ML-KEM-768 component
+provides post-quantum security. Both must be broken to compromise the
+hybrid.
+
+\texttt{lux/crypto} already implements ML-KEM at
+\texttt{encryption/mlkem.go}. The \texttt{hanzoai/age} and
+\texttt{luxfi/age} forks will add X-Wing as a new recipient type.
+
+\subsection{Migration Phases}
+
+\begin{description}[nosep]
+  \item[Phase 1 (current):] X25519 recipients. Adequate for operational
+    data with limited shelf life. AES-256 at the sqlcipher layer
+    (Layer~1) already provides 128-bit post-quantum security via Grover's
+    bound, protecting on-disk data independently.
+  \item[Phase 2 (planned):] X-Wing hybrid recipients
+    (\texttt{age1xwing1...}) in \texttt{hanzoai/age} and
+    \texttt{luxfi/age}. Backward compatible---old X25519 recipients
+    continue to work. New replicas encrypted to both X-Wing and X25519
+    recipients during transition.
+  \item[Phase 3 (future):] Pure ML-KEM-768 or ML-KEM-1024 recipients
+    when the ecosystem matures and X25519 is considered deprecated.
+\end{description}
+
+\subsection{Three-Layer Post-Quantum Status}
+
+\begin{table}[H]
+\centering
+\caption{Post-quantum status of each encryption layer.}
+\label{tab:pq-status}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Layer} & \textbf{Algorithm} & \textbf{PQ Status} & \textbf{PQ Path} \\
+\midrule
+1. Disk  & AES-256 (sqlcipher) & Safe (128-bit PQ) & No change needed \\
+2. S3    & age X25519          & Vulnerable         & X-Wing (Phase 2) \\
+3. Wire  & TLS 1.3             & Depends on suite   & PQ TLS when available \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% ============================================================
+\section{Compatibility}\label{sec:compat}
+%% ============================================================
+
+\subsection{Database Engines}
+
+The replication standard is compatible with any SQLite-based database
+engine:
+
+\begin{table}[H]
+\centering
+\caption{Supported database engines.}
+\label{tab:engines}
+\begin{tabular}{@{}llc@{}}
+\toprule
+\textbf{Engine} & \textbf{Package} & \textbf{SQLCipher} \\
+\midrule
+Hanzo Base & \texttt{hanzoai/base} & Optional \\
+PocketBase (upstream) & \texttt{pocketbase/pocketbase} & No \\
+Raw SQLite & \texttt{mattn/go-sqlite3} & Optional \\
+Turso / libSQL & \texttt{tursodatabase/libsql} & No \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The replicator operates at the WAL level and is agnostic to the
+database engine. Any process that writes a SQLite WAL file is
+supported.
+
+\subsection{Object Storage Backends}
+
+Any S3-compatible API is supported:
+
+\begin{itemize}[nosep]
+  \item MinIO (\texttt{hanzoai/s3}) --- primary, deployed per cluster.
+  \item AWS S3 --- production fallback.
+  \item Google Cloud Storage (S3-compatible mode) --- for GKE clusters.
+  \item Cloudflare R2 --- for edge deployments.
+  \item Local filesystem --- for development (\texttt{type: file}).
+\end{itemize}
+
+\subsection{Lux Ecosystem Services}
+
+The following services adopt this standard:
+
+\begin{table}[H]
+\centering
+\caption{Ecosystem adoption.}
+\label{tab:adoption}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Service} & \textbf{Databases} & \textbf{Sync Interval} &
+  \textbf{Snapshot Interval} \\
+\midrule
+ATS & per-org (500+) & 1\,s & 1\,h \\
+Broker & per-org & 1\,s & 1\,h \\
+Transfer Agent & per-org & 1\,s & 30\,min \\
+IAM & single & 5\,s & 1\,h \\
+KMS & single & 1\,s & 15\,min \\
+Insights & per-org & 10\,s & 6\,h \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% ============================================================
+\section{Operational Considerations}\label{sec:ops}
+%% ============================================================
+
+\subsection{Monitoring}
+
+The replicator exposes Prometheus metrics on \texttt{:9091/metrics}:
+
+\begin{itemize}[nosep]
+  \item \texttt{replicate\_wal\_bytes\_total} --- total WAL bytes shipped.
+  \item \texttt{replicate\_wal\_segments\_total} --- total WAL segments
+    uploaded.
+  \item \texttt{replicate\_snapshot\_bytes\_total} --- total snapshot
+    bytes uploaded.
+  \item \texttt{replicate\_last\_sync\_seconds} --- time since last
+    successful sync.
+  \item \texttt{replicate\_restore\_duration\_seconds} --- histogram
+    of restore times.
+  \item \texttt{replicate\_encryption\_errors\_total} --- age
+    encryption failures.
+\end{itemize}
+
+An alert fires if \texttt{replicate\_last\_sync\_seconds} exceeds
+$3\times$ the configured sync interval.
+
+\subsection{Disaster Recovery}
+
+\begin{enumerate}[nosep]
+  \item \textbf{Pod restart}: Init container restores from S3.
+    Automatic. No data loss.
+  \item \textbf{Node failure}: Pod rescheduled to new node. Init
+    container restores from S3. No data loss.
+  \item \textbf{S3 bucket loss}: Restore from S3 cross-region
+    replication (configured separately). RPO = cross-region
+    replication lag (typically < 15\,min).
+  \item \textbf{Master key loss}: Unrecoverable without KMS backup.
+    KMS itself uses Shamir secret sharing for its unseal key.
+  \item \textbf{Corrupted WAL}: Replicator detects checksum mismatch,
+    falls back to last valid snapshot, alerts operator.
+\end{enumerate}
+
+\subsection{Cost Model}
+
+S3 storage cost for a typical ATS deployment (500 orgs, avg 50\,MB
+per org DB, hourly snapshots, 1\,s WAL sync):
+
+\begin{itemize}[nosep]
+  \item Snapshot storage: $500 \times 50\,\text{MB} \times 24 = 600\,\text{GB/day}$
+    (with 24h retention). At \$0.023/GB: \$13.80/day.
+  \item WAL storage: approximately $10\times$ DB size per day with
+    30-day retention. At \$0.023/GB: \$2.88/day.
+  \item Total: approximately \$500/month for 500 orgs with full
+    durability. Lifecycle policies garbage-collect snapshots older
+    than 30 days.
+\end{itemize}
+
+%% ============================================================
+\section{Conclusion}\label{sec:conclusion}
+%% ============================================================
+
+This proposal standardizes encrypted SQLite replication across the
+Lux ecosystem. The combination of age X25519 encryption,
+HKDF-derived per-principal keys, and WAL-based continuous streaming
+provides sub-second RPO with zero plaintext egress. The sidecar
+pattern requires no application changes: existing Base services gain
+durability by adding a Kustomize patch. PVCs become optional. Pod
+restarts become transparent. The chain remains the source of truth
+for securities; this standard ensures that application state---the
+complement to on-chain state---is equally durable.
+
+\begin{thebibliography}{9}
+
+\bibitem{age}
+F.~Valsorda, ``age: A simple, modern and secure encryption tool,''
+\url{https://age-encryption.org/}, 2019.
+
+\bibitem{litestream}
+B.~Johnson, ``Litestream: Streaming SQLite replication,''
+\url{https://litestream.io/}, 2021.
+
+\bibitem{rfc5869}
+H.~Krawczyk and P.~Eronen, ``HMAC-based Extract-and-Expand Key
+Derivation Function (HKDF),'' RFC~5869, IETF, May 2010.
+
+\bibitem{sqlcipher}
+Zetetic LLC, ``SQLCipher: Full Database Encryption for SQLite,''
+\url{https://www.zetetic.net/sqlcipher/}, 2008.
+
+\bibitem{lux-capsule}
+Z.~Kelling, ``The Capsule: A Sovereign Encrypted Process for Web5
+Computing,'' Lux Industries, 2025.
+
+\bibitem{lux-ats}
+Z.~Kelling, ``Non-Custodial Blockchain ATS: Architecture of a
+Regulatory-Compliant Securities Exchange,'' Lux Industries, 2025.
+
+\bibitem{lux-kms}
+Z.~Kelling, ``LP-062: Key Management Service,'' Lux Proposals, 2025.
+
+\bibitem{xwing}
+M.~Connolly, ``X-Wing: The Hybrid KEM You've Been Looking For,''
+Internet-Draft, IETF CFRG,
+\url{https://www.ietf.org/archive/id/draft-connolly-cfrg-xwing-kem-05.html},
+2024.
+
+\bibitem{fips203}
+NIST, ``Module-Lattice-Based Key-Encapsulation Mechanism Standard
+(ML-KEM),'' FIPS~203, August 2024.
+
+\end{thebibliography}
+
+\end{document}
