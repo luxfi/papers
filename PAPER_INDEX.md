@@ -1,10 +1,10 @@
 # Lux Research Papers — Complete Index
 
-**55 papers, 2017–2026. 10+ years of research. Quantum-safe. Open. Permissionless.**
+**80 papers, 2017–2026. 10+ years of research. Quantum-safe. Open. Permissionless.**
 
-**Lineage:** Hanzo Labs (2017) → Lux Industries (2019) → Present
+**Lineage:** Open source (2008) → Hanzo Labs (2014) → Lux Industries (2019) → Present
 
-**Consensus evolution:** HotStuff (2019) → Snow/Avalanche fork (2019) → Quasar hybrid PQ (2022–2025)
+**Consensus evolution:** HotStuff (2019) → Snow/Avalanche fork (2019) → Quasar triple-proof PQ (2022–2026)
 
 ---
 
@@ -33,6 +33,7 @@ Distributed key management — no single point of trust.
 | 2021 | `lux-threshold-mpc` *(revised 2025)* | FROST unforgeability + CGGMP21 UC-security + Taproot integration + MPC group address + LSS dynamic resharing |
 | 2023 | `lux-mchain-mpc` | MPC chain architecture, NATS transport, session lifecycle |
 | 2023 | `lux-warp-messaging` | BLS aggregate signature cross-chain messaging |
+| 2026 | `lux-validator-mpc` | **Threshold signing for validators: CGGMP21 + FROST + DKG + resharing** |
 
 ## III. Post-Quantum Cryptography (2019–2025)
 
@@ -45,9 +46,15 @@ Quantum resistance at every layer — lattice, hash-based, hybrid.
 | 2024 | `lux-pq-crypto-suite` | ML-DSA (FIPS 204), SLH-DSA (FIPS 205), ML-KEM (FIPS 203) |
 | 2024 | `lux-ringtail-pq` | Lattice-based threshold signatures (LWE) |
 | 2024 | `lux-quantum-consensus` | Quantum-resistant validator signatures |
-| 2025 | `lux-quasar-consensus` | Hybrid BLS + Ringtail dual-signature finality |
+| 2025 | `lux-quasar-consensus` | Triple-proof BLS + ZK(ML-DSA) + Ringtail quantum finality |
 | 2025 | `lux-quasar-benchmarks` | Performance: 10K validators, sub-second finality |
 | 2025 | `lux-tfhe` | Threshold Fully Homomorphic Encryption |
+| 2026 | `lux-triple-proof-consensus` | **248-byte epoch proofs, 357μs finality, 1ms blocks, 1TB/year** |
+| 2026 | `lux-hybrid-pq-architecture` | **Hybrid classical+PQ: BLS+ML-DSA dual-sig, ML-KEM+ECDH hybrid KEM** |
+| 2026 | `lux-quantum-threat-blockchain` | **Blockchain quantum threat model: 5 attack vectors, timeline, economics** |
+| 2026 | `lux-pq-migration` | **Three-phase PQ migration: hybrid → PQ-primary → pure PQ** |
+| 2026 | `lux-crypto-agility` | Crypto-agile algorithm registry for zero-downtime upgrades |
+| 2026 | `lux-hybrid-certificates` | Hybrid X.509 certificates with PQ + classical dual signatures |
 
 ## IV. Consensus & Execution (2020–2026)
 
@@ -75,6 +82,10 @@ The omnichain liquidity layer — trustless, sovereign, yield-bearing.
 | 2022 | `lux-teleport-omnichain` *(revised 2025)* | **Full protocol: 18 native bridge programs, 270 chain IDs, MPC group key, IBridgeToken, configurable rotation delay** |
 | 2023 | `lux-bridge` | Threshold-secured bridge with formal MPC analysis |
 | 2024 | `lux-omnichain-yield` *(revised 2025)* | **Yield-bearing bridge tokens, 29 strategies, xLUX flywheel, VIRTUAL\_SHARES 1e8, 54 security tests** |
+| 2026 | `lux-teleport-protocol-spec` | **Auditor-ready spec: asset taxonomy, solvency state machine, message schema** |
+| 2026 | `lux-credit-protocol-spec` | **Credit protocol: LETH/LBTC issuance invariants, failure modes** |
+| 2026 | `lux-secure-messaging` | **13-field envelope, 5 replay classes, 8 mandatory verification checks** |
+| 2026 | `lux-cross-chain-security` | **Multi-chain security inheritance, 4 attack classes, finality propagation** |
 
 ## VI. DeFi Protocols (2019–2024)
 
@@ -92,6 +103,7 @@ Complete on-chain financial infrastructure.
 | 2024 | `lux-restaking` | EigenLayer/Symbiotic restaking integration |
 | 2024 | `lux-oracle-infrastructure` | Multi-source price aggregation |
 | 2024 | `lux-market-nft` | NFT AMM (LSSVM/sudoswap-style) |
+| 2026 | `lux-performance-security-tradeoffs` | **MPC/FHE/BLS/ML-DSA benchmarks, temporal composition architecture** |
 
 ## VII. Governance & Compliance (2022–2025)
 
@@ -113,6 +125,10 @@ Private transactions, FHE, TEE, zero-knowledge.
 | 2024 | `lux-privacy-pool` | Shielded pool with nullifier tracking |
 | 2024 | `lux-tee-computing-mesh` | Trusted execution environment mesh |
 | 2025 | `lux-tfhe` | Threshold FHE for confidential DeFi |
+| 2026 | `lux-fhe-smart-contracts` | **FHE VM: encrypted state transitions, Go+NTT SIMD impl** |
+| 2026 | `lux-fhe-mpc-hybrid` | **FHE+MPC: encrypted compute + distributed decryption** |
+| 2026 | `lux-fhe-api` | FHE precompile API specification |
+| 2026 | `lux-fhe-benchmarks` | FHE performance: bootstrapping, throughput, latency |
 
 ## IX. Chain-Specific Protocols (2024)
 
@@ -129,6 +145,19 @@ Named protocol implementations for specific chain functions.
 | 2023 | `lux-nebula-protocol` | - | Distributed storage |
 | 2023 | `lux-photon-protocol` | - | Message propagation |
 | 2021 | `lux-gchain-graphql` | G-Chain | GraphQL indexing chain |
+
+## X. Security & Infrastructure (2026)
+
+Master security model, operational security, formal methods.
+
+| Year | Paper | Formal Contribution |
+|------|-------|---------------------|
+| 2026 | `lux-master-security-model` | **4 adversary classes, 3 assumption families, per-layer guarantees, machine-checkable invariants** |
+| 2026 | `lux-zero-trust-validators` | Zero-trust validator architecture |
+| 2026 | `lux-hsm-boundary` | Hardware security module integration boundaries |
+| 2026 | `lux-reproducible-builds` | Deterministic builds for cryptographic software |
+| 2026 | `lux-proof-methodology` | Formal verification methodology and proof standards |
+| 2026 | `lux-adoption-roadmap` | Enterprise adoption path for PQ infrastructure |
 
 ---
 
