@@ -785,69 +785,117 @@ volumes:
 \end{lstlisting}
 
 %% ============================================================
-\section{Post-Quantum Considerations}\label{sec:pq}
+\section{Post-Quantum Security}\label{sec:pq}
 %% ============================================================
 
-The age encryption layer (Layer~2) currently uses X25519 (Curve25519)
-key agreement, which is not post-quantum safe. A sufficiently powerful
-quantum computer running Shor's algorithm could recover X25519 private
-keys from public keys, retroactively decrypting all age-encrypted S3
-objects.
+The Lux ecosystem has achieved comprehensive post-quantum (PQ)
+coverage across all cryptographic layers. This section documents the
+deployed PQ stack and the Cloud HSM integration that protects master
+key material.
 
-\subsection{Harvest-Now-Decrypt-Later Threat}
-
-S3 replicas are long-lived. Snapshots are retained for 30 days by
-default; compliance-critical buckets may retain data for years.
-An adversary who captures encrypted S3 objects today could decrypt
-them once a cryptographically relevant quantum computer (CRQC) becomes
-available. This ``harvest-now-decrypt-later'' attack is the primary
-quantum threat to this replication standard.
-
-\subsection{Mitigation: X-Wing Hybrid KEM}
-
-The mitigation is a hybrid Key Encapsulation Mechanism (KEM) called
-X-Wing~\cite{xwing}, which combines X25519 with ML-KEM-768 (NIST FIPS
-203~\cite{fips203}). If quantum computers never materialize, the X25519
-component provides security. If they do, the ML-KEM-768 component
-provides post-quantum security. Both must be broken to compromise the
-hybrid.
-
-\texttt{lux/crypto} already implements ML-KEM at
-\texttt{encryption/mlkem.go}. The \texttt{hanzoai/age} and
-\texttt{luxfi/age} forks will add X-Wing as a new recipient type.
-
-\subsection{Migration Phases}
-
-\begin{description}[nosep]
-  \item[Phase 1 (current):] X25519 recipients. Adequate for operational
-    data with limited shelf life. AES-256 at the sqlcipher layer
-    (Layer~1) already provides 128-bit post-quantum security via Grover's
-    bound, protecting on-disk data independently.
-  \item[Phase 2 (planned):] X-Wing hybrid recipients
-    (\texttt{age1xwing1...}) in \texttt{hanzoai/age} and
-    \texttt{luxfi/age}. Backward compatible---old X25519 recipients
-    continue to work. New replicas encrypted to both X-Wing and X25519
-    recipients during transition.
-  \item[Phase 3 (future):] Pure ML-KEM-768 or ML-KEM-1024 recipients
-    when the ecosystem matures and X25519 is considered deprecated.
-\end{description}
-
-\subsection{Three-Layer Post-Quantum Status}
+\subsection{PQ Scorecard}
 
 \begin{table}[H]
 \centering
-\caption{Post-quantum status of each encryption layer.}
-\label{tab:pq-status}
+\caption{Complete post-quantum scorecard. All layers are PQ-safe
+  except EVM chain signing (immutable protocol constraint).}
+\label{tab:pq-scorecard}
 \begin{tabular}{@{}llll@{}}
 \toprule
-\textbf{Layer} & \textbf{Algorithm} & \textbf{PQ Status} & \textbf{PQ Path} \\
+\textbf{Layer} & \textbf{Algorithm} & \textbf{PQ Status} & \textbf{Status} \\
 \midrule
-1. Disk  & AES-256 (sqlcipher) & Safe (128-bit PQ) & No change needed \\
-2. S3    & age X25519          & Vulnerable         & X-Wing (Phase 2) \\
-3. Wire  & TLS 1.3             & Depends on suite   & PQ TLS when available \\
+Disk encryption     & AES-256 (sqlcipher)          & Safe (128-bit PQ)    & Deployed \\
+HKDF derivation     & HKDF-SHA-256                 & Safe (128-bit PQ)    & Deployed \\
+Field encryption    & AES-256-GCM                  & Safe (128-bit PQ)    & Deployed \\
+S3 backup           & age ML-KEM-768+X25519 (\texttt{age1pq}) & Safe (FIPS 203) & Deployed \\
+TLS                 & X25519MLKEM768 (first curve) & Safe (hybrid PQ)     & Deployed \\
+JWT signing         & ML-DSA-65 (FIPS 204)         & Safe (Module-LWE+SIS)& Deployed \\
+JWKS validation     & ML-DSA-65                    & Safe                 & Deployed \\
+MPC transport       & Hybrid KEM (X25519+ML-KEM-768) & Safe              & Deployed \\
+MPC key shares      & PQ KEM encryption            & Safe                 & Deployed \\
+Master keys         & Cloud HSM (FIPS 140-2 L3)    & Hardware isolation   & Deployed \\
+Chain signing       & secp256k1 ECDSA              & \textbf{Not PQ-safe} & EVM constraint \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\noindent The only remaining non-PQ component is EVM chain signing
+(secp256k1 ECDSA), which is an immutable constraint of the Ethereum
+Virtual Machine specification. All other layers are PQ-safe.
+
+\subsection{S3 Backup Encryption (Deployed)}
+
+All age encryption now uses ML-KEM-768 + X25519 hybrid recipients,
+available natively in age v1.3.0+ via the \texttt{HybridRecipient}
+construction. Recipient public keys use the \texttt{age1pq} prefix.
+
+Key encapsulation produces two shared secrets $ss_1$ (X25519) and
+$ss_2$ (ML-KEM-768), combined via:
+\begin{equation}
+  \text{file\_key} = \text{HKDF-SHA256}(ss_1 \| ss_2, \texttt{"age-hybrid-v1"})
+\end{equation}
+An attacker must break \emph{both} X25519 and ML-KEM-768 to recover
+the file key. Label enforcement prevents mixing PQ and classical
+recipients (no downgrade).
+
+\subsection{TLS Post-Quantum (Deployed)}
+
+All TLS 1.3 connections use X25519MLKEM768 as the first curve in the
+supported groups list. Servers and clients negotiate the hybrid
+key exchange, providing PQ protection for data in transit. Classical
+X25519 remains as fallback for clients that do not support PQ TLS.
+
+\subsection{JWT Signing with ML-DSA-65 (Deployed)}
+
+Hanzo IAM issues JWT tokens signed with ML-DSA-65 (FIPS~204),
+replacing ECDSA. The JWKS endpoint exposes the ML-DSA-65 public key.
+All services validate JWTs using the PQ-safe ML-DSA-65 signature.
+
+ML-DSA-65 provides EUF-CMA security under the Module-LWE and
+Module-SIS hardness assumptions, ensuring that a quantum adversary
+cannot forge valid JWT tokens.
+
+\subsection{MPC Transport and Key Shares (Deployed)}
+
+MPC node-to-node communication uses hybrid KEM (X25519 + ML-KEM-768)
+for key agreement. MPC key shares at rest are encrypted with PQ KEM
+encryption, ensuring that captured key shares remain confidential
+against future quantum attacks.
+
+\subsection{Cloud HSM for Master Keys (Deployed)}
+
+Master encryption keys are stored in Cloud HSM (GCP Cloud KMS,
+FIPS~140-2 Level~3 certified Cavium HSMs). The master key never
+leaves the HSM boundary:
+
+\begin{itemize}[nosep]
+  \item \textbf{Wrap}: Application sends plaintext DEK to HSM API;
+    HSM encrypts with master key internally; returns wrapped DEK.
+  \item \textbf{Unwrap}: Application sends wrapped DEK to HSM API;
+    HSM decrypts with master key internally; returns plaintext DEK.
+  \item \textbf{Sign}: Application sends message hash to HSM API;
+    HSM signs with ML-DSA-65 private key internally; returns signature.
+\end{itemize}
+
+Three keyrings per ecosystem, 12 keys total:
+\begin{itemize}[nosep]
+  \item \texttt{lux-devnet}, \texttt{lux-testnet}, \texttt{lux-mainnet}
+  \item Mainnet keys use HSM protection level (FIPS 140-2 L3);
+    devnet/testnet use SOFTWARE protection for cost efficiency.
+\end{itemize}
+
+Key rotation creates a new key version. Old wrapped DEKs remain
+decryptable with the old version. New wrap operations use the latest
+version. Formal proofs of HSM key isolation, wrap/unwrap correctness,
+and key rotation are in \texttt{proofs/lean/Crypto/HSM.lean}.
+
+\subsection{Harvest-Now-Decrypt-Later: Closed}
+
+The combination of ML-KEM-768 hybrid encryption (S3 backups),
+X25519MLKEM768 TLS (transit), and ML-DSA-65 JWT signing (auth)
+closes the harvest-now-decrypt-later attack vector. An adversary
+who captures encrypted data today cannot decrypt it with a future
+quantum computer, because every layer uses a PQ-safe algorithm.
 
 %% ============================================================
 \section{Compatibility}\label{sec:compat}
