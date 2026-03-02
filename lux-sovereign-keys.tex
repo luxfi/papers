@@ -1,0 +1,569 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{tikz}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{longtable}
+\usepackage{tabularx}
+\usetikzlibrary{positioning,arrows.meta,shapes.geometric}
+
+\definecolor{codebg}{gray}{0.95}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  breaklines=true,
+  frame=single,
+  rulecolor=\color{gray},
+  xleftmargin=0.5em,
+  xrightmargin=0.5em,
+  showstringspaces=false,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  keywordstyle=\color{blue!70!black}\bfseries,
+  commentstyle=\color{green!50!black}\itshape,
+}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{property}{Property}[section]
+\newtheorem{invariant}{Invariant}[section]
+
+\title{\textbf{Sovereign Key Management\\in Post-Quantum Local-First Applications}}
+
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network} \\[6pt]
+\textit{Lux Industries, Inc.} \\
+\texttt{research@lux.network}
+}
+
+\date{April 2026}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+We describe a key management architecture for local-first applications on
+the Lux Network where users hold their own keys and service providers
+cannot decrypt user data.  The architecture uses Argon2id for passphrase-based
+root key derivation, ML-KEM-1024 (FIPS 203) for post-quantum key encapsulation,
+AES-256-GCM for symmetric encryption, and ML-DSA-87 (FIPS 204) for
+post-quantum digital signatures.  Vault sharing uses ML-KEM envelope
+encryption; threshold control uses CGGMP21 (ECDSA) and FROST (EdDSA)
+with user-controlled signer sets.  Fully homomorphic encryption over
+lattices enables private computation on encrypted data without provider
+access.  We contrast this sovereign model with the regulated custody model
+where operator decrypt capability is a legal requirement, and show that
+both models share the same cryptographic primitives but differ in trust
+assumptions.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ======================================================================
+\section{The Sovereign App Model}
+\label{sec:model}
+
+\subsection{Local-First Principle}
+
+In the sovereign model, the user's device is the primary data store.  Data
+is encrypted at rest on the device; the provider never sees plaintext.  The
+chain provides verifiable checkpoints and ordering, but is not the primary
+storage layer for user data.
+
+\begin{definition}[Sovereign Application]
+An application is \emph{sovereign} if:
+\begin{enumerate}[nosep]
+  \item The user holds the root decryption key.
+  \item The provider cannot derive the root key from any data it holds.
+  \item The application functions offline (reads and writes to local state).
+  \item Sync, storage, and recovery services are replaceable without data loss.
+\end{enumerate}
+\end{definition}
+
+\subsection{Chain Anchors}
+
+The blockchain provides three services to sovereign applications:
+\begin{enumerate}[nosep]
+  \item \textbf{Ordering}: a total order on state transitions, preventing
+        equivocation.
+  \item \textbf{Availability}: encrypted data blobs can be anchored on-chain
+        for disaster recovery (the chain stores ciphertext, not plaintext).
+  \item \textbf{Capability tokens}: on-chain tokens representing access
+        permissions, revocable by the key holder.
+\end{enumerate}
+
+The chain never stores plaintext user data.  It stores commitments
+(hashes), encrypted envelopes, and capability references.
+
+\subsection{Provider Agnosticism}
+
+The sync layer (cloud backup, multi-device replication) is a replaceable
+service.  The provider receives only encrypted envelopes.  Switching
+providers requires re-uploading encrypted blobs; no re-encryption is needed
+because the provider never held a key.
+
+% ======================================================================
+\section{Key Architecture}
+\label{sec:keys}
+
+\subsection{Root Key Derivation}
+
+The user's root key is derived from a passphrase using Argon2id
+\cite{argon2}:
+
+\begin{equation}
+  \text{rootKey} = \text{Argon2id}(\text{passphrase}, \text{salt}, t=3, m=65536, p=4)
+\end{equation}
+
+Parameters: 3 iterations, 64 MiB memory, 4 parallel lanes.  The salt is
+generated once and stored alongside the encrypted vault header (the salt
+is not secret).  The output is 32 bytes, used as the master symmetric key.
+
+The root key never leaves the device.  It is held in memory only during
+an active session and zeroed on lock/logout.
+
+\subsection{Per-Vault Data Encryption Key}
+
+Each vault (a logical container for related data---e.g., a company's
+cap table, a personal document set) has its own DEK.  The DEK is a random
+256-bit key, encrypted to the vault owner's ML-KEM-1024 public key:
+
+\begin{equation}
+  \text{encDEK} = \text{ML-KEM-1024.Encapsulate}(\text{ownerPubKey}) \to (\text{encapsulated}, \text{sharedSecret})
+\end{equation}
+
+The shared secret serves as the DEK.  The encapsulated key blob is stored
+alongside the vault metadata.
+
+To share a vault with another user, the DEK is re-encapsulated to the
+recipient's ML-KEM-1024 public key.  Each recipient gets their own
+encapsulated key blob; the DEK itself is never transmitted in plaintext.
+
+\subsection{Per-Document Encryption}
+
+Individual documents are encrypted with AES-256-GCM using the vault DEK
+and a random 12-byte nonce per document.  This is implemented in
+\texttt{lux/transfer/pkg/crypto/envelope.go}:
+
+\begin{lstlisting}[language=Go,caption={envelope.go: ML-KEM + AES-256-GCM envelope}]
+func Seal(plaintext []byte,
+          recipientPubKey []byte) (*Envelope, error) {
+    pk, err := mlkem.PublicKeyFromBytes(
+        recipientPubKey, mlkem.MLKEM1024)
+    // ML-KEM encapsulate: shared secret + encapsulated key
+    encapsulated, sharedSecret, err := pk.Encapsulate()
+    // AES-256-GCM with shared secret as key
+    block, err := aes.NewCipher(sharedSecret[:32])
+    gcm, err := cipher.NewGCM(block)
+    nonce := make([]byte, gcm.NonceSize())
+    rand.Read(nonce)
+    ciphertext := gcm.Seal(nil, nonce, plaintext, nil)
+    return &Envelope{
+        Ciphertext:      ciphertext,
+        EncapsulatedKey: encapsulated,
+        Nonce:           nonce,
+        Algorithm:       AlgoMLKEM1024_AES256GCM,
+    }, nil
+}
+\end{lstlisting}
+
+Decryption requires the recipient's ML-KEM-1024 private key to
+decapsulate the shared secret, then AES-256-GCM decryption:
+
+\begin{lstlisting}[language=Go,caption={envelope.go: decryption path}]
+func Open(env *Envelope,
+          recipientPrivKey []byte) ([]byte, error) {
+    sk, err := mlkem.PrivateKeyFromBytes(
+        recipientPrivKey, mlkem.MLKEM1024)
+    sharedSecret, err := sk.Decapsulate(env.EncapsulatedKey)
+    block, err := aes.NewCipher(sharedSecret[:32])
+    gcm, err := cipher.NewGCM(block)
+    plaintext, err := gcm.Open(
+        nil, env.Nonce, env.Ciphertext, nil)
+    return plaintext, nil
+}
+\end{lstlisting}
+
+\subsection{Post-Quantum Signatures}
+
+All envelopes can be signed using ML-DSA-87 (FIPS 204 \cite{fips204}).
+The signer's public key is included in the envelope for verification:
+
+\begin{lstlisting}[language=Go,caption={envelope.go: ML-DSA-87 signing}]
+func Sign(data []byte,
+          signerPrivKey []byte) ([]byte, error) {
+    sk, err := mldsa.PrivateKeyFromBytes(
+        mldsa.MLDSA87, signerPrivKey)
+    return sk.Sign(data)
+}
+\end{lstlisting}
+
+ML-DSA-87 provides NIST Security Level 5---equivalent security to
+AES-256 against quantum adversaries.
+
+\subsection{Algorithm Summary}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Function} & \textbf{Algorithm} & \textbf{Standard} & \textbf{Security Level} \\
+\midrule
+Key derivation    & Argon2id       & RFC 9106       & Memory-hard \\
+Key encapsulation & ML-KEM-1024    & FIPS 203       & NIST Level 5 \\
+Symmetric encrypt & AES-256-GCM    & FIPS 197       & 256-bit \\
+Digital signature  & ML-DSA-87      & FIPS 204       & NIST Level 5 \\
+Threshold ECDSA   & CGGMP21        & ---            & secp256k1 \\
+Threshold EdDSA   & FROST          & RFC 9591       & Ed25519 \\
+\bottomrule
+\end{tabular}
+\caption{Cryptographic algorithms and their security levels.}
+\label{tab:algorithms}
+\end{table}
+
+% ======================================================================
+\section{FHE for Private Computation}
+\label{sec:fhe}
+
+\subsection{Motivation}
+
+Some computations require operating on data from multiple parties without
+revealing individual values.  Examples in the securities domain:
+\begin{itemize}[nosep]
+  \item Accreditation verification: does an investor's income exceed
+        a threshold without revealing the exact amount?
+  \item Private voting: aggregate votes without revealing individual choices.
+  \item Compliance checks: verify aggregate investment limits across
+        multiple accounts.
+\end{itemize}
+
+\subsection{Implementation}
+
+The FHE module in \texttt{lux/transfer/pkg/crypto/fhe.go} uses lattice-based
+fully homomorphic encryption from the \texttt{luxfi/fhe} library:
+
+\begin{lstlisting}[language=Go,caption={fhe.go: parameter initialization}]
+func NewFHEKey() (*FHEKey, error) {
+    params, err := fhe.NewParametersFromLiteral(fhe.PN10QP27)
+    intParams, err := fhe.NewIntegerParams(params, 2)
+    kg := fhe.NewKeyGenerator(params)
+    sk, pk := kg.GenKeyPair()
+    return &FHEKey{
+        params: params, intParams: intParams,
+        sk: sk, pk: pk,
+    }, nil
+}
+\end{lstlisting}
+
+The parameter set \texttt{PN10QP27} provides approximately 128-bit security.
+Integer operations support 64-bit unsigned values, sufficient for monetary
+amounts and share counts.
+
+\subsection{Encrypted Comparison}
+
+The core operation is homomorphic comparison, enabling threshold checks
+on encrypted data:
+
+\begin{lstlisting}[language=Go,caption={fhe.go: encrypted comparison}]
+func CompareEncrypted(a, b *FHECiphertext,
+                      key *FHEEvalKey) (int, error) {
+    // Computed homomorphically, then single-bit
+    // results are decrypted.
+    // In production the final decryption would
+    // be done via MPC.
+}
+\end{lstlisting}
+
+The comparison result is a single encrypted bit.  In the sovereign model,
+the final decryption is distributed via MPC among user-controlled signers,
+so no single party learns the underlying values.
+
+\subsection{Integration with Sovereign Keys}
+
+FHE ciphertexts are encrypted under the vault's FHE public key (generated
+alongside the ML-KEM key pair).  The FHE secret key is held by the user
+or split via MPC among user-designated parties.  The provider stores
+ciphertexts and can perform homomorphic operations, but cannot decrypt
+the results.
+
+% ======================================================================
+\section{MPC for Threshold Control}
+\label{sec:mpc}
+
+\subsection{Same Primitives, Different Trust}
+
+The sovereign model uses the same threshold signing protocols as the
+regulated model (CGGMP21 for ECDSA, FROST for EdDSA).  The difference
+is who controls the signers:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Property} & \textbf{Regulated (Liquidity)} & \textbf{Sovereign (Lux)} \\
+\midrule
+Shard holders    & Operator + HSM + cold   & User + trusted parties \\
+Threshold        & 2-of-3 (operator is 1)  & User-defined $t$-of-$n$ \\
+Operator shards  & 1 (below threshold)     & 0 \\
+Recovery         & Operator cold storage   & Social recovery \\
+Key generation   & Operator-initiated DKG  & User-initiated DKG \\
+\bottomrule
+\end{tabular}
+\caption{MPC trust model comparison.}
+\label{tab:mpc-comparison}
+\end{table}
+
+\subsection{User-Controlled Signers}
+
+In the sovereign model, the user initiates distributed key generation (DKG)
+and designates the signer set.  Typical configurations:
+\begin{itemize}[nosep]
+  \item \textbf{Personal}: 2-of-3 with user device, backup device, and a
+        recovery share held by a trusted contact.
+  \item \textbf{Organization}: 3-of-5 with board members as shard holders.
+  \item \textbf{DAO}: $m$-of-$n$ with on-chain governance controlling
+        signer rotation.
+\end{itemize}
+
+The provider holds zero shards.  The provider cannot sign, cannot veto,
+and cannot participate in signing.
+
+\subsection{Social Recovery}
+
+If the user loses their device, recovery uses threshold shares distributed
+to trusted parties at vault creation time.  The recovery protocol:
+
+\begin{enumerate}[nosep]
+  \item User contacts $t$ of their $n$ designated recovery parties.
+  \item Each party authenticates the user (out-of-band: video call, in-person,
+        pre-shared secret).
+  \item Each party submits their recovery share to the new device.
+  \item The new device reconstructs the root key from $t$ shares.
+  \item The root key decrypts the vault DEK; all data is accessible.
+\end{enumerate}
+
+No operator involvement.  No ``forgot password'' flow that bypasses
+encryption.  If the user cannot reach $t$ recovery parties, the data is
+permanently inaccessible.  This is the intended behavior: data sovereignty
+means the user bears the responsibility.
+
+% ======================================================================
+\section{Contrast with Regulated Model}
+\label{sec:contrast}
+
+The regulated custody model (deployed by Partner, Inc.\ for the Liquidity ATS)
+and the sovereign model (deployed on Lux Network) use identical cryptographic
+primitives but make opposite trust assumptions.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5cm}p{5cm}@{}}
+\toprule
+\textbf{Property} & \textbf{Regulated (Liquidity)} & \textbf{Sovereign (Lux)} \\
+\midrule
+Data encryption &
+  AES-256-GCM, per-org DEK from HMAC-SHA256 &
+  AES-256-GCM, per-vault DEK from ML-KEM-1024 \\[4pt]
+Master key holder &
+  Operator (Google Cloud KMS, HSM-backed) &
+  User (Argon2id from passphrase) \\[4pt]
+Can operator decrypt? &
+  Yes (required by SEC 17a-4) &
+  No (by design) \\[4pt]
+Key encapsulation &
+  Not used (HMAC derivation) &
+  ML-KEM-1024 (FIPS 203) \\[4pt]
+Signatures &
+  HMAC-SHA256 (migrating to ML-DSA-87) &
+  ML-DSA-87 (FIPS 204) \\[4pt]
+Threshold signing &
+  CGGMP21/FROST, operator holds 1 shard &
+  CGGMP21/FROST, operator holds 0 shards \\[4pt]
+Recovery &
+  Operator cold storage + KMS &
+  Social recovery ($t$-of-$n$ shares) \\[4pt]
+Data loss on key loss? &
+  No (operator can re-derive DEK) &
+  Yes (if $< t$ recovery parties available) \\[4pt]
+Regulatory compliance &
+  SEC 17a-4, FINRA 4511, BSA &
+  User responsibility \\
+\bottomrule
+\end{tabular}
+\caption{Full comparison of regulated and sovereign key architectures.}
+\label{tab:full-comparison}
+\end{table}
+
+The choice between models is a policy decision, not a cryptographic one.
+The same \texttt{luxfi/crypto} library implements both.  The difference
+is in key hierarchy: who holds the root, and whether the provider can
+derive decryption keys.
+
+\begin{invariant}[Model Exclusivity]
+A deployment is either regulated or sovereign.  There is no hybrid where
+the operator ``sometimes'' can decrypt.  The trust model is determined at
+deployment time by key hierarchy configuration.
+\end{invariant}
+
+% ======================================================================
+\section{Security Analysis}
+\label{sec:security}
+
+\subsection{Post-Quantum Security}
+
+ML-KEM-1024 provides IND-CCA2 security under the Module Learning With
+Errors (MLWE) assumption at NIST Security Level 5 \cite{fips203}.  This
+means a quantum adversary with access to a cryptographically relevant
+quantum computer cannot distinguish ML-KEM ciphertexts from random, and
+therefore cannot recover shared secrets or DEKs.
+
+ML-DSA-87 provides EUF-CMA security under the Module Short Integer
+Solution (MSIS) and MLWE assumptions at NIST Security Level 5 \cite{fips204}.
+
+\begin{theorem}[Post-Quantum Confidentiality]
+Under the MLWE assumption with parameters as specified in FIPS 203 for
+ML-KEM-1024, the probability that a quantum polynomial-time adversary
+$\mathcal{A}$ can distinguish the encryption of a chosen message from
+random is:
+\[
+  \text{Adv}^{\text{IND-CCA2}}_{\text{ML-KEM-1024}}(\mathcal{A}) \leq \text{negl}(\lambda)
+\]
+where $\lambda$ is the security parameter (256 bits for Level 5).
+\end{theorem}
+
+\subsection{Forward Secrecy}
+
+Each envelope uses a fresh ML-KEM encapsulation, producing an ephemeral
+shared secret.  Compromise of the recipient's long-term private key
+enables decryption of past envelopes (the encapsulated keys are stored
+alongside ciphertexts).  True forward secrecy requires an interactive
+protocol (e.g., Signal's X3DH adapted for ML-KEM), which is out of
+scope for this document but planned for the Lux secure messaging layer
+\cite{lux-messaging}.
+
+For vault-level forward secrecy, periodic key rotation is supported:
+the vault DEK is re-generated, all documents are re-encrypted, and the
+old ML-KEM key pair is destroyed.
+
+\subsection{Metadata Protection}
+
+The sync protocol transmits encrypted envelopes.  The provider observes:
+\begin{itemize}[nosep]
+  \item Envelope size (mitigated by padding to fixed block sizes).
+  \item Timing of uploads/downloads (mitigated by batching).
+  \item Public keys of recipients (inherent to ML-KEM; mitigated by
+        using ephemeral recipient identifiers).
+\end{itemize}
+
+The provider does not observe: plaintext content, file names, document
+types, or the relationship between documents within a vault.
+
+\subsection{Revocation}
+
+Access revocation uses on-chain capability tokens.  Each vault access
+grant is represented by an on-chain token.  Revoking access burns the
+token.  The revoked party still holds the encapsulated key blob from
+the previous sharing, but:
+\begin{enumerate}[nosep]
+  \item The vault DEK is rotated after revocation.
+  \item All documents are re-encrypted with the new DEK.
+  \item New envelopes are encapsulated only to remaining authorized keys.
+\end{enumerate}
+
+The revoked party retains access to data encrypted before revocation
+(this is inherent to any system where decryption keys were previously
+distributed).  Preventing access to historical data requires re-encryption
+with key exclusion, which is performed automatically on revocation.
+
+\subsection{Security Level Summary}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Threat} & \textbf{Protection} & \textbf{Assumption} \\
+\midrule
+Quantum key recovery       & ML-KEM-1024 Level 5 & MLWE hardness \\
+Quantum signature forgery  & ML-DSA-87 Level 5   & MSIS + MLWE hardness \\
+Brute-force root key       & Argon2id (64 MiB)   & Memory-hard \\
+Threshold signing bypass   & CGGMP21/FROST $t$-of-$n$ & DLP on secp256k1/Ed25519 \\
+Provider data access       & Envelope encryption  & Provider holds no keys \\
+Single point of failure    & Social recovery      & $\geq t$ parties honest \\
+\bottomrule
+\end{tabular}
+\caption{Threat-protection mapping.}
+\label{tab:threats}
+\end{table}
+
+% ======================================================================
+\section{Conclusion}
+
+The sovereign key architecture on Lux Network ensures that service providers
+cannot access user data.  Users derive root keys from passphrases via
+Argon2id, encrypt data with ML-KEM-1024 + AES-256-GCM envelopes, and
+sign with ML-DSA-87---all at NIST post-quantum Security Level 5.
+Threshold MPC (CGGMP21/FROST) distributes signing authority among
+user-controlled parties with zero operator shards.  FHE enables
+computation on encrypted data without decryption.  The architecture
+uses the same cryptographic primitives as the regulated custody model
+but inverts the trust hierarchy: the user is the root of trust, not
+the operator.
+
+% ======================================================================
+\begin{thebibliography}{99}
+
+\bibitem{fips203}
+  National Institute of Standards and Technology,
+  ``FIPS 203: Module-Lattice-Based Key-Encapsulation Mechanism Standard (ML-KEM),''
+  August 2024.
+
+\bibitem{fips204}
+  National Institute of Standards and Technology,
+  ``FIPS 204: Module-Lattice-Based Digital Signature Standard (ML-DSA),''
+  August 2024.
+
+\bibitem{fips197}
+  National Institute of Standards and Technology,
+  ``FIPS 197: Advanced Encryption Standard (AES),''
+  November 2001.
+
+\bibitem{argon2}
+  A.~Biryukov, D.~Dinu, D.~Khovratovich,
+  ``Argon2: New Generation of Memory-Hard Functions for Password Hashing and Other Applications,''
+  RFC 9106, September 2021.
+
+\bibitem{cggmp21}
+  R.~Canetti, R.~Gennaro, S.~Goldfeder, N.~Makriyannis, U.~Peled,
+  ``UC Non-Interactive, Proactive, Threshold ECDSA with Identifiable Aborts,''
+  in \emph{Proceedings of the 2020 ACM CCS}, 2020.
+
+\bibitem{frost}
+  C.~Komlo and I.~Goldberg,
+  ``FROST: Flexible Round-Optimized Schnorr Threshold Signatures,''
+  in \emph{Selected Areas in Cryptography (SAC)}, 2020.
+
+\bibitem{lux-messaging}
+  Lux Industries,
+  ``Secure Messaging Protocol for Lux Network,''
+  Technical Report, 2026.
+
+\end{thebibliography}
+
+\end{document}
