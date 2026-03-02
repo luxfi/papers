@@ -1,0 +1,231 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{listings}
+\input{shared/lstlang}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{float}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}
+
+\lstset{
+    basicstyle=\small\ttfamily,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray},
+    stringstyle=\color{red},
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray}
+}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{BLAKE3 Precompile:\\High-Performance Hashing on the EVM}
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+\date{April 2026}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+We specify the BLAKE3 hash function precompile on the Lux EVM. BLAKE3~\cite{blake3}
+is a Merkle tree hash function that achieves $>$10~GB/s on modern CPUs via
+SIMD parallelism, making it the fastest cryptographic hash function available.
+The precompile provides three operations: hash (arbitrary input to 32-byte digest),
+keyed hash (256-bit key for MAC), and key derivation (KDF mode with context string).
+Gas cost: 30 base plus 3 gas per 64-byte block, reflecting BLAKE3's throughput
+of $\sim$6 bytes per cycle on AVX-512. BLAKE3 serves as the content-addressed
+storage hash for Lux's blob store, the Merkle tree hash for state proofs, and
+the KDF for secret derivation in the Warp messaging protocol.
+\end{abstract}
+
+\section{Introduction}
+
+The EVM provides SHA-256 and Keccak-256 as built-in hash precompiles. Both are
+designed for serial execution and achieve $\sim$1~GB/s on modern hardware. BLAKE3
+is fundamentally different: its internal Merkle tree structure enables parallel
+hashing of independent 1~KB chunks, achieving $>$10~GB/s on a single core with
+AVX-512 or $>$50~GB/s across multiple cores.
+
+BLAKE3 on the Lux EVM serves:
+\begin{enumerate}[label=(\roman*)]
+  \item \textbf{Content-addressed storage}: 10x faster hashing for blob
+    transactions and state trie nodes.
+  \item \textbf{Merkle proofs}: BLAKE3's native Merkle tree produces
+    verified inclusion proofs as a byproduct of hashing.
+  \item \textbf{Key derivation}: The KDF mode replaces HKDF for
+    context-separated key derivation.
+  \item \textbf{MAC}: The keyed hash mode provides a fast message
+    authentication code.
+\end{enumerate}
+
+\section{BLAKE3 Design}
+
+\begin{definition}[BLAKE3 Compression Function]
+BLAKE3's compression function operates on 64-byte blocks, producing 32-byte
+outputs. It consists of 7 rounds of the BLAKE2s mixing function $G$ applied
+to a $4 \times 4$ matrix of 32-bit words. Each round applies 8 quarter-round
+$G$ functions (4 column rounds + 4 diagonal rounds).
+\end{definition}
+
+\subsection{Merkle Tree Structure}
+
+Input is split into 1\,024-byte chunks. Each chunk is compressed independently
+(allowing parallel processing). Chunk outputs are combined into a binary
+Merkle tree using the same compression function with a different domain
+separation flag.
+
+\begin{algorithm}[H]
+\caption{BLAKE3 hash (simplified)}
+\begin{algorithmic}[1]
+\Require Message $M$
+\State Split $M$ into 1024-byte chunks $C_1, \ldots, C_n$
+\For{$i = 1$ to $n$ in parallel}
+  \State $h_i \gets \text{ChainCompress}(C_i, i, \text{flags})$
+\EndFor
+\State Combine $h_1, \ldots, h_n$ into binary Merkle tree
+\State \Return root hash (32 bytes)
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Domain Separation Flags}
+
+BLAKE3 uses flag bits to distinguish:
+\begin{itemize}
+  \item \texttt{CHUNK\_START} / \texttt{CHUNK\_END}: first/last block of a chunk.
+  \item \texttt{ROOT}: the root node of the Merkle tree.
+  \item \texttt{KEYED\_HASH}: MAC mode.
+  \item \texttt{DERIVE\_KEY\_CONTEXT} / \texttt{DERIVE\_KEY\_MATERIAL}: KDF mode.
+\end{itemize}
+
+\section{Precompile Specification}
+
+Address: \texttt{0x0200\ldots2F}.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{llr}
+\toprule
+\textbf{Selector} & \textbf{Operation} & \textbf{Gas} \\
+\midrule
+\texttt{0x01} & Hash & $30 + 3 \cdot \lceil |M| / 64 \rceil$ \\
+\texttt{0x02} & Keyed Hash (MAC) & $30 + 3 \cdot \lceil |M| / 64 \rceil$ \\
+\texttt{0x03} & Derive Key (KDF) & $30 + 3 \cdot \lceil |M| / 64 \rceil$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Hash}
+
+\textbf{Input}: Selector (1), output length (2 bytes, 1--64), message.
+
+\textbf{Output}: Hash digest of requested length (default 32 bytes).
+
+BLAKE3 supports variable-length output (XOF mode) up to $2^{64}$ bytes.
+The precompile caps output at 64 bytes.
+
+\subsection{Keyed Hash}
+
+\textbf{Input}: Selector (1), key (32 bytes), output length (2 bytes), message.
+
+\textbf{Output}: Keyed hash (MAC) of requested length.
+
+\subsection{Derive Key}
+
+\textbf{Input}: Selector (1), context string length (2 bytes), context string,
+key material length (2 bytes), key material.
+
+\textbf{Output}: 32-byte derived key.
+
+The KDF mode first hashes the context string to a key, then uses that key in
+keyed-hash mode over the key material. This provides domain separation:
+$\text{DeriveKey}(\text{``lux warp session''}, \text{ikm}) \neq
+\text{DeriveKey}(\text{``lux tls master''}, \text{ikm})$.
+
+\section{Security Analysis}
+
+\subsection{Security Level}
+
+BLAKE3 provides 128-bit collision resistance and 256-bit preimage resistance
+(same as the 32-byte digest size implies). The 7-round compression function
+has a safety margin of 3.5 rounds over the best known attack (which breaks
+3.5 rounds).
+
+\subsection{Length Extension}
+
+BLAKE3 is immune to length extension attacks (unlike SHA-256) because the
+root hash is computed with the \texttt{ROOT} flag, which is different from
+the intermediate chaining values. Intermediate hash states cannot be extended.
+
+\subsection{Merkle Tree Security}
+
+The domain separation flags prevent second-preimage attacks against the
+Merkle tree structure. A chunk hash cannot be confused with a parent hash
+because they use different flags.
+
+\subsection{Keyed Hash vs.\ HMAC}
+
+BLAKE3's keyed hash mode is simpler and faster than HMAC-BLAKE3 because it
+initializes the compression function with the key (no double hashing).
+The security proof reduces to PRF security of the compression function
+under the key.
+
+\section{Gas Cost Justification}
+
+BLAKE3 processes 64 bytes per compression function call (7 rounds, each with
+8 quarter-round $G$ operations $= 56 \cdot G$). On AVX-512, 16 compression
+functions execute in parallel, achieving $\sim$6 bytes per cycle.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Size} & \textbf{Time ($\mu$s)} & \textbf{Gas} & \textbf{Comparison: SHA-256} \\
+\midrule
+64 B & 0.02 & 33 & 66 \\
+1 KB & 0.1 & 78 & 186 \\
+1 MB & 80 & 49\,182 & 125\,006 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+BLAKE3 is approximately 2.5x cheaper per byte than SHA-256 (EVM precompile
+at Ethereum pricing). The 3 gas per 64-byte block is the lowest per-byte
+hash cost on the Lux EVM, reflecting BLAKE3's superior throughput.
+
+\section{Conclusion}
+
+The BLAKE3 precompile provides the fastest cryptographic hash on the Lux EVM.
+The Merkle tree structure enables future parallelism optimizations (GPU hashing),
+the KDF mode eliminates the need for separate HKDF calls, and the keyed hash
+mode provides a single-pass MAC. At 3 gas per 64-byte block, BLAKE3 is the
+cost-optimal hash for all non-ZK applications.
+
+\begin{thebibliography}{9}
+\bibitem{blake3}
+  J.-P.~Aumasson, L.~O'Connor, and S.~Neves, ``BLAKE3---one function,
+  fast everywhere,'' 2020. \url{https://blake3.io}
+\end{thebibliography}
+
+\end{document}

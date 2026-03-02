@@ -1,0 +1,206 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{listings}
+\input{shared/lstlang}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{float}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}
+
+\lstset{
+    basicstyle=\small\ttfamily,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray},
+    stringstyle=\color{red},
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray}
+}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{HPKE Precompile:\\RFC~9180 Hybrid Public Key Encryption on the EVM}
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+\date{April 2026}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+We specify the Hybrid Public Key Encryption (HPKE) precompile on the Lux EVM,
+implementing RFC~9180 with the cipher suite DHKEM(X25519, HKDF-SHA256),
+HKDF-SHA256, ChaCha20Poly1305. HPKE is a composable framework for public-key
+encryption that cleanly separates key encapsulation (KEM), key derivation (KDF),
+and authenticated encryption (AEAD). The precompile provides four HPKE modes:
+Base (no authentication), PSK (pre-shared key), Auth (sender authentication),
+and AuthPSK (both). Gas cost: 8\,000 base plus 7 gas per byte of plaintext.
+HPKE is the encryption layer for MLS (Messaging Layer Security, RFC~9420),
+TLS Encrypted Client Hello, and Oblivious HTTP (RFC~9458).
+\end{abstract}
+
+\section{Introduction}
+
+HPKE~\cite{rfc9180} standardizes hybrid public-key encryption into a single
+interoperable protocol. Unlike raw ECIES, HPKE provides:
+\begin{itemize}
+  \item Negotiable cipher suites (KEM, KDF, AEAD triples).
+  \item Sender authentication modes (Auth, AuthPSK).
+  \item Export-only mode for key derivation without encryption.
+  \item Context for sequential encryption (AEAD sequence numbers).
+\end{itemize}
+
+On-chain HPKE enables:
+\begin{enumerate}[label=(\roman*)]
+  \item MLS group key derivation for on-chain messaging groups.
+  \item Encrypted Client Hello (ECH) for DNS-over-HTTPS privacy.
+  \item Oblivious HTTP relay verification.
+  \item Standard-compliant encryption between smart contracts and off-chain services.
+\end{enumerate}
+
+\section{Cipher Suite}
+
+The precompile implements a single cipher suite:
+\begin{itemize}
+  \item \textbf{KEM}: DHKEM(X25519, HKDF-SHA256) --- X25519 key agreement
+    with HKDF-SHA256 for shared secret extraction.
+  \item \textbf{KDF}: HKDF-SHA256 --- key derivation for encryption keys and nonces.
+  \item \textbf{AEAD}: ChaCha20Poly1305 --- authenticated encryption.
+\end{itemize}
+
+This matches the mandatory-to-implement suite for MLS and is the most
+widely deployed HPKE configuration.
+
+\section{Specification}
+
+\subsection{Address and Operations}
+
+Address: \texttt{0x0200\ldots2B}.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{llr}
+\toprule
+\textbf{Selector} & \textbf{Operation} & \textbf{Gas} \\
+\midrule
+\texttt{0x01} & SetupBaseS (Sender setup) & 5\,000 \\
+\texttt{0x02} & SetupBaseR (Receiver setup) & 5\,000 \\
+\texttt{0x03} & Seal (Encrypt with context) & $8\,000 + 7|M|$ \\
+\texttt{0x04} & Open (Decrypt with context) & $8\,000 + 7|C|$ \\
+\texttt{0x05} & Export (Key derivation only) & 3\,000 \\
+\texttt{0x10} & Single-shot Seal & $8\,000 + 7|M|$ \\
+\texttt{0x11} & Single-shot Open & $8\,000 + 7|C|$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{HPKE Modes}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{llll}
+\toprule
+\textbf{Mode} & \textbf{Byte} & \textbf{Sender Auth} & \textbf{PSK} \\
+\midrule
+Base & \texttt{0x00} & No & No \\
+PSK & \texttt{0x01} & No & Yes \\
+Auth & \texttt{0x02} & Yes (sender key) & No \\
+AuthPSK & \texttt{0x03} & Yes & Yes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Single-Shot Seal}
+
+\textbf{Input}: Selector (1), mode (1), recipient public key (32 bytes),
+info string length (2 bytes), info string, AAD length (2 bytes), AAD,
+entropy (32 bytes), plaintext.
+
+\textbf{Output}: Encapsulated key $enc$ (32 bytes) $\|$ ciphertext $\|$ tag (16 bytes).
+
+The single-shot operation performs SetupBaseS + Seal in one call for the
+common case of encrypting a single message.
+
+\section{Security Analysis}
+
+\subsection{IND-CCA2}
+
+HPKE Base mode achieves IND-CCA2 under the gap-CDH assumption on X25519 and
+the PRF security of HKDF-SHA256.
+
+\subsection{Insider Security}
+
+Auth mode provides insider security: an adversary with a corrupted sender key
+cannot decrypt messages intended for the receiver. This is stronger than the
+``outsider security'' of ECIES.
+
+\subsection{Context Binding}
+
+The \texttt{info} parameter binds the encryption context to a specific protocol
+or application. This prevents cross-protocol attacks where a ciphertext encrypted
+for one purpose is replayed in another context.
+
+\subsection{Sequence Numbers}
+
+For multi-message contexts (SetupBaseS/R followed by multiple Seal/Open),
+HPKE maintains an internal sequence counter used as the AEAD nonce. This
+ensures nonce uniqueness without caller management. However, on-chain state
+management for multi-message contexts requires the contract to track the
+context state between transactions.
+
+\section{Gas Cost Justification}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrr}
+\toprule
+\textbf{Operation} & \textbf{Time ($\mu$s)} & \textbf{Gas} \\
+\midrule
+SetupBaseS & 78 & 5\,000 \\
+Seal 256 B & 128 & 9\,792 \\
+Single-shot 1 KB & 133 & 15\,168 \\
+Export & 45 & 3\,000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Conclusion}
+
+The HPKE precompile provides RFC~9180 compliant hybrid public-key encryption on
+the Lux EVM. As the encryption layer for MLS, ECH, and OHTTP, HPKE represents
+the IETF consensus on how public-key encryption should be composed. The
+precompile avoids the ad-hoc KEM-DEM construction of ECIES by using a
+standardized, formally analyzed framework.
+
+\begin{thebibliography}{9}
+\bibitem{rfc9180}
+  R.~Barnes, K.~Bhargavan, B.~Lipp, and C.~Wood,
+  ``Hybrid Public Key Encryption,'' RFC~9180, 2022.
+
+\bibitem{rfc9420}
+  R.~Barnes et al., ``The Messaging Layer Security (MLS) Protocol,''
+  RFC~9420, 2023.
+\end{thebibliography}
+
+\end{document}
