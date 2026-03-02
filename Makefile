@@ -18,17 +18,20 @@ pdfs:
 	@mkdir -p pdfs
 
 # Compile a single .tex file to PDF
+# Build in-place so shared/ sty resolves correctly for cover pages
 pdfs/%.pdf: %.tex | pdfs
 	@echo "Compiling $<..."
-	@pdflatex -interaction=nonstopmode -output-directory=pdfs $< > /dev/null || true
-	@cd pdfs && bibtex $(*F) 2>/dev/null || true
-	@pdflatex -interaction=nonstopmode -output-directory=pdfs $< > /dev/null || true
-	@pdflatex -interaction=nonstopmode -output-directory=pdfs $< > /dev/null || true
-	@if [ -f pdfs/$(*F).pdf ]; then \
-		echo "✓ Successfully compiled $(*F).pdf"; \
+	@pdflatex -interaction=nonstopmode $< > /dev/null || true
+	@bibtex $(*F) 2>/dev/null || true
+	@pdflatex -interaction=nonstopmode $< > /dev/null || true
+	@pdflatex -interaction=nonstopmode $< > /dev/null || true
+	@if [ -f $(*F).pdf ]; then \
+		mv $(*F).pdf pdfs/; \
+		echo "✓ $(*F).pdf"; \
 	else \
-		echo "✗ Failed to compile $(*F).pdf"; \
+		echo "✗ $(*F).pdf"; \
 	fi
+	@rm -f $(*F).aux $(*F).log $(*F).bbl $(*F).blg $(*F).out $(*F).toc 2>/dev/null || true
 
 # Clean auxiliary files
 .PHONY: clean
