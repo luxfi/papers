@@ -26,6 +26,12 @@ export function Header({ config }: HeaderProps) {
           <div className="flex items-center gap-4">
             <nav className="hidden md:flex items-center gap-5 text-sm">
               <a
+                href="https://proofs.lux.network"
+                className="text-muted-foreground hover:text-foreground transition-colors"
+              >
+                Formal Proofs
+              </a>
+              <a
                 href={config.website}
                 target="_blank"
                 rel="noopener noreferrer"
