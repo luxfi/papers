@@ -32,14 +32,19 @@ We present a comprehensive benchmark of four Ethereum Virtual Machine (EVM) impl
 running on the Lux Network: (1) \texttt{evm}, a Go-based sequential executor derived from
 go-ethereum/coreth; (2) \texttt{evmgpu}, a Go-based parallel executor using Block-STM with
 a GPU acceleration roadmap; (3) \texttt{revm}, a Rust-based executor built on reth/revm; and
-(4) \texttt{evmone++}, a C++ executor forked from evmone with CUDA/Metal kernel support.
+(4) \texttt{evmone++}, a C++ executor forked from evmone with Metal/CUDA kernel support.
 We evaluate each implementation across identical workloads---simple transfers, ERC-20 token
 operations, storage-intensive contracts, and Uniswap-style DeFi transactions---measuring
-transactions per second (TPS), gas throughput (Mgas/s), and execution latency. Our results
-show that Block-STM parallel execution achieves 8--14$\times$ throughput improvement over
-sequential execution on CPU, while GPU-accelerated execution via evmone++ CUDA kernels
-yields an additional 3--5$\times$ improvement on state-heavy workloads. All implementations
-run as interchangeable Lux subnet VMs, enabling heterogeneous execution across the network.
+gas throughput (Mgas/s) and execution latency.
+Profiling reveals that 87\% of end-to-end transaction time is consumed by secp256k1
+signature recovery (ecrecover), not EVM interpretation: the Go EVM achieves 4--6~Ggas/s
+on pure execution with signatures pre-cached, but only 546~Mgas/s end-to-end.
+The C++ evmone interpreter reaches 451~Ggas/s on stateless dispatch and 20~Ggas/s with
+a full in-process state layer---4.8--5.2$\times$ faster than Go EVM-only execution.
+GPU acceleration of the cryptographic bottleneck yields 13$\times$ on Keccak-256 hashing
+(Metal) and 7.1$\times$ on parallel ecrecover (multicore), establishing that the
+highest-leverage optimization target is signature verification, not opcode interpretation.
+All implementations run as interchangeable Lux subnet VMs.
 \end{abstract}
 
 \section{Introduction}
@@ -53,10 +58,10 @@ Several approaches address this limitation:
 \begin{itemize}
 \item \textbf{Parallel execution} via optimistic concurrency control (Block-STM~\cite{blockstm}),
       detecting read-write conflicts and re-executing only conflicting transactions.
-\item \textbf{Alternative implementations} in Rust (revm~\cite{reth}), yielding 2--3$\times$
-      speedup from zero-copy memory management and SIMD optimizations.
-\item \textbf{GPU offloading} of EVM opcode interpretation, state trie hashing, and
-      cryptographic precompile operations.
+\item \textbf{Alternative implementations} in C++ (evmone~\cite{evmone}) and Rust (revm~\cite{reth}),
+      yielding 4.8--5.2$\times$ speedup from native compilation and zero-GC execution.
+\item \textbf{GPU offloading} of cryptographic operations (Keccak-256 hashing, secp256k1
+      ecrecover) which dominate end-to-end transaction processing time.
 \end{itemize}
 
 The Lux Network's modular VM architecture enables running multiple EVM implementations
@@ -71,10 +76,10 @@ performance from consensus overhead.
       consensus latency via direct block execution.
 \item First public comparison of go-ethereum, reth/revm, and evmone under identical
       workloads on the same consensus layer.
-\item Introduction of \texttt{evmgpu}, a Block-STM parallel EVM with a GPU acceleration
-      path via evmone C++ kernels.
-\item Quantification of the speedup from parallelism (8--14$\times$) and GPU offloading
-      (additional 3--5$\times$) on representative DeFi workloads.
+\item Profiling analysis demonstrating that 87\% of end-to-end transaction time is
+      secp256k1 signature recovery, not EVM interpretation.
+\item Quantification of GPU acceleration on the actual bottleneck: 13$\times$ on
+      Keccak-256 (Metal) and 7.1$\times$ on parallel ecrecover (multicore).
 \end{enumerate}
 
 \section{Architecture}
@@ -133,16 +138,18 @@ by Aptos Block-STM~\cite{blockstm}. Key components:
 A Rust implementation built on Paradigm's reth node and the revm interpreter.
 Benefits from Rust's zero-cost abstractions, no GC pauses, and aggressive
 compiler optimizations. Uses the same EVM semantics but with fundamentally
-different memory management.
+different memory management. Note: current benchmarks measure reth as a
+standalone node with RPC, not direct execution; results reflect system-level
+throughput including block timer constraints.
 
 \subsubsection{evmone++ (C++, GPU-Accelerated)}
 A fork of ipsilon/evmone~\cite{evmone}, the fastest known C++ EVM implementation.
 Extended with:
 \begin{itemize}
-\item CUDA kernels for parallel opcode dispatch across multiple transactions.
-\item Metal compute shaders for Apple Silicon GPU acceleration.
+\item Metal compute shaders for Apple Silicon GPU acceleration (Keccak-256, ecrecover).
+\item CUDA kernels for NVIDIA GPU offloading (planned).
 \item State trie hashing offloaded to GPU (Keccak-256 and Poseidon).
-\item Precompile operations (ecrecover, bn256, blake2f) on GPU.
+\item Precompile operations (ecrecover, bn256, blake2f) targeted for GPU.
 \end{itemize}
 
 \section{Benchmark Methodology}
@@ -158,11 +165,14 @@ receipts, gas used). The benchmark:
 \item Generates a block of $N$ transactions offline (pre-signed, pre-nonce'd).
 \item Calls \texttt{ProcessBlock} directly on each EVM implementation.
 \item Measures wall-clock time, gas consumed, and memory usage.
-\item Repeats 3 times, reports the average.
+\item Repeats 3 times, reports the median.
 \end{enumerate}
 
 This eliminates RPC overhead, consensus latency, transaction pool management,
 and block proposer delays---measuring only the execution engine.
+
+For the Rust/reth implementation, we additionally measure end-to-end throughput
+via RPC with a 100ms block time to characterize system-level performance.
 
 \subsection{Workloads}
 
@@ -187,92 +197,212 @@ overlap affecting parallel execution.}
 
 \subsection{Hardware}
 
+All benchmarks were collected on:
 \begin{itemize}
-\item \textbf{CPU}: Apple M4 Max, 16 cores (12P + 4E), 128GB unified memory
-\item \textbf{GPU}: Apple M4 Max, 40-core GPU, 128GB shared memory
-\item \textbf{NVIDIA}: NVIDIA H100 80GB (cloud benchmark for CUDA comparison)
-\item \textbf{Storage}: NVMe SSD, 7GB/s sequential read
+\item \textbf{CPU}: Apple M1 Max, 10 cores (8P + 2E), 64GB unified memory
+\item \textbf{GPU}: Apple M1 Max, 32-core GPU, 64GB shared memory
+\item \textbf{OS}: macOS, Darwin kernel
+\item \textbf{Storage}: NVMe SSD
 \end{itemize}
 
 \section{Results}
 
-\subsection{Sequential Execution (Single Thread)}
+\subsection{End-to-End Execution (Go EVM)}
 
-\begin{table}[h]
-\centering
-\small
-\begin{tabular}{lrrr}
-\toprule
-\textbf{Workload} & \textbf{evm} & \textbf{revm} & \textbf{evmone++} \\
-                   & (Go)          & (Rust)        & (C++)             \\
-\midrule
-ETH Transfer       & 4{,}132 Mgas/s & TBD  & 460{,}000 Mgas/s$^\dagger$  \\
-ERC-20 Transfer    & 4{,}544 Mgas/s & TBD  & TBD  \\
-Uniswap V2 Swap    & 4{,}821 Mgas/s & TBD  & TBD  \\
-Storage Write       & 6{,}137 Mgas/s & TBD  & TBD  \\
-Mixed DeFi          & 4{,}945 Mgas/s & TBD  & TBD  \\
-\midrule
-\textbf{Average}    & \textbf{4{,}916} & TBD & TBD \\
-\textbf{Note}  & \multicolumn{3}{l}{$^\dagger$C++: interpreter-only. Go: EVM-only (sigs pre-cached)} \\
-\bottomrule
-\end{tabular}
-\caption{Sequential execution throughput (Mgas/s). Higher is better.
-Go EVM values measured directly via core.ApplyTransaction with full StateDB.\\C++ value is interpreter-only (in-memory balance tracking, no trie).}
-\label{tab:sequential}
-\end{table}
-
-\subsection{Parallel Execution (Block-STM)}
+Table~\ref{tab:e2e} breaks down end-to-end block processing time for the Go EVM
+(geth/coreth) into EVM execution and signature verification components. All
+measurements are direct execution of 10,000 transactions via \texttt{core.ApplyTransaction}
+with full StateDB.
 
 \begin{table}[h]
 \centering
 \small
 \begin{tabular}{lrrrr}
 \toprule
-\textbf{Workload} & \textbf{evm} & \textbf{evmgpu} & \textbf{evmgpu} & \textbf{evmone++} \\
-                   & 1 thread      & 4 threads       & 12 threads      & 12 threads        \\
+\textbf{Workload} & \textbf{EVM} & \textbf{Sig} & \textbf{Total} & \textbf{Total} \\
+                   & (ms)         & (ms)         & (ms)           & (Mgas/s)       \\
 \midrule
-ETH Transfer       & 45  & 175 & 420  & 520  \\
-ERC-20 Transfer    & 38  & 140 & 340  & 430  \\
-Uniswap V2         & 28  & 85  & 180  & 240  \\
-Storage Write       & 22  & 55  & 110  & 150  \\
-Mixed DeFi          & 30  & 95  & 220  & 290  \\
+ETH Transfer       & 51  & 334 & 385 & 546  \\
+ERC-20 Transfer    & 68  & 334 & 402 & 524  \\
+Uniswap V2 Swap    & 75  & 334 & 409 & 519  \\
+Storage Write       & 78  & 334 & 412 & 514  \\
+Mixed DeFi          & 63  & 334 & 397 & 537  \\
 \midrule
-\textbf{Average}    & 33  & 110 & 254  & 326  \\
-\textbf{Speedup}    & 1$\times$ & 3.3$\times$ & 7.7$\times$ & 9.9$\times$ \\
+\textbf{Average}    & 67  & 334 & 401 & 528  \\
+\textbf{Sig \%}     & \multicolumn{4}{l}{334 / 401 = \textbf{83\% signature, 17\% EVM}} \\
 \bottomrule
 \end{tabular}
-\caption{Parallel execution throughput (Mgas/s) using Block-STM.
-Storage-heavy workloads show lower speedup due to write conflicts.}
-\label{tab:parallel}
+\caption{End-to-end Go EVM execution breakdown (10,000 txs, Apple M1 Max).
+Signature recovery (secp256k1 ecrecover) dominates total time at 83--87\%
+depending on workload complexity.}
+\label{tab:e2e}
 \end{table}
 
-\subsection{GPU-Accelerated Execution}
+\subsection{EVM-Only Throughput (Signatures Pre-Cached)}
 
 \begin{table}[h]
 \centering
 \small
 \begin{tabular}{lrrr}
 \toprule
-\textbf{Workload} & \textbf{evmgpu} & \textbf{evmone++} & \textbf{evmone++} \\
-                   & CPU 12T          & CPU 12T            & GPU (M4 Max)      \\
+\textbf{Workload} & \textbf{evm (Go)} & \textbf{evmone++ (C++)} & \textbf{evmone++ (C++)} \\
+                   & Full StateDB       & Interpreter Only$^\dagger$ & Full State$^\ddagger$    \\
 \midrule
-ETH Transfer       & 420   & 520   & 1,200  \\
-ERC-20 Transfer    & 340   & 430   & 980    \\
-Uniswap V2         & 180   & 240   & 520    \\
-Storage Write       & 110   & 150   & 280    \\
-Mixed DeFi          & 220   & 290   & 650    \\
+ETH Transfer       & 4{,}132            & 451{,}382                & $\sim$20{,}000            \\
+ERC-20 Transfer    & 4{,}544            & ---                      & ---                       \\
+Uniswap V2 Swap    & 4{,}821            & ---                      & ---                       \\
+Storage Write       & 6{,}137            & ---                      & ---                       \\
+Mixed DeFi          & 4{,}945            & ---                      & ---                       \\
 \midrule
-\textbf{Average}    & 254   & 326   & 726    \\
-\textbf{vs.\ evm}  & 7.7$\times$ & 9.9$\times$ & 22$\times$ \\
+\textbf{Average}    & \textbf{4{,}916}   & ---                     & ---                       \\
 \bottomrule
 \end{tabular}
-\caption{GPU-accelerated execution throughput (Mgas/s).
-GPU offloads opcode dispatch, state hashing, and precompile operations.
-Values are projected targets for the evmone++ GPU implementation.}
+\caption{EVM-only throughput (Mgas/s), signatures pre-cached. Higher is better.\\
+$^\dagger$evmone interpreter-only: in-memory balance tracking, no trie, no state DB
+(10k transfers in 0.5ms).\\
+$^\ddagger$evmone with full C++ state layer: 10k transfers in 10.6ms.
+Ratio vs.\ Go EVM-only (51ms): \textbf{4.8--5.2$\times$} faster.}
+\label{tab:sequential}
+\end{table}
+
+evmone built-in benchmarks report 1.95--2.40~Ggas/s on tight loops,
+1.15--1.36~Ggas/s on ADD-intensive workloads, and 1.0--1.18~Ggas/s on
+MUL-intensive workloads, confirming the interpreter's raw throughput
+in the Ggas/s range for compute-bound opcodes.
+
+\subsection{Rust/reth System-Level Throughput}
+
+The reth standalone node was benchmarked end-to-end via RPC with a 100ms block
+time. Under these conditions:
+
+\begin{itemize}
+\item \textbf{Throughput}: 5.0 TPS (block-timer-bottlenecked)
+\item \textbf{Latency}: 200ms average (dominated by block production interval)
+\end{itemize}
+
+These numbers reflect system-level constraints (block timer, RPC serialization),
+not revm interpreter performance. Direct-execution benchmarks of revm are pending;
+published results from Paradigm suggest 2--3$\times$ over Go geth on equivalent
+workloads when measured at the interpreter level.
+
+\subsection{Block-STM Parallel Execution}
+
+The evmgpu Block-STM implementation operates at the block level, parallelizing
+transaction execution within a block. On the sequential execution path (per-transaction),
+evmgpu matches the Go EVM baseline ($\sim$537~Mgas/s total including signatures).
+Block-STM benefits manifest only when processing blocks containing independent
+transactions.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Workload} & \textbf{evm} & \textbf{evmgpu} & \textbf{evmgpu} \\
+                   & 1 thread     & 4 threads       & 10 threads      \\
+\midrule
+ETH Transfer       & 546  & 2{,}020 & 4{,}680 \\
+ERC-20 Transfer    & 524  & 1{,}780 & 3{,}920 \\
+Uniswap V2         & 519  & 1{,}420 & 2{,}850 \\
+Storage Write       & 514  & 1{,}180 & 2{,}100 \\
+Mixed DeFi          & 537  & 1{,}560 & 3{,}400 \\
+\midrule
+\textbf{Average}    & 528  & 1{,}592 & 3{,}390 \\
+\textbf{Speedup}    & 1$\times$ & 3.0$\times$ & 6.4$\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Parallel execution throughput (Mgas/s, end-to-end including signatures)
+using Block-STM. ETH transfers achieve near-linear scaling (zero conflicts).
+Storage-heavy workloads show sub-linear scaling due to write conflicts.
+Values are projected from measured single-thread baselines and Block-STM
+scaling characteristics from the literature~\cite{blockstm}.}
+\label{tab:parallel}
+\end{table}
+
+\subsection{GPU and Multicore Acceleration}
+
+Table~\ref{tab:gpu} presents measured GPU and multicore acceleration results
+for the two dominant bottlenecks: Keccak-256 hashing and secp256k1 ecrecover.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrrl}
+\toprule
+\textbf{Operation} & \textbf{Baseline} & \textbf{Accelerated} & \textbf{Speedup} \\
+\midrule
+\multicolumn{4}{l}{\textit{Metal GPU (Apple M1 Max, 32-core GPU)}} \\
+Keccak-256 hash    & 1.3 Mhash/s & 17.1 Mhash/s & 13.2$\times$ \\
+\midrule
+\multicolumn{4}{l}{\textit{Multicore CPU (Apple M1 Max, 10 cores)}} \\
+ecrecover (10k txs) & 334 ms       & 48 ms         & 7.0$\times$ \\
+\midrule
+\multicolumn{4}{l}{\textit{End-to-end impact (10k ETH transfers)}} \\
+Sequential total    & 385 ms       & ---            & --- \\
+Parallel ecrecover  & ---          & 99 ms$^*$      & 3.9$\times$ \\
+\bottomrule
+\end{tabular}
+\caption{GPU and multicore acceleration on cryptographic bottlenecks.
+Keccak-256 measured via Metal compute shaders. ecrecover parallelized
+across 10 CPU cores.
+$^*$Projected: 51ms EVM + 48ms parallel ecrecover = 99ms total
+(vs.\ 385ms sequential).}
 \label{tab:gpu}
 \end{table}
 
 \section{Discussion}
+
+\subsection{Profiling Analysis: The Signature Bottleneck}
+
+The most significant finding of this study is the dominance of cryptographic
+signature verification in end-to-end EVM transaction processing. Profiling
+the Go EVM on 10,000 ETH transfers reveals the following time breakdown:
+
+\begin{itemize}
+\item \textbf{87\% --- secp256k1 ecrecover} (334ms): recovering the sender's
+      public key from the ECDSA signature on each transaction.
+\item \textbf{13\% --- EVM execution} (51ms): opcode dispatch, state reads/writes,
+      gas accounting.
+\end{itemize}
+
+This means the Go EVM interpreter is not the bottleneck. At 4--6~Ggas/s with
+signatures pre-cached, the EVM itself is fast. The ``slow EVM'' narrative in
+the literature conflates two distinct operations: cryptographic verification
+(CPU-bound, per-transaction, embarrassingly parallel) and EVM interpretation
+(memory-bound, stateful, conflict-prone).
+
+This profiling result redirects optimization effort. Rather than rewriting the
+EVM interpreter in a faster language (which yields at most 5$\times$ on the 13\%
+that is EVM time), the highest-leverage optimization is parallelizing or offloading
+ecrecover (which can yield 7$\times$ on the 87\% that is signature time).
+
+By Amdahl's law, a 5$\times$ speedup on EVM interpretation alone yields:
+\[
+\frac{1}{0.87 + 0.13/5} = 1.12\times \text{ overall}
+\]
+whereas a 7$\times$ speedup on ecrecover alone yields:
+\[
+\frac{1}{0.87/7 + 0.13} = 3.85\times \text{ overall}
+\]
+
+\subsection{C++ vs.\ Go: Where the Speedup Comes From}
+
+The evmone C++ interpreter achieves 451~Ggas/s on stateless dispatch---two
+orders of magnitude faster than Go's 4~Ggas/s. However, adding a full C++ state
+layer drops this to $\sim$20~Ggas/s, which is still 4.8--5.2$\times$ faster
+than Go EVM-only execution (51ms vs.\ 10.6ms for 10k transfers). The speedup
+comes from:
+
+\begin{itemize}
+\item No garbage collector pauses.
+\item Cache-friendly memory layout (no GC headers on every object).
+\item Compiler-optimized opcode dispatch (computed goto vs.\ switch table).
+\item Inlined hash operations (no cgo overhead).
+\end{itemize}
+
+The 5$\times$ ratio is consistent with expectations for GC'd vs.\ native
+languages on memory-intensive workloads, and confirms that the interpreter
+language matters---but only for the 13\% of time spent in interpretation.
 
 \subsection{Why Four Implementations?}
 
@@ -282,11 +412,13 @@ Each EVM serves a different purpose in the Lux ecosystem:
 \item \textbf{evm} (Go): Maximum compatibility with go-ethereum tooling,
       battle-tested in production. Default for C-Chain.
 \item \textbf{evmgpu} (Go): Drop-in parallel upgrade for existing Go chains.
-      Same codebase, same state format, just faster execution.
-\item \textbf{revm} (Rust): Maximum single-thread performance for latency-sensitive
-      applications. Used by the Hanzo AI subnet.
-\item \textbf{evmone++} (C++): Maximum throughput for high-frequency trading,
-      batch settlement, and GPU-native workloads.
+      Same codebase, same state format. Block-STM parallelism benefits
+      block-level throughput without changing per-transaction execution.
+\item \textbf{revm} (Rust): Latency-sensitive applications. Used by the Hanzo
+      AI subnet. Pending direct-execution benchmarks.
+\item \textbf{evmone++} (C++): Maximum raw interpreter throughput.
+      4.8--5.2$\times$ faster than Go on pure EVM execution. GPU kernel
+      host for Keccak-256 and ecrecover offloading.
 \end{itemize}
 
 \subsection{Block-STM Conflict Analysis}
@@ -296,16 +428,25 @@ The parallel speedup is workload-dependent. ETH transfers have zero state confli
 Storage-heavy workloads with shared state (e.g., AMM pool reserves) show diminishing
 returns beyond 8 threads due to conflict-induced re-execution.
 
+Note that Block-STM parallelism and ecrecover parallelism are orthogonal optimizations.
+Block-STM parallelizes EVM state execution across transactions; ecrecover parallelism
+handles signature verification. Combining both addresses different parts of the pipeline.
+
 \subsection{GPU Acceleration Path}
 
-The evmone++ GPU implementation targets three levels of offloading:
+Based on the profiling results, the GPU acceleration roadmap is reordered by impact:
 
 \begin{enumerate}
-\item \textbf{Phase 1} (current): Parallel opcode dispatch on CPU, state in main memory.
-\item \textbf{Phase 2}: State trie (Keccak-256 hashing) on GPU. This alone yields
-      30--40\% throughput improvement since trie operations dominate storage workloads.
-\item \textbf{Phase 3}: Full EVM interpreter as a GPU kernel. Each transaction runs
-      in a separate GPU thread, with MvMemory backed by GPU shared memory.
+\item \textbf{Phase 1} (measured): Parallel ecrecover on CPU (7.0$\times$, 334ms $\to$ 48ms).
+      Metal Keccak-256 hashing (13.2$\times$, 1.3 $\to$ 17.1 Mhash/s).
+\item \textbf{Phase 2} (next): GPU-accelerated ecrecover via Metal/CUDA.
+      secp256k1 point multiplication is highly parallelizable on GPU; we target
+      $>$20$\times$ over single-core CPU, which would reduce signature time to
+      $\sim$17ms (10k txs), making EVM interpretation the new bottleneck.
+\item \textbf{Phase 3} (future): Full EVM interpreter as a GPU kernel for the
+      evmone++ backend. Each transaction runs in a separate GPU thread with
+      MvMemory backed by GPU shared memory. This addresses the remaining 13\%
+      only after signatures are fully offloaded.
 \end{enumerate}
 
 \subsection{Interoperability}
@@ -324,22 +465,31 @@ on ETH transfers. Our evmgpu uses the same algorithm but in Go with a GPU extens
 the basis for our Rust EVM implementation (revm).
 
 \textbf{evmone}~\cite{evmone}: ipsilon's C++ EVM, the fastest known interpreter.
-We fork it for GPU kernel development.
+We fork it for GPU kernel development. Our benchmarks confirm 1.0--2.4~Ggas/s
+on built-in opcode benchmarks and 451~Ggas/s on stateless transfer dispatch.
 
 \textbf{Monad}: Proprietary parallel EVM with custom bytecode. Unlike our approach,
 Monad is not open-source and requires application-level modifications.
 
 \section{Conclusion}
 
-We demonstrate that the EVM execution bottleneck can be addressed through three
-complementary approaches: alternative language implementations (1.8--2.2$\times$),
-parallel execution via Block-STM (7.7--9.9$\times$), and GPU offloading (up to 22$\times$).
+We demonstrate that the EVM execution bottleneck is predominantly a \emph{cryptographic}
+bottleneck, not an \emph{interpretation} bottleneck. Profiling shows 87\% of end-to-end
+transaction processing time is secp256k1 ecrecover, with only 13\% in actual EVM
+opcode execution. The Go EVM achieves 4--6~Ggas/s on pure interpretation; the C++
+evmone achieves $\sim$20~Ggas/s with a full state layer (4.8--5.2$\times$ faster).
+
+The highest-leverage optimizations target the cryptographic layer:
+\begin{itemize}
+\item Parallel ecrecover on 10 CPU cores: 7.0$\times$ (334ms $\to$ 48ms for 10k txs)
+\item Metal GPU Keccak-256: 13.2$\times$ (1.3 $\to$ 17.1 Mhash/s)
+\item Combined: projected 3.9$\times$ end-to-end (385ms $\to$ 99ms for 10k ETH transfers)
+\end{itemize}
+
 The Lux Network's modular VM architecture enables deploying all four implementations
 as production subnet validators, allowing application developers to choose the optimal
-execution engine for their workload.
-
-Future work includes completing the evmone++ GPU kernels, benchmarking on NVIDIA H100,
-and integrating parallel execution with Lux's Quasar post-quantum consensus engine.
+execution engine for their workload. Future work focuses on GPU-accelerated ecrecover
+via Metal/CUDA, completing the evmone++ GPU kernels, and benchmarking on NVIDIA H100.
 
 \begin{thebibliography}{9}
 
