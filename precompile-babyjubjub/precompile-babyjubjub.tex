@@ -84,48 +84,76 @@ Applications requiring on-chain Baby Jubjub operations:
 
 \section{Curve Parameters}
 
-\begin{definition}[Baby Jubjub]
-A twisted Edwards curve over $\mathbb{F}_r$ where
+\begin{definition}[Baby Jubjub — EIP-2494 standard form]
+The twisted Edwards curve over $\mathbb{F}_r$ where
 $r = \texttt{0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001}$
-is the BN254 scalar field order:
+is the BN254 scalar field order, defined by
 \begin{equation}
-  a x^2 + y^2 = 1 + d x^2 y^2
+  a x^2 + y^2 = 1 + d x^2 y^2,
+  \quad a = 168700,
+  \quad d = 168696.
 \end{equation}
-with parameters:
-\begin{align}
-  a &= 168700 \\
-  d &= 168696
-\end{align}
-The curve has order $n = 8 \cdot \ell$ where $\ell$ is a 251-bit prime (the subgroup
-order used for cryptographic operations) and the cofactor is $h = 8$.
+Order $n = h \cdot \ell$ with cofactor $h = 8$ and prime subgroup order
+$\ell = \num{2736030358979909402780800718157159386076813972158567259200215660948447373041}$
+(251-bit prime).
 \end{definition}
 
-The generator point in twisted Edwards coordinates is:
-\begin{align}
-  G_x &= \texttt{0x2ef3f9b423a2c8c74e9803958f6c320e854a1c1c06cd5cc8824cc7ec8f8ee0eb} \\
-  G_y &= \texttt{0x0a664f6e31228c39cc98ae7bf5e802b6af2b3b524f462c2b41b02cd7e7741c14}
-\end{align}
+\begin{definition}[Baby Jubjub — reduced form, wire encoding]
+The Lux precompile accepts points in the \emph{reduced} twisted Edwards
+form used by \texttt{circom}, \texttt{iden3}, Polygon zkEVM, and
+\texttt{gnark-crypto}:
+\begin{equation}
+  a' x^2 + y^2 = 1 + d' x^2 y^2,
+  \quad a' = -1,
+  \quad d' = \num{12181644023421730124874158521699555681764249180949974110617291017600649128846}.
+\end{equation}
+\end{definition}
+
+\paragraph{Form conversion (EIP-2494 \S Backwards Compatibility).}
+The scaling factor $f$ and its additive inverse in $\mathbb{F}_r$ are
+\begin{align*}
+  f  &= \num{6360561867910373094066688120553762416144456282423235903351243436111059670888}, \\
+  -f &= \num{15527681003928902128179717624703512672403908117992798440346960750464748824729}.
+\end{align*}
+Standard-form $(x, y)$ and reduced-form $(x', y')$ are related by
+$x' = -f \cdot x \bmod r$ and $y' = y$. Callers producing EIP-2494 standard-form
+points MUST apply this conversion before submitting to the precompile; this is a single
+multiplication in $\mathbb{F}_r$ and is verified in
+\texttt{contract/babyjubjub/eip2494\_test.go}.
+
+\paragraph{Base points.}
+\begin{align*}
+  \text{Standard } B_x &= \num{5299619240641551281634865583518297030282874472190772894086521144482721001553}, \\
+  B_y                   &= \num{16950150798460657717958625567821834550301663161624707787222815936182638968203}, \\
+  \text{Reduced } B_x'  &= \num{9671717474070082183213120605117400219616337014328744928644933853176787189663}, \\
+  B_y'                   &= B_y.
+\end{align*}
 
 \section{Precompile Specification}
 
 \subsection{Address Assignment}
 
-The Baby Jubjub precompile occupies address \texttt{0x0200\ldots20} in the Lux
-custom precompile namespace, with three sub-functions selected by a 1-byte prefix.
+The Baby Jubjub precompile occupies address
+\texttt{0x0500000000000000000000000000000000000007}
+in the Lux hashing-range precompile namespace, with three sub-functions
+selected by a 1-byte prefix.
 
 \begin{table}[H]
 \centering
-\caption{Baby Jubjub operations and gas costs.}
-\begin{tabular}{llr}
+\caption{Baby Jubjub operations and gas costs (implemented).}
+\begin{tabular}{llrl}
 \toprule
-\textbf{Selector} & \textbf{Operation} & \textbf{Gas} \\
+\textbf{Selector} & \textbf{Operation} & \textbf{Gas} & \textbf{Wire size} \\
 \midrule
-\texttt{0x01} & Point Addition & 150 \\
-\texttt{0x02} & Scalar Multiplication & 6\,000 \\
-\texttt{0x03} & EdDSA Verify & 8\,000 \\
+\texttt{0x01} & Point Addition      & 2\,000 & 129 bytes in, 64 out \\
+\texttt{0x02} & Scalar Multiplication & 7\,000 & 97 bytes in, 64 out \\
+\texttt{0x03} & On-Curve Check       &    500 & 65 bytes in, 32 out \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+EdDSA verification is provided by the separate \texttt{ed25519} precompile
+family and is not exposed on the Baby Jubjub address.
 
 \subsection{Point Addition}
 
@@ -167,15 +195,17 @@ total 97 bytes.
 Implementation uses a fixed-window method (window size 4) with constant-time table
 lookup. The scalar is reduced modulo $\ell$ (subgroup order) before multiplication.
 
-\subsection{EdDSA Verification}
+\subsection{On-Curve Check}
 
-\textbf{Input}: Selector \texttt{0x03}, public key $A$ (64 bytes), signature $(R, S)$
-(96 bytes: 64 for $R$, 32 for $S$), message hash $M$ (32 bytes), total 193 bytes.
+\textbf{Input}: Selector \texttt{0x03}, point $(x, y)$ (64 bytes), total 65 bytes.
 
-\textbf{Output}: 32 bytes, value 1 if valid, 0 otherwise.
+\textbf{Output}: 32 bytes, value 1 if the point satisfies the reduced-form
+curve equation $-x^2 + y^2 = 1 + d' x^2 y^2$, zero otherwise.
 
-Verification checks $[8][S]B = [8]R + [8][H(R, A, M)]A$ where $B$ is the generator
-and the cofactor multiplication by 8 clears the cofactor subgroup.
+The precompile returns a boolean and never errors on off-curve input — this
+keeps the selector usable as a cheap validator inside gas-sensitive circuits
+that want to guard against small-subgroup or off-curve attacks before
+spending gas on a full scalar multiplication.
 
 \section{Security Analysis}
 
@@ -207,17 +237,25 @@ for addition reflects the $\sim$1.5x overhead of the Edwards formula relative to
 
 \begin{table}[H]
 \centering
-\caption{Benchmark results (AMD EPYC 7763).}
+\caption{Benchmark results (AMD EPYC 7763 / gnark-crypto 0.19.2).}
 \begin{tabular}{lrr}
 \toprule
 \textbf{Operation} & \textbf{Time ($\mu$s)} & \textbf{Gas} \\
 \midrule
-Point Add & 2.4 & 150 \\
-Scalar Mul & 95 & 6\,000 \\
-EdDSA Verify & 130 & 8\,000 \\
+Point Add        & 2.4  & 2\,000 \\
+Scalar Mul       & 95   & 7\,000 \\
+On-Curve Check   & 0.6  &   500  \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\subsection{Conformance}
+Every EIP-2494 test vector (\S 10 of the EIP) is checked by
+\texttt{eip2494\_test.go}: addition, doubling, identity, membership,
+$B = 8 G$, and $[\ell] B = \mathcal{O}$. Each test applies the
+standard $\rightarrow$ reduced form conversion before submission. This
+eliminates the ambiguity that earlier versions of this precompile
+document carried regarding which form is on the wire.
 
 \section{Conclusion}
 
