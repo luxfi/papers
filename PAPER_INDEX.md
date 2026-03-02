@@ -4,7 +4,7 @@
 
 **Lineage:** Open source (2008) → Hanzo Labs (2014) → Lux Industries (2019) → Present
 
-**Consensus evolution:** HotStuff (2019) → Snow/Avalanche fork (2019) → Quasar triple-proof PQ (2022–2026)
+**Consensus evolution:** Photon (2019) → Wave → Nova → Nebula → Prism → Quasar triple-proof PQ (2026)
 
 ---
 
@@ -16,7 +16,7 @@ The mathematical bedrock: consensus, data structures, identity.
 |------|-------|---------------------|
 | 2017 | `lux-ntt-transform` | Number Theoretic Transform for lattice operations |
 | 2017 | `lux-lightspeed-dex` | Sub-microsecond CLOB matching engine |
-| 2019 | `lux-consensus` | Snow family consensus: safety + liveness proofs (HotStuff → Snow) |
+| 2019 | `lux-consensus` | Original consensus: safety + liveness proofs |
 | 2020 | `lux-data-availability` | Erasure coding DA guarantees |
 | 2020 | `lux-fraud-proofs` | Interactive fraud proof game completeness |
 | 2020 | `lux-state-sync` | Merkle-based state synchronization |
@@ -58,11 +58,11 @@ Quantum resistance at every layer — lattice, hash-based, hybrid.
 
 ## IV. Consensus & Execution (2020–2026)
 
-From Snow to Quasar — the consensus evolution.
+From Photon to Quasar — the consensus evolution.
 
 | Year | Paper | Formal Contribution |
 |------|-------|---------------------|
-| 2020 | `lux-consensus` | Snow family: Snowball, Snowflake, Avalanche |
+| 2020 | `lux-consensus` | Lux consensus: Photon, Wave, Nova, Nebula, Prism, Quasar |
 | 2021 | `lux-evm-precompiles` | Custom EVM opcodes for crypto primitives |
 | 2023 | `lux-zap-wire-protocol` | Binary wire protocol (sub-microsecond serialization) |
 | 2023 | `lux-zap-benchmarks` | 434M orders/sec on GPU, 1M ops/sec on CPU |
@@ -167,7 +167,7 @@ Master security model, operational security, formal methods.
 Foundations (2019-2020)
     │
     ├── Consensus (2020-2025)
-    │     ├── Snow → FPC → Quasar
+    │     ├── Photon → Wave → Nova → Quasar
     │     └── ZAP wire protocol → GPU EVM
     │
     ├── Threshold Crypto (2021-2025)
