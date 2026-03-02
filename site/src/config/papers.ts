@@ -48,7 +48,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-consensus.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-04-01',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Consensus', 'Physics-Inspired', 'Metastable'],
     },
     {
@@ -60,7 +60,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-quantum-consensus.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-06-01',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Consensus', 'Post-Quantum', 'Cryptography', 'Dilithium'],
     },
     {
@@ -72,7 +72,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-quasar-consensus.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-09-01',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Consensus', 'Post-Quantum', 'BLS', 'Ringtail', 'Finality'],
     },
     {
@@ -84,7 +84,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-fpc-consensus.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-12-01',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Consensus', 'Performance', 'Probabilistic', 'Low-Latency'],
     },
     {
@@ -96,7 +96,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-achain-attestation.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-10-01',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['TEE', 'Attestation', 'AI Compute', 'SGX', 'SEV-SNP', 'H100'],
     },
     {
@@ -108,7 +108,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-gchain-graphql.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-08-01',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['GraphQL', 'Indexing', 'BadgerDB', 'Query Engine'],
     },
     {
@@ -120,7 +120,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-mchain-mpc.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-09-15',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries', 'Vishnu Seesahai'],
       tags: ['MPC', 'Threshold Signatures', 'CGG21', 'MuSig2', 'FROST'],
     },
     {
@@ -132,7 +132,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-zchain.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-11-01',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Privacy', 'zkEVM', 'FHE', 'TEE', 'Smart Contracts'],
     },
     {
@@ -144,7 +144,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-bridge.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-07-01',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries', 'Vishnu Seesahai'],
       tags: ['Bridge', 'IBC', 'Zero-Knowledge', 'Interoperability'],
     },
     {
@@ -156,7 +156,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-ntt-transform.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-05-15',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Post-Quantum', 'NTT', 'Gas Optimization', 'EVM'],
     },
     {
@@ -168,7 +168,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-ethfalcon-post-quantum.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-07-01',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Post-Quantum', 'FALCON', 'Ethereum', 'Signatures'],
     },
     {
@@ -180,7 +180,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-universal-threshold-signatures.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-09-01',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries', 'Vishnu Seesahai'],
       tags: ['Threshold Signatures', 'MPC', 'Post-Quantum', 'CMP', 'FROST'],
     },
     {
@@ -192,7 +192,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-verkle-trees.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-10-01',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Verkle Trees', 'Scalability', 'Stateless', 'State Proofs'],
     },
     {
@@ -204,7 +204,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-fraud-proofs.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-11-15',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Layer 2', 'Optimistic Rollups', 'Fraud Proofs', 'Scalability'],
     },
     {
@@ -216,7 +216,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-tee-computing-mesh.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-12-01',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['TEE', 'Confidential Computing', 'SGX', 'SEV-SNP', 'TDX'],
     },
     {
@@ -228,7 +228,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-lightspeed-dex.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-05-01',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['DeFi', 'DEX', 'HFT', 'FPGA', 'Low-Latency'],
     },
     {
@@ -240,7 +240,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-credit-lending.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-08-15',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['DeFi', 'Lending', 'Credit', 'Self-Repaying'],
     },
     {
@@ -252,7 +252,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-oracle-infrastructure.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-09-01',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Oracle', 'AI', 'Price Feeds', 'Chainlink', 'Pyth'],
     },
     {
@@ -264,7 +264,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-perpetuals-derivatives.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-10-15',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['DeFi', 'Perpetuals', 'Derivatives', 'GMX', 'Trading'],
     },
     {
@@ -276,7 +276,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-market-nft.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-07-15',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['NFT', 'Marketplace', 'Reservoir', 'Multi-Chain'],
     },
     {
@@ -288,7 +288,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-id-iam.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-06-15',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Identity', 'IAM', 'OAuth', 'WebAuthn', 'SSO'],
     },
     {
@@ -300,7 +300,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-id-did-specification.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-06-20',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['DID', 'Identity', 'W3C', 'Verifiable Credentials'],
     },
     {
@@ -312,7 +312,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-governance-dao.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-08-01',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Governance', 'DAO', 'Holographic Consensus', 'Multi-Ecosystem'],
     },
     {
@@ -324,7 +324,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-dao-governance-framework.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2024-08-15',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['DAO', 'Governance', 'Azorius', 'ERC6551', 'NFT'],
     },
     {
@@ -336,7 +336,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-data-availability.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2025-02-20',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Data Availability', 'Erasure Coding', 'KZG', 'Scalability'],
     },
     {
@@ -348,7 +348,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-economics.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2025-02-20',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Economics', 'Appchain', 'Fee Structure', 'Tokenomics'],
     },
     {
@@ -360,7 +360,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-evm-precompiles.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2025-02-20',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['EVM', 'Precompiles', 'Post-Quantum', 'Cryptography'],
     },
     {
@@ -372,7 +372,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-interchain-transfers.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2025-02-20',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Interchain', 'Cross-Chain', 'Atomic', 'Transfers'],
     },
     {
@@ -384,7 +384,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-liquid-staking.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2025-02-20',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Liquid Staking', 'DeFi', 'Staking', 'Derivatives'],
     },
     {
@@ -396,7 +396,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-privacy-pool.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2025-02-20',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Privacy', 'ZK Proofs', 'Compliance', 'Selective Disclosure'],
     },
     {
@@ -408,7 +408,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-restaking.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2025-02-20',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Restaking', 'Shared Security', 'Validators', 'EigenLayer'],
     },
     {
@@ -420,7 +420,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-state-sync.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2025-02-20',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['State Sync', 'Merkle Proofs', 'Performance', 'Networking'],
     },
     {
@@ -432,7 +432,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-tokenomics.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2025-02-20',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Tokenomics', 'Token Distribution', 'Emission', 'Governance'],
     },
     {
@@ -444,7 +444,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-validator-economics.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2025-02-20',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Validators', 'Economics', 'Staking', 'Slashing'],
     },
     {
@@ -456,7 +456,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-warp-messaging.tex',
       githubUrl: 'https://github.com/luxfi/papers',
       date: '2025-02-20',
-      authors: ['Lux Partners'],
+      authors: ['Lux Industries'],
       tags: ['Warp', 'Messaging', 'Cross-Chain', 'Communication'],
     },
   ],
