@@ -24,6 +24,7 @@ Compilation: `pdflatex <file>.tex` (uses `shared/luxcover.sty` for cover pages).
 | `lux-nebula-protocol.tex` | Nebula Protocol: Probabilistic Finality in Sparse Networks |
 | `lux-photon-protocol.tex` | Photon Protocol: Zero-Latency Consensus Pipelining |
 | `lux-prism-protocol.tex` | Prism Protocol: Multi-Spectrum Parallel Consensus |
+| `dag-evm-formal.tex` | DAG-EVM and Conflict-Graph Consensus for the Lux Multi-Chain (Lean 4 + TLA+) |
 | `lux-ray-protocol.tex` | Ray Protocol: Adaptive Finality with Light-Speed Confirmation |
 | `lux-data-availability.tex` | Data Availability Sampling in Lux Network |
 | `lux-state-sync.tex` | Fast State Synchronization for Blockchain Nodes via Merkle Range Proofs |
