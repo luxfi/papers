@@ -116,7 +116,10 @@ and Bitcoin Taproot. No single threshold protocol covers both.
 \end{itemize}
 
 The framework is deployed in Lux Teleport, securing cross-chain transfers across
-20 execution environments and 270+ blockchains.
+18 native bridge programs and 270 registered chain IDs. On-chain verification uses
+a single MPC group address---the aggregate public key from DKG---rather than
+individual signer keys: $\texttt{ecrecover}(\text{digest}, \sigma) = \texttt{mpcGroupAddress}$.
+Individual signer identities exist for accountability and identifiable abort only.
 
 \subsection{Notation}
 
@@ -652,19 +655,23 @@ A signer rotation from set $\mathcal{P} = \{P_1, \ldots, P_n\}$ to set
 $\mathcal{P}' = \{P'_1, \ldots, P'_{n'}\}$ with overlap
 $\mathcal{P} \cap \mathcal{P}' \geq t$ proceeds as:
 \begin{enumerate}[nosep]
-  \item \textbf{Announce} (on-chain): New signer set $\mathcal{P}'$ is posted with a
-    7-day timelock.
-  \item \textbf{Reshare}: After timelock expiry, $t$ members of $\mathcal{P}$ run a
-    resharing protocol to generate shares for $\mathcal{P}'$ under the same public key.
+  \item \textbf{Announce} (on-chain): New MPC group address is posted with a
+    configurable rotation delay (default 24h, governor-settable $\in [0, 7\text{d}]$).
+  \item \textbf{Reshare}: After delay expiry, $t$ members of $\mathcal{P}$ run an LSS
+    dynamic resharing protocol to generate shares for $\mathcal{P}'$ under the same
+    public key (0.14ms for $3 \to 5$, 3.5ms for $50 \to 100$).
   \item \textbf{Activate}: $\mathcal{P}'$ proves liveness by producing a threshold
-    signature, and the on-chain registry transitions.
+    signature, and the on-chain registry transitions to the new group address.
   \item \textbf{Revoke}: Old shares from $\mathcal{P} \setminus \mathcal{P}'$ are
     zeroed.
 \end{enumerate}
 \end{definition}
 
-The 7-day timelock provides on-chain visibility: any observer can verify the upcoming
-rotation and challenge it (e.g., via governance) before activation.
+The rotation delay is an operational parameter, not a security invariant---the MPC
+threshold \emph{is} the trust model. Setting the delay to 0 enables instant rotation
+when operationally required (e.g., emergency signer replacement). The delay provides
+on-chain visibility: any observer can verify the upcoming rotation and challenge it
+(e.g., via governance) before activation.
 
 \begin{theorem}[Rotation Security]
 \label{thm:rotation-sec}
@@ -846,11 +853,14 @@ StarkNet & 1 ECDSA verify & $k$ ECDSA verifies & $(k{-}1)$ verifies & Account ve
 \end{table*}
 
 \paragraph{Ethereum.} On EVM chains, \texttt{ecrecover} costs 3,000 gas. A
-CGGMP21 threshold signature requires exactly one \texttt{ecrecover} call. A
-$k$-of-$n$ Gnosis Safe multisig requires $k$ \texttt{ecrecover} calls plus
-contract overhead ($\sim$40,000 gas base). For the Teleport production configuration
-of $t = 67$, $n = 100$: threshold costs 24,000 gas (base + 1 ecrecover);
-equivalent multisig costs 241,000 gas (base + 67 ecrecover). Savings: 90\%.
+CGGMP21 threshold signature requires exactly one \texttt{ecrecover} call, verifying
+against the MPC group address: $\texttt{ecrecover}(\text{digest}, \sigma) ==
+\texttt{mpcGroupAddress}$. Individual signers are not visible on-chain; only the
+aggregate key matters for verification. A $k$-of-$n$ Gnosis Safe multisig requires
+$k$ \texttt{ecrecover} calls plus contract overhead ($\sim$40,000 gas base). For
+the Teleport production configuration of $t = 67$, $n = 100$: threshold costs
+24,000 gas (base + 1 ecrecover); equivalent multisig costs 241,000 gas (base + 67
+ecrecover). Savings: 90\%.
 
 \paragraph{Bitcoin Taproot.} A Taproot key-path spend using FROST requires 64 bytes
 of witness data (one Schnorr signature). An equivalent $k$-of-$n$ using
@@ -1010,6 +1020,11 @@ secret share $s_i$. The implementation enforces:
   \item \textbf{Nonce pre-generation}: For latency-sensitive paths, nonce pairs are
     pre-generated in batches and stored encrypted at rest. Each nonce is marked as
     consumed atomically with protocol execution.
+  \item \textbf{Broadcast serialization}: A \texttt{sync.Mutex} on
+    \texttt{StoreBroadcastMessage} prevents a race condition where concurrent FROST
+    signing sessions could overwrite each other's commitment messages in the broadcast
+    store. Without this lock, two sessions arriving simultaneously could corrupt the
+    commitment list $B$, leading to inconsistent binding factors and signing failure.
 \end{enumerate}
 
 \subsection{Performance}
@@ -1030,10 +1045,13 @@ Sign & FROST & 8 ms & 180 ms \\
 Presign & CGGMP21 & 120 ms & 4,200 ms \\
 Sign (online) & CGGMP21 & 2 ms & 12 ms \\
 Refresh & Both & 12 ms & 680 ms \\
+LSS Reshare ($3 \to 5$) & Both & 0.14 ms & --- \\
+LSS Reshare ($50 \to 100$) & Both & --- & 3.5 ms \\
 \bottomrule
 \end{tabular}
 \caption{Latency benchmarks (median over 1,000 runs, single-machine simulation with
-network latency of 0ms between parties).}
+network latency of 0ms between parties). LSS (Lux Secret Sharing) dynamic resharing
+enables threshold changes (e.g., $3$-of-$5 \to 3$-of-$7$) without DKG restart.}
 \label{tab:perf}
 \end{table}
 
@@ -1210,10 +1228,14 @@ CGGMP21 for ECDSA chains. The framework provides:
     (Theorem~\ref{thm:composition}).
   \item \textbf{Bitcoin Taproot}: FROST KeygenTaproot produces x-only public keys
     (BIP-340) for key-path spends indistinguishable from single-signer outputs.
-  \item \textbf{Operational safety}: 7-day timelocked signer rotation with on-chain
-    visibility; proactive key refresh without public key change.
+  \item \textbf{MPC group address}: On-chain verification uses a single aggregate
+    key ($\texttt{ecrecover} == \texttt{mpcGroupAddress}$), not individual signers.
+  \item \textbf{Operational safety}: Configurable rotation delay (default 24h, 0 for
+    instant, max 7d) with on-chain visibility; proactive key refresh without public
+    key change; LSS dynamic resharing for threshold changes.
   \item \textbf{Production performance}: 98ms end-to-end FROST signing, 47ms CGGMP21
-    online signing with presignatures, in geographically distributed deployment.
+    online signing with presignatures, 0.14ms LSS reshare ($3 \to 5$), in
+    geographically distributed deployment.
 \end{enumerate}
 
 The framework is deployed in Lux Teleport, securing cross-chain asset transfers across
