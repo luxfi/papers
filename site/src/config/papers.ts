@@ -530,5 +530,21 @@ export const siteConfig: SiteConfig = {
         { label: 'Formal Proofs', url: 'https://proofs.lux.network' },
       ],
     },
+    {
+      id: 'lss-mpc',
+      title: 'LSS: Linear Shamir\'s Secret Sharing for MPC',
+      subtitle: 'Dynamic Threshold Signatures with Live Secret Resharing',
+      abstract: 'Pragmatic MPC framework wrapping CGGMP21 (threshold ECDSA) and FROST (threshold Schnorr/EdDSA) under a unified interface with live membership changes. Coordinator-driven verifiable resharing via JVSS enables transition from (t, n) to (t\', n +/- k) without reconstructing the master key. Multi-chain adaptation for 20+ blockchains, sub-25ms signing latency, and post-quantum security via Ringtail lattice-based threshold signatures.',
+      pdfUrl: 'https://github.com/luxfi/papers/raw/main/pdfs/lux-lss-mpc.pdf',
+      latexUrl: 'https://github.com/luxfi/papers/blob/main/lux-lss-mpc.tex',
+      githubUrl: 'https://github.com/luxfi/papers',
+      date: '2024-01-01',
+      authors: ['Vishnu Seesahai', 'Zach Kelling'],
+      tags: ['Threshold', 'MPC', 'FROST', 'CGGMP21', 'Resharing', 'JVSS', 'Post-Quantum', 'Ringtail'],
+      relatedLinks: [
+        { label: 'luxfi/threshold (Go)', url: 'https://github.com/luxfi/threshold' },
+        { label: 'luxfi/mpc (Go)', url: 'https://github.com/luxfi/mpc' },
+      ],
+    },
   ],
 }
