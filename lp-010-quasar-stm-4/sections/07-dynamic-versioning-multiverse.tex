@@ -1,0 +1,93 @@
+\section{Dynamic versioning (Multiverse)}
+
+\label{sec:multiverse}
+%% ============================================================================
+
+\subsection{One mode does not fit all lanes}
+
+Multiverse~\cite{multiverse2026} observes that always-on multi-version
+concurrency control is expensive in low-contention regions
+(unnecessary version chain traffic) and unsafe in pathological hot
+regions (repair storms). The remedy is per-region mode selection.
+QuasarSTM~4.0 adopts the same prescription per lane:
+
+\begin{lstlisting}[language=C++]
+enum class VersioningMode : uint8_t {
+    SingleVersionFast = 0,   // low contention; no MVCC chain
+    MultiVersion      = 1,   // standard ordered MVCC (3.0 default)
+    Reducer           = 2,   // commutative fast path (Tier 3)
+    Serialized        = 3,   // pathological hot lane: strict canonical order
+};
+\end{lstlisting}
+
+\subsection{Per-mode semantics}
+
+\begin{description}[leftmargin=2em,style=nextline]
+\item[\texttt{SingleVersionFast}] No version chain. Writes overwrite.
+      Validation is the lane-clock check (\S\ref{sec:tier1}). Used for
+      \texttt{Owned} lanes by default.
+
+\item[\texttt{MultiVersion}] Standard ordered MVCC over the
+      Motor-style VersionBlock (\S\ref{sec:versionblock}). Validation
+      is Tier~1 lane clock + Tier~2 key-MVCC. Default for
+      \texttt{Shared} and \texttt{Unknown}.
+
+\item[\texttt{Reducer}] Writes are pushed as
+      \texttt{DeferredOp}s into the per-lane reducer queue
+      (\S\ref{sec:tier3}); validation skips Tier~2 entirely; commit
+      happens at horizon time. Used for \texttt{Commutative} and most
+      \texttt{HotShared}.
+
+\item[\texttt{Serialized}] Writes execute strictly in canonical order.
+      Concurrent readers see the latest committed value but the
+      writer-ordering is enforced. Reserved for pathological hot lanes
+      where reducer composition is impossible (e.g. an unmerged
+      multi-AMM router ledger).
+\end{description}
+
+\subsection{Mode binding}
+
+The mode is bound per-lane in the \texttt{LaneClockEntry}
+(\S\ref{sec:tier1}) at round start and is fixed for the duration of
+the round. Mode changes are made between rounds based on hot-lane
+telemetry, ConflictSpec hints, and LaneClass updates. The decision
+function is deterministic in the per-round telemetry, so two validators
+running 4.0 against the same canonical-order trace bind identical
+modes.
+
+\begin{table}[ht]
+\centering
+\small
+\caption{Default mode binding by LaneClass (\S\ref{sec:laneclass}).}
+\label{tab:mode-binding}
+\begin{tabular}{ll}
+\toprule
+\textbf{LaneClass} & \textbf{Default mode} \\
+\midrule
+\texttt{Owned}        & \texttt{SingleVersionFast} \\
+\texttt{Shared}       & \texttt{MultiVersion} \\
+\texttt{HotShared}    & \texttt{Reducer}, escalating to \texttt{Serialized} \\
+\texttt{Commutative}  & \texttt{Reducer} \\
+\texttt{Unknown}      & \texttt{MultiVersion} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Why determinism is preserved}
+
+The mode binding is published in the per-round telemetry roots
+(\S\ref{sec:abmf}) and is part of the cert subject when mode-binding
+divergence would otherwise be possible. Two validators that disagree
+on the mode binding cannot agree on the round's roots; the consensus
+engine surfaces the disagreement as a fork. In practice, the binding
+is deterministic in the round inputs and there is no disagreement.
+
+\begin{remark}[Mode is round-scoped]
+The mode of a lane in round~$n$ is a function of telemetry and
+classification observed during round~$n-1$. There is no within-round
+mode change. This is what makes the MVCC VersionBlock layout and the
+reducer queue layout per-round-arena allocations rather than per-key
+allocations.
+\end{remark}
+
+%% ============================================================================

@@ -1,0 +1,145 @@
+\section{Correctness Invariants}
+
+\label{sec:correctness}
+%% ============================================================================
+
+QuasarSTM is specified by four invariants. Determinism and ordered
+serializability are the safety properties; repair monotonicity and
+horizon safety are the structural properties that make the safety
+properties achievable on a GPU.
+
+\subsection{Determinism}
+
+\begin{theorem}[Determinism]
+\label{thm:determinism}
+For any input $(D, \mathit{txs}, \mathit{parent\_state})$ where $D$
+is the round descriptor, $\mathit{txs}$ is the canonical-order
+transaction sequence, and $\mathit{parent\_state}$ is the parent
+state root, two executions of the QuasarSTM round on any pair of
+backends in $\{\mathrm{Metal},\, \mathrm{CUDA},\, \mathrm{CPU}\}$
+produce bit-identical $\mathit{state\_root}$,
+$\mathit{receipts\_root}$, $\mathit{execution\_root}$, and
+$\mathit{mode\_root}$.
+\end{theorem}
+
+\begin{proof}[Sketch]
+By induction on round structure. Refraction is deterministic
+(Invariant~\ref{inv:refraction-deterministic}). Lane and key-version
+data structures are open-addressed with stable insertion order
+keyed by canonical index. Tier-1, Tier-2, Tier-3 validation
+predicates are pure functions of structural data
+(Definitions~\ref{def:tier1}, \ref{def:tier2}, \ref{def:tier3}).
+The contention manager is deterministic
+(Lemma~\ref{lem:contention-deterministic}). TicToc determinism is
+enforced (Invariant~\ref{inv:tictoc-determinism}). Horizon
+construction is canonical-order (Lemma~\ref{lem:horizon-complete}).
+Each link in the round-result chain is therefore a deterministic
+function of its predecessors; the composition is deterministic.
+The cross-backend invariant (Invariant~\ref{inv:cross-backend}) is
+verified by differential fuzzing against the CPU reference.
+\end{proof}
+
+\subsection{Ordered Serializability}
+
+\begin{theorem}[Ordered serializability]
+\label{thm:serializable}
+For any committed result of a QuasarSTM round under ordering oracle
+$\mathcal{O}$, there exists a serial schedule $S$ over the committed
+transactions, equivalent to the committed result, that respects
+$\preceq_{\mathrm{can}}$.
+\end{theorem}
+
+\begin{proof}[Sketch]
+Each committed transaction passed Tier-1, Tier-2, or Tier-3
+validation. By Lemma~\ref{lem:tier1-sufficient}, Tier-1 commits
+observed visible versions. By Definition~\ref{def:tier2}, Tier-2
+commits did the same. Tier-3 commits respect $\preceq_{\mathrm{can}}$
+through deterministic reducer composition (the reducer consumes ops
+in canonical-index order).
+TicToc relaxation
+(Lemma~\ref{lem:tictoc-relax}) admits commits whose observations are
+\emph{still} serializable under $\preceq_{\mathrm{can}}$, never
+otherwise (Invariant~\ref{inv:tictoc-determinism}). The serial
+schedule $S$ is the canonical-index ordering of the committed set,
+augmented with reducer effects in their canonical order; equivalence
+to the committed result follows from per-tier serializability.
+\end{proof}
+
+\subsection{Repair Monotonicity}
+
+\begin{theorem}[Repair monotonicity]
+\label{thm:repair-monotone}
+Let $T$ be any transaction and let $\iota_1 < \iota_2 < \cdots$ be
+its incarnation numbers across repairs in a single round. Then:
+\begin{enumerate}[leftmargin=2em,nosep]
+\item Each repair strictly increases the incarnation:
+      $\iota_{i+1} = \iota_i + 1$.
+\item No incarnation $\iota_j$ with $j < \mathrm{final}$ commits.
+\item Only the final incarnation contributes to the round result.
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}[Sketch]
+(1) Algorithm~\ref{alg:repair} step~5 (and step~9 in the full-reexec
+branch) increments the incarnation counter. (2) The validator
+discards records tagged with non-final incarnations; speculative
+versions written by superseded incarnations are GC'd
+(Definition~\ref{def:gc-reclaim}). (3) The visible-version chain
+indexes by $(\mathit{key}, \mathit{tx\_index},
+\mathit{incarnation})$; at commit time only the topmost valid
+incarnation is exposed.
+\end{proof}
+
+\begin{invariant}[Repair monotonicity invariant]
+\label{inv:repair-monotone}
+The incarnation counter on any \texttt{StmTxn} record is
+monotonically non-decreasing throughout a round; an invalidated
+incarnation cannot be reused.
+\end{invariant}
+
+\subsection{Horizon Safety}
+
+\begin{theorem}[Horizon safety]
+\label{thm:horizon-safety}
+For any commit horizon $h$ produced by the round, the canonical
+prefix (Nova) or causal cut (Nebula) of $h$ contains only
+transactions in terminal state, and the $\mathit{horizon\_root}$
+commits to a state in which all canonical predecessors are stable.
+\end{theorem}
+
+\begin{proof}[Sketch]
+Definition~\ref{def:commit-horizon} requires every transaction in
+the horizon to be \textsc{Committable} or beyond and forbids
+unresolved earlier dependencies. Invariant~\ref{inv:horizon-safety}
+is the validator-enforced predicate. Lemma~\ref{lem:horizon-complete}
+ensures every committed transaction belongs to exactly one horizon
+in canonical order, so the chain
+$\rho_0 \to \rho_1 \to \cdots$
+of horizon roots is a deterministic commitment over the round.
+\end{proof}
+
+\subsection{Test-Enforced Round Invariants}
+
+In addition to the four headline theorems, the test surface
+(\S\ref{sec:performance}) enforces seven implementation invariants:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item Same input + same parent state + same mode $\Rightarrow$
+      same roots (Theorem~\ref{thm:determinism}).
+\item Committed result equals canonical Nova order or deterministic
+      Nebula causal order (Theorem~\ref{thm:serializable}).
+\item Host cannot choose validate / repair / commit order
+      (host = doorbell + I/O).
+\item Every read observes the correct visible version
+      (Definition~\ref{def:visible}).
+\item Each repair increments incarnation; invalid incarnations
+      cannot commit (Theorem~\ref{thm:repair-monotone}).
+\item No transaction beyond unresolved dependencies enters a commit
+      horizon (Theorem~\ref{thm:horizon-safety}).
+\item Metal $\equiv$ CUDA $\equiv$ CPU reference for all roots
+      and conflict/repair behaviour
+      (Invariant~\ref{inv:cross-backend}).
+\end{enumerate}
+
+
+%% ============================================================================

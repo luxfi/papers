@@ -1,0 +1,121 @@
+\section{A/B/M/F drain services}
+
+\label{sec:abmf}
+%% ============================================================================
+
+\subsection{Service set growth}
+
+LP-132~\cite{lp132-quasarexec} (3.0 substrate) defined 12 GPU services.
+QuasarSTM~4.0 grows the set to 16 by adding four new drains, each with
+a dedicated device-resident ring and the same wave-tick budget contract
+as the 3.0 services. The 16-service enum is the single normative source:
+
+\begin{lstlisting}[language=C++]
+enum class ServiceId : uint32_t {
+    // 3.0 substrate (12)
+    Ingress           = 0,
+    Decode            = 1,
+    Crypto            = 2,
+    DagReady          = 3,
+    Exec              = 4,
+    Validate          = 5,
+    Repair            = 6,
+    Commit            = 7,
+    StateRequest      = 8,
+    StateResp         = 9,
+    CertLane          = 10,
+    CertOut           = 11,
+
+    // 4.0 production (4 new) -- A/B/M/F
+    AdaptiveSchedule  = 12,
+    BridgeAttest      = 13,
+    MarketAuction     = 14,
+    FiberCheckpoint   = 15,
+
+    Count             = 16,
+};
+\end{lstlisting}
+
+\subsection{AdaptiveSchedule (A)}
+
+\textbf{Inputs:} ConflictSpec records (\S\ref{sec:conflictspec}),
+LaneClass classifications (\S\ref{sec:laneclass}), predictor entries.
+\textbf{Outputs:} per-tx scheduling decision routed to
+\texttt{Exec} (with declared lane sets attached) or to the speculative
+fallback path.
+
+The drain consults the source-priority order
+(\S\ref{sec:conflictspec}) and emits the highest-priority
+\texttt{ConflictSpec} per transaction. It also publishes the per-tx
+predictor confidence so the validator can attribute later repair
+events to predictor mis-prediction.
+
+\subsection{BridgeAttest (B)}
+
+\textbf{Inputs:} cross-chain attestation messages from the omnichain
+bridge (LP-016 / LP-017). \textbf{Outputs:} per-message verifier
+result onto the \texttt{Commit} ring.
+
+BridgeAttest is the GPU-side termination of the cross-chain attestation
+path: messages arrive as bundles of source-chain commitments and
+threshold signatures, and the drain runs the same on-device BLS /
+Ringtail / Groth16 verifiers (\S\ref{sec:verifiers}) against the
+cross-chain VK published in the BridgeRoundDescriptor extension.
+
+This is what makes 4.0 capable of executing bridge commits in the same
+wave-tick budget as ordinary EVM, rather than spilling them to a
+separate host-side path.
+
+\subsection{MarketAuction (M)}
+
+\textbf{Inputs:} order-append \texttt{DeferredOp}s
+(\S\ref{sec:tier3}) and cancel ops within an auction batch window.
+\textbf{Outputs:} \texttt{AuctionMatch} entries that reduce to the
+batch-cleared book state at horizon time.
+
+MarketAuction is the precompile-level batched matching path for hot
+DEX lanes. It reduces an entire batch of order/cancel events into a
+single match-and-clear transformation, eliminating the storm of
+SSTORE conflicts that would otherwise hit the order book level lanes.
+The output is a single \texttt{AuctionMatch} reducer entry per market
+per round.
+
+\subsection{FiberCheckpoint (F)}
+
+\textbf{Inputs:} fiber state at \texttt{CALL}-frame return,
+explicit checkpoint opcode, or cold-state suspend
+(\S\ref{sec:checkpoints}). \textbf{Outputs:}
+\texttt{FiberCheckpoint} records into the fiber's per-fiber checkpoint
+ring.
+
+This drain owns checkpoint emission and GC. It runs at
+\texttt{CALL}-frame boundaries and at end-of-round to recycle older
+checkpoints back into the per-round arena.
+
+\subsection{Wave-tick budget}
+
+Each new drain has a fixed per-tick budget enforced by the wave-tick
+kernel. The budgets are tuned per backend; the cross-backend
+determinism harness (\S\ref{sec:determinism}) verifies that any
+budget setting that produces output also produces byte-identical
+outputs across Metal and CUDA.
+
+\begin{table}[ht]
+\centering
+\small
+\caption{Per-tick budgets for the four new 4.0 services
+(default; tunable).}
+\label{tab:abmf-budgets}
+\begin{tabular}{ll}
+\toprule
+\textbf{Service} & \textbf{Budget per tick} \\
+\midrule
+\texttt{AdaptiveSchedule} & 4096 ConflictSpec admissions \\
+\texttt{BridgeAttest}     &  256 attestation verifications \\
+\texttt{MarketAuction}    &   64 markets per auction tick \\
+\texttt{FiberCheckpoint}  & 4096 checkpoint emits + GC events \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% ============================================================================

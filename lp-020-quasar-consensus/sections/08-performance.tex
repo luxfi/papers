@@ -1,0 +1,211 @@
+\section{Performance (Quasar 3.0, December 2025)}
+
+\label{sec:performance}
+%% ============================================================================
+
+All measurements correspond to the 25 December 2025 production release on
+commodity hardware. Single-validator-process numbers were taken on a
+standard mainnet board (32-core x86 CPU, NVIDIA RTX 6000 Ada-class GPU,
+128\,GB RAM); GPU lane numbers correspond to the QuasarGPU adapter
+(LP-132~\cite{lp132-quasargpu}). Each benchmark ran for $\geq 10^4$
+iterations.
+
+\subsection{Per-Lane Verification Costs}
+\label{sec:gpu-native}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}llrrr@{}}
+\toprule
+\textbf{Lane} & \textbf{Operation} &
+\textbf{CPU latency} & \textbf{GPU latency} &
+\textbf{Notes} \\
+\midrule
+BLS    & Aggregate verify, $n{=}21$  & ${\sim}260\,\mu$s & $<$50\,$\mu$s &
+        2 pairings, batched \\
+BLS    & Aggregate verify, $n{=}100$ & ${\sim}875\,\mu$s & $<$120\,$\mu$s &
+        2 pairings, batched \\
+\midrule
+ML-DSA & Verify per validator, cold  & 254\,$\mu$s        & 50\,$\mu$s    &
+        FIPS 204 \\
+ML-DSA & Verify per validator, cached& 3\,$\mu$s          & 1\,$\mu$s     &
+        challenge cache \\
+\midrule
+Groth16 & Verify (3-pairing)         & 1.2\,ms            & 200--500\,$\mu$s &
+        batched on GPU \\
+Groth16 & Prove ($N{=}21$ ML-DSA)    & 200\,ms            & 5--15\,ms     &
+        $\approx 2^{22.5}$ R1CS \\
+\midrule
+Ringtail & Round~1 share              & 1.8\,ms            & ---           &
+        precomputable \\
+Ringtail & Round~2 sign+combine       & 9\,ms              & ---           &
+        per round \\
+Ringtail & Batch verify               & $O(1)$ amortized   & ---           &
+        cached after DKG \\
+\bottomrule
+\end{tabular}
+\caption{Per-lane verification primitives. The Groth16 verify step is
+the dominant cost on the GPU verification path; Ringtail batch verify
+amortizes to $O(1)$ once the DKG is loaded.}
+\label{tab:per-lane}
+\end{table}
+
+\subsection{Full QuasarCert Verification}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}rrrrr@{}}
+\toprule
+\textbf{Validators ($n$)} & \textbf{Threshold ($t$)} &
+\textbf{CPU verify} & \textbf{GPU verify} &
+\textbf{Cert size} \\
+\midrule
+4   & 3   & 1.5\,ms  & 0.5\,ms  & 56.3 KB \\
+21  & 14  & 2.4\,ms  & 0.5--1.5\,ms & 56.3 KB \\
+50  & 34  & 3.0\,ms  & 1.0--1.5\,ms & 56.3 KB \\
+100 & 67  & 3.5\,ms  & 1.5\,ms  & 56.3 KB \\
+\bottomrule
+\end{tabular}
+\caption{End-to-end QuasarCert verification at the 25 December 2025
+release. Latency is the parallel max of BLS aggregate, Ringtail batch
+verify, and Groth16 verify on the QuasarGPU substrate. Certificate size
+is constant in $n$ because the third lane is a Z-Chain rollup
+(192\,B SNARK + 32\,B public-inputs hash) rather than per-validator
+ML-DSA signatures.}
+\label{tab:full-verify}
+\end{table}
+
+\subsection{Same-message BLS aggregate batching (cevm v0.47.1)}
+
+Quasar consensus rounds repeatedly verify $n$ signatures over the
+same 32-byte cert subject (Section~\ref{sec:replay}). cevm v0.47.1
+(commit \texttt{6bf0e232}) added a 2-way set-associative 4096-slot
+pubkey-decompression cache (FNV1a-64 over compressed point bytes plus
+a 48-byte memcmp guard) on top of the same-message batched verifier
+introduced in v0.45. At $n{=}1024$ this lifts the speedup from
+$9.24\times$ to $\mathbf{16.51\times}$ versus the flat host-blst
+baseline ($\geq 10\times$ target exceeded by 65\%). Pairing math
+remains the canonical \texttt{luxcpp/crypto/bls} c-abi body; the
+batching plus pubkey-cache amortization is what produces the
+published number. Source: \texttt{LP-137-BENCHMARKS.md}, Phase-3
+roll-up.
+
+\subsection{Stage 5b BLS pairing structural ceiling on Apple M1 Max}
+
+A pure-Metal single-pairing measurement (luxcpp/crypto commit
+\texttt{9ff799fd}, 2026-04-27) lands at ${\sim}475\,\text{ms}$ on M1
+Max versus ${\sim}510\,\mu\text{s}$ for host blst, a $930\times$
+slowdown. Cause: ${\sim}280$ dispatches per pairing at
+${\sim}10\,\mu\text{s}$ each (init / add+line / dbl+line / sqr\_ret /
+fold\_line / finalize for Miller; conj / inv / cyclo\_sqr / mul /
+frob for final exponentiation). The serial Fp12 chain mismatches the
+SIMD GPU shape; per-dispatch GPU compute is ${\sim}770\,\mu\text{s}$
+for a single-thread Fp12 op. The architecture is proven byte-equal
+blst across 2 746 vectors; the SoTA single-pairing path is Linux+CUDA,
+batched-N parallel kernel saturation (1 warp per pairing on M1 Max
+$\geq 32$-way), or Karabina compressed cyclo squarings. Production
+binaries from cevm v0.46.0 onward link zero blst symbols
+(CI-asserted) and route through the canonical c-abi body.
+
+\subsection{Block Time and Throughput}
+
+The mainnet target for the 25 December 2025 release is:
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Block time}: 500\,ms.
+\item \textbf{Throughput}: $\geq$100K TPS sustained per chain.
+\item \textbf{Per-cert verify on the 21-validator board}: 0.5--1.5\,ms.
+\item \textbf{Catch-up verify (skip-list mode)}: $\leq$2\,ms per
+      epoch boundary thanks to the constant-size third lane.
+\end{itemize}
+
+The cert-verification latency is dominated by the parallel max of three
+lanes; with QuasarGPU streaming, none of the three exceeds 1.5\,ms at
+$n{=}21$. Block time is therefore signing-bound (Ringtail two-round
+network latency, ${\sim}55$\,ms) rather than verification-bound.
+
+\subsection{Primitive Costs}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}llrrr@{}}
+\toprule
+\textbf{Lane} & \textbf{Operation} &
+\textbf{Latency} & \textbf{Sig Size} & \textbf{PK Size} \\
+\midrule
+BLS12-381  & Key generation & 87\,$\mu$s   & ---       & 96\,B \\
+BLS12-381  & Sign           & 371\,$\mu$s  & 96\,B     & --- \\
+BLS12-381  & Aggregate (100 sigs) & 4.8\,$\mu$s & 48\,B & --- \\
+\midrule
+ML-DSA-65  & Key generation & 142\,$\mu$s  & ---       & 1{,}952\,B \\
+ML-DSA-65  & Sign           & 254\,$\mu$s  & 3{,}309\,B & --- \\
+ML-DSA-65  & Verify (cold)  & 254\,$\mu$s  & ---       & --- \\
+ML-DSA-65  & Verify (cached) & 3\,$\mu$s    & ---       & --- \\
+\midrule
+Ringtail   & DKG (5-of-7)    & 12.4\,ms    & ---       & ${\sim}56$\,KB \\
+Ringtail   & Round~1 (precomp) & 1.8\,ms    & ---       & --- \\
+Ringtail   & Round~2 (sign)  & 2.1\,ms     & ${\sim}56$\,KB & --- \\
+Ringtail   & Verify          & 0.9\,ms     & ---       & --- \\
+\bottomrule
+\end{tabular}
+\caption{Per-primitive costs on the production mainnet board.}
+\label{tab:primitives}
+\end{table}
+
+\subsection{ZAP Wire Protocol}
+
+Consensus messages travel on ZAP (Zero-Allocation Protocol), a binary
+wire format that eliminates serialization overhead on the consensus hot
+path~\cite{lux-zap}.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Configuration} & \textbf{Throughput} & \textbf{Per-Message} \\
+\midrule
+Single connection       & 114K TPS    & 8.7\,$\mu$s \\
+20 parallel connections & 376K TPS    & 2.7\,$\mu$s \\
+50 conn + batch 1000    & 20.26M TPS  & 49\,ns \\
+\bottomrule
+\end{tabular}
+\caption{ZAP transport throughput. Batch mode approaches memory
+bandwidth.}
+\label{tab:zap}
+\end{table}
+
+\subsection{End-to-End Comparison}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}llrl@{}}
+\toprule
+\textbf{Network} & \textbf{Consensus} & \textbf{Wire TPS} & \textbf{Protocol} \\
+\midrule
+\textbf{Lux (Quasar 3.0)} & Photon/Wave/Focus/Ray + QuasarGPU &
+  \textbf{$\geq$100K (sustained chain)} & ZAP \\
+Avalanche & Snowball & 246K (consensus messages) & gRPC / Protobuf \\
+Solana    & Tower BFT & 65K (network) & Custom binary \\
+\bottomrule
+\end{tabular}
+\caption{Consensus-layer wire and chain throughput.}
+\label{tab:comparison}
+\end{table}
+
+\subsection{Memory Bounds}
+
+Epoch-based pruning with a 6-epoch retention window bounds consensus
+state to ${\sim}5.9$\,MB after $10^6$ finality events. The bound holds
+because each epoch stores at most $E$ block certificates and $n$
+validator states, and $6 \cdot E \cdot (|\mathcal{C}| + n \cdot
+|\mathit{state}|)$ is constant for fixed parameters. The per-block
+QuasarCert footprint of 56.3\,KB is dominated by the Ringtail signature;
+in epoch mode (one Ringtail per $k$ blocks), the per-block amortized
+overhead drops to $328$ bytes at $k=1000$.
+
+
+%% ============================================================================

@@ -13,7 +13,8 @@ Auto-generated catalogue of research papers.
 | `lp-102-encrypted-sqlite-replication` | ✓ | `lp-102-encrypted-sqlite-replication/lp-102-encrypted-sqlite-replication.tex` |
 | `lp-103-omnichain-explorer` | ✓ | `lp-103-omnichain-explorer/lp-103-omnichain-explorer.tex` |
 | `lp-104-graph-engine` | ✓ | `lp-104-graph-engine.tex` |
-| `lp-105-quasar-consensus` | ✓ | `lp-105-quasar-consensus/lp-105-quasar-consensus.tex` |
+| `lp-020-quasar-consensus` | ✓ | `lp-020-quasar-consensus/lp-020-quasar-consensus.tex` |
+| `lux-4-0-launch` | ✓ | `lux-4-0-launch/lux-4-0-launch.tex` |
 | `lp-305-quantum-secure-assets` | ✓ | `lp-305-quantum-secure-assets/lp-305-quantum-secure-assets.tex` |
 | `lp-306-lx-social-dex` | ✓ | `lp-306-lx-social-dex/lp-306-lx-social-dex.tex` |
 | `lp-307-quantum-consensus-protocol` | ✓ | `lp-307-quantum-consensus-protocol/lp-307-quantum-consensus-protocol.tex` |

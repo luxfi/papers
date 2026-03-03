@@ -1,6 +1,6 @@
 # Lux Papers -- LLM.md
 
-## LP-105: Quasar Consensus (`lp-105-quasar-consensus.tex`)
+## LP-020: Quasar Consensus (`lp-020-quasar-consensus.tex`)
 
 Main protocol paper. 19 pages. Sections:
 
@@ -28,13 +28,13 @@ Companion proof: `/Users/z/work/lux/proofs/quasar-cert-soundness.tex` (10 pages,
 - **Appendix D** (`\ref{app:setup}`): Groth16 trusted setup. Circuit-specific SRS, N-party ceremony (Bowe-Gabizon-Miers 2017), PLONK/Marlin as universal-setup upgrade path (192B -> ~500B).
 - **Appendix E** (`\ref{app:ringtail-params}`): Ringtail parameter tightness. d=2048, q~2^48, BKZ beta~430. Classical 2^142, quantum 2^130.35 via BDGL sieving + Grover. Comparison table with ML-DSA-65 and ML-KEM-768. Four explicit caveats.
 
-LP-105 Thm 7.5 and Thm 7.7 now cross-reference these appendices via `\cite{qcert-proof}`.
+LP-020 Thm 7.5 and Thm 7.7 now cross-reference these appendices via `\cite{qcert-proof}`.
 
 ## Related Papers
 
-- `lux-quasar-consensus.tex`: Earlier Quasar draft (superseded by LP-105).
-- `lux-triple-proof-consensus.tex`: Triple-proof note (superseded by LP-105).
-- `lux-ringtail-pq.tex`: Ringtail scheme (cited by LP-105 as [ringtail]).
+- `lux-quasar-consensus.tex`: Earlier Quasar draft (superseded by LP-020).
+- `lux-triple-proof-consensus.tex`: Triple-proof note (superseded by LP-020).
+- `lux-ringtail-pq.tex`: Ringtail scheme (cited by LP-020 as [ringtail]).
 - `lux-threshold-mpc.tex`: FROST + CGGMP21 for T-Chain custody.
 - `lux-zchain.tex`: Z-Chain privacy/ZKP architecture.
 - `lux-mchain-mpc.tex`: M-Chain (predecessor of T-Chain concept).
@@ -43,6 +43,6 @@ LP-105 Thm 7.5 and Thm 7.7 now cross-reference these appendices via `\cite{qcert
 
 ```bash
 cd ~/work/lux/papers
-/Library/TeX/texbin/pdflatex -interaction=nonstopmode lp-105-quasar-consensus.tex
+/Library/TeX/texbin/pdflatex -interaction=nonstopmode lp-020-quasar-consensus.tex
 # Run twice for cross-references
 ```

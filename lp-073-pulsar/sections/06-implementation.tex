@@ -1,0 +1,117 @@
+\section{Implementation}
+\label{sec:implementation}
+
+The shipping implementation spans four repositories: \texttt{github.com/luxfi/pulsar} (math kernel + key-era lifecycle), \texttt{github.com/luxfi/threshold} (LSS framework + Pulsar adapter), \texttt{github.com/luxfi/consensus} (Quasar integration), and \texttt{github.com/luxfi/warp} (cross-chain envelope). All layers are byte-equal across the Go canonical and the in-flight C++ port; KAT vectors gate every release.
+
+\subsection{Go canonical}
+
+The production reference is \texttt{github.com/luxfi/pulsar} \cite{ringtailgo} (the Sign math is forked byte-equal from the upstream Ringtail academic reference \cite{ringtail2025}). The relevant files are:
+
+\begin{itemize}
+\item \texttt{sign/config.go} (28 lines): every numeric constant, listed in Table~\ref{tab:constants}.
+\item \texttt{sign/sign.go} (374 lines): \textsc{Gen}, \textsc{SignRound1}, \textsc{SignRound2Preprocess}, \textsc{SignRound2}, \textsc{SignFinalize}, \textsc{Verify}, \textsc{CheckL2Norm}, \textsc{FullRankCheck}.
+\item \texttt{threshold/threshold.go} (294 lines): higher-level wrapper around \texttt{sign} that exposes $\textsc{GenerateKeys}(t, n, \mathrm{rand})$, the $\textsc{Signer}$ object, and the $\textsc{Round1Data}$/$\textsc{Round2Data}$/$\textsc{Signature}$ wire types.
+\item \texttt{primitives/hash.go} (209 lines): \textsc{Hash}, \textsc{LowNormHash}, \textsc{GaussianHash}, \textsc{PRF}, \textsc{GenerateMAC}, \textsc{PRNGKey}.
+\item \texttt{primitives/shamir.go} (147 lines): the optimized $t = K$ Shamir path and \textsc{ComputeLagrangeCoefficients}.
+\item \texttt{utils/utils.go} (524 lines): NTT-aware matrix-vector multiplies (\textsc{MatrixVectorMul}, \textsc{MatrixMatrixMul}, \textsc{VectorPolyMul}), rounding helpers (\textsc{RoundVector}, \textsc{RestoreVector}, \textsc{RoundCoefficients}), Gaussian elimination over $\mathbb{F}_q$ (\textsc{GaussianEliminationModQ}), and the BLAKE3-XOF random-byte budget (\textsc{PrecomputeRandomness}).
+\end{itemize}
+
+The canonical depends on \texttt{github.com/luxfi/lattice/v7} \cite{lattigov7} for ring arithmetic, NTT, samplers, and serialization. The version pin is normative: bumping to \texttt{v8} or upstream Lattigo would introduce SIMD-NTT path differences that break byte equality on the $\textsc{WriteTo}$ stream.
+
+\subsection{Key-era lifecycle}
+
+The lifecycle additions to upstream Ringtail (Section~\ref{sec:lifecycle}) live alongside the math kernel:
+
+\begin{itemize}
+\item \texttt{pulsar/keyera/keyera.go}: \textsc{Bootstrap}, \textsc{Reshare}, \textsc{Reanchor} entrypoints. Three lineage scalars (\textsf{KeyEraID}, \textsf{Generation}, \textsf{RollbackFrom}) per Section~\ref{sec:lifecycle:lineage}; \textsc{KeyEra} carries a \textsc{GroupKey} pointer that is byte-identical across every reshare within one era.
+\item \texttt{pulsar/reshare/}: VSR primitives. Two distinct callable shapes: \textsc{Refresh} (HJKY97 same-set zero-poly \cite{hjky97}) and \textsc{ReshareToNewSet} (Desmedt--Jajodia old-qualified-subset \cite{desmedtjajodia97}). Plus \texttt{commit.go} for lattice Pedersen verification, \texttt{transcript.go} for canonical transcript bytes under TupleHash256, and \texttt{activation.go} for the \texttt{QUASAR-PULSAR-ACTIVATE-v1} message.
+\item \texttt{pulsar/dkg2/}: the Pedersen-DKG-over-$R_q$ trusted-dealer-free path (\S\ref{sec:lifecycle:dkg}). Hiding under MLWE on $\mathbf{B}$; binding under MSIS on $[\mathbf{A}\,|\,\mathbf{B}]$. Ships as a parallel-track production option to the Bootstrap MPC ceremony.
+\item \texttt{pulsar/hash/}: the canonical \texttt{Pulsar-SHA3} hash profile (TupleHash256 / cSHAKE256 over FIPS 202 / SP 800-185). The default suite identifier \texttt{"Pulsar-SHA3"} pins the transcript-binding profile.
+\end{itemize}
+
+\subsection{LSS-Pulsar adapter}
+
+The orchestration layer is the LSS framework \cite{luxlssmpc,lp077} at \texttt{github.com/luxfi/threshold}. The Pulsar adapter at \texttt{threshold/protocols/lss/lss\_pulsar.go} is the analogue of \texttt{lss\_cmp.go} (ECDSA) and \texttt{lss\_lens.go} (curve, LP-103 \cite{lp103}). Section~\ref{sec:lss-pulsar} elaborates the adapter contract; this implementation note records the file layout:
+
+\begin{itemize}
+\item \textsc{DynamicResharePulsar} validates KeyEraID, Generation, GroupKey-pointer agreement; delegates lattice math to \texttt{pulsar/keyera}; bumps Generation; preserves KeyEraID; sets RollbackFrom $= 0$ on forward transitions.
+\item \textsc{PulsarSnapshotManager} retains a configurable rolling history of share states; \textsc{Rollback}(\textit{targetGeneration}) restores a prior snapshot under the no-slashing failure ladder (\S\ref{sec:lifecycle:rollback}).
+\item \textsc{BuildActivationTranscript} produces the canonical \texttt{reshare.TranscriptInputs} binding chain id, network id, key-era id, generations, epochs, set hashes, thresholds, group-pk hash, Nebula root, hash-suite id, implementation version, and variant.
+\end{itemize}
+
+\subsection{Quasar consensus integration}
+
+\texttt{github.com/luxfi/consensus/protocol/quasar} consumes \texttt{pulsar/keyera} and the LSS-Pulsar adapter:
+
+\begin{itemize}
+\item \texttt{epoch.go}: \textsc{InitializeEpoch} delegates to \texttt{keyera.Bootstrap}; \textsc{RotateEpoch} delegates to \textsc{lss.DynamicResharePulsar} gated by activation-cert verification under the unchanged GroupKey.
+\item \texttt{reshare\_epoch.go}: production wiring under the \texttt{QUASAR-PULSAR-ACTIVATE-v1} domain prefix; \textsc{ReshareEpoch} (set rotation) and \textsc{RefreshEpoch} (same-set proactive refresh).
+\item \texttt{types.go}: \texttt{EpochKeys} carries \texttt{KeyEraID}, \texttt{Generation}, \texttt{RollbackFrom}; \textsc{BundleSigner} re-derives Lambda for the participating subset.
+\end{itemize}
+
+The 258-test Quasar suite exercises the integrated path; the consensus build passes \texttt{GOWORK=off go test ./protocol/quasar/...} cleanly.
+
+\subsection{Warp 2.0 cross-chain envelope}
+
+The cross-chain emission of a Pulse on a Warp message envelope lives at \texttt{github.com/luxfi/warp} (root) plus \texttt{github.com/luxfi/warp/pulsar} (Pulse path). The split exists so the root warp package does not import the Pulsar kernel directly; the dispatch surface is the small \texttt{PulseVerifier} interface, with the concrete kernel-driven verifier in the subpackage:
+
+\begin{itemize}
+\item \texttt{warp/envelope.go}: \texttt{EnvelopeV2} carries the v1 Beam (\texttt{Message}) plus the four transcript-binding fields (\texttt{SourceNebulaRoot}, \texttt{SourceKeyEraID}, \texttt{SourceGeneration}, \texttt{HashSuiteID}) and two optional PQ lanes (\texttt{PulsarPulse}, \texttt{MLDSACertSet}). The leading \texttt{0x02} byte discriminates v2 from v1 wire bytes.
+\item \texttt{warp/pulsar/pulsar.go}: \textsc{KernelVerifier} drives the lattice verification path; \textsc{BuildSigningBytes} produces the canonical transcript under the \texttt{WARP-PULSAR-ENVELOPE-v1} domain prefix; \textsc{HorizonFromEnvelope} lifts a verified envelope into the \texttt{HorizonCertificate} shape (\S\ref{sec:quasar}).
+\item Forward compatibility: a v2 receiver decodes v1 bytes via \texttt{ParseEnvelope} (PQ lanes empty). Backward compatibility: v1 receivers reject v2 bytes (the leading \texttt{0x02} is not a valid RLP-list prefix); senders that need to reach v1-only verifiers emit Warp 1.x bytes on the v1 channel.
+\end{itemize}
+
+The \texttt{WARP-PULSAR-ENVELOPE-v1} prefix is distinct from any consensus-side prefix (\texttt{QUASAR-PULSAR-BUNDLE-v1}, \texttt{QUASAR-PULSAR-ACTIVATE-v1}, etc.) so a Pulse over a bundle root cannot be replayed as a Pulse over a cross-chain envelope.
+
+\subsection{C++ port}
+
+The C++ port lives at \texttt{luxcpp/crypto/ringtail/cpp/ringtail.\{hpp,cpp\}} \cite{lp137} (691 LOC at LP-137-ACTUAL-STATE 2026-04-28). The C-ABI shim exposes \texttt{ringtail\_setup}, \texttt{ringtail\_sign}, \texttt{ringtail\_verify} per LP-137 \S3. The C++ body mirrors the Go canonical layer for layer:
+
+\begin{itemize}
+\item \texttt{ringtail/cpp/ring.hpp} replicates Lattigo's $\textsc{MRed}$, $\textsc{BRed}$, $\textsc{NTTStandard}$, $\textsc{INTTStandard}$ on \texttt{uint64\_t} with $\texttt{\_\_int128}$ extended multiplication.
+\item \texttt{ringtail/cpp/serialize.hpp} implements $\textsc{WriteTo}$ in the wire format of \S\ref{sec:wire-format}, byte-for-byte.
+\item \texttt{ringtail/cpp/sampler.hpp} ports the Ziggurat tables ($\textsc{kn}$, $\textsc{wn}$, $\textsc{fn}$) verbatim and replicates the BLAKE2-XOF buffer-refill discipline.
+\item \texttt{ringtail/cpp/protocol.hpp} contains the protocol pseudocode of \S\ref{sec:protocol}.
+\end{itemize}
+
+The cross-implementation Known-Answer-Test contract (\S\ref{sec:wire-format}) gates every release.
+
+\subsection{GPU kernels}
+
+GPU kernels live under \texttt{ringtail/gpu/\{metal,cuda,wgsl\}/} \cite{lp137}. The dominant cost is $A \cdot \hat R$ in Round 1 ($m_{\textrm{pk}} \times n_{\textrm{vec}} \cdot n_{\textrm{vec}} \times (\bar D + 1) = 8 \times 7 \cdot 7 \times 49$). The Lattigo SIMD-NTT \cite{lattigov7} delivers 6--9 Mops/s of NTT throughput on Apple M2 Ultra at $N = 2^{20}$; per LP-164 \cite{lp164} the GPU crossover threshold is $N^* = 1$ for FHE-class NTT, so Pulsar's per-poly NTT at $\varphi = 256$ crosses over at small but nontrivial $K$. Per-platform kernel sources, crossover-threshold sweeps, and benchmarks are tracked in LP-137 \cite{lp137}.
+
+\subsection{Test oracle}
+
+The Go canonical test suite is the byte oracle:
+
+\begin{itemize}
+\item \texttt{sign/sign\_test.go}: per-component unit tests.
+\item \texttt{sign/local.go}: \textsc{LocalRun}, the end-to-end multi-party orchestration that the threshold-package \cite{ringtailgo} wraps.
+\item \texttt{threshold/threshold\_test.go}: $K = 5$ end-to-end at $\mu = $ ``Message''.
+\item \texttt{utils/utils\_test.go}: matrix/vector primitive coverage.
+\end{itemize}
+
+The KAT manifest (\S\ref{sec:wire-format}.7) is the cross-implementation gate.
+
+\subsection{Performance}
+
+Indicative timings on a single Apple Silicon M2 Ultra core, Go canonical:
+
+\begin{table}[H]
+\centering
+\caption{Phase timings, $K = 5$, $\mu = $ ``Message''. Numbers from \texttt{LocalRun(10)} median (\texttt{sign/local.go:21}).}
+\begin{tabular}{lr}
+\toprule
+Phase & Median (ms) \\
+\midrule
+\textsc{Gen}                  & 95 \\
+\textsc{SignRound1} (per party)            & 185 \\
+\textsc{SignRound2Preprocess} (per party)  & 35 \\
+\textsc{SignRound2}  (per party)           & 22 \\
+\textsc{SignFinalize}        & 8 \\
+\textsc{Verify}              & 9 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Round 1 is the dominant per-party cost; the C++ port at LP-137 closes the bulk of the matrix-multiply gap, and GPU acceleration is targeted to bring Round 1 below 50~ms at $K = 21$. The 3-second consensus interval of Lux mainnet (LP-020 \cite{lp020}) accommodates the current Go canonical at $K \le 21$ with an order-of-magnitude headroom.

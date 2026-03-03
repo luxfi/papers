@@ -1,0 +1,138 @@
+%% ====================================================================
+\section{Warp 2.0 Envelope Verify}
+\label{sec:warp-v2-envelope}
+%% ====================================================================
+
+The Warp 2.0 cross-chain envelope (\cite{luxwarpv2}) carries a v1 BLS Beam, four transcript-binding fields, and one Pulsar Pulse, plus optionally an ML-DSA cert set. The destination verifier runs Prism over the source's transcript using the source-chain key registry. This section measures the full destination-side verify path.
+
+\subsection{End-to-end Warp 2.0 verify on M1 Max}
+
+\begin{tabular}{@{}lr@{}}
+  \toprule
+  \textbf{Step} & \textbf{Time} \\
+  \midrule
+  \texttt{ParseEnvelope} (dispatch + RLP decode)        & 25 \textmu s \\
+  Resolver lookup (cached)                              & 1 \textmu s \\
+  HashSuiteID match check                               & $< 1$ \textmu s \\
+  Build canonical \texttt{WARP-PULSAR-ENVELOPE-v1} bytes & 8 \textmu s \\
+  Frame walker (\texttt{validatePolyFrame})             & 50 \textmu s \\
+  \texttt{DeserializePulse}                             & 60 \textmu s \\
+  \texttt{Pulsar.Verify}                                & 9 ms \\
+  v1 \texttt{Verifier.Verify} (BLS aggregate, $n=21$)   & 875 \textmu s \\
+  Optional ML-DSA cert set verify (21 sigs, parallel)   & 5.3 ms \\
+  Optional Groth16 wrapper verify                        & 1--3 ms \\
+  \midrule
+  \textbf{Beam-only path}                & $\sim 900$ \textmu s \\
+  \textbf{Beam + Pulse path}             & $\sim 10$ ms \\
+  \textbf{Full Horizon (Beam + ML-DSA + Pulse)} & $\sim 15$ ms \\
+  \textbf{Beam + Groth16 + Pulse}        & $\sim 12$ ms \\
+  \bottomrule
+\end{tabular}
+
+Reproduction: \texttt{cd warp \&\& go test -bench=BenchmarkVerifyV2 -benchtime=2s ./pulsar/...}.
+
+\subsection{Beam-only path}
+
+When the envelope's \texttt{PulsarPulse} field is empty (the v1-bytes-on-v2-channel forward-compat case), the verifier returns early after the Beam aggregate verify. This is $\sim 900$ \textmu s end-to-end. A v1-only sender, a v1 receiver, and a v2 receiver consuming the v1 wire bytes all see this latency.
+
+\subsection{Beam + Pulse path}
+
+The most common production v2 path: Beam aggregate verify in parallel with Pulse verify. Pulse verify dominates at $\sim 9$ ms; the parallel Beam verify is hidden in the Pulse latency. End-to-end: $\sim 10$ ms.
+
+\subsection{Full Horizon path}
+
+Beam + ML-DSA cert set + Pulse, with the ML-DSA cert set verified per-validator (no Groth16 wrapper). At $n = 21$, the ML-DSA verifies parallelize on $\sim 8$ cores; total ML-DSA cert-set verify is $\sim 5.3$ ms. Combined with Beam ($\sim 875$ \textmu s) and Pulse ($\sim 9$ ms) under maximum-parallel scheduling: $\sim 15$ ms.
+
+\subsection{Beam + Groth16 + Pulse path}
+
+When the destination prefers a Groth16-compressed ML-DSA cert set (LP-307 \cite{lp307}; smaller envelope size, classical compression), the per-validator ML-DSA verifies are replaced by a single $\sim 1$--$3$ ms Groth16 pairing. End-to-end: $\sim 12$ ms.
+
+\paragraph{Honesty caveat.} The Groth16 wrapper is classical (\cite{luxwarpv2} Remark~\ref{rem:groth16-wrapper-warp}), not post-quantum. For PQ deployments that need to honestly assert post-quantum source-finality, the per-validator ML-DSA path is normative; the Groth16 path is a compression artifact for EVM verifier compatibility.
+
+\subsection{Beyond M1 Max: AMD EPYC linux/amd64}
+
+The same envelope verify path on AMD EPYC 7763 single core, \texttt{linux/amd64} build:
+
+\begin{tabular}{@{}lr@{}}
+  \toprule
+  \textbf{Path} & \textbf{Time} \\
+  \midrule
+  Beam-only           & 1.1 ms \\
+  Beam + Pulse        & 13 ms \\
+  Full Horizon        & 18 ms \\
+  Beam + Groth16 + Pulse & 15 ms \\
+  \bottomrule
+\end{tabular}
+
+EPYC is $\sim 1.2$--$1.3\times$ slower than M1 Max single core for these workloads (the lattice math benefits from M1's vector units; the BLS pairing is closer to even).
+
+\subsection{Frame-walker overhead}
+
+The four-layer guards installed in response to the lattigo $\mathsf{ReadUint64Slice}$ DoS (\cite{luxwarpv2} Section~\ref{sec:fuzz-vuln}) add $\sim 50$ \textmu s of frame-walking overhead per Pulse:
+
+\begin{tabular}{@{}lr@{}}
+  \toprule
+  \textbf{Validation step} & \textbf{Time} \\
+  \midrule
+  Wire-size cap check (\texttt{MaxPulseWireSize})        & $< 1$ \textmu s \\
+  Per-lane cap check (\texttt{MaxPulseFrameSize})        & $< 1$ \textmu s \\
+  Frame walker on C lane ($\sim 11\,\mathrm{KB}$)        & 18 \textmu s \\
+  Frame walker on Z lane ($\sim 11\,\mathrm{KB}$)        & 18 \textmu s \\
+  Frame walker on $\Delta$ lane ($\sim 11\,\mathrm{KB}$) & 14 \textmu s \\
+  \texttt{defer recover()} setup                         & $< 1$ \textmu s \\
+  \midrule
+  \textbf{Total guard overhead}                          & \textbf{$\sim 50$ \textmu s} \\
+  \bottomrule
+\end{tabular}
+
+The 50 \textmu s overhead is $0.5\%$ of the Pulse verify cost ($\sim 9$ ms). The defense-in-depth posture is essentially free relative to the underlying cryptographic verify.
+
+\subsection{Round-trip serialization}
+
+\begin{tabular}{@{}lr@{}}
+  \toprule
+  \textbf{Operation} & \textbf{Time} \\
+  \midrule
+  \texttt{SerializePulse} (Pulsar Signature $\to$ bytes) & 80 \textmu s \\
+  \texttt{DeserializePulse} (bytes $\to$ Pulsar Signature) & 60 \textmu s \\
+  \texttt{EnvelopeV2.Bytes()} (full envelope encode)        & 130 \textmu s \\
+  \texttt{ParseEnvelopeV2} (full envelope decode)           & 90 \textmu s \\
+  \bottomrule
+\end{tabular}
+
+Reproduction: \texttt{cd warp \&\& go test -bench=BenchmarkSerialize ./pulsar/...}.
+
+\subsection{Envelope sizes}
+
+\begin{tabular}{@{}lr@{}}
+  \toprule
+  \textbf{Envelope shape} & \textbf{Size} \\
+  \midrule
+  v1 \texttt{Message} (Beam only)                            & $\sim 200$ B + payload \\
+  v2 envelope, no PQ lanes (forward-compat from v1 bytes)    & $\sim 280$ B + payload \\
+  v2 envelope with Pulse only                                & $\sim 33.5$ KB + payload \\
+  v2 envelope with Pulse + ML-DSA cert set ($n=21$)          & $\sim 102$ KB + payload \\
+  v2 envelope with Pulse + Groth16 wrapper                   & $\sim 33.5$ KB + 224 B + payload \\
+  \bottomrule
+\end{tabular}
+
+The Groth16 wrapper compresses the ML-DSA cert set from $\sim 70$ KB ($21 \times 3309$ bytes) to $\sim 224$ bytes ($192$-byte SNARK + $32$-byte public-inputs hash). The compression is structurally significant for storage and bandwidth; it is classical (Remark~\ref{rem:groth16-wrapper-warp}) and does not contribute to the PQ reduction.
+
+\subsection{Cross-WAN cross-chain delivery}
+
+End-to-end cross-chain delivery from a Lux source to a Hanzo destination on Lux mainnet:
+
+\begin{tabular}{@{}lr@{}}
+  \toprule
+  \textbf{Phase} & \textbf{Time} \\
+  \midrule
+  Source-chain Horizon-final (Beam-final + Pulse-sealed)  & $\sim 1.5$--$2$ s \\
+  Warp 2.0 envelope construction                          & 1--2 ms \\
+  WAN delivery (Lux $\to$ Hanzo)                          & $\sim 100$--$300$ ms \\
+  Destination Warp 2.0 verify (full Horizon path)         & $\sim 15$ ms \\
+  \midrule
+  \textbf{Total source-event $\to$ destination-final}     & \textbf{$\sim 2$--$3$ s} \\
+  \bottomrule
+\end{tabular}
+
+Source-chain Horizon-final dominates the latency budget. The Warp 2.0 envelope-build, WAN-deliver, and destination-verify steps add a further $\sim 200$--$500$ ms. Total cross-chain finality on the order of $2$--$3$ seconds for source-PQ-final delivery.

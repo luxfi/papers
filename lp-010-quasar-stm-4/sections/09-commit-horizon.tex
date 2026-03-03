@@ -1,0 +1,105 @@
+\section{Commit horizon}
+
+\label{sec:horizon}
+%% ============================================================================
+
+\subsection{Horizon as a finalisation primitive}
+
+QuasarSTM~3.0 sketched the commit horizon: a contiguous Nova prefix or
+a valid Nebula causal cut that can be finalised in one batch instead of
+transaction-by-transaction~\cite{lp010-quasarstm-3}. 4.0 ships the
+production semantics.
+
+\begin{lstlisting}[language=C++]
+struct CommitHorizon {
+    uint64_t prefix_len;            // Nova: number of canonical-order txs committed
+    Hash     causal_cut_root;       // Nebula: commitment over the cut frontier
+    Hash     reducer_state_root;    // post-reduce snapshot for all Reducer lanes
+    uint64_t round_index;           // Quasar round this horizon belongs to
+    uint64_t advanced_at_tick;      // wave-tick index where this horizon advanced
+    uint8_t  mode;                  // 0=Nova, 1=Nebula
+    uint8_t  pad[7];
+};
+\end{lstlisting}
+
+\subsection{Advance condition}
+
+A horizon advance over canonical-order range $[t_a, t_b]$ requires:
+\begin{enumerate}[leftmargin=2em]
+\item Every $t \in [t_a, t_b]$ has passed Tier~1 / Tier~2 / Tier~3 (as
+      applicable).
+\item No repair is outstanding for any $t$ in the range.
+\item Every \texttt{Reducer}-mode lane touched in the range has run
+      \texttt{deterministic\_reduce\_at\_commit} (\S\ref{sec:tier3}).
+\item For Nebula, the cut frontier is a valid antichain in the DAG.
+\end{enumerate}
+
+When the four conditions hold, the horizon advances to $t_b$, the
+roots are computed once, and the per-tx receipts are emitted. Per-tx
+roots are not emitted; this is what slashes per-transaction certificate
+overhead.
+
+\subsection{Roots emitted at horizon advance}
+
+At each horizon advance, the round-result roots
+(\texttt{block\_hash}, \texttt{state\_root}, \texttt{receipts\_root},
+\texttt{execution\_root}, \texttt{mode\_root}) are recomputed and the
+new \texttt{hint\_roots}~\cite{chiron2025} are appended:
+
+\[
+\mathit{hint\_roots} = \langle
+\mathit{access\_spec\_root},\;
+\mathit{dependency\_graph\_root},\;
+\mathit{hot\_lane\_root},\;
+\mathit{conflict\_profile\_root},\;
+\mathit{reducer\_plan\_root}
+\rangle
+\]
+
+The \texttt{hint\_roots} ride in the existing \texttt{roots} slot of
+\texttt{QuasarRoundResult}---no wire-format change. They are
+non-load-bearing: replay validators consume them to schedule faster,
+but safety does not depend on them~\cite{chiron2025}.
+
+\subsection{Horizon safety}
+
+\begin{theorem}[Horizon safety]
+\label{thm:horizon-safety}
+For any commit horizon $H$ advanced from $t_{a-1}$ to $t_b$ in a Quasar
+round, the post-horizon state is canonically equivalent to the
+sequential execution of $t_a, t_{a+1}, \ldots, t_b$ in canonical order,
+modulo the reduction rule for \texttt{Reducer}-mode lanes
+(\S\ref{sec:tier3}).
+\end{theorem}
+\begin{proof}[Proof sketch]
+For $t \in [t_a, t_b]$ in \texttt{SingleVersionFast} or
+\texttt{MultiVersion}, Tier~1 and Tier~2 validation guarantee that
+$t$'s reads see the canonical visible version (3.0 \S\,5,
+\cite{lp010-quasarstm-3,adya2000essn}). For \texttt{Reducer}-mode
+lanes, Algorithm~\ref{alg:reduce} applies operations in canonical
+order over \texttt{tx\_id}, which is the same order as sequential
+execution. \texttt{Serialized} mode trivially executes writes in
+canonical order. Hence the post-horizon state matches a sequential
+execution that handles \texttt{Reducer} lanes by applying their
+operations in tx-id order.
+\end{proof}
+
+\subsection{Why per-round, not per-tick}
+
+A round may advance the horizon multiple times within its wave-tick
+budget. The horizon is per-round; each advance emits one set of roots.
+The certificate (LP-020) is emitted at \emph{round} end and binds
+\emph{the final horizon} of the round, not intermediate horizons.
+Intermediate horizons are convenient checkpoints for replay validators
+but are not certified.
+
+\begin{remark}[Nova vs.\ Nebula horizon]
+In Nova mode, the horizon is always a prefix of the canonical order
+($t_b - t_{a-1}$ contiguous transactions). In Nebula mode, the horizon
+is a causal cut (an antichain in the DAG); the canonical order is
+extended by the deterministic tie-break rule from
+3.0~\cite{lp010-quasarstm-3} so that reduction order over
+\texttt{tx\_id} remains well-defined.
+\end{remark}
+
+%% ============================================================================

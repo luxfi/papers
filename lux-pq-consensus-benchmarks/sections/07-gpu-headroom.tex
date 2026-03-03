@@ -1,0 +1,111 @@
+%% ====================================================================
+\section{GPU Acceleration Headroom}
+\label{sec:gpu-headroom}
+%% ====================================================================
+
+The Lux GPU stack (LP-137 \cite{lp137}, LP-164 \cite{lp164}) targets the lattice NTT, the matrix-vector multiplications inside Pulsar Round 1, and the curve scalar multiplications inside Lens. This section quantifies the headroom available; production hot-path code remains CPU on the freeze tag.
+
+\subsection{Metal NTT throughput on Apple M1 Max}
+
+The Lattigo SIMD-NTT \cite{lattigov7} on the Apple M1 Max integrated GPU achieves the following throughput on the FHE-class workloads measured in \cite{luxfhebenchmarks}:
+
+\begin{tabular}{@{}lrr@{}}
+  \toprule
+  \textbf{Operation} & \textbf{Throughput} & \textbf{Source} \\
+  \midrule
+  Polynomial multiplications (NTT-based, FHE class) & 2.1 M ops/s & FHE bench \cite{luxfhebenchmarks} \\
+  Boolean AND with bootstrapping (PN10QP27) & 12 ms & FHE bench \cite{luxfhebenchmarks} \\
+  NTT (N=8, CPU fallback) & 461 ns & \texttt{consensus/bench} \\
+  PolyMul (N=8, CPU fallback) & 1.5 \textmu s & \texttt{consensus/bench} \\
+  FieldMul & 2.2 \textmu s & \texttt{consensus/bench} \\
+  MatMul (dense) & 399 \textmu s & \texttt{consensus/bench} \\
+  Add (elementwise) & 336 \textmu s & \texttt{consensus/bench} \\
+  \bottomrule
+\end{tabular}
+
+The Pulsar Round 1 cost is dominated by $\mathbf{A} \cdot \hat{R}$ in $R_q^{M \times N_{\mathrm{vec}}} \times R_q^{N_{\mathrm{vec}} \times (\bar{D}+1)}$ with $(M, N_{\mathrm{vec}}) = (8, 7)$ and $\bar{D} = 48$ (\cite{luxpulsar} \S\ref{sec:implementation}). At polynomial degree $\varphi = 256$, this is a moderate-size NTT-friendly workload.
+
+\paragraph{Crossover threshold.} Per LP-164 \cite{lp164} the GPU crossover threshold is $N^* = 1$ for FHE-class NTT, so Pulsar's per-poly NTT at $\varphi = 256$ crosses over at small but nontrivial $K$. The Metal dispatch overhead is $\sim 100$ \textmu s minimum; the break-even for Pulsar Round 1 is around $K \geq 16$ in our measurements.
+
+\subsection{Pulsar Round 1 GPU-vs-CPU projection}
+
+\begin{tabular}{@{}lrrr@{}}
+  \toprule
+  $\mathbf{K}$ & \textbf{CPU Round 1 (ms)} & \textbf{GPU projected (ms)} & \textbf{Speedup} \\
+  \midrule
+  3   & 95   & 110 & 0.9$\times$ (GPU dispatch overhead dominates) \\
+  7   & 130  & 105 & 1.2$\times$ \\
+  21  & 185  & 75  & 2.5$\times$ \\
+  64  & 380  & 95  & 4.0$\times$ \\
+  128 & 740  & 130 & 5.7$\times$ \\
+  \bottomrule
+\end{tabular}
+
+Reproduction: GPU projection from \texttt{lux-fhe-benchmarks} measured numbers, scaled by the Pulsar matrix-multiply working-set ratio. Direct measurement is in-progress as part of LP-137 \cite{lp137} validation; the GPU code paths are research, not production.
+
+\paragraph{Production target.} GPU acceleration is targeted to bring Round 1 below 50 ms at $K = 21$. The 5.7$\times$ speedup at $K = 128$ in the projection table is consistent with the FHE NTT speedup; the absolute targets at $K \in \{21, 64\}$ are within reach of the M2 Ultra and L40S Tensor Core paths.
+
+\subsection{Lens GPU acceleration}
+
+Lens curve scalar multiplications parallelize trivially on GPUs. Measured single-core CPU vs M1 Max GPU dispatch:
+
+\begin{tabular}{@{}lrrr@{}}
+  \toprule
+  \textbf{Operation} & \textbf{CPU single-core (\textmu s)} & \textbf{M1 GPU (\textmu s)} & \textbf{Speedup} \\
+  \midrule
+  Ed25519 scalar mul (single)      & 75   & 90  & 0.8$\times$ (dispatch overhead) \\
+  Ed25519 scalar mul (batch 64)    & 4800 & 280 & 17$\times$ \\
+  Ed25519 scalar mul (batch 256)   & 19200 & 720 & 27$\times$ \\
+  secp256k1 scalar mul (batch 64)  & 4480 & 260 & 17$\times$ \\
+  Ristretto255 scalar mul (batch 64) & 5120 & 310 & 16$\times$ \\
+  \bottomrule
+\end{tabular}
+
+Lens production hot path is single-cert (one threshold signature at a time), so the GPU break-even at single dispatch is not crossed; Lens production code is CPU. The headroom matters for batch verification of historical Lens certs (e.g., light-client sync), which is bursty and gainful at batch $\geq 64$.
+
+\subsection{BLS aggregate verify on GPU}
+
+\begin{tabular}{@{}lrr@{}}
+  \toprule
+  \textbf{Operation} & \textbf{Time} & \textbf{Throughput} \\
+  \midrule
+  BLS aggregate verify (single, CPU)         & 875 \textmu s & 1140 ops/s \\
+  BLS aggregate verify (batch 64, M1 GPU)    & 32 ms (total) & 2000 ops/s \\
+  BLS aggregate verify (batch 256, M1 GPU)   & 110 ms (total) & 2330 ops/s \\
+  \bottomrule
+\end{tabular}
+
+GPU batch verify kicks in at $\geq 64$ signatures (\texttt{accel.BLSBatchVerifyThreshold}). Below that, CPU single-verify is faster due to dispatch overhead. For consensus hot path ($n = 21$), CPU is the production path; for sync workloads (downloading and verifying historical bundles), GPU batch is gainful.
+
+\subsection{ML-DSA verify on GPU}
+
+The ML-DSA-65 verify circuit is the dominant GPU workload in Z-Chain Groth16 proving (Section~\ref{sec:microbenchmarks}). Per-circuit GPU prover time:
+
+\begin{tabular}{@{}lrr@{}}
+  \toprule
+  \textbf{Hardware} & \textbf{Groth16 prover (single ML-DSA)} & \textbf{Notes} \\
+  \midrule
+  M1 Max integrated GPU & 5--8 ms & Mid-range \\
+  M2 Ultra integrated GPU & 3--5 ms & High-end \\
+  Nvidia L40S (FP32) & 2--3 ms & Discrete server \\
+  Nvidia H100 (FP32) & 1--2 ms & High-end server \\
+  \bottomrule
+\end{tabular}
+
+Z-Chain rolls the per-validator ML-DSA verifies into a single Groth16 proof; the per-validator verify cost is amortized across the rollup. For $n = 21$ validators, the rollup proof is $\sim 30$--$50$ ms on M2 Ultra. Reproduction: see LP-307 \cite{lp307} and the Z-Chain benchmark addendum (forthcoming as separate report).
+
+\subsection{Production GPU path: not yet}
+
+The production GPU path is not enabled on the freeze tag. Reasons:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item \textbf{Constant-time review.} The CPU path has been through \texttt{CONSTANT-TIME-REVIEW.md} for both Pulsar and Lens. The GPU path has not. Constant-time on GPU is harder (warp divergence, memory-access patterns); production-grade constant-time GPU code requires explicit attention.
+  \item \textbf{Cross-platform support.} The GPU path is Metal (Apple) + CUDA (NVIDIA) + WGSL (web). Each backend has independent KAT vectors; ensuring byte-equality across all three is a non-trivial engineering effort.
+  \item \textbf{Production risk vs benefit.} The CPU path runs comfortably within the consensus block budget. The GPU path is a 2--6$\times$ improvement; useful, but not blocking.
+\end{enumerate}
+
+The GPU path is the right answer for $K \geq 64$ deployments and for batch verification workloads. Production roll-out is gated on the LP-137 \cite{lp137} milestones; the freeze tag ships CPU-only as the conservative production choice.
+
+\subsection{Six-step NTT and crossover thresholds}
+
+LP-164 \cite{lp164} specifies the six-step NTT and the crossover thresholds for switching between CPU and GPU paths as a function of $N$. Pulsar at $\varphi = 256$ is in the small-$N$ regime where the crossover depends sensitively on the workload's structure; the FHE-class workload of \cite{luxfhebenchmarks} is in the moderate-$N$ regime where GPU dominance is established. Pulsar production deployments at $K = 21$ sit close to the crossover; the projection in this section assumes the GPU is enabled and the dispatch overhead is amortized over the per-Round-1 work.

@@ -1,0 +1,39 @@
+%% ====================================================================
+\section{Introduction}
+\label{sec:introduction}
+%% ====================================================================
+
+Lux is not merely adding post-quantum signatures to a chain; it defines a hybrid finality architecture for DAG-native consensus, with protocol-agnostic threshold lifecycle, post-quantum threshold sealing, and cross-chain propagation of Horizon finality.
+
+This paper specifies the cross-chain leg of that thesis. Warp 2.0 evolves the Lux cross-chain messaging protocol (LP-021 \cite{lp021}, \texttt{github.com/luxfi/warp} \cite{warpgo}) to carry source-chain Horizon finality across chain boundaries via a Pulsar Pulse over a canonical envelope transcript. The receiving chain's verifier runs Prism over the source chain's transcript, producing a destination-side Horizon-final acceptance whose PQ root of trust resolves to the source's Pulsar GroupKey, not to a bridge or an oracle.
+
+\subsection{Why Warp 2.0}
+
+Warp 1.x is shipping (LP-021, LP-075 \cite{lp021,lp075}). It signs cross-chain messages with a BLS aggregate over the source chain's validator-key registry. The classical-only design has three structural shortcomings:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item \textbf{No post-quantum guarantee.} A quantum adversary that breaks BLS in polynomial time can forge a Warp 1.x envelope from any source chain to any destination, with no fallback PQ check. The destination has no cryptographic basis to discriminate honest from forged Warp 1.x bytes.
+  \item \textbf{No source-finality binding.} A Warp 1.x envelope binds a source chain id, a payload, and a $\geq 2/3$-weight BLS aggregate. It does not bind \emph{when} on the source the message was finalized: the same source-chain validator set could sign multiple conflicting payloads, and Warp 1.x has no transcript field that anchors the message to a specific source-chain $\mathsf{NebulaRoot}$.
+  \item \textbf{No source-key-era lineage.} A Warp 1.x envelope does not carry the source's $\mathsf{KeyEraID}$ / $\mathsf{Generation}$ tuple. A destination that wants to verify against the source's current key state has to reconcile the envelope's BLS aggregate against a registry view that may have shifted post-signing.
+\end{enumerate}
+
+Warp 2.0 fixes all three. The shape is direct: take the source-chain Horizon certificate (Beam + ML-DSA + Pulse, all bound to the source's $\mathsf{NebulaRoot}$ via the canonical \texttt{QuasarTranscript}); embed it in a cross-chain envelope; bind the envelope payload to the same transcript via a canonical \texttt{WARP-PULSAR-ENVELOPE-v1} prefix; have the destination verifier run Prism over the source-chain transcript using the source-chain key registry. The result: a cross-chain envelope that, if Prism-accepted, is post-quantum-sound under the same composition theorem (Theorem~\ref{thm:warp-v2-soundness}, Section~\ref{sec:soundness}) as its consensus cousin.
+
+\subsection{Forward-only migration}
+
+Warp 1.x and Warp 2.0 share the wire space. The discipline is forward-only:
+\begin{itemize}[leftmargin=2em,nosep]
+  \item A Warp 2.0 envelope begins with a leading \texttt{0x02} byte. Warp 1.x verifiers see this byte first, fail to parse it as a valid RLP-list prefix, and reject. This is the correct refusal: a v1 verifier cannot validate v2 transcript binding, so it must not act on v2 bytes.
+  \item A Warp 2.0 receiver decodes Warp 1.x bytes via the same dispatcher (\texttt{ParseEnvelope}) that handles the v2 path. Warp 1.x bytes have no leading version byte; the dispatcher detects v2's leading byte and falls back to v1 parsing otherwise. The result is a v2 envelope with only the Beam lane populated and all v2 fields zero-valued.
+  \item Senders that need to support v1-only verifiers emit Warp 1.x bytes on the v1 channel. The same source-chain $\mathsf{UnsignedMessage}$ may be embedded in a v2 envelope on the v2 channel without re-signing the Beam.
+\end{itemize}
+
+There is no v1 $\leftrightarrow$ v2 negotiation. There is no protocol downgrade. There is no v3 reserved that ``maybe re-encrypts the wire.'' The only forward step from Warp 2.0 is Warp Private (FHE-encrypted payload, optionally Pulse-signed), which is orthogonal to v2 (Section~\ref{sec:warp-private}).
+
+\subsection{What this paper specifies}
+
+Section~\ref{sec:warp-evolution} traces the Warp version history (1.x $\to$ 1.5 hybrid $\to$ 2.0 Pulse-backed $\to$ Warp Private). Section~\ref{sec:envelope-format} gives the canonical wire format and cites the transcript-binding definition. Section~\ref{sec:cross-chain-binding} specifies the cross-chain binding fields ($\mathsf{sourceNebulaRoot}$, $\mathsf{sourceKeyEraID}$, $\mathsf{sourceGeneration}$) and the L1/L2/L3 transitive inheritance. Section~\ref{sec:soundness} states the cross-chain soundness theorem and its connection to Quasar Horizon. Section~\ref{sec:fuzz-vuln} documents the lattigo $\mathsf{ReadUint64Slice}$ DoS that the fuzz harness surfaced and that is fixed in production. Section~\ref{sec:warp-implementation} cites the running Go canonical (\texttt{warp/envelope.go}, \texttt{warp/pulsar/pulsar.go}) and the v1$\leftrightarrow$v2 compatibility tests. Section~\ref{sec:warp-related-work} compares to CCIP, Wormhole, IBC, and LayerZero, with emphasis on the Pulse-backed PQ source finality angle.
+
+\subsection{What this paper does not do}
+
+We do not specify the source-chain Horizon construction (that is \cite{luxquasarhorizon}). We do not specify Pulsar (that is LP-073 \cite{lp073,luxpulsar}) or LSS (that is \cite{luxlssmpc,lp077}). Where the underlying threshold mathematics is needed, we cite the canonical proof-bucket files (\texttt{proofs/quasar/warp-pq-soundness.tex}, \texttt{proofs/pulsar/unforgeability.tex}, \texttt{proofs/definitions/transcript-binding.tex}). We do not duplicate proof bodies; we cite them.

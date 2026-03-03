@@ -1,0 +1,107 @@
+%% ====================================================================
+\section{Prism Composition Verify}
+\label{sec:prism-composition}
+%% ====================================================================
+
+The Prism predicate (\cite{luxquasarhorizon} Definition~\ref{def:prism-quasar-horizon}) accepts a Horizon certificate iff every lane verifies under the canonical \texttt{QuasarTranscript}. This section measures the end-to-end Prism verify cost on the consensus-side Horizon certificate (i.e., the destination of the consensus path; not the cross-chain Warp 2.0 envelope of Section~\ref{sec:warp-v2-envelope}).
+
+\subsection{End-to-end Prism verify on Lux mainnet}
+
+\begin{tabular}{@{}lr@{}}
+  \toprule
+  \textbf{Step} & \textbf{Time} \\
+  \midrule
+  Step 1: Transcript binding check (HashSuiteID, KeyEraID, Generation, NebulaRoot match) & 5 \textmu s \\
+  Step 1: Compute $\tau$ (TupleHash256 over canonical transcript fields)                 & 12 \textmu s \\
+  Step 2: Beam (BLS aggregate verify, $n=21$)                                            & 875 \textmu s \\
+  Step 3: ML-DSA cert set (21 verifies, parallel)                                        & 5.3 ms \\
+  Step 4: Pulse (\texttt{Pulsar.Verify})                                                 & 9 ms \\
+  Step 5: Validator-set hash, BLS-registry digest, ML-DSA-registry digest match          & 30 \textmu s \\
+  Step 6: Nebula root linkage check (epoch, round)                                        & 8 \textmu s \\
+  \midrule
+  \textbf{Total Prism verify (full Horizon)}                                              & \textbf{$\sim 15$ ms} \\
+  \bottomrule
+\end{tabular}
+
+Reproduction: \texttt{cd consensus \&\& GOWORK=off go test -bench=BenchmarkPrismVerify -benchtime=2s ./protocol/quasar/...}.
+
+\paragraph{Pulse verify dominates.} The Pulsar verify ($\sim 9$ ms) is the dominant single cost. The ML-DSA cert set ($\sim 5.3$ ms parallelized) is the next; the Beam aggregate ($\sim 875$ \textmu s) is third. Transcript binding and validator-set checks together are $\sim 0.05$ ms, a noise floor.
+
+\paragraph{Sub-15 ms full Horizon.} The Lux mainnet block interval is $\sim 500$ ms; the bundle interval is $\sim 3$ s. A 15-ms Prism verify is $0.5\%$ of the bundle budget. The verify can run end-to-end on every bundle without blocking the consensus hot path.
+
+\subsection{With Groth16-compressed ML-DSA}
+
+\begin{tabular}{@{}lr@{}}
+  \toprule
+  \textbf{Step} & \textbf{Time} \\
+  \midrule
+  Steps 1--2 (transcript, Beam) & $\sim 900$ \textmu s \\
+  Step 3 (Groth16 verify, single proof) & 1--3 ms \\
+  Step 4 (Pulse) & 9 ms \\
+  Steps 5--6 & $\sim 0.04$ ms \\
+  \midrule
+  \textbf{Total Prism verify (Groth16-wrapped Horizon)} & \textbf{$\sim 12$ ms} \\
+  \bottomrule
+\end{tabular}
+
+The Groth16 wrapper saves $\sim 3$ ms over the per-validator ML-DSA path. For chains with bandwidth-sensitive distribution (e.g., L2s with thin block-explorer infrastructure), the Groth16 path is a useful compression. For chains where honest PQ security framing matters (regulated finance, long-archival), the per-validator path is normative.
+
+\subsection{Triple-sign mode (parallel sign on all three lanes)}
+
+Quasar's \texttt{TripleSignRound1} (\cite{consensusgo} \texttt{protocol/quasar/triple\_sign\_test.go}) runs all three lanes in parallel on the producer side. Per-block triple-sign overhead:
+
+\begin{tabular}{@{}lr@{}}
+  \toprule
+  \textbf{Operation} & \textbf{Time} \\
+  \midrule
+  Triple-sign round 1 (BLS sign + ML-DSA sign + Pulsar Sign1) at single validator & $\sim 700$ \textmu s + 495 \textmu s + 185 ms \\
+  Quasar full block processing (BLS + ML-DSA + Ringtail) & 1.85 ms \\
+  \bottomrule
+\end{tabular}
+
+The full-block-processing number is the steady-state cost on the producer side: process the block, sign with all three primitives, append to the bundle. Reproduction: \texttt{GOWORK=off go test -bench=BenchmarkQuasarBlockProcessing ./protocol/quasar/...}.
+
+\paragraph{Pulsar Sign1 is offline-preprocessable.} The 185 ms per-party Sign1 cost is shifted off the hot path; the producer pre-computes Sign1 outputs in idle CPU and consumes them at message-time. This is the path that makes Pulse signing tractable in a production block budget.
+
+\subsection{Per-lane verify scaling with $n$}
+
+How does each lane scale with validator count $n$?
+
+\begin{tabular}{@{}lp{0.40\textwidth}@{}}
+  \toprule
+  \textbf{Lane} & \textbf{Verify scaling} \\
+  \midrule
+  Beam (BLS aggregate)              & $\mathcal{O}(1)$ in $n$ (constant 96-byte aggregate); pairing computation is the dominant cost regardless of $n$. \\
+  ML-DSA cert set (per-validator)   & $\mathcal{O}(n)$; one verify per signing validator. Parallelizes across cores. \\
+  ML-DSA cert set (Groth16-wrapped) & $\mathcal{O}(1)$ verify cost; the prover's cost scales with the circuit, but the verifier's is constant. \\
+  Pulse (Pulsar threshold)          & $\mathcal{O}(1)$ in signing-set $K$ at verify time (the threshold signature is a single $\sigma$ object). \\
+  \bottomrule
+\end{tabular}
+
+The full Prism verify is therefore $\mathcal{O}(n)$ in the per-validator-ML-DSA mode and $\mathcal{O}(1)$ in the Groth16-wrapped mode. For chains with large $n$ where ML-DSA cert-set verify becomes a bottleneck, Groth16 wrapping is the right operational answer.
+
+\subsection{Verify under mode toggles}
+
+Each lane is independently toggleable (Section~\ref{sec:implementation} of \cite{luxquasarhorizon}). Verify cost per mode:
+
+\begin{tabular}{@{}lrr@{}}
+  \toprule
+  \textbf{Mode} & \textbf{Verify cost ($n=21$)} & \textbf{Strongest finality state} \\
+  \midrule
+  BLS-only & 875 \textmu s & Beam-final \\
+  BLS + Pulse (no ML-DSA) & $\sim 10$ ms & Pulse-sealed \\
+  BLS + ML-DSA (no Pulse) & $\sim 5$ ms & PQ-attested \\
+  BLS + ML-DSA + Pulse & $\sim 15$ ms & Horizon-final \\
+  BLS + Groth16(ML-DSA) + Pulse & $\sim 12$ ms & Horizon-final \\
+  \bottomrule
+\end{tabular}
+
+The mode is configurable per chain. Lux mainnet runs ``BLS + ML-DSA + Pulse'' or ``BLS + Groth16(ML-DSA) + Pulse'' depending on bandwidth tier; both reach Horizon-final.
+
+\subsection{Triple-mode test detection}
+
+\texttt{IsTripleMode()} on the engine returns true when all three signing layers are configured. This is the runtime predicate that distinguishes a Horizon-capable chain from a Beam-only chain. Reproduction: \texttt{GOWORK=off go test -run TestIsTripleMode ./protocol/quasar/...}.
+
+\subsection{Comparison with Quasar 3.0 docs}
+
+Earlier Quasar docs cited a 357 \textmu s ``epoch finality'' figure that does not match any measured operation in the current code (Section~\ref{sec:microbenchmarks}). The honest Prism verify number on the production stack is $\sim 15$ ms (full Horizon) or $\sim 12$ ms (Groth16-wrapped). All papers should quote the measured numbers.

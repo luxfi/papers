@@ -1,0 +1,68 @@
+\section{Nebula-FHE: DAG/GPU-native scheduling}
+\label{sec:nebula-fhe-scheduling}
+
+Nebula-FHE is the DAG/GPU-native scheduler for encrypted computation
+in Lux. The F-Chain \texttt{drain\_fhe} service from LP-013 is its
+canonical realisation; this section describes the layer Nebula-FHE
+exposes to non-F-Chain deployments and to encrypted-coprocessor
+workloads outside the wave-tick kernel.
+
+\subsection{Job model}
+
+A Nebula-FHE job is a tuple
+\[
+  \mathsf{FheJob} = (\mathsf{circuit\_dag\_root},
+  \mathsf{ciphertext\_inputs},
+  \mathsf{evaluation\_key\_id})
+\]
+where \texttt{circuit\_dag\_root} is the merkle root of the encrypted
+circuit DAG, \texttt{ciphertext\_inputs} is the input vector (LWE
+ciphertexts in the canonical wire format), and \texttt{evaluation\_key\_id}
+references the bootstrap-key + key-switch-key pair the runtime should
+use. The job emits an $\mathsf{FheReceipt} = (\mathsf{output\_root},
+\mathsf{kernel\_id}, \mathsf{cost})$ where \texttt{output\_root} is the
+merkle root over the produced ciphertexts and \texttt{kernel\_id}
+identifies the kernel sequence (CPU vs Lux FHE-CUDA vs Lux FHE-HIP).
+
+\subsection{Scheduling policy}
+
+The DAG planner orders FheJobs by lane affinity:
+
+\begin{itemize}
+\item \textbf{Lane-local}: independent ciphertexts (no shared
+encrypted state) execute in parallel; this is the throughput sweet spot
+of the GPU backends.
+\item \textbf{Hot-lane}: shared encrypted state (e.g. an encrypted
+ERC-20 \texttt{totalSupply}) routes through a deterministic reducer
+under LP-010 \S HotLaneMode. The reducer is itself an FHE circuit; it
+runs on the same GPU backend but is single-threaded for the contended
+slot.
+\end{itemize}
+
+The lane assignment is decided up front by the planner, not by the
+GPU at execution time. This keeps GPU dispatch deterministic --- a
+property the dual-runtime equivalence theorem
+(\S\,\ref{sec:cross-runtime-katology}, Theorem~\ref{thm:fhe-dual-runtime-equivalence})
+relies on.
+
+\subsection{F-Chain co-residency}
+
+Inside an F-Chain wave tick, Nebula-FHE jobs run as the
+\texttt{drain\_fhe} service alongside \texttt{drain\_exec} (plaintext
+EVM), \texttt{drain\_validate} (Block-STM), \texttt{drain\_commit}
+(root chain), and \texttt{drain\_cert\_lane} (BLS / Ringtail / ML-DSA
+/ FChainTFHE). LP-013 \S Wave-tick co-residency specifies the layout
+in detail. The same \texttt{MvccSlot} table backs both encrypted and
+plaintext SLOAD; Block-STM sees ciphertext as opaque bytes.
+
+\subsection{Outside F-Chain}
+
+For non-F-Chain deployments (e.g. an external encrypted-coprocessor
+service consumed by a confidential-ERC-20 dApp on a non-F-Chain L1),
+Nebula-FHE exposes the same job model through
+\texttt{github.com/luxfi/fhe-coprocessor}. The coprocessor publishes
+$\mathsf{FheReceipt}$ commitments via Warp 2.0 envelopes (LP-021v2,
+\texttt{WarpEnvelopeV2}); the destination chain verifies the Pulse
+over the receipt root and accepts the encrypted result without
+trusting the coprocessor unilaterally. \emph{Status: planned for the
+v0.1.0-rc2-coproc milestone.}

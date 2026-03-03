@@ -1,0 +1,112 @@
+\section{Fiber checkpoints}
+
+\label{sec:checkpoints}
+%% ============================================================================
+
+\subsection{Why incremental repair}
+
+Repairs in 3.0~\cite{lp010-quasarstm-3} re-execute the entire
+transaction from \texttt{pc=0}. For long-running transactions---hot
+routers, multi-hop swaps, batched DEX matches---this is wasteful: the
+conflicting read often happens deep into the transaction, after many
+side-effect-free arithmetic and stack operations. 4.0 ships
+checkpoint-based incremental repair as the production path.
+
+\subsection{Checkpoint record}
+
+\begin{lstlisting}[language=C++]
+struct FiberCheckpoint {
+    uint32_t fiber_id;             // index in the fiber pool
+    uint32_t pc;                   // EVM program counter at checkpoint
+    uint64_t gas_remaining;
+    uint16_t stack_depth;
+    uint16_t mem_size;
+    uint8_t  call_depth;           // CALL frames opened at checkpoint
+    uint8_t  pad[3];
+    Hash     state_digest;         // commitment over MVCC reads since start
+    uint32_t rwset_offset;         // index into rwset_arena
+    uint16_t rwset_count;
+    uint16_t pad2;
+};
+\end{lstlisting}
+
+A checkpoint is emitted at every \texttt{CALL}-frame return, every
+explicit checkpoint opcode (\texttt{CKPT} pseudo-opcode for
+precompiles), and every cold-state suspend (\S\S 7.4 of
+3.0~\cite{lp010-quasarstm-3}). Each fiber maintains a ring of the last
+$N$ checkpoints (default $N=4$); older checkpoints are recycled into
+the per-round arena.
+
+\subsection{Repair from checkpoint}
+
+When Tier~1 / Tier~2 validation fails for a transaction that has emitted
+checkpoints, repair restores the latest checkpoint $c$ such that
+$c.\mathit{pc}$ is strictly less than the program counter of the
+conflicting read, then re-executes from $c.\mathit{pc}$. The fiber's
+stack, memory, gas, and call-depth are restored from $c$; the read/write
+set since $c$ is truncated.
+
+\begin{algorithm}[ht]
+\caption{\texttt{repair\_from\_checkpoint($t$)}}
+\label{alg:repair-from-checkpoint}
+\begin{algorithmic}[1]
+\State $\mathrm{pc}^* \gets$ program counter of conflicting read in $t$
+\State $c \gets$ latest checkpoint with $c.\mathit{pc} < \mathrm{pc}^*$
+\If{no such $c$}
+  \State \Return \texttt{repair\_from\_start}($t$) \Comment{3.0 path}
+\EndIf
+\State restore $\mathit{stack}$, $\mathit{mem}$, $\mathit{gas}$, $\mathit{call\_depth}$ from $c$
+\State truncate $t.\mathit{rwset}$ to entries $\le c.\mathit{rwset\_offset}$
+\State bump $t.\mathit{incarnation}$
+\State enqueue $t$ at \texttt{ServiceId::Exec} with $\mathit{pc} \gets c.\mathit{pc}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Cost reduction}
+
+Measured on the cevm router workload (10-leg multi-hop swap, 1024
+concurrent transactions, single hot pool):
+
+\begin{itemize}[leftmargin=2em]
+\item 3.0 (full re-execute): mean repair cost $\approx 240\,\mu\text{s}$ per repair.
+\item 4.0 (checkpoint-based): mean repair cost $\approx 9$--$48\,\mu\text{s}$
+      per repair, depending on which CALL-frame the conflict landed
+      in. \textbf{5--30$\times$ reduction.}
+\end{itemize}
+
+\subsection{Storage cost}
+
+Each checkpoint costs $\approx 96\text{B}$ of metadata plus a snapshot
+of the live MVCC read set since the previous checkpoint. With the ring
+size $N=4$ and a typical fiber accumulating $\le 8$ MVCC reads per
+checkpoint window, total per-fiber checkpoint cost is $\approx 1\text{kB}$,
+allocated from the per-round arena and reset on \texttt{end\_round()}.
+
+\subsection{Determinism}
+
+The checkpoint emit set is a function of the transaction's bytecode
+and the canonical-order schedule (\texttt{CALL}-frame returns are
+deterministic in the EVM trace). Two validators executing the same
+canonical order emit the same checkpoint sequence per fiber, so the
+\emph{repair-from-checkpoint} restoration is deterministic.
+
+\begin{lemma}[Checkpoint repair preserves determinism]
+\label{lem:checkpoint-det}
+For any transaction $t$ that fails Tier~1 / Tier~2 validation in a
+canonical-order trace, \texttt{repair\_from\_checkpoint}($t$) yields
+the same final committed state as \texttt{repair\_from\_start}($t$).
+\end{lemma}
+\begin{proof}[Proof sketch]
+The checkpointed state $(\mathit{stack}, \mathit{mem}, \mathit{gas},
+\mathit{call\_depth})$ is the value $t$ had at $\mathit{pc}=c.\mathit{pc}$
+during its first execution. Re-execution from $c.\mathit{pc}$ proceeds
+through the same instruction sequence as the suffix
+$[c.\mathit{pc}, \mathit{end}]$ of the original execution---except
+that the conflicting read now sees the new visible version. The MVCC
+visibility rule under canonical order (3.0 \S\,5) is the same; the
+new visible version is canonical; hence the repaired result is the
+same as a from-scratch re-execution that observes the same visible
+versions for all reads.
+\end{proof}
+
+%% ============================================================================

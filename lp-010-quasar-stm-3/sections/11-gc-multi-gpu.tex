@@ -1,0 +1,135 @@
+\section{Garbage Collection and Multi-GPU Sharding}
+
+\label{sec:gc}
+%% ============================================================================
+
+QuasarSTM allocates speculative versions in a per-round arena. If
+versions are not aggressively reclaimed the arena saturates within a
+few rounds. Multi-GPU operation imposes the additional constraint
+that lane state must shard cleanly across devices without cross-GPU
+hot keys.
+
+\subsection{Epoch / Horizon GC}
+
+\begin{definition}[Safe GC point]
+\label{def:safe-gc}
+The safe GC point of a round is
+\begin{align*}
+\mathit{safe\_gc\_point} = \min\bigl(\,
+& \mathit{lowest\_active\_tx\_index},\\
+& \mathit{lowest\_repair\_dependency},\\
+& \mathit{current\_commit\_horizon},\\
+& \mathit{lowest\_live\_checkpoint\_reference}\,\bigr).
+\end{align*}
+\end{definition}
+
+\begin{definition}[GC reclamation]
+\label{def:gc-reclaim}
+The GC service reclaims, for any record $r$ with canonical position
+$p_r$:
+\begin{itemize}[leftmargin=2em,nosep]
+\item invalid incarnations of $r$ where $p_r < \mathit{safe\_gc\_point}$;
+\item superseded speculative versions whose canonical successor
+      has committed;
+\item checkpoint memory not referenced by any active repair;
+\item read records for committed transactions.
+\end{itemize}
+\end{definition}
+
+A dedicated workgroup
+($\mathtt{ServiceId::StmGC} = \mathtt{0x0451}$) runs the reclaimer
+concurrently with execution. The arena is multi-producer / single-
+consumer; GC never blocks the round path.
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Counter} & \textbf{Definition} \\
+\midrule
+\texttt{versions\_allocated}    & total speculative versions allocated this round \\
+\texttt{versions\_reclaimed}    & versions reclaimed by GC \\
+\texttt{checkpoint\_bytes\_live}& checkpoint memory currently pinned \\
+\texttt{mvcc\_arena\_pressure}  & arena occupancy ratio \\
+\bottomrule
+\end{tabular}
+\caption{GC telemetry fields exported in
+\texttt{QuasarStmTelemetry}.}
+\label{tab:gc-telemetry}
+\end{table}
+
+\subsection{Lane-Keyed Multi-GPU Sharding}
+
+\begin{definition}[Lane sharding function]
+\label{def:lane-shard}
+For a deployment with $G$ GPUs, the lane sharding function is
+\[
+\mathit{gpu\_id}(L) = H(\mathit{lane\_id}_L) \bmod G.
+\]
+The map is fixed for the duration of the round.
+\end{definition}
+
+\begin{definition}[Local vs distributed transaction]
+\label{def:local-distributed}
+A transaction $T$ is \emph{local} iff
+$\{\mathit{gpu\_id}(L) : L \in \mathit{LH}(T)\}$ is a singleton.
+Otherwise $T$ is \emph{distributed}.
+\end{definition}
+
+\subsection{Distributed Transaction Protocol}
+
+\begin{algorithm}[H]
+\caption{Distributed transaction $T$ touching GPUs $G_1,\ldots,G_k$}
+\label{alg:distributed-tx}
+\begin{algorithmic}[1]
+\State Each $G_i$ executes the local fragment of $T$ on its lanes,
+       producing a per-GPU fragment root $\rho_i$.
+\State Each $G_i$ validates the local lane clocks
+       ($\mathit{LaneClock}[L].\mathit{version}$) against $T$'s
+       snapshot.
+\State Fragment validation results are aggregated under a
+       deterministic reduction (e.g., AND of per-GPU validity bits)
+       at the round leader.
+\State \textbf{if} all fragments valid \textbf{then} commit; else
+       enter coordinated repair (each $G_i$ rolls back its fragment
+       to the latest local checkpoint).
+\end{algorithmic}
+\end{algorithm}
+
+\begin{lemma}[Distributed atomicity]
+\label{lem:distributed-atomic}
+For any distributed transaction $T$, $T$ commits on all involved
+GPUs or on none.
+\end{lemma}
+
+\begin{proof}[Sketch]
+The aggregator publishes a single commit decision derived from the
+deterministic reduction of per-GPU validity. Each GPU acts on the
+aggregated decision; per-GPU local commits are gated on the
+aggregated bit. There is no path to partial commit.
+\end{proof}
+
+\subsection{Cross-GPU Invariants}
+
+\begin{invariant}[Cross-GPU lane consistency]
+\label{inv:cross-gpu-lane}
+For any lane $L$ and any GPU $G_i$ with $\mathit{gpu\_id}(L) = i$:
+the canonical writer of $L$ at any point is recorded in $G_i$'s
+lane-clock arena and nowhere else.
+\end{invariant}
+
+\begin{invariant}[Cross-backend equivalence]
+\label{inv:cross-backend}
+For any deterministic round and any pair of backends in
+$\{\mathrm{Metal},\, \mathrm{CUDA},\, \mathrm{CPU\,reference}\}$, the
+produced \texttt{state\_root}, \texttt{receipts\_root},
+\texttt{execution\_root}, and \texttt{mode\_root} are
+bit-identical.
+\end{invariant}
+
+The CPU reference (\texttt{evmgpu} Go) is the differential-fuzzing
+oracle for Metal and CUDA; structural divergence is a build
+breaker.
+
+
+%% ============================================================================

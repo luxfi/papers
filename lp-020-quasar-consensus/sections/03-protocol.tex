@@ -1,0 +1,150 @@
+\section{Protocol}
+
+\label{sec:protocol}
+%% ============================================================================
+
+Quasar 3.0 inherits the Quasar consensus family of staged probabilistic-DAG
+protocols. Two engine variants share the family:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Nova} (linear chain): Photon $\to$ Wave $\to$ Focus $\to$ Ray.
+\item \textbf{Nebula} (DAG): Flare $\to$ Horizon $\to$ Field, with the
+      same QuasarCert at the finalization step.
+\end{itemize}
+
+Both variants finalize a block by producing the same QuasarCert
+artifact (Section~\ref{sec:quasarcert}). What differs is the upstream
+voting structure---linear in Nova, DAG in Nebula. We describe Nova here
+and reference~\cite{lux-nova,lux-nebula} for the DAG case.
+
+\subsection{Phase 1: Photon (Proposal Emission)}
+
+The leader for height $h$ (round-robin over the validator set, rotated
+each epoch) constructs a block $B_h$ containing:
+\begin{itemize}[leftmargin=2em,nosep]
+\item The parent block hash $h_{\text{parent}} = H(B_{h-1})$.
+\item A batch of transactions from the mempool.
+\item The leader's BLS signature over $B_h$.
+\item A timestamp $\tau_h$ and the seven chain roots $\boldsymbol{\rho}$
+      (Definition~\ref{def:roots}) observed at $\tau_h$.
+\end{itemize}
+The leader broadcasts $\langle \textsc{Propose}, B_h, \boldsymbol{\rho}
+\rangle$ to all validators. Photon emission is fire-and-forget: the leader
+does not wait for acknowledgments.
+
+\subsection{Phase 2: Wave (Fast Probabilistic Consensus)}
+
+Upon receiving a valid proposal, each validator $v_i$ enters the Wave
+phase. Wave implements Fast Probabilistic Consensus (FPC) with
+phase-dependent thresholds.
+
+\begin{definition}[FPC Threshold Selection]
+\label{def:fpc}
+For round $r$ with sample size $k$, the threshold $\alpha_r$ is:
+\[
+\alpha_r = \left\lceil \theta_r \cdot k \right\rceil, \qquad
+\theta_r = \theta_{\min} + (\theta_{\max} - \theta_{\min}) \cdot
+\frac{\mathrm{SHA256}(\mathit{seed} \,\|\, r) \bmod 2^{16}}{2^{16}}.
+\]
+Default: $\theta_{\min} = 0.5$, $\theta_{\max} = 0.8$.
+\end{definition}
+
+\begin{algorithm}
+\caption{Wave: FPC voting round}
+\label{alg:wave}
+\begin{algorithmic}[1]
+\Require Validator $v_i$, block $B_h$, round $r$, sample size $k$
+\State $S \gets \text{SamplePeers}(k)$
+\State $\alpha_r \gets \lceil \text{FPCThreshold}(r, k) \rceil$
+\State $\mathit{votes} \gets 0$
+\For{$v_j \in S$}
+    \State $\mathit{votes} \gets \mathit{votes} +
+      \text{QueryPreference}(v_j, B_h)$
+\EndFor
+\If{$\mathit{votes} \geq \alpha_r$}
+    \State $\mathit{pref}_i \gets \textsc{Accept}$
+\Else
+    \State $\mathit{pref}_i \gets \textsc{Reject}$
+\EndIf
+\If{$\mathit{pref}_i = \mathit{prevPref}_i$}
+    \State $\mathit{confidence}_i \gets \mathit{confidence}_i + 1$
+\Else
+    \State $\mathit{confidence}_i \gets 0$
+\EndIf
+\If{$\mathit{confidence}_i \geq \beta$}
+    \State \textbf{enter} Focus with $\mathit{pref}_i$
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Phase 3: Focus (Certificate Subject Lock)}
+
+Once $\mathit{pref}_i = \textsc{Accept}$ has stabilized for $\beta$
+consecutive rounds, $v_i$ enters Focus and computes the certificate
+subject of Definition~\ref{def:subject}, binding the seven chain roots
+$\boldsymbol{\rho}$, mode $\mu$, parent block hash, parent state root,
+parent execution root, gas limit, and base fee. Focus is the boundary
+between probabilistic vote propagation (Wave) and cryptographic
+finalization (Ray). At this point all three signing lanes share a single
+32-byte digest.
+
+\subsection{Phase 4: Ray (Three-Lane Signing)}
+
+In Ray, $v_i$ produces three signatures over the same
+$\mathsf{cert\_subject}$ in parallel:
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{BLS}: $\sigma_i^{\mathrm{BLS}} = \mathit{sk}_i^{\mathrm{BLS}}
+      \cdot H_{\mathbb{G}_1}(\mathsf{cert\_subject})$.
+      96-byte (uncompressed) or 48-byte (compressed) $\mathbb{G}_1$
+      signature.
+\item \textbf{Ringtail}: contribute share $\sigma_i^{\mathrm{RT}}$ to
+      Q-Chain's two-round threshold protocol on
+      $\mathsf{cert\_subject}$ using $\mathit{sk}_i^{\mathrm{RT}}$. The
+      Q-Chain combiner produces $\sigma^{\mathrm{RT}}$.
+\item \textbf{ML-DSA-65}: $\sigma_i^{\mathrm{ML}} =
+      \mathsf{MLDSA.Sign}(\mathit{sk}_i^{\mathrm{ML}},
+      \mathsf{cert\_subject})$. 3{,}309-byte signature, transmitted only
+      to Z-Chain (not gossiped network-wide).
+\end{enumerate}
+
+The validator broadcasts $\langle \textsc{QuasarVote}, i,
+\sigma_i^{\mathrm{BLS}}, \sigma_i^{\mathrm{RT}} \rangle$ on the consensus
+plane and submits $\sigma_i^{\mathrm{ML}}$ to Z-Chain. Z-Chain proves the
+batch (Section~\ref{sec:lane3}) and emits the Groth16 artifact
+$(\pi_{\mathrm{ZK}}, h_x)$ where $\pi_{\mathrm{ZK}}$ is the 192-byte
+SNARK and $h_x$ is the 32-byte public-inputs hash.
+
+\subsection{Finalization}
+
+A block proposer that observes (a) an aggregate
+$\sigma^{\mathrm{BLS}}_{\mathrm{agg}}$ over $\geq 2f+1$ BLS shares,
+(b) a valid Ringtail $\sigma^{\mathrm{RT}}$ from Q-Chain, and (c) a valid
+$(\pi_{\mathrm{ZK}}, h_x)$ from Z-Chain, constructs the QuasarCert
+$\mathcal{C}_h = (\sigma^{\mathrm{BLS}}_{\mathrm{agg}},
+\sigma^{\mathrm{RT}}, \pi_{\mathrm{ZK}}, h_x)$ and broadcasts
+$\langle \textsc{Finalize}, B_h, \mathcal{C}_h \rangle$. Any validator
+verifies $\mathcal{C}_h$ by checking the three lanes against
+$\mathsf{cert\_subject}$ as in Definition~\ref{def:verify-qcert}.
+
+\subsection{Epoch Rotation}
+
+Quasar 3.0 groups blocks into epochs of fixed length $E$. At epoch
+boundaries:
+\begin{itemize}[leftmargin=2em,nosep]
+\item Validator sets may change (additions, removals, stake changes);
+      $P_\text{val}$ updates.
+\item Q-Chain runs a new Ringtail DKG; $Q_\text{cer}$ updates and
+      the previous threshold key is retired.
+\item Z-Chain may rotate the verifying key (for example, when adding
+      validators changes the circuit's public-input arity);
+      $Z_\text{vk}$ updates.
+\item Epoch certificates summarize the finalized chain state.
+\item Epochs older than 6 are pruned from active memory; only epoch
+      certificates are retained.
+\end{itemize}
+The 6-epoch retention window bounds active memory to $O(6 \cdot E \cdot
+n)$ regardless of total chain length.
+
+
+%% ============================================================================
