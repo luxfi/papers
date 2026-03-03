@@ -1,0 +1,101 @@
+\section{Lane-clock Tier 1 (production)}
+
+\label{sec:tier1}
+%% ============================================================================
+
+\subsection{Predicate}
+
+QuasarSTM~3.0 sketched a lane clock per
+lane~\cite{lp010-quasarstm-3}. 4.0 ships it as the production fast
+validation predicate. A transaction~$t$ with reads
+$R_t \subseteq \mathit{Lanes}$ and writes
+$W_t \subseteq \mathit{Lanes}$ is Tier-1 valid iff every lane it read
+shows the same \emph{lane clock} at validate time as it did at execute
+time, and no canonical-order predecessor that has not yet committed
+has a write to a lane in $R_t$:
+
+\[
+\mathrm{Tier1}(t) \;\Longleftrightarrow\;
+\bigwedge_{l \in R_t} \mathit{lc}^{\mathrm{val}}(l) = \mathit{lc}^{\mathrm{exec}}_t(l)
+\;\;\wedge\;\;
+\nexists\, t' \prec_{\mathrm{can}} t : t' \in W^{-1}(R_t) \wedge \neg \mathrm{committed}(t')
+\]
+
+The implementation is an O$(|R_t|)$ table lookup against a per-round
+shared-memory \texttt{LaneClockEntry} table:
+
+\begin{lstlisting}[language=C++]
+struct LaneClockEntry {
+    Hash     lane_id;
+    uint64_t clock;
+    uint32_t last_writer_tx;       // canonical-order index
+    uint8_t  versioning_mode;      // see VersioningMode
+    uint8_t  lane_class;           // see LaneClass
+    uint16_t pad;
+};
+\end{lstlisting}
+
+When Tier~1 passes, $t$ commits without consulting the per-key version
+chain. Tier~2 (key-MVCC) and Tier~3 (semantic reducers) only fire when
+Tier~1 disagrees, which the production telemetry shows happens in
+under 5\% of transactions on the regulated-DEX workload mix.
+
+\subsection{Why the substrate (3.0) deferred this}
+
+Tier~1 in 3.0 was a sketch because the lane-clock table needed:
+(a)~deterministic insertion order so that the table contents at
+validate time match across backends;
+(b)~atomic clock bump on write commit;
+(c)~per-round arena reset semantics tying the table lifetime to the
+QuasarRoundDescriptor lifetime.
+4.0 ships all three. The deterministic insertion order is fixed by the
+canonical lane $\!ID$ enumeration order:
+
+\[
+\mathit{lane\_id} = H(\mathit{domain}, \mathit{contract},
+\mathit{account}, \mathit{asset}, \mathit{market}, \mathit{nonce\_lane},
+\mathit{storage\_prefix})
+\]
+
+(unchanged from 3.0~\cite{lp010-quasarstm-3}). Lane IDs are sorted at
+round start and indexed; the table is keyed by sorted index, not by
+hash.
+
+\subsection{Atomicity}
+
+Clock bumps use a single atomic fetch-add on the table slot's
+\texttt{clock} field, with the \texttt{last\_writer\_tx} and
+\texttt{versioning\_mode} fields written under the same memory fence.
+This is the only contended atomic on the lane-clock fast path; the rest
+of the validation predicate is read-only.
+
+\begin{lemma}[Tier-1 monotonicity]
+\label{lem:tier1-mono}
+For any lane~$l$ and any pair of executions of the same canonical
+order, the sequence of \texttt{clock} values written to the
+\texttt{LaneClockEntry} for $l$ is identical.
+\end{lemma}
+\begin{proof}[Proof sketch]
+Every clock bump corresponds to a write commit in canonical order. The
+canonical order is fixed by Quasar consensus. Hence the bump sequence
+is fixed. The atomic fetch-add returns the bumped value; the value is
+deterministic in the bump count.
+\end{proof}
+
+Lemma~\ref{lem:tier1-mono} is what makes byte-identical roots possible
+across Metal and CUDA backends (\S\ref{sec:determinism}). The lane
+clock is the most-touched piece of shared metadata in the round; if
+its bumps were nondeterministic, every downstream root would diverge.
+
+\subsection{Hot-lane telemetry}
+
+Per-round, every lane records the count of Tier-1 mismatches
+(\texttt{tier1\_mismatch\_count}). When this exceeds
+\texttt{HOT\_LANE\_CONFLICT\_THRESHOLD} (default 16), the lane is
+promoted to \texttt{HotShared} class for the \emph{next} round
+(\S\ref{sec:laneclass}, \S\ref{sec:multiverse}). In-round mode is
+fixed---4.0 does not allow within-round class changes, because they
+would break determinism with respect to ordering decisions already
+made.
+
+%% ============================================================================

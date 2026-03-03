@@ -1,0 +1,75 @@
+%% ====================================================================
+\section{Cross-Chain Binding}
+\label{sec:cross-chain-binding}
+%% ====================================================================
+
+A Warp 2.0 envelope carries three lineage scalars from the source chain. This section specifies what each one binds and how the destination verifier uses it.
+
+\subsection{The three lineage scalars}
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item $\mathsf{sourceNebulaRoot}$: the source chain's canonical bundle root for the bundle that the Pulse signs. A 32-byte digest binding the source chain's validator-set hash, parent epoch, and bundled vertices (Section~\ref{sec:formal-model} of \cite{luxquasarhorizon}; equivalently \texttt{proofs/definitions/transcript-binding.tex} Definition~\ref{def:horizon-transcript}).
+  \item $\mathsf{sourceKeyEraID}$: the source chain's Pulsar group-key lineage ID at the time of signing. Bumps only at Reanchor. Stable across LSS Reshare / Refresh within the era.
+  \item $\mathsf{sourceGeneration}$: the source chain's LSS resharing generation ID at the time of signing. Bumps every Refresh / Reshare under the same $\mathsf{GroupKey}$.
+\end{itemize}
+
+The destination chain resolves $(\mathsf{sourceChainID}, \mathsf{sourceKeyEraID}, \mathsf{sourceGeneration})$ to the source's $\mathsf{GroupKey}$ + $\mathsf{HashSuiteID}$ via a $\mathsf{GroupKeyResolver}$ (\cite{warpgo} \texttt{warp/pulsar/pulsar.go} L82--97).
+
+\subsection{The GroupKey resolver}
+
+\begin{verbatim}
+type GroupKeyResolver interface {
+    ResolveGroupKey(
+        sourceChainID [32]byte,
+        keyEraID uint64,
+        generation uint64,
+    ) (gk *pulsarKernel.GroupKey, suiteID string, err error)
+}
+\end{verbatim}
+
+The resolver is implemented by the destination chain against its source-chain key registry --- a contract that records the source's GroupKey lineage as it evolves through Bootstrap, Reshare, and Reanchor events. Returning a zero-pointer GroupKey or empty suiteID is treated as $\mathsf{ErrGroupKeyResolverFailed}$.
+
+\paragraph{Within an era.} For every $g$ within the same $\eta$, the GroupKey is byte-identical (Lemma~\ref{lem:gk-byte-identical} of \texttt{proofs/lss/lifecycle-safety.tex}). Therefore the resolver only needs to learn the source's $\eta$ on Reanchor; intermediate Refresh / Reshare events do not require new resolver state.
+
+\paragraph{Across eras.} A Reanchor event on the source chain produces a new $\eta$ and a new $\mathsf{GroupKey}$. The destination's resolver must observe the Reanchor (typically by validating a destination-side update transaction that carries the Reanchor's activation cert) before it can verify v2 envelopes signed under the new $\eta$.
+
+\paragraph{Why this is not a centralized bridge oracle.} The resolver does not introduce trust beyond the destination chain itself: the resolver's state is on-chain on the destination, updated via destination-side transactions whose finality is itself Horizon-final on the destination. The trust model is destination Horizon $+$ source Horizon (the two compose); there is no third-party oracle.
+
+\subsection{Transitive L1 / L2 / L3 inheritance}
+
+The L1 / L2 / L3 tier model (Section~\ref{sec:tier-model} of \cite{luxquasarhorizon}, Definition~\ref{def:network-tiers-horizon}) extends to Warp 2.0 cross-chain envelopes through transcript binding:
+
+\paragraph{Source = L1 (sovereign).} The source chain's Horizon-final binds its own validator-set Pulse + ML-DSA. The Warp 2.0 envelope's Pulse inherits from the source's $\mathsf{GroupKey}$ at $(\eta, g)$. The destination's verifier returns Horizon-final acceptance iff Prism accepts.
+
+\paragraph{Source = L2 (co-validating with primary $N_P$).} The source chain's activation transcript binds $\mathsf{primary\_nebula\_root}$ from $N_P$. The Warp 2.0 envelope's Pulse over the source's NebulaRoot transitively inherits from $N_P$'s validator set: a destination receiving an L2 Warp message verifies the L2's Pulse and, transitively, the L2's anchor to its primary network --- without trusting the L2 in isolation. The transitive inheritance is Theorem~\ref{thm:l2-covalidation} of \texttt{proofs/quasar/l1-l2-covalidation.tex}, applied at the cross-chain layer.
+
+\paragraph{Source = L3 (rollup / validity / app-execution).} The source's Horizon-final inherits from the underlying L1/L2's Pulse + ML-DSA via the L3's chosen proof system (Groth16, STARK, FHE circuit). The Warp 2.0 envelope from an L3 carries the L3's Pulse over the L3's bundle root; the destination's resolver maps the L3's $\mathsf{sourceKeyEraID}$ to the underlying L1/L2's GroupKey at the bound moment. The L3's proof system is a compatibility / compression / privacy adapter, not the PQ root of trust (Remark~\ref{rem:groth16-wrapper-warp}, Section~\ref{sec:soundness}).
+
+\subsection{Cross-chain validator-set evolution}
+
+A common operational worry: ``what if the source chain rotates its validator set between the time the Warp envelope is signed and the time it lands on the destination?'' Warp 2.0's answer: bind the $(\eta, g)$ at signing, resolve the GroupKey accordingly. Validator rotation within an era does not change the GroupKey (Lemma~\ref{lem:gk-byte-identical}), so the destination resolver can verify against the stable $\mathsf{GroupKey}_\eta$ without reconciling the precise $g$. Across-era rotation (Reanchor) does change the GroupKey, and the destination's resolver must observe the Reanchor before envelopes signed under the new $\eta$ verify.
+
+The discipline is symmetric: a source-chain Reanchor produces a new $\eta$; envelopes signed under the new $\eta$ are unverifiable on the destination until the destination's resolver state has been updated; updating the resolver state is a destination-side transaction whose own finality is Horizon-final. There is no out-of-band bridge component.
+
+\subsection{Cross-chain Horizon batching}
+
+Multiple source NebulaRoots may be packed into a single Pulse with a Merkle root over the batch. The transcript becomes:
+
+\begin{verbatim}
+WarpEnvelopeV2BatchedTranscript := H_T(
+    "WARP-PULSAR-ENVELOPE-BATCHED-v1",
+    sourceChainID,
+    Merkle(payload_1, payload_2, ..., payload_k),
+    Merkle(sourceNebulaRoot_1, ..., sourceNebulaRoot_k),
+    sourceKeyEraID,
+    sourceGeneration,
+)
+\end{verbatim}
+
+The destination provides Merkle proofs to verify individual payloads against the batched transcript. This is an extension; the Mar-3 freeze ships single-payload v2 envelopes.
+
+\subsection{Replay protection}
+
+A Warp 2.0 envelope is replay-safe across chain boundaries: the $\mathsf{sourceChainID}$ binds the originator, and the destination's chain id is bound via the destination's payload-level conventions (e.g., \texttt{AddressedCall} carries a destination chain id). At the source-finality level, the $\mathsf{sourceNebulaRoot}$ pins the bundle: replaying the same envelope at a later source-bundle would not match the destination's resolver because the resolver verifies the envelope's $(\mathsf{sourceKeyEraID}, \mathsf{sourceGeneration})$ matches what the source had at the bundle.
+
+The PQ lanes are not vulnerable to replay across protocols: the personalization tag \texttt{WARP-PULSAR-ENVELOPE-v1} differs from the consensus-side tag \texttt{QUASAR-PULSAR-BUNDLE-v1}, so a Pulse over a bundle root cannot be lifted into an envelope (Section~\ref{sec:envelope-format}).

@@ -1,0 +1,290 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{../../shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\input{../../shared/lstlang}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  breaklines=true,
+  frame=single,
+  numbers=none,
+  keywordstyle=\color{blue!70!black}\bfseries,
+  commentstyle=\color{green!50!black}\itshape,
+  stringstyle=\color{red!60!black},
+  showstringspaces=false,
+}
+
+\title{Lux MPTC Serialization Specification}
+\author{
+Zach Kelling\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+\date{2026-03-03}
+
+\begin{document}
+
+\luxcoverpage
+
+\section*{Abstract}
+
+\noindent We present Lux, a hybrid post-quantum consensus architecture for DAG-native chains. Lux separates fast operational finality from durable post-quantum finality. Validators emit Photons over a Nebula DAG substrate; classical BLS aggregates form Beams for low-latency confirmation, while ML-DSA attestations and Pulsar lattice-threshold Pulses provide post-quantum finality over Nebula roots. Prism binds all certificate lanes to the same transcript, and Quasar reaches Horizon finality when the bound lanes verify.
+
+\textbf{This document.} Canonical wire formats for every Lux MPTC artifact: Pulsar shares, Pulsar signatures, Pulsar transcripts, Lens shares, Lens signatures, LSS snapshots, Horizon certificates, and Warp 2.0 envelopes. Where the wire format depends on length-prefix discipline, the discipline is normative and specified at byte resolution. The single source of truth is the canonical Go (\texttt{github.com/luxfi/pulsar}, etc.); this document specifies the format such that a C++ / WGSL / CUDA implementer can produce byte-equal output without reading the Go.
+
+\section{Encoding primitives}
+
+\subsection{Length-prefixed bytes}
+
+A length-prefixed byte slice is encoded as:
+
+\begin{lstlisting}
+[uint64 LE length] [length × byte payload]
+\end{lstlisting}
+
+Lengths are 8-byte little-endian unsigned integers. The Pulsar wire format uses this primitive throughout; \texttt{appendLenPrefixed} in \texttt{warp/pulsar/pulsar.go} is the canonical encoder.
+
+\subsection{TupleHash256 framing}
+
+TupleHash256 (NIST SP 800-185 \cite{nistsp800185}) takes a tuple of byte strings $(\tau_1, \ldots, \tau_k)$ and a personalization string $S$. It produces an unambiguous hash by encoding the lengths and the personalization into the absorption.
+
+The Lux usage:
+
+\begin{lstlisting}
+H_T(S, tau_1, ..., tau_k) := TupleHash256(input=(tau_1, ..., tau_k),
+                                          customization=S,
+                                          output_length=32 bytes)
+\end{lstlisting}
+
+A Pulsar transcript hash uses $S = \text{``PULSAR-TRANSCRIPT-v1''}$ (Section~\ref{sec:pulsar-transcript}); a Quasar transcript uses $S = \text{``QUASAR-TRANSCRIPT-v1''}$; a Warp 2.0 envelope uses $S = \text{``WARP-PULSAR-ENVELOPE-v1''}$.
+
+\section{Pulsar share}
+
+A Pulsar share is one validator's piece of the threshold key. Wire format:
+
+\begin{lstlisting}
+PulsarShare := struct {
+    Index        uint64       // 1-based party index
+    KeyEraID     uint64       // group-key lineage
+    Generation   uint64       // LSS resharing version
+    GroupKeyHash [32]byte     // hash of (A, b_tilde) public key bytes
+    ShareBytes   []byte       // s_i in NTT-Mont form, len-prefixed
+    Seeds        [][]byte     // pairwise PRF seeds, len-prefixed each
+    MACKeys      [][]byte     // pairwise MAC keys, len-prefixed each
+    HashSuiteID  string       // e.g., "Pulsar-SHA3"
+    Lambda       []byte       // Lagrange coefficient for this share, len-prefixed
+}
+\end{lstlisting}
+
+The \texttt{ShareBytes} encoding mirrors Lattigo \texttt{v7}'s \texttt{Vector[Poly].WriteTo}: outer 8-byte vector length, then per-element 8-byte poly-levels-count followed by per-level (8-byte coeff-count + coeff-count $\times$ 8-byte uint64). See Section~\ref{sec:lattigo-vector}.
+
+\section{Pulsar signature}
+
+A Pulsar threshold signature is the output of $\mathsf{Pulsar.Combine}$ on $K$ partial signatures. Wire format:
+
+\begin{lstlisting}
+PulsarSignature := struct {
+    C       Poly      // challenge polynomial, len-prefixed Lattigo Poly
+    Z       Vector    // response vector, len-prefixed Lattigo Vector[Poly]
+    Delta   Vector    // hint correction, len-prefixed Lattigo Vector[Poly]
+}
+\end{lstlisting}
+
+Encoded byte stream:
+
+\begin{lstlisting}
+[len(C bytes)]   [C bytes]
+[len(Z bytes)]   [Z bytes]
+[len(Delta bytes)] [Delta bytes]
+\end{lstlisting}
+
+A signature is $\sim 33$ KB on Pulsar mainnet parameters. \texttt{warp/pulsar/SerializePulse} produces this format; \texttt{warp/pulsar/DeserializePulse} parses it with the four-layer guards (Section~\ref{sec:lattigo-vector}).
+
+\subsection{Lattigo Poly / Vector wire format (normative)}
+\label{sec:lattigo-vector}
+
+A Lattigo \texttt{v7} \texttt{Poly} is encoded as:
+
+\begin{lstlisting}
+Poly := [
+    uint64 LE      levels        // matrix outer length (typically 1 for ring-q)
+    per level:
+        uint64 LE   coeff_count
+        coeff_count × uint64 LE  // the coefficient slice
+]
+\end{lstlisting}
+
+A \texttt{Vector[Poly]} is encoded as:
+
+\begin{lstlisting}
+Vector[Poly] := [
+    uint64 LE      n              // number of polys in the vector
+    n × Poly                       // each poly encoded as above
+]
+\end{lstlisting}
+
+\textbf{Hardening discipline.} Every length-prefix is bounded by $\mathsf{MaxLatticeUintSliceLen} = 4096$. Every nested slice's length is checked against the available bytes \emph{before} lattigo's \texttt{ReadFrom} is invoked. The frame walkers \texttt{validatePolyFrame} and \texttt{validateVectorPolyFrame} (\texttt{warp/pulsar/pulsar.go}) implement this discipline; a malformed input is rejected before lattigo can recurse.
+
+\section{Pulsar transcript inputs}
+\label{sec:pulsar-transcript}
+
+A Pulsar transcript hash is computed over:
+
+\begin{lstlisting}
+TranscriptInputs := struct {
+    ChainID, NetworkID, GroupID                    [32]byte
+    KeyEraID, OldGeneration, NewGeneration         uint64
+    OldEpochID, NewEpochID                         uint64
+    OldSetHash, NewSetHash                         [32]byte
+    ThresholdOld, ThresholdNew                     uint64
+    GroupPublicKeyHash                             [32]byte
+    NebulaRoot                                     [32]byte
+    HashSuiteID                                    string
+    ImplementationVersion                          string
+    Variant                                        string  // "refresh" or "reshare"
+    PrimaryNetworkID                               []byte  // empty for L1; set for L2
+    PrimaryNebulaRoot                              [32]byte // zero for L1; bound for L2
+}
+\end{lstlisting}
+
+Each field is length-prefix-encoded as part of the TupleHash256 input tuple. The order is canonical (per \texttt{pulsar/reshare/transcript.go}); two distinct field tuples yield distinct hashes by collision resistance of TupleHash256 with the \texttt{PULSAR-TRANSCRIPT-v1} personalization.
+
+\section{Pulsar activation message}
+
+\begin{lstlisting}
+ActivationMsg := "QUASAR-PULSAR-ACTIVATE-v1"
+              || TranscriptHash(T)
+              || ReshareTranscript.Hash(R)
+\end{lstlisting}
+
+Where $\mathcal{T}$ is the TranscriptInputs above and $\mathcal{R}$ encodes (commit digests, complaint hashes, disqualified senders, qualified quorum) per \texttt{pulsar/reshare/activation.go}.
+
+\section{Lens share and signature}
+
+Lens uses curve-side serialization:
+
+\begin{lstlisting}
+LensShare := struct {
+    Index        uint64
+    KeyEraID, Generation uint64
+    GroupKeyHash [32]byte
+    ShareScalar  [32]byte    // big-endian scalar for Ed25519 / Ristretto255 / secp256k1
+    HashSuiteID  string
+    Lambda       [32]byte    // Lagrange coefficient
+}
+
+LensSignature := struct {
+    R    [32]byte    // commitment point (compressed)
+    s    [32]byte    // response scalar
+}
+\end{lstlisting}
+
+Signature size is 64 bytes, regardless of group choice (Ed25519, secp256k1, Ristretto255). Curve-specific encoding follows the standard for each group.
+
+\section{LSS snapshot}
+
+\begin{lstlisting}
+LSSSnapshot := struct {
+    Eta              uint64               // KeyEraID
+    Generation       uint64
+    RollbackFrom     uint64
+    ValidatorSet     [][20]byte           // node IDs
+    Threshold        uint64
+    State            []byte               // encrypted share state, len-prefixed
+    Timestamp        int64
+    GroupKeyHash     [32]byte
+    HashSuiteID      string
+}
+\end{lstlisting}
+
+The \texttt{State} field is encrypted under a chain-configured snapshot key (typically a chain-internal KMS reference). Decryption is gated by snapshot-manager authority; the on-disk snapshot does not reveal share material to disk-level adversaries.
+
+\section{Horizon certificate}
+
+\begin{lstlisting}
+HorizonCertificate := struct {
+    Beam        bls.AggregateCertificate    // 96-byte BLS aggregate
+    MLDSA       mldsa.CertificateSet         // signer bitmap + per-validator sigs
+                                             //   (or Z-Chain Groth16 rollup)
+    Pulsar      pulsar.Certificate           // one Pulse, ~33 KB
+    NebulaRoot  [32]byte
+    KeyEraID    uint64
+    GroupID     [32]byte
+    Generation  uint64
+    HashSuiteID string
+    Epoch       uint64
+    Round       uint64
+    ValidatorSetHash [32]byte
+}
+\end{lstlisting}
+
+Each component is length-prefix-encoded. The wire format is the same in the Quasar consensus path and in the Warp 2.0 destination's lift-into-HorizonCertificate path; one canonical shape, two embedding contexts.
+
+\section{Warp 2.0 envelope}
+
+The canonical wire format:
+
+\begin{lstlisting}
+0x02                                          // version byte (1 byte)
+||
+RLP([                                         // RLP-encoded list of 7 fields
+    Message,                                  // v1 Beam (UnsignedMessage + BitSetSignature)
+    SourceNebulaRoot     [32]byte,            // canonical bundle root
+    SourceKeyEraID       uint64,              // Pulsar lineage
+    SourceGeneration     uint64,              // LSS lineage
+    HashSuiteID          string,              // e.g. "Pulsar-SHA3"; "" defaults
+    PulsarPulse          []byte,              // empty if absent
+    MLDSACertSet         []byte               // empty if absent
+])
+\end{lstlisting}
+
+\paragraph{Why RLP and not protobuf.} Warp 1.x already uses RLP (Ethereum recursive length prefix \cite{rlp}) for compatibility with EVM clients. Warp 2.0 maintains the RLP discipline so that v1 receivers see v2 bytes as ``not a valid RLP-list prefix'' and reject. Switching to protobuf or any other encoding would break the forward-only migration discipline.
+
+\paragraph{Wire bounds.} \texttt{MaxEnvelopeV2Size = 4 × MaxMessageSize}, conservatively bounded for the optional Pulse and ML-DSA cert-set bytes.
+
+\section{Cross-implementation byte-equality}
+
+The Go canonical produces byte-equal output across runs for every artifact in this spec. KAT vectors gate every release:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \texttt{pulsar/cmd/ringtail\_oracle\_v2/}: emits 16 KAT entries covering every Pulsar wire object.
+  \item \texttt{pulsar/scripts/regen-kats.sh}: deterministic regeneration; \texttt{--verify} confirms byte-equality.
+  \item \texttt{warp/pulsar/testdata/}: representative Warp 2.0 envelope KAT.
+\end{itemize}
+
+A C++ / WGSL / CUDA implementer SHOULD produce byte-equal output against these KATs. Where this spec and the canonical disagree, the canonical is the tiebreaker; a discrepancy is a spec bug, not an implementation bug.
+
+\section{Endianness, alignment, padding}
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item Endianness: little-endian for all uint64 fields (consistent with Lattigo v7's wire format).
+  \item Alignment: no implicit alignment; lengths and payloads are byte-packed.
+  \item Padding: no padding. A trailing-byte difference between two encodings of the same logical content is a wire-format error.
+\end{itemize}
+
+\section{Versioning}
+
+Every wire format that may evolve carries an explicit version byte or version field:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item Warp envelope: \texttt{0x01} (legacy v1, no version byte) and \texttt{0x02} (v2). No v3 reserved.
+  \item Pulsar transcript: \texttt{ImplementationVersion} string field (e.g., \texttt{"pulsar-v1.0"}).
+  \item Hash suite: \texttt{HashSuiteID} string field (e.g., \texttt{"Pulsar-SHA3"}).
+\end{itemize}
+
+A version mismatch returns an explicit error; there is no negotiation, no fallback, no implicit upgrade.
+
+\bibliographystyle{plain}
+\bibliography{../references}
+
+\end{document}

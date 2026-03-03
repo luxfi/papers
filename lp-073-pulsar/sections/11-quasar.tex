@@ -1,0 +1,170 @@
+%% ====================================================================
+\section{Pulsar in Quasar Horizon}
+\label{sec:quasar}
+%% ====================================================================
+
+Pulsar does not stand alone. It is the post-quantum threshold finality
+lane of \emph{Quasar Horizon}, the Lux consensus stack
+(LP-020 \cite{lp020}). Quasar reaches a finality boundary by composing
+three independent verification lanes plus optional Lens (LP-103
+\cite{lp103}) classical-threshold control-plane certificates.
+
+\subsection{The vocabulary stack}
+
+\begin{tabular}{@{}p{0.16\textwidth}p{0.50\textwidth}p{0.28\textwidth}@{}}
+  \toprule
+  \textbf{Name} & \textbf{Role} & \textbf{Per-validator} \\
+  \midrule
+  Photon  & Individual validator vote / attestation & Own credential \\
+  Lumen   & PQ encrypted+authenticated stream carrying Photons (forthcoming Lumen LP) & Own hybrid-KEM/ML-DSA + OTS \\
+  Beam    & BLS aggregate certificate (LP-075 \cite{lp075}) & Own BLS keypair \\
+  Pulsar  & PQ lattice threshold finality (this paper) & \textbf{Share} of one group key \\
+  Pulse   & One Pulsar threshold certificate over a Nebula root & --- \\
+  ML-DSA  & PQ accountability cert set (LP-070 \cite{lp070}) & Own ML-DSA keypair \\
+  Lens    & Classical curve threshold (LP-103 \cite{lp103}) & \textbf{Share} of one group key \\
+  Prism   & Certificate-composition verifier (LP-105) & --- \\
+  Horizon & Quasar finality boundary; Prism-bound hybrid finality & --- \\
+  Quasar  & Full leaderless consensus protocol (LP-020) & --- \\
+  \bottomrule
+\end{tabular}
+
+The canonical narrative (LP-105 \cite{lp105}): \emph{Nebula provides
+the DAG/GPU-native substrate. Photons are validator signals carried
+through Lumen streams and cohered into Beams. LSS moves threshold
+shares across generations. Lens emits classical threshold certificates;
+Pulsar emits post-quantum Pulses. Prism verifies that every certificate
+lane refracts from the same Nebula transcript. Quasar reaches the
+Horizon when finality is sealed.}
+
+\subsection{Why three lanes (and not one)}
+
+The lanes have different security and operational profiles:
+
+\paragraph{BLS Beam (independent keypairs, classical fast path).}
+$\mathcal{O}(1)$-size aggregate over $N$ validators. Sub-millisecond
+verify. Broken in polynomial time by Shor's algorithm; provides only
+a classical speed-up to a quantum adversary
+\cite{drijvers2019}.\footnote{See LP-021 / pq-finality-no-bls
+\cite{lp020} for the formal argument that BLS contributes no PQ
+security to a multi-lane cert.} Used as the fast classical finality
+layer.
+
+\paragraph{ML-DSA cert set (independent keypairs, PQ accountability).}
+Each validator signs individually with FIPS-204 ML-DSA-65. The per-
+validator signatures may optionally be \emph{compressed} via a Z-Chain
+Groth16 rollup (LP-307 \cite{fips204,lp070}); the per-block cert is then
+a $\sim 192$-byte SNARK plus a public-inputs hash. Provides per-validator
+PQ \emph{accountability} (i.e., who signed what). Cannot be aggregated
+into a single threshold signature without an honest dealer or formal
+threshold-ML-DSA construction; current work in active production-research
+has not standardized.
+
+\paragraph{Important: Groth16 is not post-quantum.} The optional
+Groth16 wrapper around the ML-DSA cert set is a \emph{classical
+succinct proof of post-quantum signature verification}, not a PQ
+proof system. Pairing-based SNARKs rely on elliptic-curve discrete-log
+assumptions and break under Shor's algorithm. Pulsar's PQ finality
+flows from ML-DSA's Module-LWE/Module-SIS reduction and from Pulsar's
+Module-LWE reduction (Theorem \ref{thm:pulsar-suf-cma}); the Groth16
+wrapper is a compatibility / compression / privacy adapter for EVM
+verifiers, not the PQ root of trust. See proof bucket
+\texttt{proofs/quasar/horizon-soundness.tex} Remark
+\ref{rem:groth16-wrapper}.
+
+\paragraph{Pulsar pulse (shared group key, PQ threshold finality).}
+$\mathcal{O}(1)$-size compact PQ threshold certificate per bundle.
+Provides \emph{post-quantum threshold} finality under the active key
+era's group public key. The right shape for asynchronous finality
+checkpoints over already-finalized BLS bundles.
+
+\paragraph{Together.}
+A Quasar Horizon certificate combines BLS Beam (immediate classical
+finality), ML-DSA cert set (per-validator PQ accountability +
+slashing-evidence material), and Pulsar pulse (compact PQ threshold
+finality over the bundle root). No single lane suffices; the
+combination is the contribution.
+
+\subsection{The Horizon certificate shape (Prism-bound)}
+
+\begin{verbatim}
+type HorizonCertificate struct {
+    Beam        bls.AggregateCertificate
+    MLDSA       mldsa.CertificateSet      // signer bitmap + sigs (or
+                                          //   Z-Chain Groth16 rollup)
+    Pulsar      pulsar.Certificate        // the Pulse
+    NebulaRoot  ids.ID                    // bound by all lanes
+    KeyEraID    pulsar.KeyEraID
+    GroupID     pulsar.GroupID            // partitioned-set deployments
+    Generation  uint64
+    HashSuiteID string                    // e.g., "Pulsar-SHA3"
+}
+\end{verbatim}
+
+\textbf{Prism} (LP-105 \cite{lp105}) is the certificate-composition
+verifier. Its acceptance order:
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item Verify domain separation and transcript binding (every lane
+        references the same Nebula root, hash-suite, KeyEraID, and
+        Generation).
+  \item Verify BLS Beam aggregate.
+  \item Verify ML-DSA attestation set against signer bitmap (or
+        Groth16 rollup against public-inputs hash).
+  \item Verify Pulsar Pulse under the active KeyEra/GroupKey.
+  \item Verify signer-set and validator-set hashes match epoch state.
+  \item Verify Nebula root / epoch / round linkage.
+\end{enumerate}
+
+\paragraph{Horizon is not ``BLS OR Pulsar.''} It is Prism-bound hybrid
+finality: every required lane refracts from the same transcript. A
+Beam by itself, or a Pulse by itself, may exist as an intermediate
+confirmation; only Prism's composite acceptance crosses the Horizon.
+
+\subsection{Asynchronous PQ finality}
+
+Pulsar pulses do not need to land in the same round as the BLS Beam.
+Quasar uses BLS for fast finality (sub-second), and Pulsar for
+delayed PQ finality over already-finalized bundles. This avoids
+pushing heavy two-round PQ threshold signing into every hot-path
+vote --- the right design for permissionless deployment, where the
+WAN-distributed validator set cannot guarantee sub-second
+collective lattice signing.
+
+A Quasar bundle aggregates several BLS-finalized blocks (e.g.,
+$\sim 6$ blocks in $\sim 3$ seconds). The bundle root is what the
+Pulsar pulse signs. Even with substantial preprocessing, the online
+phase of the lattice 2-round signing comfortably fits within the
+3-second bundle interval at $K = 21$ active validators per group.
+
+\subsection{Where the systems contribution lives}
+
+The crypto primitives in this paper are well-established:
+\begin{itemize}[leftmargin=2em,nosep]
+  \item Two-round MAC-authenticated lattice threshold signing
+        \cite{ringtail2025,thresholdraccoon,hermine}.
+  \item Proactive secret sharing \cite{hjky97}.
+  \item Secret redistribution to new access structures \cite{desmedtjajodia97}.
+  \item Verifiable redistribution \cite{wongwangwing02}.
+  \item Standardized PQ signature for individual accountability
+        \cite{fips204}.
+  \item BLS aggregate over independent keypairs \cite{bls}.
+\end{itemize}
+
+What is novel in this work is the \emph{composition}: a permissionless-
+consensus deployment architecture that
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item operates the lattice threshold primitive over rotating validator
+        sets without a per-epoch trusted dealer;
+  \item gates each generation transition on an activation certificate
+        verifying under the unchanged group public key;
+  \item recovers from failed activation via a non-punitive rollback
+        ladder that does not require slashing-based attribution;
+  \item scales to large validator sets via grouped Pulsar
+        certificates;
+  \item composes BLS, ML-DSA, and Pulsar into a single Horizon
+        finality artifact with explicit lane-by-lane verification;
+  \item plugs into a universal MPC lifecycle framework (LSS) shared
+        with curve-side schemes (Lens / FROST) and ECDSA (CMP).
+\end{enumerate}
+
+The crypto exists. The systems layer that turns it into permissionless
+PQ-threshold consensus is the contribution.

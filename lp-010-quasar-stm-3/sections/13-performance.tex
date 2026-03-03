@@ -1,0 +1,186 @@
+\section{Performance}
+
+\label{sec:performance}
+%% ============================================================================
+
+All measurements were taken on commodity hardware (Apple M1~Max,
+10~CPU cores, 32~GPU cores, 64\,GB unified memory) under macOS,
+with the Lux \texttt{cevm} substrate at the QuasarSTM~3.0 spec-freeze
+revision (December~15, 2025). The CUDA backend was sanity-checked
+on an NVIDIA H100 (80\,GB) with identical structural parity.
+
+\subsection{End-to-End Stress}
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Bench} & \textbf{Tx count} &
+\textbf{Wave ticks} & \textbf{Wall time} \\
+\midrule
+\texttt{single\_tx\_real\_roots}     & 1     & 1   & ${<}\,2\,\text{ms}$ \\
+\texttt{multi\_tx\_counters}         & 128   & 2   & ${\sim}\,18\,\text{ms}$ \\
+\texttt{bounded\_backpressure}       & 1024  & 32  & ${\sim}\,150\,\text{ms}$ \\
+\texttt{end\_to\_end\_stress}        & 1024  & 8   & ${\sim}\,150\,\text{ms}$ \\
+\bottomrule
+\end{tabular}
+\caption{End-to-end wall time for representative round shapes on
+M1~Max. \texttt{end\_to\_end\_stress} is the canonical 8-tick
+1024-tx benchmark cited in the abstract.}
+\label{tab:end-to-end}
+\end{table}
+
+\subsection{Hot-Key Contention (Textbook Block-STM)}
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Workload} & \textbf{Conflicts} &
+\textbf{Repairs} & \textbf{Commits} \\
+\midrule
+\texttt{block\_stm\_independent\_txs} (64 disjoint keys) & 0   & 0   & 64 \\
+\texttt{block\_stm\_conflict\_repair} (16 same-key)      & 120 & 120 & 16 \\
+\bottomrule
+\end{tabular}
+\caption{Block-STM behaviour under disjoint-key and same-key
+contention. The 16 same-key transactions produce exactly
+$\binom{16}{2} = 120$ pairwise conflicts and $120$ repairs,
+converging to $16$ commits. This matches the Aptos
+\cite{gelashvili2022blockstm} reference behaviour, on GPU.}
+\label{tab:hot-key}
+\end{table}
+
+\begin{remark}[Why the conflict count is exact]
+\label{rem:exact-conflict}
+The pairwise count $120$ is structural: under canonical-index
+ordering, transaction $T_j$ at position $j$ conflicts with each
+of $T_0, \ldots, T_{j-1}$ on the shared key. Summing over $j$ from
+$1$ to $15$ yields $\sum_{j=1}^{15} j = 120$. The value is the
+same on Metal and CUDA and on the CPU reference, by
+Invariant~\ref{inv:cross-backend}.
+\end{remark}
+
+\subsection{Repair Amplification Targets}
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Workload} & \textbf{Target $\mathit{repair\_amplification}$} \\
+\midrule
+disjoint-lane DEX                  & ${<}\,1.01$ \\
+balanced-lane DEX                  & ${<}\,1.05$ \\
+heavy-contention DEX               & ${<}\,2.00$, controlled degradation \\
+adversarial Zipfian                & bounded by $\mathtt{MAX\_TOTAL\_REPAIRS}$ \\
+\bottomrule
+\end{tabular}
+\caption{Production targets for repair amplification
+($\mathit{repair\_amplification} =
+\mathit{repair\_count}/\mathit{committed\_count}$). The headline
+metric exported on every \texttt{QuasarRoundResult}.}
+\label{tab:repair-amp}
+\end{table}
+
+If $\mathit{repair\_amplification} > 1.05$ for sustained periods,
+Prism refraction needs tuning: the workload is producing predictable
+hot lanes that should have been isolated upstream.
+
+\subsection{Conformance Bench Ladder}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}llp{6.6cm}@{}}
+\toprule
+\textbf{Bench} & \textbf{Workload} & \textbf{Target} \\
+\midrule
+A & 1\,M / 10\,M / 100\,M disjoint-lane transfers
+   & lane-fast (Tier-1) hit $> 95\%$ \\
+B & Zipfian key sampling
+   & hot-lane detection + bounded repair amplification \\
+C & AMM hotspot (many swaps, one pool)
+   & generic STM degrades; semantic / precompile path survives \\
+D & Order-book append (many appends, one market)
+   & \textsc{Append} reducer + deterministic batch matching \\
+E & Router (long EVM fibers with late \texttt{SLOAD} conflict)
+   & checkpoint rollback beats full re-exec by $5{-}30\times$ \\
+F & Cold-state suspension (forced page misses)
+   & suspended fibers do not stall the wave scheduler \\
+G & Nebula frontier (DAG antichains of varying conflict density)
+   & Prism refraction reduces \texttt{repair\_count} \\
+\bottomrule
+\end{tabular}
+\caption{LP-010 conformance benchmark ladder. Each row is a
+required test on the round path; failure on any row is a
+specification violation.}
+\label{tab:bench-ladder}
+\end{table}
+
+\subsection{Per-Stage Telemetry on the Stress Round}
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Counter} & \textbf{Value} \\
+\midrule
+\texttt{tx\_count}                       & 1024 \\
+\texttt{committed\_count}                & 1024 \\
+\texttt{conflict\_count}                 & 0 (disjoint workload) \\
+\texttt{repair\_count}                   & 0 \\
+\texttt{lane\_fast\_valid\_count} (Tier-1) & ${>}\,970$ \\
+\texttt{key\_valid\_count} (Tier-2)        & ${<}\,55$ \\
+\texttt{semantic\_valid\_count} (Tier-3)   & 0 \\
+\texttt{commit\_horizon\_count}            & 8--16 \\
+\texttt{mvcc\_versions\_allocated}         & ${\sim}\,3.2{\times}10^3$ \\
+\texttt{mvcc\_versions\_reclaimed}         & ${\sim}\,3.2{\times}10^3$ \\
+\texttt{mvcc\_arena\_pressure}             & ${<}\,0.05$ \\
+\bottomrule
+\end{tabular}
+\caption{Telemetry from the 1024-tx end-to-end stress round.
+Tier-1 absorbs ${>}\,95\%$ of validation; the arena pressure stays
+under 5\% thanks to per-horizon GC.}
+\label{tab:stress-telemetry}
+\end{table}
+
+\subsection{Service-Level Latency}
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Service} (\texttt{ServiceId}) & \textbf{Per-tick budget} \\
+\midrule
+\texttt{StmPredict} (\texttt{0x0410})      & ${\sim}\,1\,\mu\text{s}$ \\
+\texttt{StmRefract} (\texttt{0x0411})      & ${\sim}\,8\,\mu\text{s}$ \\
+\texttt{EvmFiberExec} (\texttt{0x0420})    & wave-tick dominant \\
+\texttt{StmLaneValidate} (\texttt{0x0430}) & ${\sim}\,4\,\mu\text{s}$ per slice \\
+\texttt{StmKeyValidate} (\texttt{0x0431})  & ${\sim}\,15\,\mu\text{s}$ per slice \\
+\texttt{StmSemanticValidate} (\texttt{0x0432}) & per-reducer \\
+\texttt{StmRepairSelect} (\texttt{0x0440}) & ${\sim}\,2\,\mu\text{s}$ \\
+\texttt{StmRepairExec} (\texttt{0x0441})   & per-tx \\
+\texttt{StmCommitHorizon} (\texttt{0x0450})& ${\sim}\,3\,\mu\text{s}$ \\
+\texttt{StmGC} (\texttt{0x0451})           & background \\
+\bottomrule
+\end{tabular}
+\caption{Per-service GPU wave-tick budget on M1~Max. Validation
+splits cleanly across services; the wave-tick scheduler
+\cite{lp132-quasarexec} interleaves them within a single bounded
+kernel re-launch.}
+\label{tab:service-latency}
+\end{table}
+
+\subsection{Cross-Backend Determinism}
+
+The Metal and CUDA backends share the layout types
+(\texttt{quasar\_gpu\_layout.hpp}) byte-for-byte; structural drift is
+caught by \texttt{static\_assert} at compile time. The CPU reference
+(\texttt{evmgpu} Go) is the differential-fuzzing oracle for both GPU
+backends. The 19-binary GPU test surface
+(parity, modes, host-bridge, pipeline, unified, gpu-state, opcodes,
+dispatch, refund, access-list, stack-depth, storage-overflow, $\ldots$)
+passes on M1~Max; CUDA parity on H100 is verified at v0.41.
+
+
+%% ============================================================================

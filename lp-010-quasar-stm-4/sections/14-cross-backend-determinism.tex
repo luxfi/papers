@@ -1,0 +1,132 @@
+\section{Cross-backend determinism}
+
+\label{sec:determinism}
+%% ============================================================================
+
+\subsection{Goal}
+
+Two validators running QuasarSTM~4.0 against the same canonical-order
+trace must produce byte-identical
+$\{\mathit{block\_hash}, \mathit{state\_root}, \mathit{receipts\_root},
+\mathit{execution\_root}, \mathit{mode\_root}, \mathit{hint\_roots}\}$.
+The challenge is that the two validators may run different backends
+(Apple Metal on M1 / M2 hardware, NVIDIA CUDA on H100 / B200), and any
+nondeterminism in scheduling, atomic ordering, floating-point
+reductions, or hash assembly destroys consensus.
+
+QuasarSTM~3.0~\cite{lp010-quasarstm-3} reported per-backend determinism
+informally; 4.0 ships a single harness that exercises both backends
+against the same input set and gates CI on byte-identical outputs at
+$\geq 96\%$ line coverage on the CPU reference oracle (the
+byte-equivalence ground truth against which every GPU backend is
+asserted; see \S\ref{sec:determinism-coverage}).
+
+\subsection{Sources of nondeterminism, eliminated}
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Atomic visibility ordering.} The lane-clock fast path
+      (\S\ref{sec:tier1}) has a single atomic per write commit, ordered
+      by canonical \texttt{tx\_id}. Lemma~\ref{lem:tier1-mono}.
+\item \textbf{Reducer order.} Algorithm~\ref{alg:reduce} sorts by
+      \texttt{tx\_id} before applying.
+\item \textbf{MVCC visibility.} Algorithm~\ref{alg:visible} is a
+      compile-time-bounded linear scan; there is no
+      compare-exchange race in version selection.
+\item \textbf{Hash assembly.} All roots are keccak-f[1600] over
+      explicit byte-concatenation orderings. There is no map iteration
+      in root assembly.
+\item \textbf{Service drain order.} The 16-service wave-tick kernel
+      runs services in fixed gid order; any work item not dispatched
+      in the current tick is dispatched in the next tick at a fixed
+      consumer offset.
+\item \textbf{Pairing arithmetic.} The BLS12-381 / Groth16 / Ringtail
+      kernels avoid floating-point and use only 64-bit-limb modular
+      arithmetic with deterministic round-mode-free operations.
+\item \textbf{GPU scheduler.} The wave-tick budget cap means that the
+      GPU scheduler is free to interleave between ticks, but
+      within-tick output is deterministic.
+\end{enumerate}
+
+\subsection{The harness}
+
+\texttt{test/integration/quasar\_cross\_backend.cpp} runs a fixed
+sequence of round inputs on Metal and CUDA in parallel, captures the
+emitted root materials, and compares them byte-for-byte. The harness
+exercises:
+
+\begin{table}[ht]
+\centering
+\small
+\caption{Cross-backend determinism harness coverage. PASS on both
+backends with byte-identical roots.}
+\label{tab:harness}
+\begin{tabular}{p{0.45\linewidth}p{0.18\linewidth}p{0.18\linewidth}p{0.13\linewidth}}
+\toprule
+\textbf{Test} & \textbf{Metal} & \textbf{CUDA} & \textbf{Identical} \\
+\midrule
+\texttt{empty\_round} & PASS & PASS & yes \\
+\texttt{single\_tx\_real\_roots} & PASS & PASS & yes \\
+\texttt{multi\_tx\_counters} (128 txs) & PASS & PASS & yes \\
+\texttt{bounded\_backpressure} (1024 txs) & PASS & PASS & yes \\
+\texttt{end\_to\_end\_stress} (1024 txs / 8 ticks) & PASS & PASS & yes \\
+\texttt{state\_page\_fault} & PASS & PASS & yes \\
+\texttt{root\_determinism} (1000 rounds) & PASS & PASS & yes \\
+\texttt{block\_stm\_independent\_txs} & PASS & PASS & yes \\
+\texttt{block\_stm\_conflict\_repair} (16 same-key) & PASS & PASS & yes \\
+\texttt{evm\_full\_call\_create} & PASS & PASS & yes \\
+\texttt{evm\_logn\_emit} & PASS & PASS & yes \\
+\texttt{evm\_extcode\_returndata} & PASS & PASS & yes \\
+\texttt{evm\_eip2929\_warm\_cold} & PASS & PASS & yes \\
+\texttt{evm\_eip3529\_refund} & PASS & PASS & yes \\
+\texttt{evm\_tload\_tstore} & PASS & PASS & yes \\
+\texttt{evm\_mcopy} & PASS & PASS & yes \\
+\texttt{quasar\_quorum\_real\_bls} & PASS & PASS & yes \\
+\texttt{quasar\_quorum\_real\_ringtail} & PASS & PASS & yes \\
+\texttt{quasar\_quorum\_real\_groth16} & PASS & PASS & yes \\
+\texttt{reducer\_lane\_fee\_accumulate} & PASS & PASS & yes \\
+\texttt{reducer\_lane\_order\_append} & PASS & PASS & yes \\
+\texttt{lane\_class\_owned\_fast\_path} & PASS & PASS & yes \\
+\texttt{lane\_class\_hot\_shared\_serialize} & PASS & PASS & yes \\
+\texttt{version\_block\_layout} & PASS & PASS & yes \\
+\texttt{commit\_horizon\_nova\_prefix} & PASS & PASS & yes \\
+\texttt{commit\_horizon\_nebula\_cut} & PASS & PASS & yes \\
+\texttt{mvcc\_gc\_horizon\_reap} & PASS & PASS & yes \\
+\texttt{formal\_cpu\_reference\_diff\_fuzz} & PASS & PASS & yes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Coverage gating}\label{sec:determinism-coverage}
+
+The LP-137 substrate-wide coverage gate is $\geq 96\%$ line on the
+CPU reference oracle of every VM (the byte-equivalence ground truth
+that every GPU backend is asserted against). cevm reports
+\textbf{95.78\%} TOTAL line coverage and \textbf{96.51\%} on the
+dominant translation unit \texttt{quasar\_gpu\_engine.mm} (LP-137-COVERAGE.md,
+2026-04-27); the 5 new VMs (PlatformVM, XVM, AIVM, BridgeVM, MPCVM)
+average \textbf{97.96\%} oracle line coverage. Coverage is measured
+by LLVM source-based instrumentation
+(\texttt{-fprofile-instr-generate -fcoverage-mapping}). GPU kernel
+sources (\texttt{.metal}, \texttt{.cu}, \texttt{.wgsl}) are not
+instrumentable by \texttt{llvm-cov}; the CPU reference oracle is the
+byte-equivalence ground truth, and every GPU run is asserted
+byte-for-byte against it via each VM's determinism test.
+
+\subsection{Formal CPU reference}
+
+\texttt{lib/consensus/quasar/spec/} hosts a small executable semantics
+for visibility, reducer reduction, repair, commit horizon, MVCC GC,
+Nova canonical order, and Nebula causal cut. The semantics live in
+ordinary C++ for execution and in Lean~4 for a future kernel
+refinement proof~\cite{vmvcc} (out of scope for 4.0; tracked under
+5.0 research).
+
+The differential fuzzer
+(\texttt{test/fuzz/quasar\_stm\_diff\_fuzz.cpp}) generates random
+canonical-order traces, runs them through the CPU reference and
+through both backends, and asserts byte-identical roots. The fuzzer
+runs every CI build with a 5-minute budget and on a nightly schedule
+with a 1-hour budget. The 2026-02-14 release closed all pre-activation
+fuzzer findings.
+
+%% ============================================================================

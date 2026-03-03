@@ -1,5 +1,9 @@
 # Lux Network Research Papers
 
+> Lux is not merely adding post-quantum signatures to a chain; it defines a hybrid finality architecture for DAG-native consensus, with protocol-agnostic threshold lifecycle, post-quantum threshold sealing, and cross-chain propagation of Horizon finality.
+
+See [LP-105 §Claims and evidence](https://github.com/luxfi/lps/blob/main/LP-105-lux-stack-lexicon.md#claims-and-evidence) for the canonical claims/evidence table and the ten architectural commitments — single source of truth.
+
 Technical and formal papers covering the Lux multi-consensus blockchain: Quasar consensus engine, post-quantum cryptography, cross-chain bridging, DeFi protocols, and EVM infrastructure.
 
 ## Structure

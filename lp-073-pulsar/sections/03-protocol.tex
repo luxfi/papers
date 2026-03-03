@@ -1,0 +1,561 @@
+\section{Protocol}
+\label{sec:protocol}
+
+The protocol is a 2-round distributed signing scheme on top of a
+$(t, n)$ Shamir setup over $R_q$, augmented with the Pulsar lifecycle
+operations (Refresh, Reshare, Activation, Reanchor). We give every
+algorithm in mathematical pseudocode with explicit input / output types
+and explicit $\mathbb{Z}_q$ / $R_q$ operations. Line numbers reference
+the Go canonical at \texttt{github.com/luxfi/pulsar} (Pulsar fork) and
+\texttt{github.com/luxfi/ringtail} (per-signature kernel)
+\cite{ringtailgo,ringtailgo2026}.
+
+\subsection{Notation}
+\label{sec:protocol:notation}
+
+\begin{itemize}[nosep]
+  \item $R = \mathbb{Z}[X] / (X^{\varphi} + 1)$ with $\varphi = 256$;
+        $R_q = R / qR$ with $q$ the 48-bit prime of \S\ref{sec:parameters}.
+  \item $R_\xi = \mathbb{Z}[X] / (X^{\varphi} + 1)$ reduced mod $2^{18}$;
+        $R_\nu$ similarly mod $2^{19}$.
+  \item Polynomial arithmetic in $R_q$ is performed in
+        \emph{NTT-Montgomery} form: every $a(X) \in R_q$ is stored as
+        $\hat a = (a \cdot 2^{64} \bmod q)$ with NTT applied.
+        Multiplication is coefficient-wise $(\hat a \hat b) \bmod q$
+        with Montgomery reduction.
+  \item $\mathbf{A} \in R_q^{m_{\mathrm{pk}} \times n_{\mathrm{vec}}}$,
+        $m_{\mathrm{pk}} = 8$, $n_{\mathrm{vec}} = 7$, $\bar D = 48$.
+  \item $\mathcal{D}(\sigma)$ is the discrete-Gaussian distribution
+        over $R$ with width $\sigma$, sampled per-coefficient via
+        Lattigo Ziggurat.
+  \item $\textsc{NTT}, \textsc{INTT}, \textsc{MForm}, \textsc{IMForm}$
+        denote forward/inverse NTT and Montgomery form / inverse
+        Montgomery form.
+  \item $\textsc{WriteTo}$ is the LP-073 \S\ref{sec:wire-format} wire
+        serialisation.
+  \item $\odot$ is element-wise polynomial multiplication on a vector.
+  \item $\mathbf{1}$ is the constant polynomial $1 \in R_q$ in
+        NTT-Montgomery form (i.e., $\textsc{MForm}(\textsc{NTT}(X^0))$).
+\end{itemize}
+
+\subsection{\textsc{Gen} (key generation, trusted-dealer or DKG)}
+\label{sec:protocol:gen}
+
+\textsc{Gen} (\texttt{sign/sign.go:48}) takes a 32-byte trusted-dealer
+seed $k_{\mathrm{TD}}$ and a list of pre-computed Lagrange coefficients
+$\lambda_i$ for the active set $T = \{0, \ldots, K-1\}$
+(\texttt{primitives/shamir.go:122}).
+
+\paragraph{Inputs:} $k_{\mathrm{TD}} \in \{0,1\}^{256}$,
+$T = \{0, \ldots, K-1\}$, threshold $t \leq K$, Lagrange coefficients
+$\boldsymbol\lambda = (\lambda_0, \ldots, \lambda_{K-1}) \in R_q^K$.
+
+\paragraph{Outputs:} Group key
+$\mathsf{GK} = (\mathbf{A}, \tilde{\mathbf{b}}) \in
+R_q^{m_{\mathrm{pk}} \times n_{\mathrm{vec}}} \times
+R_\xi^{m_{\mathrm{pk}}}$; per-party share $\mathrm{sk}_i \in
+R_q^{n_{\mathrm{vec}}}$; pairwise PRF seeds
+$\mathsf{seeds} \in (\{0,1\}^{256})^{K \times K}$; pairwise MAC keys
+$\mathsf{macKeys} \in (\{0,1\}^{256})^{K \times K}$ symmetric.
+
+\paragraph{Steps:}
+\begin{enumerate}[leftmargin=2em, nosep]
+\item $\mathbf{A} \leftarrow \textsc{UniformPolyMatrix}(R_q,
+      m_{\mathrm{pk}}, n_{\mathrm{vec}})$ in NTT-Montgomery form,
+      sampled coefficient-wise from $\mathbb{Z}_q$ via BLAKE3-XOF over
+      $k_{\mathrm{TD}}$.
+\item Pre-compute deterministic random byte budget by BLAKE3-XOF over
+      $k_{\mathrm{TD}}$ \cite{blake3} (\texttt{utils/utils.go:444}):
+      \[
+        \textsc{precomp}
+        = K^2 \cdot 32 + \varphi \cdot n_{\mathrm{vec}} \cdot (K-1)
+          \cdot \lceil \log_2(q)/8 \rceil + K(K-1)\cdot 32.
+      \]
+\item Seed BLAKE2 keyed PRNG \cite{blake2} from $k_{\mathrm{TD}}$.
+\item $\mathbf{s} \leftarrow \mathcal{D}(\sigma_E)^{n_{\mathrm{vec}}}$
+      sampled per-coefficient in standard form.
+\item Run optimised Shamir secret-sharing (\cite{lp077}; the $t = K$
+      path samples $K - 1$ uniform shares per coefficient and computes
+      the last to satisfy the Lagrange constraint):
+      \[
+        \mathrm{sk}_i \leftarrow \textsc{ShamirSecretSharing}(R_q,
+        \mathbf{s}, K, \boldsymbol\lambda).
+      \]
+      For each coefficient slot $k \in [0, \varphi)$, the share
+      polynomial $f_k(X) \in \mathbb{Z}_q[X]$ has degree $\leq t - 1$
+      with $f_k(0) = s_k$ and $f_k(\alpha_i) = (\mathrm{sk}_i)_k$.
+\item Convert $\mathrm{sk}_i$ and $\mathbf{s}$ to NTT-Montgomery form.
+\item $\mathbf{e} \leftarrow \mathcal{D}(\sigma_E)^{m_{\mathrm{pk}}}$
+      in NTT-Montgomery form.
+\item Compute the LWE relation in $R_q^{m_{\mathrm{pk}}}$:
+      \[
+        \mathbf{b} \;=\; \mathbf{A} \cdot \mathbf{s} + \mathbf{e}
+        \;\bmod\; q,
+      \]
+      output in NTT-Montgomery form.
+\item Convert $\mathbf{b}$ to standard form, then compress to
+      $R_\xi$ by per-coefficient rounding:
+      \[
+        \tilde b_k = \bigl\lfloor (b_k + 2^{\xi - 1}) / 2^{\xi}
+                     \bigr\rfloor
+        \quad \forall k \in [0, \varphi).
+      \]
+      The result $\tilde{\mathbf{b}} \in R_\xi^{m_{\mathrm{pk}}}$ is
+      the rounded public-key vector.
+\item For every ordered pair $(i, j)$, sample
+      $\mathsf{seeds}[i][j] \in \{0,1\}^{256}$ uniformly.
+\item For every unordered pair $\{i, j\}$, sample
+      $\mathsf{macKeys}[i][j] = \mathsf{macKeys}[j][i]$ uniformly.
+\item Erase $\mathbf{e}$ and $\mathbf{s}$ (only shares $\mathrm{sk}_i$
+      survive after dealer state is destroyed).
+\end{enumerate}
+
+\paragraph{Public output:} $\mathsf{GK} = (\mathbf{A},
+\tilde{\mathbf{b}})$. \\
+\paragraph{Per-party output:} $(\mathrm{sk}_i, \mathsf{seeds}[i],
+\mathsf{macKeys}[i], \lambda_i)$ for $i \in T$.
+
+\subsection{\textsc{SignRound1} (offline commitment)}
+\label{sec:protocol:round1}
+
+Each party $i$, on input $(\mathbf{A}, \mathit{sid}, k_{\mathrm{PRF}},
+T)$ (\texttt{sign.go:99}), produces $D_i \in R_q^{m_{\mathrm{pk}}
+\times (\bar D + 1)}$ and $\{\textsc{MAC}_{i \to j}\}_{j \in T \setminus
+\{i\}}$.
+
+\paragraph{Inputs:} $\mathbf{A}$, session id $\mathit{sid} \in
+\mathbb{Z}_{2^{64}}$, PRF key $k_{\mathrm{PRF}} \in \{0,1\}^{256}$,
+active set $T \subseteq \{0, \ldots, n-1\}$ with $|T| = K$.
+
+\paragraph{Outputs:} Commitment matrix $D_i \in R_q^{m_{\mathrm{pk}}
+\times (\bar D + 1)}$ in NTT-Montgomery form; pairwise MAC values
+$\textsc{MAC}_{i \to j} \in \{0,1\}^{256}$ for each $j \in T \setminus
+\{i\}$.
+
+\paragraph{Steps:}
+\begin{enumerate}[leftmargin=2em, nosep]
+\item Derive PRNG key from share:
+      $k_{\mathrm{sk}} \leftarrow \textsc{BLAKE3}(\textsc{WriteTo}(
+      \mathrm{sk}_i))[:32]$.
+\item Seed BLAKE2 keyed PRNG from $k_{\mathrm{sk}}$.
+\item Sample masking nonces (per-party):
+      \begin{align*}
+        r^* \;&\leftarrow\; \mathcal{D}(\sigma_*)^{n_{\mathrm{vec}}}, \\
+        e^* \;&\leftarrow\; \mathcal{D}(\sigma_*)^{m_{\mathrm{pk}}}, \\
+        R_i \;&\leftarrow\; \mathcal{D}(\sigma_E)^{n_{\mathrm{vec}}
+                            \times \bar D}, \\
+        E_i \;&\leftarrow\; \mathcal{D}(\sigma_E)^{m_{\mathrm{pk}}
+                            \times \bar D},
+      \end{align*}
+      all in NTT-Montgomery form. The ``star'' column carries
+      $\eta_\varepsilon \cdot \sigma_*$ slack reservation for the
+      $L_2$ acceptance bound.
+\item Concatenate the star column with $R_i$ to form the augmented
+      mask:
+      \[
+        \hat R_i = [r^* \,|\, R_i] \in R_q^{n_{\mathrm{vec}} \times
+        (\bar D + 1)}, \qquad
+        \hat E_i = [e^* \,|\, E_i] \in R_q^{m_{\mathrm{pk}} \times
+        (\bar D + 1)}.
+      \]
+\item Compute the commitment:
+      \[
+        D_i \;=\; \mathbf{A} \cdot \hat R_i + \hat E_i
+        \;\bmod\; q
+        \quad \in \quad R_q^{m_{\mathrm{pk}} \times (\bar D + 1)},
+      \]
+      in NTT-Montgomery form.
+\item For each $j \in T \setminus \{i\}$:
+      \[
+        \textsc{MAC}_{i \to j}
+        \;=\; \textsc{GenerateMAC}(D_i,\; \mathsf{macKeys}[i][j],\;
+        i,\; \mathit{sid},\; T,\; j,\; \mathit{verify} {=} \bot).
+      \]
+      \textsc{GenerateMAC} (\texttt{primitives/hash.go:34}) emits
+      $\textsc{BLAKE3}$ over the byte stream specified in
+      \S\ref{sec:wire-format} truncated to 256 bits.
+\end{enumerate}
+
+\paragraph{Per-party output broadcast:} $(D_i,
+\{\textsc{MAC}_{i \to j}\}_{j \in T \setminus \{i\}})$.
+
+\subsection{\textsc{SignRound2Preprocess} (MAC verify, full-rank check)}
+\label{sec:protocol:r2pre}
+
+After collecting $\{D_j, \textsc{MAC}_{j \to i}\}_{j \in T}$ from all
+signers, party $i$ runs (\texttt{sign.go:147}):
+
+\paragraph{Inputs:} $\{D_j\}_{j \in T}$, $\{\textsc{MAC}_{j \to i}\}_{j
+\in T \setminus \{i\}}$, $\mathbf{A}$, $\tilde{\mathbf{b}}$,
+$\mathit{sid}$, $T$.
+
+\paragraph{Outputs:} Aggregate commitment $D_\Sigma \in
+R_q^{m_{\mathrm{pk}} \times (\bar D + 1)}$ (with column 0 retained
+for the message-binding step) and transcript hash $h_{\mathrm{tx}} \in
+\{0,1\}^{256}$. Aborts if any check fails.
+
+\paragraph{Steps:}
+\begin{enumerate}[leftmargin=2em, nosep]
+\item Compute the transcript hash:
+      \[
+        h_{\mathrm{tx}}
+        \;=\; \textsc{BLAKE3}\bigl(
+          \textsc{WriteTo}(\mathbf{A}) \,\|\,
+          \textsc{WriteTo}(\tilde{\mathbf{b}}) \,\|\,
+          \mathit{sid}_{\mathrm{BE}} \,\|\,
+          |T|_{\mathrm{BE}} \,\|\,
+          T_{\mathrm{BE}} \,\|\,
+          \textsc{WriteTo}(D_0) \,\|\, \cdots \,\|\,
+          \textsc{WriteTo}(D_{|T|-1})
+        \bigr)[:32].
+      \]
+\item For each $j \neq i$: recompute
+      $\textsc{MAC}^{\mathrm{exp}}_{j \to i}$ with $\mathit{verify} =
+      \top$ and reject the round if it differs from the received MAC.
+      The asymmetric ``identity in slot 0'' (sender on generate,
+      recipient on verify) prevents reflection.
+\item Aggregate: $D_\Sigma = \sum_{j \in T} D_j$ in NTT-Montgomery form.
+\item Drop column 0 of $D_\Sigma$ (the $r^*$ aggregate). For each
+      coefficient slot $k \in [0, \varphi)$, run Gaussian elimination
+      on the resulting $m_{\mathrm{pk}} \times \bar D$ matrix over
+      $\mathbb{F}_q$ (\texttt{sign.go:348}):
+      \[
+        \mathrm{rank}\bigl( D_\Sigma[1:\bar D+1]_k \bigr) = m_{\mathrm{pk}}
+        \quad \forall k \in [0, \varphi).
+      \]
+      If any slot is rank-deficient, abort.
+\end{enumerate}
+
+\subsection{\textsc{SignRound2} (message binding, partial signature)}
+\label{sec:protocol:round2}
+
+Party $i$ now binds the message $\mu \in \{0,1\}^*$ (\texttt{sign.go:173}).
+
+\paragraph{Inputs:} $h_{\mathrm{tx}}$, $\mu$, $D_\Sigma$,
+$\mathrm{sk}_i$, $\mathsf{seeds}[i]$, $k_{\mathrm{PRF}}$, $\lambda_i$,
+$\mathbf{A}$, $\tilde{\mathbf{b}}$.
+
+\paragraph{Outputs:} Partial signature $z_i \in R_q^{n_{\mathrm{vec}}}$
+in NTT-Montgomery form.
+
+\paragraph{Steps:}
+\begin{enumerate}[leftmargin=2em, nosep]
+\item Sample challenge-side $u'$:
+      \[
+        u' \;\leftarrow\; \textsc{GaussianHash}(R_q, h_{\mathrm{tx}},
+        \mu, \sigma_U, B_U, \bar D)
+        \quad \in \quad R_q^{\bar D},
+      \]
+      a length-$\bar D$ Discrete-Gaussian vector seeded from
+      $\textsc{BLAKE3}(h_{\mathrm{tx}} \,\|\, \mu)$.
+\item Prepend the constant $\mathbf{1}$:
+      $u = [\mathbf{1} \,|\, u'] \in R_q^{\bar D + 1}$, NTT-Montgomery.
+\item Compute the raw message-binding hint:
+      \[
+        h_{\mathrm{raw}} \;=\; D_\Sigma \cdot u
+        \quad \in \quad R_q^{m_{\mathrm{pk}}},
+      \]
+      NTT-Montgomery, then $\textsc{INTT} + \textsc{IMForm}$ to
+      standard form.
+\item Compress to $R_\nu$:
+      \[
+        \tilde h_k \;=\; \bigl\lfloor (h_{\mathrm{raw},k} +
+        2^{\nu-1}) / 2^{\nu} \bigr\rfloor
+        \quad \forall k.
+      \]
+\item Derive the low-norm ternary challenge:
+      \[
+        c \;=\; \textsc{LowNormHash}(R_q, \mathbf{A}, \tilde{\mathbf{b}},
+        \tilde{\mathbf{h}}, \mu, \kappa)
+        \quad \in \quad R_q,
+      \]
+      a Hamming-weight-$\kappa$ ternary polynomial in NTT-Montgomery
+      form, seeded from $\textsc{BLAKE3}(\textsc{WriteTo}(\mathbf{A})
+      \,\|\, \textsc{WriteTo}(\tilde{\mathbf{b}}) \,\|\,
+      \textsc{WriteTo}(\tilde{\mathbf{h}}) \,\|\, \mu)$.
+\item Compute the symmetric pairwise mask sums:
+      \begin{align*}
+        \textsc{mask}
+        \;&=\; \sum_{j \in T} \textsc{PRF}(R_q, \mathsf{seeds}[i][j],
+                k_{\mathrm{PRF}}, \mu, h_{\mathrm{tx}},
+                n_{\mathrm{vec}}), \\
+        \textsc{mask}'
+        \;&=\; \sum_{j \in T} \textsc{PRF}(R_q, \mathsf{seeds}[j][i],
+                k_{\mathrm{PRF}}, \mu, h_{\mathrm{tx}},
+                n_{\mathrm{vec}}),
+      \end{align*}
+      both in NTT-Montgomery form.
+\item Compute the partial signature:
+      \[
+        z_i \;=\; \hat R_i \cdot u
+        + \textsc{mask}'
+        + (\mathrm{sk}_i \odot \lambda_i \odot c)
+        - \textsc{mask}
+        \quad \in \quad R_q^{n_{\mathrm{vec}}},
+      \]
+      NTT-Montgomery. ($\odot$ is element-wise polynomial multiplication;
+      the dot product over $\hat R_i \cdot u$ is the standard
+      matrix-vector multiply.)
+\end{enumerate}
+
+\paragraph{Cancellation invariant.} The asymmetric mask term cancels
+across honest parties because the seed $\mathsf{seeds}[i][j] =
+\mathsf{seeds}[j][i]$ is symmetric. Hence
+$\sum_{i \in T} (\textsc{mask}'_i - \textsc{mask}_i) = 0$ over a
+honest aggregate, and only the $\mathrm{sk}_i \odot \lambda_i \odot c$
+contribution survives the sum (Lagrange-recombines to $\mathbf{s}
+\odot c$ at $0$ via the Shamir identity).
+
+\subsection{\textsc{SignFinalize} (combine into a single signature)}
+\label{sec:protocol:finalize}
+
+The designated combiner $\textsc{CombinerID} \in T$ collects
+$\{z_j\}_{j \in T}$ and produces the final signature
+$\sigma = (c, z, \Delta)$ (\texttt{sign.go:234}).
+
+\paragraph{Inputs:} $\{z_j\}_{j \in T}$, $\mathbf{A}$,
+$\tilde{\mathbf{b}}$, $c$, $\tilde{\mathbf{h}}$.
+
+\paragraph{Outputs:} Signature
+$\sigma = (c, z, \Delta) \in R_q \times R_q^{n_{\mathrm{vec}}} \times
+R_\nu^{m_{\mathrm{pk}}}$.
+
+\paragraph{Steps:}
+\begin{enumerate}[leftmargin=2em, nosep]
+\item Aggregate partials: $z = \sum_{j \in T} z_j \in R_q^{n_{\mathrm{vec}}}$,
+      NTT-Montgomery.
+\item Decompress public key:
+      $\mathbf{b} \leftarrow \textsc{RestoreVector}(R_q, R_\xi,
+      \tilde{\mathbf{b}}, \xi)$ via per-coefficient $b_k = \tilde b_k
+      \cdot 2^\xi$. Convert to NTT-Montgomery form.
+\item Compute the verifier reconstruction:
+      \[
+        Az \;=\; \mathbf{A} \cdot z, \qquad
+        Az\_bc \;=\; Az - \mathbf{b} \cdot c
+        \quad \in \quad R_q^{m_{\mathrm{pk}}},
+      \]
+      NTT-Montgomery, then $\textsc{INTT} + \textsc{IMForm}$ to
+      standard form.
+\item Compress to $R_\nu$:
+      $\widetilde{Az\_bc} \leftarrow \textsc{RoundVector}(R_q, R_\nu,
+      Az\_bc, \nu)$.
+\item Compute the per-coefficient correction $\Delta \in
+      R_\nu^{m_{\mathrm{pk}}}$:
+      \[
+        \Delta_k \;=\; \tilde h_k - \widetilde{Az\_bc}_k
+        \quad \in \quad R_\nu \text{ (raw coefficients, no NTT).}
+      \]
+\end{enumerate}
+
+\paragraph{Output:} $\sigma = (c, z, \Delta)$ where $c \in R_q$
+(NTT-Montgomery), $z \in R_q^{n_{\mathrm{vec}}}$ (NTT-Montgomery), and
+$\Delta \in R_\nu^{m_{\mathrm{pk}}}$ (raw coefficients).
+
+\subsection{\textsc{Verify}}
+\label{sec:protocol:verify}
+
+A standalone verifier with $(\mathbf{A}, \tilde{\mathbf{b}})$ accepts
+$\sigma = (c, z, \Delta)$ for $\mu$ iff (\texttt{sign.go:268}):
+
+\begin{enumerate}[leftmargin=2em, nosep]
+\item Recompute $\mathbf{b} \leftarrow \textsc{RestoreVector}(R_q,
+      R_\xi, \tilde{\mathbf{b}}, \xi)$, NTT-Montgomery.
+\item $Az \leftarrow \mathbf{A} \cdot z$ on a copy of $z$.
+\item $Az\_bc \leftarrow Az - \mathbf{b} \cdot c$, NTT-Montgomery,
+      then $\textsc{INTT} + \textsc{IMForm}$.
+\item $\widetilde{Az\_bc} \leftarrow \textsc{RoundVector}(R_q, R_\nu,
+      Az\_bc, \nu)$.
+\item $h_{\mathrm{rec}} \leftarrow \widetilde{Az\_bc} + \Delta$ in
+      $R_\nu$.
+\item $c' \leftarrow \textsc{LowNormHash}(R_q, \mathbf{A},
+      \tilde{\mathbf{b}}, h_{\mathrm{rec}}, \mu, \kappa)$. If
+      $c' \neq c$ in NTT-Montgomery representation, reject.
+\item $\Delta_{\mathrm{full}} \leftarrow \textsc{RestoreVector}(R_q,
+      R_\nu, \Delta, \nu)$ in $R$ via $\nu$-bit shift.
+\item Convert $z$ to standard form and compute the squared $L_2$ norm
+      over signed coefficients in $(-q/2, q/2]$:
+      \[
+        \sum_k (\Delta_k^{\mathrm{signed}})^2
+        + \sum_k (z_k^{\mathrm{signed}})^2 \;\leq\; B^2,
+      \]
+      $B^2 = 184\,960\,669\,042\,442\,604\,975\,662\,780\,477$
+      \cite{dilithium} (\texttt{sign.go:303}).
+\end{enumerate}
+
+\paragraph{Hint $\Delta$.} Rounding $\mathbf{A}z - \mathbf{b}c$ at
+scale $2^\nu$ does not exactly recover $\tilde{\mathbf{h}}$ because of
+carry propagation across the rounding boundary. $\Delta$ corrects this
+per-coefficient; the $L_2$ bound prevents a forger from inflating
+$\Delta$ to satisfy the equation with an arbitrary $c$.
+
+\subsection{\textsc{Refresh} (HJKY97 proactive refresh)}
+\label{sec:protocol:refresh}
+
+Same committee, same threshold, defends against mobile-adversary share
+accumulation across time \cite{hjky97}.
+
+\paragraph{Inputs:} Per-party share $(\mathrm{sk}_i)_{i \in V}$,
+threshold $t$, randomness oracle.
+
+\paragraph{Outputs:} Refreshed shares
+$(\mathrm{sk}_i')_{i \in V}$ with the same constant term
+$\mathbf{s}$ at slot $0$.
+
+\paragraph{Steps (each party $i$):}
+\begin{enumerate}[leftmargin=2em, nosep]
+\item Sample a degree-$(t-1)$ \emph{zero-polynomial}
+      $z_i(X) \in R_q[X]$ with $z_i(0) = 0$ (per coefficient slot,
+      sample $t-1$ random $\mathbb{Z}_q$ coefficients and constrain
+      slot 0 to zero).
+\item For each $j \in V$, compute $z_i(\alpha_j) \in R_q^{n_{\mathrm{vec}}}$
+      and broadcast a lattice Pedersen commit
+      $\mathbf{C}_{i,j} = \mathbf{A} \cdot \textsc{NTT}(z_i(\alpha_j))
+      + \mathbf{B} \cdot \textsc{NTT}(r_{i,j})$ on the contribution
+      with auxiliary mask $r_{i,j} \leftarrow \mathcal{D}(\sigma_E)$.
+\item Each party $j$ aggregates incoming contributions:
+      $\mathrm{sk}_j' = \mathrm{sk}_j + \sum_{i \in V} z_i(\alpha_j)$.
+\item Verify each contribution against its commit (binding under
+      MSIS on $[\mathbf{A}\,|\,\mathbf{B}]$, hiding under MLWE on
+      $\mathbf{B}$ \cite{wongwangwing02}); abort and run complaint
+      protocol if any commit fails to open.
+\end{enumerate}
+
+\paragraph{Invariant.} The refreshed sharing polynomial
+$f'(X) = f(X) + \sum_i z_i(X)$ has $f'(0) = f(0) = \mathbf{s}$ because
+each $z_i(0) = 0$. Hence $\mathbf{A}, \tilde{\mathbf{b}}$ are unchanged
+(Theorem~\ref{thm:pulsar-reshare}, Refresh case).
+
+\subsection{\textsc{Reshare} (Desmedt--Jajodia97 redistribution)}
+\label{sec:protocol:reshare}
+
+New committee $V'$ with new threshold $t'$, $V \cap V'$ may be empty.
+
+\paragraph{Inputs:} Old share set $(\mathrm{sk}_i)_{i \in V}$, old
+threshold $t$, new committee $V' \subseteq \mathcal{V}$, new
+threshold $t' \leq |V'|$, qualified subset $Q \subseteq V$ with
+$|Q| \geq t$.
+
+\paragraph{Outputs:} New per-party shares
+$(\mathrm{sk}_j')_{j \in V'}$ that recombine to the same $\mathbf{s}$.
+
+\paragraph{Steps:}
+\begin{enumerate}[leftmargin=2em, nosep]
+\item Each $i \in Q$ samples a degree-$(t' - 1)$ polynomial
+      $g_i(X) \in R_q[X]^{n_{\mathrm{vec}}}$ with $g_i(0) =
+      \mathrm{sk}_i$ (per coefficient slot, sample $t' - 1$ random
+      $\mathbb{Z}_q$ coefficients and constrain slot 0 to the share).
+\item For each $j \in V'$, $i$ computes $g_i(\beta_j) \in
+      R_q^{n_{\mathrm{vec}}}$ where $\beta_j$ is the new evaluation
+      point for $j$, and broadcasts a lattice Pedersen commit
+      $\mathbf{C}_{i,j} = \mathbf{A} \cdot \textsc{NTT}(g_i(\beta_j))
+      + \mathbf{B} \cdot \textsc{NTT}(r_{i,j})$ on the contribution.
+\item Compute new Lagrange coefficients
+      $\lambda^Q_i(0) \in R_q$ for the qualified subset $Q$ at $0$
+      (\texttt{primitives.ComputeLagrangeCoefficients}).
+\item Each new party $j$ aggregates contributions weighted by
+      Lagrange coefficients of $Q$:
+      \[
+        \mathrm{sk}_j' \;=\; \sum_{i \in Q} \lambda^Q_i(0) \cdot
+        g_i(\beta_j) \quad \in \quad R_q^{n_{\mathrm{vec}}}.
+      \]
+\item Verify each commit (binding/hiding as in Refresh).
+\item Regenerate pairwise PRF seeds and MAC keys for $V'$ via
+      authenticated key exchange (X25519 baseline; ML-KEM-768 hybrid
+      \cite{fips203} for PQ-aware deployments).
+\end{enumerate}
+
+\paragraph{Invariant.} The new sharing polynomial
+$G(X) = \sum_{i \in Q} \lambda^Q_i(0) \cdot g_i(X)$ satisfies
+$G(0) = \sum_{i \in Q} \lambda^Q_i(0) \cdot \mathrm{sk}_i = f(0) =
+\mathbf{s}$ by Lagrange identity~\eqref{eq:pulsar-lagrange}. Hence
+$\mathbf{A}, \tilde{\mathbf{b}}$ are unchanged
+(Theorem~\ref{thm:pulsar-reshare}, Reshare case).
+
+\subsection{\textsc{Activate} (the consensus circuit-breaker)}
+\label{sec:protocol:activate}
+
+After Reshare or Refresh produces a candidate post-state $\Pi'$ at
+generation $g+1$, the new committee threshold-signs an activation
+message under the unchanged GroupKey to attest that the new shares can
+sign.
+
+\paragraph{Inputs:} New share set
+$(\mathrm{sk}_j')_{j \in V'}$, lifecycle context $(\eta, g+1,
+\mathrm{old\_set\_hash}, \mathrm{new\_set\_hash},
+\mathrm{old}\_t, \mathrm{new}\_t,
+\mathsf{GKH}, \mathrm{transcript\_hash},
+\mathrm{pairwise\_commit}, \mathrm{impl\_version})$.
+
+\paragraph{Outputs:} Activation signature $\sigma_{\mathrm{act}} \in
+R_q \times R_q^{n_{\mathrm{vec}}} \times R_\nu^{m_{\mathrm{pk}}}$ that
+verifies under $(\mathbf{A}, \tilde{\mathbf{b}})$.
+
+\paragraph{Steps:}
+\begin{enumerate}[leftmargin=2em, nosep]
+\item Construct the activation message
+      $\mu_{\mathrm{act}}$ as the byte concatenation
+      \begin{verbatim}
+"QUASAR-PULSAR-ACTIVATE-v1" ||
+   chain_id || network_id ||
+   eta || group_id ||
+   old_epoch || new_epoch ||
+   old_set_hash || new_set_hash ||
+   old_t || new_t ||
+   GKH || transcript_hash ||
+   pairwise_commit || impl_version
+      \end{verbatim}
+\item Run \textsc{SignRound1} (\S\ref{sec:protocol:round1}),
+      \textsc{SignRound2Preprocess} (\S\ref{sec:protocol:r2pre}),
+      \textsc{SignRound2} (\S\ref{sec:protocol:round2}),
+      \textsc{SignFinalize} (\S\ref{sec:protocol:finalize}) under the
+      new committee $V'$ on $\mu = \mu_{\mathrm{act}}$.
+\item Run \textsc{Verify} (\S\ref{sec:protocol:verify}) under the
+      \emph{unchanged} $(\mathbf{A}, \tilde{\mathbf{b}})$ from the
+      pre-state.
+\item If verification succeeds, the chain commits $\Pi'$ and bumps
+      $g \to g+1$. If it fails, the chain stays at $g$ and triggers
+      Rollback (\S\ref{sec:protocol:rollback}).
+\end{enumerate}
+
+\paragraph{What this proves.} Theorem~\ref{thm:pulsar-activation}:
+$\mathsf{VerifyActivation}$ accepts iff the new committee shares
+Lagrange-recombine to the original $\mathbf{s}$, except with negligible
+probability under MLWE/MSIS.
+
+\subsection{\textsc{Rollback}}
+\label{sec:protocol:rollback}
+
+\paragraph{Inputs:} Target generation $g_{\mathrm{target}} = g - 1$
+(or any prior on-chain $g_j$); current state $\Pi_{\mathrm{cur}}$ at
+generation $g$.
+
+\paragraph{Outputs:} Restored state $\Pi'$ at generation $g+1$ with
+$r = g_{\mathrm{target}}$ and $\mathsf{GKH}(\Pi') = \mathsf{GKH}(\Pi_{
+g_{\mathrm{target}}})$.
+
+\paragraph{Steps:}
+\begin{enumerate}[leftmargin=2em, nosep]
+\item Retrieve snapshot of $\Pi_{g_{\mathrm{target}}}$ from
+      \texttt{PulsarSnapshotManager}.
+\item Reinstate per-party shares from the snapshot.
+\item Bump generation to $g + 1$, set $r = g_{\mathrm{target}}$,
+      preserve $\eta$ and $\mathsf{GKH}$.
+\item Emit a rollback evidence transaction with the failed activation
+      cert (if any) for forensic review.
+\end{enumerate}
+
+\paragraph{Invariant.} By Lemma~13 of \cite{quasarcertsoundness}
+(``Rollback-lineage forward reconstruction''), the on-chain
+$(\eta, g, r)$ tuple sequence uniquely reconstructs the canonical
+forward path the rollback restored to. The chain stays signing-live
+throughout.
+
+\subsection{\textsc{Reanchor} (era boundary)}
+\label{sec:protocol:reanchor}
+
+A governance event executes a fresh ceremony or Pedersen DKG
+(\S\ref{sec:lifecycle:dkg}) producing
+$(\mathbf{A}_{\eta+1}, \tilde{\mathbf{b}}_{\eta+1})$ with
+$\mathsf{GKH}_{\eta+1} \neq \mathsf{GKH}_\eta$. The new era starts at
+$g = 0$, $r = 0$. Reanchor is rare (annual at most in production); it
+is the only transition that breaks GroupKey continuity.

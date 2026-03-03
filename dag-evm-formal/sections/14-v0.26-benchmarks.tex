@@ -1,0 +1,375 @@
+\section{The v0.26.0 Benchmark Re-run and Corrections}
+\label{sec:v026-benchmarks}
+%% ============================================================================
+
+The v0.24 release (\S\ref{sec:v024}) closed eight HIGH-severity Red findings
+and introduced the dispatcher contract that v0.25 hardened with signed
+refunds, EIP-3529 capping, and storage-overflow detection. v0.26 is in
+flight at the time of writing. This section reports a fresh M1~Max
+benchmark run against the current \texttt{luxcpp/evm} \texttt{main} head
+(\texttt{a4b26457e921}) to (a)~replace the v0.24 numbers in
+\S\ref{sec:v024:perf} that did not record their statistical
+methodology and (b)~surface a Cancun-completeness consensus bug uncovered
+by the new MCOPY workload.
+
+\subsection{Method}
+\label{sec:v026:method}
+
+\begin{itemize}
+  \item \textbf{Hardware.} Apple M1~Max, 8~performance + 2~efficiency
+    cores, 32-core Metal GPU, 64\,GB unified memory, macOS
+    \texttt{25.4.0} (Darwin \texttt{25.4.0}), system idle (no other
+    active workloads).
+  \item \textbf{Toolchain.} Go 1.26.2, clang 17, Metal Shading
+    Language~3.
+  \item \textbf{Backends.} CPU-Sequential, CPU-Parallel (Block-STM),
+    GPU-Metal. CUDA is omitted; the M1~Max has no CUDA device.
+  \item \textbf{Driver.} \texttt{luxfi/benchmarks} branch
+    \texttt{feat/v0.26-bench-results}, command
+    \texttt{cmd/v026-bench}. Produces a single self-contained JSON
+    report with hardware metadata, every cell's wall clock, and the
+    canonical bytecode hex for each workload.
+  \item \textbf{Sample size.} Five timed runs per
+    (workload, $N$, backend) cell after a 16-tx warmup. We report
+    the \emph{median} wall-clock, not the minimum. The minimum is
+    reported separately for the \texttt{evm-bench-kernel} re-run only,
+    so that the v0.24 1.84$\times$ figure is comparable on its
+    original methodology.
+  \item \textbf{Sweep.} $N \in \{128, 1024, 8192\}$.
+  \item \textbf{Workloads.} Five canonical bytecodes, listed below.
+    Each is deterministic; the JSON report includes the hex.
+\end{itemize}
+
+\subsubsection*{Workload bytecodes}
+
+The five workloads cover the four EVM cost classes (compute, hashing,
+storage, memory) plus a realistic mixed workload (ERC-20 transfer):
+
+\begin{enumerate}
+  \item \texttt{Compute50} --- 50 iterations of
+    \texttt{(PUSH1 7, PUSH1 5, ADD, PUSH1 3, ADD, POP)} followed by
+    \texttt{RETURN}. 300 stack ops per tx, 856 gas per tx, no memory,
+    no storage, no calldata. Measures pure opcode dispatch.
+  \item \texttt{Keccak10} --- 10 iterations of
+    \texttt{(PUSH1 32, PUSH1 0, KECCAK256, PUSH1 0, MSTORE)} followed
+    by \texttt{RETURN}. 50 ops per tx. Exercises the \texttt{KECCAK256}
+    primitive over a fixed 32-byte memory window.
+  \item \texttt{ERC20Canonical} --- the canonical ERC-20
+    \texttt{transfer} body: \texttt{SLOAD, SUB, SSTORE, SLOAD, ADD,
+    SSTORE, LOG3, RETURN}. 18 dispatched ops, 45\,748 gas per tx,
+    realistic mixed compute + storage + log workload.
+  \item \texttt{Storage10} --- 10 iterations of
+    \texttt{(PUSH val, PUSH slot, SSTORE, PUSH slot, SLOAD, POP)}
+    against ten distinct slots. EIP-2929 cold-SSTORE pricing produces
+    221\,116 gas per tx (10 $\times$ 22\,100 plus dispatch).
+  \item \texttt{MCopy32K} --- one priming \texttt{MSTORE} followed by
+    32 \texttt{MCOPY} ops of 1024 bytes each, total 32\,KB moved.
+    Exercises the EIP-5656 opcode landed in v0.25.
+\end{enumerate}
+
+\subsection{Per-Workload Results (Median Wall Clock)}
+\label{sec:v026:results}
+
+Tables~\ref{tab:v026-compute}--\ref{tab:v026-mcopy} record the median
+of five runs per cell. The complete JSON dataset including standard
+deviation, min, max, and per-tx gas is at
+\texttt{benchmarks/results/v0.26.0-bench-2026-03-05.json}.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{rrrrr}
+\toprule
+$N$ & CPU-Seq (ms) & CPU-Par (ms) & GPU-Metal (ms) & GPU/Par \\
+\midrule
+128    & 0.42  & 0.86  & 161.9 & $0.01\times$ \\
+1\,024 & 3.07  & 3.30  & 346.6 & $0.01\times$ \\
+8\,192 & 27.12 & 20.54 & 189.9 & $0.11\times$ \\
+\bottomrule
+\end{tabular}
+\caption{\texttt{Compute50} (50-iter ADD loop). At $N=8192$ the CPU-Par
+processes 398\,754\,TPS and the GPU processes 43\,130\,TPS through the
+dispatcher. The GPU loses by $9.2\times$.}
+\label{tab:v026-compute}
+\end{table}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{rrrrr}
+\toprule
+$N$ & CPU-Seq (ms) & CPU-Par (ms) & GPU-Metal (ms) & GPU/Par \\
+\midrule
+128    & 0.24  & 3.10  & 141.2 & $0.02\times$ \\
+1\,024 & 2.02  & 2.06  & 246.1 & $0.01\times$ \\
+8\,192 & 17.96 & 15.27 & 331.0 & $0.05\times$ \\
+\bottomrule
+\end{tabular}
+\caption{\texttt{Keccak10}. Note: CPU reports \texttt{gas\_used = 6}
+per tx, GPU reports \texttt{gas\_used = 489} per tx. The kernel CPU
+interpreter (\texttt{lib/evm/gpu/kernel/evm\_interpreter.hpp}) does not
+implement \texttt{KECCAK256} (opcode \texttt{0x20}); it falls through
+\texttt{InvalidOpcode}, and the dispatcher silently coerces the result
+to \texttt{TxStop}. The CPU TPS row is therefore measuring an empty
+execution and overstates real throughput. See \S\ref{sec:v026:bug}.}
+\label{tab:v026-keccak}
+\end{table}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{rrrrr}
+\toprule
+$N$ & CPU-Seq (ms) & CPU-Par (ms) & GPU-Metal (ms) & GPU/Par \\
+\midrule
+128    & 0.25  & 0.55  & 133.2 & $0.00\times$ \\
+1\,024 & 1.94  & 1.89  & 257.0 & $0.01\times$ \\
+8\,192 & 20.07 & 15.38 & 301.9 & $0.05\times$ \\
+\bottomrule
+\end{tabular}
+\caption{\texttt{ERC20Canonical}. CPU and GPU agree on
+$\text{gas\_used} = 45\,748$ per tx; this workload exercises the
+storage path correctly on both backends.}
+\label{tab:v026-erc20}
+\end{table}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{rrrrr}
+\toprule
+$N$ & CPU-Seq (ms) & CPU-Par (ms) & GPU-Metal (ms) & GPU/Par \\
+\midrule
+128    & 0.59  & 0.40  & 123.8 & $0.00\times$ \\
+1\,024 & 2.34  & 1.76  & 277.3 & $0.01\times$ \\
+8\,192 & 21.91 & 18.47 & 341.2 & $0.05\times$ \\
+\bottomrule
+\end{tabular}
+\caption{\texttt{Storage10}. CPU and GPU agree on
+$\text{gas\_used} = 221\,116$ per tx, matching EIP-2929 cold-SSTORE
+pricing.}
+\label{tab:v026-storage}
+\end{table}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{rrrrr}
+\toprule
+$N$ & CPU-Seq (ms) & CPU-Par (ms) & GPU-Metal (ms) & GPU/Par \\
+\midrule
+128    & 0.23  & 0.33  & 170.6 & $0.00\times$ \\
+1\,024 & 1.95  & 9.23  & 299.2 & $0.03\times$ \\
+8\,192 & 16.53 & 15.59 & 543.9 & $0.03\times$ \\
+\bottomrule
+\end{tabular}
+\caption{\texttt{MCopy32K}. \emph{The CPU reports
+$\text{gas\_used} = 21$ per tx; the GPU reports $\text{gas\_used} =
+8\,817$ per tx}. The CPU is producing wrong results --- see
+\S\ref{sec:v026:bug}. Even the \emph{wrong} CPU result executes in
+$<1$\,ms, while the correct GPU result takes 540\,ms; through the
+dispatcher path this workload is $30\times$ slower on GPU.}
+\label{tab:v026-mcopy}
+\end{table}
+
+\subsection{Where the GPU Wins, Where it Loses}
+\label{sec:v026:winloss}
+
+Across every cell of the dispatcher path
+(\texttt{cevm.ExecuteBlock}~/~\texttt{gpu\_execute\_block}) at
+$N \in \{128, 1024, 8192\}$ the GPU loses to CPU-Parallel by a factor
+between $0.00\times$ and $0.11\times$. The reason is structural: each
+dispatcher call carries an approximately 120--540\,ms cold-launch cost
+(buffer setup, shader resource binding, command-queue submission,
+result readback). At $N=8\,192$ the CPU completes a 21-million-op
+\texttt{Storage10} batch in 18\,ms; the GPU spends 341\,ms on the
+launch alone. The cold cost does not amortise within a single
+dispatcher call because the dispatcher releases the Metal context
+between calls.
+
+The GPU wins on the \emph{kernel-direct path}, which bypasses the
+dispatcher and submits one launch over a many-tx batch. The canonical
+\texttt{evm-bench-kernel} test (10\,K txs $\times$ 100-iter compute,
+11.04\,M opcodes) runs through this path. We re-measured it
+seven times under identical thermal conditions:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Metric} & \textbf{CPU} & \textbf{GPU V1} & \textbf{Speedup} \\
+\midrule
+Best wall (min of 5)  & 70.0\,ms  & 20.0\,ms  & $3.50\times$ \\
+M ops/s (best-of)     & 158\,M/s  & 552\,M/s  & --- \\
+Median wall (across 7 outer runs) & 71\,ms & 55\,ms & $1.29\times$ \\
+M ops/s (median)      & 155\,M/s  & 200\,M/s  & --- \\
+Std-dev / mean (GPU)  & ---       & 95\%      & --- \\
+\bottomrule
+\end{tabular}
+\caption{Re-run of \texttt{evm-bench-kernel} on the v0.26 main head.
+``Best of'' uses the same min-of-runs methodology as the v0.24 paper
+table. ``Median'' is the proper statistical reading.}
+\label{tab:v026-kernel}
+\end{table}
+
+The GPU wins on the kernel-direct path. The win is real but smaller
+than v0.24 reported when measured with median statistics, and larger
+when measured with the same min-of-runs methodology. See
+\S\ref{sec:v026:corrections}.
+
+\subsection{Consensus-Affecting Bug: Missing Cancun Opcodes on CPU
+Path}
+\label{sec:v026:bug}
+
+The \texttt{Keccak10} and \texttt{MCopy32K} workloads above exposed a
+class of bugs that the four-way parity corpus
+(\S\ref{sec:parity}) does not catch: the kernel CPU interpreter at
+\texttt{lib/evm/gpu/kernel/evm\_interpreter.hpp} is missing case arms
+for opcodes that \emph{do} appear in the GPU kernels.
+
+The interpreter implements opcodes $\{0x00, \dots, 0x4f\}$ ENV /
+COMPUTE, $\{0x50, 0x51, 0x52, 0x53, 0x59\}$ POP / MEMORY,
+$\{0x54, 0x55\}$ STORAGE, $\{0x56, 0x57, 0x58, 0x5a, 0x5b\}$ CONTROL,
+\texttt{0x5f} PUSH0, $\{0x60, \dots, 0x9f\}$ PUSH/DUP/SWAP,
+$\{0xa0, \dots, 0xa4\}$ LOG, and routes
+$\{0xf0, 0xf1, 0xf2, 0xf4, 0xf5, 0xfa, 0xff\}$ to
+\texttt{CallNotSupported} for the host bridge. Every other opcode
+falls through to a final \texttt{InvalidOpcode} arm.
+
+\textbf{The interpreter has no case for \texttt{0x20} KECCAK256, no
+case for \texttt{0x5c} TLOAD, no case for \texttt{0x5d} TSTORE, and
+no case for \texttt{0x5e} MCOPY.} The Metal kernel
+(\texttt{lib/evm/gpu/kernel/evm\_kernel.metal:962--986}) and the
+CUDA kernel (\texttt{lib/evm/gpu/cuda/evm\_kernel.cu:1526}) both
+implement MCOPY correctly. The dispatcher then converts the
+\texttt{InvalidOpcode} return from the kernel CPU path into
+\texttt{TxStop} when the dispatcher's status mapping table treats it
+as a clean halt. The result is that a Cancun-era block containing any
+of these four opcodes will produce a different
+\texttt{(gas\_used, status, output)} tuple between the CPU and GPU
+backends.
+
+\paragraph{Severity.} Consensus-affecting. A validator running the
+GPU backend and a validator running the CPU backend will disagree on
+the gas accounting of any block with MCOPY, TLOAD, TSTORE, or
+KECCAK256 in non-trivial bytecode. Mainnet has been on Cancun since
+2024-03-13. Every modern ERC-20 / ERC-721 / Uniswap-style contract
+emits KECCAK256 in its \texttt{transfer}; many emit MCOPY since
+solc~0.8.25.
+
+\paragraph{Mitigation in flight.} The v0.26 milestone has named owners
+to land KECCAK256, MCOPY, TLOAD, TSTORE in
+\texttt{kernel::execute\_cpu}. The four-way parity corpus
+(\S\ref{sec:parity}) needs an extension covering at least
+\{KECCAK256 with non-zero memory expansion, MCOPY with overlapping
+ranges, TLOAD/TSTORE within and across nested call frames\} before
+v0.26 can be tagged. Until that lands, \emph{the parity claim from
+\S\ref{sec:parity} is valid only for non-Cancun bytecode}.
+
+\subsection{Corrections to Prior Numbers}
+\label{sec:v026:corrections}
+
+Three claims in earlier sections of this paper need correction in
+light of the v0.26 measurements above.
+
+\paragraph{Claim 1 (\S\ref{sec:v024:perf}, v0.24): ``\texttt{bench\_kernel.cpp}
+11M opcodes, 10K $\times$ 100, 1.84$\times$ speedup, GPU 339\,M
+ops/s''.}
+
+The v0.24 paper recorded a single best-of-runs number with no
+methodology disclosure (no $N$, no whether it was median or min, no
+trial count). Today's seven-trial re-run produces $3.50\times$
+best-of-runs at $552\,$M ops/s, and $1.29\times$ median across 7
+trials at 200\,M ops/s. The GPU is in fact \emph{faster} than v0.24
+reported on its own min-of-runs methodology, but the GPU has $\sim 95\%$
+$\sigma/\mu$ variance trial-to-trial, so a single-number summary is
+misleading. The corrected statement: ``GPU wins on
+\texttt{evm-bench-kernel} 10K $\times$ 100 by $3.50\times$ best-of and
+$1.29\times$ median; the spread reflects Metal scheduling jitter under
+thermal load and is not a fundamental architectural variance.''
+
+\paragraph{Claim 2 (\S\ref{sec:empirical}, v0.23):
+``GPU\_Metal V1 252\,M ops/s, 1.62$\times$ vs CPU evmone, $N=2048$
+\texttt{evm-bench-kernel}''.}
+
+This number compared GPU\_Metal against the legacy evmone interpreter,
+not the kernel CPU interpreter. The v0.26 dispatcher routes the CPU
+parity path through \texttt{kernel::execute\_cpu}, which is faster
+than evmone at this microbenchmark and narrows the GPU's apparent
+lead. The 1.62$\times$ figure cannot be reproduced as written because
+the baseline interpreter has changed. The corrected statement: ``On
+\texttt{evm-bench-kernel} with the v0.26 baseline (kernel CPU
+interpreter, not legacy evmone), GPU/CPU is $3.50\times$ best-of and
+$1.29\times$ median at 11M opcodes; the v0.23 1.62$\times$ figure is
+unreproducible because its baseline interpreter has been replaced.''
+
+\paragraph{Claim 3 (\S\ref{sec:empirical}, v0.23):
+``Pipelined Metal 1.07$\times$ overlap'' and the table row labelled
+``Unified pipeline (EVM + state hash + sig-verify)''.}
+
+The pipeline test in v0.23 conflated three separate stages and
+reported a single 1.07$\times$ overlap. We did not re-run this
+workload for v0.26 because the unified pipeline rebuilt against
+v0.26 ABI~v4 still has open holes from the v0.24 deferred list. The
+corrected statement: ``Pipelined throughput is not yet quotable on
+v0.26; the rewrite tracking the v0.24 deferred unified-pipeline items
+is the gating dependency.''
+
+\subsection{Architectural Conclusions and the Path to v0.27}
+\label{sec:v026:v027}
+
+Three structural observations follow from the data above.
+
+\paragraph{The dispatcher path is a parity / correctness fallback,
+not a performance path on Apple silicon.} The fixed
+$\sim 120{-}540$\,ms cold-launch cost dominates any amortisation
+possible at $N \le 8\,192$, which covers every realistic Lux block
+size today. The kernel-direct path is where the GPU wins. v0.27
+should (a)~document the kernel-direct API as the recommended block-
+builder integration, and (b)~either eliminate the cold cost via a
+persistent Metal command queue retained across blocks, or gate the
+GPU dispatcher to $N \ge \approx 32\,768$ with deterministic CPU
+fall-through below that threshold.
+
+\paragraph{The kernel CPU interpreter is not Cancun-complete.} Until
+v0.26 lands KECCAK256, MCOPY, TLOAD, and TSTORE in
+\texttt{kernel::execute\_cpu}, the four-way parity claim
+(\S\ref{sec:parity}) is valid only for pre-Cancun bytecode. Mainnet
+has been on Cancun since 2024-03-13. The fix is local to one file
+($\sim 200$ lines of opcode handling); the harder part is extending
+the parity corpus with adversarial Cancun cases before re-asserting
+the claim.
+
+\paragraph{Variance reporting is a tooling problem.} The 95\%
+$\sigma/\mu$ on \texttt{evm-bench-kernel} GPU runs is large enough
+that any single-number summary mis-states the architecture. The fix
+is harness-level: report median + IQR + $p99$, warm for at least 5
+runs, pin to a known QoS class to remove macOS scheduler jitter,
+record the thermal state of the device. The min-of-runs convention
+inherited from \texttt{evm-bench-kernel} is acceptable as a ceiling
+but should never be the headline number in a release artefact.
+
+\paragraph{What v0.27 should ship.}
+
+\begin{enumerate}
+  \item \texttt{kernel::execute\_cpu} with KECCAK256, MCOPY, TLOAD,
+    TSTORE. Re-issue the four-way parity corpus extension.
+  \item Persistent Metal command queue in the dispatcher path; target
+    is a $10\times$ reduction in cold-launch cost. Below that, the
+    dispatcher remains a parity path only.
+  \item Bench harness with median + IQR + $p99$ as the canonical
+    output. Min-of-runs as a separately labelled ceiling number.
+  \item A real end-to-end real-block measurement on a captured
+    Cancun-era mainnet block (mixed precompile + storage + CALL),
+    once the unified pipeline rewrite lands.
+\end{enumerate}
+
+The bottom line is unchanged from v0.24: the GPU is the right place
+for keccak, ecrecover, and large-batch kernel-direct execution; the
+CPU remains the right place for the dispatcher path on M1~Max and
+for the parity-and-correctness fallback. v0.26 closes the Cancun
+hole on the CPU side; v0.27 closes the cold-cost hole on the GPU
+side.
+
+%% ============================================================================

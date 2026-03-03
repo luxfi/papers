@@ -1,0 +1,131 @@
+\section{Prism Refraction}
+
+\label{sec:prism}
+%% ============================================================================
+
+Prism is QuasarSTM's primary contention-prevention layer. Block-STM~2.0
+let conflicts happen and repaired them; Prism in 3.0 partitions the
+ready frontier so that conflicting transactions execute in
+\emph{different} slices and the STM rarely sees the same hot conflict
+twice.
+
+\subsection{Lane Conflict Matrix}
+
+\begin{definition}[Lane conflict matrix]
+\label{def:lane-conflict}
+Given a ready frontier $F = \{T_1, \ldots, T_N\}$ with lane hint
+vectors $\mathit{LH}(T_i)$, the lane conflict matrix
+$M \in \{0,1\}^{N \times N}$ is defined by
+\[
+M_{ij} =
+\begin{cases}
+1 & \text{if } \exists L \in \mathit{LH}(T_i) \cap \mathit{LH}(T_j)
+      \text{ s.t.\ at least one access is } \textsc{Write}, \\
+0 & \text{otherwise.}
+\end{cases}
+\]
+$M$ is symmetric; $M_{ii} = 0$.
+\end{definition}
+
+The matrix is computed in linear-arithmetic time on the GPU using
+hashed lane bucket counts; full pairwise comparison is unnecessary.
+The construction is deterministic.
+
+\subsection{Slice Partition}
+
+\begin{definition}[Refraction partition]
+\label{def:refraction}
+A refraction of $F$ is a partition
+$F = S_1 \sqcup \cdots \sqcup S_q$ such that every slice $S_p$ falls
+into one of three classes:
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textsc{DisjointWrite}: $\forall T_i, T_j \in S_p,\;
+      M_{ij} = 0$.
+\item \textsc{ReadOnly}: every $T_i \in S_p$ has only $\textsc{Read}$
+      lane hints (and no writes will alter lane clocks).
+\item \textsc{HotIsolated}: $S_p = \{T : L^* \in \mathit{LH}(T)\}$ for
+      a single hot lane $L^*$; the slice is processed under a Tier-3
+      reducer or a serialised lane mode.
+\end{enumerate}
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Compute refraction of frontier $F$}
+\label{alg:refraction}
+\begin{algorithmic}[1]
+\State Bucket transactions by lane hint into a per-lane occupancy table.
+\State Mark hot lanes $L^*$ where occupancy exceeds the hot-lane
+       threshold $\theta_{\mathrm{hot}}$ or where
+       $\mathit{LaneClock}[L^*].\mathit{hotness}$ exceeds
+       $\theta_{\mathrm{hotness}}$.
+\State \textbf{for each} hot lane $L^*$: emit \textsc{HotIsolated}
+       slice $S_p \gets \{T : L^* \in \mathit{LH}(T)\}$ and remove
+       these transactions from $F$.
+\State Greedy-pack remaining transactions into \textsc{DisjointWrite}
+       slices using a deterministic colouring of the (residual) lane
+       conflict graph.
+\State Emit a single \textsc{ReadOnly} slice for purely-read
+       transactions.
+\State \Return $\{S_1, \ldots, S_q\}$.
+\end{algorithmic}
+\end{algorithm}
+
+\begin{lemma}[Refraction safety]
+\label{lem:refraction-safe}
+For any frontier $F$ and any refraction $\{S_1, \ldots, S_q\}$
+satisfying Definition~\ref{def:refraction}, executing each slice
+$S_p$ in parallel and serialising slices in the canonical order
+respects $\preceq_{\mathrm{can}}$.
+\end{lemma}
+
+\begin{proof}[Sketch]
+Within \textsc{DisjointWrite}, no two transactions touch a common
+write lane, so no MVCC conflict is possible; any read-set under
+unchanged lane clocks satisfies Tier-1.
+Within \textsc{ReadOnly}, no writes alter visibility, and the
+slice's transactions all observe the same pre-state.
+Within \textsc{HotIsolated}, the registered Tier-3 reducer or
+serialised-lane policy produces the canonical-order outcome.
+Across slices, the canonical order is respected by sequential slice
+dispatch.
+\end{proof}
+
+\subsection{Refraction Determinism}
+
+\begin{invariant}[Refraction determinism]
+\label{inv:refraction-deterministic}
+For any frontier $F$ and any pair of executions of
+Algorithm~\ref{alg:refraction} on the same $F$ and the same lane
+hint vectors, the produced partition is bit-identical (up to slice
+ordering, which is itself fixed by canonical-index lexicography).
+\end{invariant}
+
+This is mandatory: refraction sits on the round-result hash path.
+A non-deterministic refraction would propagate to
+\texttt{execution\_root} and break consensus.
+
+\subsection{Why Refraction Is the Performance Primitive}
+
+\paragraph{Same hot conflict twice.}
+Without refraction, a frontier with 64 transactions all writing to
+the AMM reserve produces $\binom{64}{2} = 2016$ pairwise conflicts on
+the same lane. The validator detects them, the repair queue
+absorbs them, and incarnation counters climb. With refraction, all
+64 transactions land in a single \textsc{HotIsolated} slice and are
+processed by a registered AMM reducer that yields exactly one
+deterministic post-state.
+
+\paragraph{Lane-fast hit rate.}
+Refraction is the precondition for the Tier-1 hit-rate target
+($> 95\%$ on disjoint-lane workloads, \S\ref{sec:performance}).
+Without partitioning, any single hot transaction in a frontier
+disturbs every co-resident transaction's lane snapshot.
+
+\paragraph{Telemetry feedback loop.}
+Hot-lane detection feeds the next round's refraction. A lane that
+caused $> \theta_{\mathrm{hot}}$ conflicts in round $r$ is promoted
+to \textsc{HotIsolated} for round $r+1$ \emph{before} the conflicts
+recur. The control loop closes within one Quasar round.
+
+
+%% ============================================================================

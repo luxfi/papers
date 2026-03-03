@@ -1,0 +1,153 @@
+\section{Three-Lane Certificate Architecture}
+
+\label{sec:crypto}
+%% ============================================================================
+
+A QuasarCert is the conjunction of three independent verification
+\emph{lanes}. Each lane has its own primitive, its own hardness
+assumption, and its own verifier. None of the three depends on the others
+to verify, and the three are scheduled and executed in parallel both
+during signing (validator-side) and during verification (light-client and
+peer-side). This section formalizes each lane.
+
+\subsection{Lane 1: BLS12-381 Aggregate Signatures}
+
+BLS12-381~\cite{boneh2001short} operates over the pairing-friendly curve
+$E(\mathbb{F}_p)$ with embedding degree 12 and 128-bit classical security.
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Key generation}: $\mathit{sk} \xleftarrow{\$} \mathbb{Z}_r$;
+      $\mathit{pk} = \mathit{sk} \cdot G_2$, with proof-of-possession.
+\item \textbf{Signing}: $\sigma = \mathit{sk} \cdot
+      H_{\mathbb{G}_1}(\mathsf{cert\_subject})$.
+\item \textbf{Aggregation}: $\sigma_{\mathrm{agg}} = \sum_{i \in Q}
+      \sigma_i$. Aggregated size is 48 bytes regardless of $|Q|$.
+\item \textbf{Verification}: $e(G_2, \sigma_{\mathrm{agg}}) =
+      e(\mathit{apk}, H_{\mathbb{G}_1}(\mathsf{cert\_subject}))$ where
+      $\mathit{apk} = \sum_{i \in Q} \mathit{pk}_i$.
+\end{itemize}
+
+BLS provides the classical fast path. Verification cost is $O(1)$ in $|Q|$
+and dominated by two pairings; an aggregate-of-aggregates check at
+$n{=}100$ runs in ${\sim}875\,\mu$s on commodity x86 CPU
+(Section~\ref{sec:performance}). This lane is broken by Shor; the other
+two lanes compensate.
+
+\subsection{Lane 2: Ringtail (Ring-LWE Threshold Signatures)}
+
+Ringtail~\cite{ringtail} is a lattice-based $t$-of-$n$ threshold
+signature scheme over the polynomial ring $R_q = \mathbb{Z}_q[X]/(X^N+1)$
+with parameters $N = 256$, $q = 2^{48} + 2561$ (NTT-friendly), module
+dimension 8, and threshold $t = \lfloor 2n/3 \rfloor + 1$.
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{DKG}: Q-Chain runs the Ringtail DKG once per epoch,
+      producing the combined public key $\mathit{pk}^{\mathrm{RT}}$ and
+      Shamir-shared secrets $\mathit{sk}_i^{\mathrm{RT}}$. The DKG
+      transcript hash is $\mathsf{qchain\_ceremony\_root}$.
+\item \textbf{Round 1 (precomputation)}: each party $P_i$ samples a nonce
+      $\mathbf{y}_i \sim D_{\sigma'}^N$ from PRF-correlated randomness,
+      commits $\mathbf{w}_i = \mathbf{A}\mathbf{y}_i$, and broadcasts
+      $\mathbf{w}_i$ with a MAC.
+\item \textbf{Round 2 (signing)}: given message
+      $m = \mathsf{cert\_subject}$, compute challenge
+      $c = H(m \,\|\, \sum_i \mathbf{w}_i)$, response
+      $\mathbf{z}_i = \mathbf{y}_i + c \cdot \mathit{sk}_i^{\mathrm{RT}}$,
+      reject if $\|\mathbf{z}_i\|$ exceeds the bound (rejection sampling).
+\item \textbf{Combination}: the Q-Chain combiner reconstructs
+      $\mathbf{z} = \sum_{i \in T} \lambda_i \mathbf{z}_i$ via Lagrange
+      interpolation over the ring.
+\item \textbf{Verification}: $\|\mathbf{z}\| \leq B$ and
+      $H(m \,\|\, \mathbf{A}\mathbf{z} - c\mathbf{t}) = c$.
+      \emph{Batch verify is $O(1)$ amortized after DKG} because the
+      verifier holds a fixed $\mathit{pk}^{\mathrm{RT}}$.
+\end{itemize}
+
+Ringtail's security reduces to Module-LWE/SIS; the production parameters
+provide $> 128$-bit classical and $> 130$-bit quantum security
+(Appendix~E of~\cite{qcert-proof}).
+
+\subsection{Lane 3: MLDSAGroth16 (Z-Chain Rollup of ML-DSA-65)}
+\label{sec:lane3}
+
+The third lane is the conceptual heart of Quasar 3.0. The naive design
+would carry $N$ raw ML-DSA-65 validator signatures in every block header,
+costing $N \times 3{,}309$ bytes (e.g.\ ${\sim}69$\,KB at $N{=}21$,
+${\sim}330$\,KB at $N{=}100$) and $N \times 254\,\mu$s per verifier. We
+instead delegate ML-DSA verification to a Z-Chain Groth16 rollup. The
+on-chain artifact reduces from $N \times 3{,}309$ bytes to a fixed
+\textbf{192-byte SNARK plus 32-byte public-inputs hash}, irrespective of
+$N$.
+
+\paragraph{Primitive: ML-DSA-65 (FIPS 204).}
+\begin{itemize}[leftmargin=2em,nosep]
+\item Public key 1{,}952 B; secret key 4{,}032 B; signature 3{,}309 B.
+\item NIST Level 3, $\geq$128-bit quantum security.
+\item Verification: 254\,$\mu$s CPU (cold), 3\,$\mu$s with cached
+      challenge (hot path).
+\end{itemize}
+
+\paragraph{Z-Chain rollup statement.}
+The MLDSAGroth16 lane is a non-interactive zero-knowledge argument for
+the relation
+\[
+\mathcal{R}_{\mathrm{ZK}} \;=\; \Bigl\{\,
+\bigl(x;\, w\bigr)
+\;:\;
+x = (\mathsf{cert\_subject},\, h_x)
+\,\land\,
+w = \bigl(\{\mathit{pk}_i^{\mathrm{ML}}\}_{i=1}^N,
+\{\sigma_i^{\mathrm{ML}}\}_{i=1}^N\bigr)
+\,\land\,\Phi(x, w)\,\Bigr\}
+\]
+where $\Phi(x, w)$ holds iff:
+\begin{enumerate}[leftmargin=2em,nosep]
+\item $h_x = H_{\text{Poseidon}}\bigl(\{\mathit{pk}_i^{\mathrm{ML}}\}_{i=1}^N
+      \,\|\, \mathsf{cert\_subject}\bigr)$.
+\item $\sum_{i=1}^{N} [\![ \mathsf{MLDSA.Verify}(\mathit{pk}_i^{\mathrm{ML}},
+      \mathsf{cert\_subject}, \sigma_i^{\mathrm{ML}}) = 1 ]\!] \;\geq\;
+      t = \lfloor 2N/3 \rfloor + 1$.
+\item Each $\mathit{pk}_i^{\mathrm{ML}}$ appears in
+      $P_\text{val}$ (the validator-set Merkle root) at the binding
+      epoch.
+\end{enumerate}
+
+The Groth16 prover, executed by Z-Chain validators, produces
+$\pi_{\mathrm{ZK}} = (A, B, C) \in \mathbb{G}_1 \times \mathbb{G}_2
+\times \mathbb{G}_1$ totalling 192 bytes (compressed), and emits the
+public-inputs hash $h_x$ (32 bytes).
+
+\paragraph{Why this is not a raw per-validator ML-DSA list.}
+The rollup is a \emph{single} succinct argument. The verifier never sees
+individual ML-DSA signatures; it sees only $(\pi_{\mathrm{ZK}}, h_x)$.
+This is critical for two reasons. First, on-chain footprint: the per-block
+post-quantum identity-binding cost is $192 + 32$ bytes regardless of
+validator count. Second, verification cost: $\mathsf{Groth16.Verify}$ is
+three pairings, executed in 200--500\,$\mu$s when batched on a GPU
+(Section~\ref{sec:gpu-native}).
+
+\paragraph{Rejection of threshold ML-DSA.}
+A different design would replace per-validator ML-DSA with a threshold
+ML-DSA scheme. We reject this for the reasons elaborated in
+Section~\ref{sec:why-not-threshold} and Appendix~A
+of~\cite{qcert-proof}: ML-DSA's Fiat--Shamir-with-Aborts requires
+rejection sampling on the \emph{combined} response $\mathbf{z}$, which
+no party can evaluate locally; relaxing the rejection bound to
+accommodate threshold signing reduces the security margin and is not
+standardized by NIST. The Z-Chain Groth16 rollup gives the same
+on-chain footprint as a threshold scheme \emph{without altering the
+underlying primitive}---each validator runs the FIPS-204 ML-DSA-65
+algorithm exactly as standardized, and the rollup proves the existence
+of a quorum of valid individual signatures.
+
+\paragraph{Trusted setup.}
+Z-Chain's Groth16 verifying key is the output of a multi-party trusted
+setup ceremony (powers-of-tau plus circuit-specific phase 2, with $\geq
+1024$ contributors). The verifying-key hash is rooted on Z-Chain as
+$\mathsf{zchain\_vk\_root}$ and bound into the certificate subject. A
+post-setup-compromise attacker can forge $\pi_{\mathrm{ZK}}$ but still
+cannot produce a Ringtail signature or break BLS, so single-compromise
+insufficiency (Theorem~\ref{thm:single}) holds.
+
+
+%% ============================================================================
