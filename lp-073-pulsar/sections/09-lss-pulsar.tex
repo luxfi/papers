@@ -1,0 +1,122 @@
+%% ====================================================================
+\section{The LSS-Pulsar Adapter}
+\label{sec:lss-pulsar}
+%% ====================================================================
+
+Pulsar's lifecycle (\S\ref{sec:lifecycle}) is concrete; the
+\emph{orchestration} of generations, rollback, snapshots, and
+dealer/coordinator role separation is provided by an external
+universal-MPC framework. We use \textbf{LSS} \cite{luxlssmpc} ---
+Lux's Linear Shamir Secret Sharing dynamic-resharing layer
+\cite{lp077}, originally specified for ECDSA-CMP and FROST and
+explicitly designed as a protocol-agnostic lifecycle extension.
+
+The contract:
+\begin{quote}\itshape
+LSS owns generations, snapshots, rollback, and dealer/coordinator
+roles. Pulsar owns lattice math: $R_q$ shares, lattice Pedersen
+commits, $\Lambda$/Seeds/MAC regeneration, and the activation
+certificate's lattice signature bytes.
+\end{quote}
+
+The wiring lives at \texttt{threshold/protocols/lss/lss\_pulsar.go} ---
+the analogue of \texttt{lss\_cmp.go} (ECDSA) and \texttt{lss\_lens.go}
+(curve, see LP-103 \cite{lp103}). The adapter exposes:
+
+\begin{verbatim}
+func DynamicResharePulsar(
+    oldConfigs map[party.ID]*PulsarConfig,
+    newPartyIDs []party.ID,
+    newThreshold int,
+    pool *pool.Pool,
+    rand io.Reader,
+) (map[party.ID]*PulsarConfig, error)
+\end{verbatim}
+
+It (1)~validates that all old configs agree on KeyEraID, Generation, and
+GroupKey pointer; (2)~reconstructs an in-process \texttt{KeyEra} from
+the union of old shares; (3)~delegates all lattice math to the Pulsar
+kernel; (4)~bumps Generation by one, preserves KeyEraID, sets
+RollbackFrom $= 0$ on forward transitions; (5)~persists the resulting
+state through \texttt{PulsarSnapshotManager} for potential rollback.
+
+\subsection{Bootstrap Dealer vs Signature Coordinator}
+
+The LSS paper distinguishes two operational roles, both inherited by
+Pulsar:
+
+\begin{tabular}{@{}p{0.20\textwidth}p{0.36\textwidth}p{0.38\textwidth}@{}}
+  \toprule
+  \textbf{Role} & \textbf{LSS responsibility} & \textbf{Pulsar / Quasar mapping} \\
+  \midrule
+  Bootstrap Dealer & Network membership manager. Orchestrates resharing. Never holds unencrypted secrets. & Foundation MPC node at chain genesis (Bootstrap). P-Chain governance authority for Reanchor. Holds no shares after ceremony close. \\
+  Signature Coordinator & Operational workhorse. Collects partial signatures. Combines certificates. & Quasar block proposer / per-epoch consensus runtime. Coordinates Sign1/Sign2/Combine for each Pulsar pulse over a bundle. \\
+  \bottomrule
+\end{tabular}
+
+Crucially, the two roles are \emph{distinct authorities}: a compromised
+Signature Coordinator cannot reshare or change the validator set
+(it has no membership-management authority), and a compromised
+Bootstrap Dealer at non-Bootstrap times cannot sign (it holds no
+shares). The role split is the operational basis for Pulsar's
+no-slashing-dependency failure model
+(\S\ref{sec:lifecycle:rollback}).
+
+\subsection{Adapter contract guarantees}
+
+\textbf{Preserved across the call.} KeyEraID, GroupKey pointer, master
+secret $\mathbf{s}$ (held only as shares; never reconstructed in any
+process), and the persistent $(\mathbf{A}, \tilde{\mathbf{b}})$ public
+key.
+
+\textbf{Changed across the call.} Generation (incremented by 1),
+participant set, threshold, share values, $\Lambda_i$ Lagrange
+coefficients, pairwise PRF Seeds, MAC keys, transcript hash.
+
+\textbf{Failure behavior.} Returns an error. The caller (LSS Rollback
+Manager or Quasar consensus) decides whether to retry, rollback, or
+reanchor. The adapter does not silently fall back.
+
+\subsection{What the adapter does \emph{not} inherit}
+
+A clean adapter must reject ECDSA-specific assumptions baked into
+LSS-CMP and the curve-side LSS-FROST adapter (LP-103 \cite{lp103}):
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item ECDSA auxiliary secrets $w$, $q$ for nonce blinding (LSS
+        Section 4 protocols I, II). Corona-style signing has Gaussian
+        blinding built into Sign1/Sign2; no $w, q$ needed.
+  \item Curve-point Pedersen commits $g^s \cdot h^r$. Pulsar uses
+        lattice commits $\mathbf{A}\cdot\mathrm{NTT}(s) + \mathbf{B}
+        \cdot\mathrm{NTT}(r)$ over $R_q$.
+  \item ECDSA scalar serialization. Pulsar uses Lattigo \texttt{v7}
+        polynomial serialization.
+  \item Curve-specific Lagrange interpolation. Pulsar uses
+        \texttt{primitives.ComputeLagrangeCoefficients} over $\mathbb{Z}_q$.
+\end{itemize}
+
+\subsection{Acceptance tests}
+
+Ten acceptance tests gate the adapter (collapsed into six
+\texttt{Test*} functions):
+
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item GroupKey pointer preserved across resharing.
+  \item KeyEraID preserved across resharing.
+  \item Generation increments by exactly one on forward transition.
+  \item RollbackFrom $= 0$ on forward transition.
+  \item $t_{\text{old}} \neq t_{\text{new}}$ works.
+  \item Old set $\neq$ new set works (disjoint rotation supported).
+  \item Regenerated shares produce a valid Pulsar threshold signature.
+  \item Signature verifies under \emph{unchanged} GroupKey, proving
+        old shares are not needed after activation.
+  \item Pairwise PRF / MAC material is regenerated for exactly the new
+        party set, with bytes that differ from the old committee's.
+  \item Rollback restores prior generation snapshot; restored state
+        carries Generation $= \text{current} + 1$ and RollbackFrom
+        $= \text{current}$, preserving monotonicity while marking
+        lineage.
+\end{enumerate}
+
+All ten pass at the time of writing
+(\texttt{threshold/protocols/lss/lss\_pulsar\_test.go}).

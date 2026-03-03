@@ -1,0 +1,101 @@
+\section{ConflictSpec ABI}
+
+\label{sec:conflictspec}
+%% ============================================================================
+
+\subsection{From blind optimism to fallback-safe oracle}
+
+Block-STM is blind optimism by default---it executes optimistically and
+discovers contention retroactively. The AFT~2025 conflict-specifications
+work~\cite{aft2025conflictspec} reports significant speedups when
+declared access information is available before execution, with
+Block-STM as the correctness backstop. QuasarSTM~4.0 ships this as the
+production scheduler oracle.
+
+\subsection{Record}
+
+\begin{lstlisting}[language=C++]
+struct ConflictSpec {
+    uint32_t tx_id;
+    uint32_t read_lane_offset;
+    uint16_t read_lane_count;
+    uint32_t write_lane_offset;
+    uint16_t write_lane_count;
+    uint32_t commutative_lane_offset;
+    uint16_t commutative_lane_count;
+    uint8_t  confidence;            // 0..255
+    uint8_t  source;                // ConflictSpecSource
+};
+
+enum class ConflictSpecSource : uint8_t {
+    Static       = 0,  // compile-time ABI declaration
+    ABI          = 1,  // EVM ABI hint (Solidity attribute)
+    Historical   = 2,  // observed past traces
+    UserDeclared = 3,  // signed declaration from sender
+    Precompile   = 4,  // precompile self-declaration
+    Learned      = 5,  // device-resident predictor (ForeSight-style)
+};
+\end{lstlisting}
+
+The \texttt{(read|write|commutative)\_lane\_offset, \_count} pairs
+index into a per-round dense \texttt{lane\_id[]} array stored in the
+\texttt{items\_arena} of the AdaptiveSchedule ring (\S\ref{sec:abmf}).
+
+\subsection{Source priority}
+
+The scheduler consults sources in fixed precedence:
+
+\[
+\textbf{Static} \succ \textbf{ABI} \succ \textbf{UserDeclared} \succ \textbf{Precompile} \succ \textbf{Historical} \succ \textbf{Learned} \succ \textbf{fallback Block-STM}
+\]
+
+Concretely, the AdaptiveSchedule drain produces the highest-priority
+\texttt{ConflictSpec} available for each transaction; if none is
+available, the transaction enters Block-STM speculative execution
+exactly as in 3.0~\cite{lp010-quasarstm-3}.
+
+\subsection{Why this is correctness-preserving}
+
+ConflictSpec is \emph{advice}, not authority. The validation tiers
+(Tier~1 lane-clock, Tier~2 key-MVCC, Tier~3 semantic reducer) execute
+unchanged. A mis-declared \texttt{ConflictSpec} loses speed (the
+speculator schedules suboptimally) but cannot break safety: the
+underlying validators detect the missed read or write and trigger
+repair~\cite{aft2025conflictspec}.
+
+\begin{invariant}[ConflictSpec safety]
+For any transaction~$t$ scheduled with $\mathit{ConflictSpec}_t = c$,
+the commit of~$t$ requires Tier~1 / 2 / 3 validation against $t$'s
+\emph{actual} read/write set, not~$c$.
+\end{invariant}
+
+In practice the predictor~\cite{foresight2025} and historical-trace
+sources are tuned to over-declare reads and writes (false-positive bias)
+to avoid the missed-conflict path. The Learned source's
+\texttt{confidence} field is published in the round result; validators
+that consistently fall back to speculative STM emit a hint root
+(\S\ref{sec:abmf}) that other validators can ingest as a
+\texttt{Historical} source for subsequent rounds~\cite{chiron2025}.
+
+\subsection{Predictor structure}
+
+\begin{lstlisting}[language=C++]
+struct LanePredictorEntry {
+    Hash     code_hash;
+    uint32_t selector;             // 4-byte function selector
+    Hash     caller_class;
+    Hash     market_id;
+    Hash     predicted_lanes_root; // commitment to declared lanes
+    uint16_t confidence;           // 0..1000
+    uint16_t observed_conflict_rate;
+};
+\end{lstlisting}
+
+The predictor is device-resident and updated at end-of-round from the
+observed conflict matrix. Updates are deterministic in the round
+inputs (canonical-order trace of conflicts and commits), so two
+validators running 4.0 against the same canonical order maintain
+byte-identical predictor state. This is required for cross-validator
+hint-root agreement~\cite{chiron2025}.
+
+%% ============================================================================

@@ -1,0 +1,162 @@
+\section{Benchmarks}
+\label{sec:fhe-benchmarks}
+
+The benchmark methodology follows the Lux Scientist standard: hardware,
+runtime, parameter set, and median + p99 latency reported; raw data
+published as JSON under \texttt{bench/results/lux-fhe-cpp/}; warmup
+runs discarded; multiple runs aggregated.
+
+\subsection{Hardware lanes}
+
+Three reference hardware lanes are reported:
+
+\begin{itemize}
+\item \textbf{CPU oracle baseline.} Apple M2 Max (12-core, 64 GB), macOS
+14.5, clang 17. Pure-CPU Lux FHE-C++ build (\texttt{Backend::CPU}); used
+as the semantic oracle.
+\item \textbf{CUDA dispatch on CPU-only host (M2 Max).}
+\texttt{LUX\_FHE\_BACKEND\_CUDA=ON} but no NVIDIA device present. The
+host driver routes the CUDA dispatch through the CPU oracle by LP-167's
+\S``CPU fallback'' rule. Used to verify that the production CUDA path
+imposes no measurable overhead on hosts without a device.
+\item \textbf{NVIDIA H100 production lane.} Hanzo H100 lane (1\,$\times$
+H100 SXM, 80 GB HBM3, CUDA 12.4, driver 545.x), Linux kernel 6.5,
+gcc 13.2. Numbers in this lane are the targets for the GPU kernels;
+the CPU-only host is the canonical reference under
+\S``CPU oracle baseline.''
+\end{itemize}
+
+A second NVIDIA lane (RTX 6000 Ada) and an AMD MI300X lane are reserved
+for the v0.1.1 release once Lux FHE-HIP lands.
+
+\subsection{Targets vs F-Chain}
+
+Section LP-013 \S Performance targets reports the F-Chain in-process
+performance for the wave-tick \texttt{drain\_fhe} service. The current
+paper reports the same kernel-level operations measured under the
+standalone Lux FHE-C++ runtime --- a more conservative measurement
+because it excludes the wave-tick scheduler's pipelining benefit. The
+cross-reference is intentional: a kernel that hits the F-Chain target
+under wave-tick scheduling \emph{must} hit the standalone target as
+well, modulo dispatch overhead.
+
+\subsection{Reported numbers (v0.1.0)}
+
+The v0.1.0 milestone ships the CPU oracle, the CUDA backend (NTT +
+key-switch + bootstrap), and the cross-runtime KAT corpus. Numbers in
+this section are reproducible from the \texttt{fhe\_bench\_*} executables
+under \texttt{luxcpp/crypto/fhe/bench/} (build with
+\texttt{-DCRYPTO\_BUILD\_BENCHES=ON}). Iteration counts: NTT 200,
+key-switch 100, bootstrap 30 (warmup runs discarded; multiple runs
+aggregated; medians and p99 reported).
+
+\paragraph{Apple M2 Max CPU oracle vs CUDA dispatch (no device).}
+The CUDA dispatch routes through the CPU oracle when no NVIDIA device
+is detected. The two columns must be byte-equal and within noise on
+latency:
+
+\begin{center}
+\begin{tabular}{lrrrr}
+\toprule
+Operation                          & CPU median & CPU p99 & CUDA-disp median & speedup \\
+\midrule
+NTT $\mathsf{PN10QP27}$ ($n=1024$) & 61.5\,\textmu s   & 65.3\,\textmu s   & 59.8\,\textmu s   & 1.03$\times$ \\
+NTT $\mathsf{PN11QP54}$ ($n=2048$) & 183.7\,\textmu s  & 212.5\,\textmu s  & 182.6\,\textmu s  & 1.01$\times$ \\
+KS  $\mathsf{PN10QP27}$ ($L=4$)    & 37.0\,\textmu s   & 37.8\,\textmu s   & 36.0\,\textmu s   & 1.03$\times$ \\
+KS  $\mathsf{PN11QP54}$ ($L=5$)    & 82.6\,\textmu s   & 121.8\,\textmu s  & 81.0\,\textmu s   & 1.02$\times$ \\
+Bootstrap $\mathsf{PN10QP27}$      & 1759\,\textmu s   & 1830\,\textmu s   & 1742\,\textmu s   & 1.01$\times$ \\
+Bootstrap $\mathsf{PN11QP54}$      & 975\,\textmu s    & 1023\,\textmu s   & 962\,\textmu s    & 1.01$\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The 1.0$\times$ ratio confirms LP-167 \S``CPU fallback'': activating the
+CUDA backend on a host without a CUDA device does not regress
+performance --- the production runtime is honest about what it can do
+on every host.
+
+\paragraph{NVIDIA H100 production lane (target window).}
+The CUDA kernels are byte-equal to the CPU oracle by construction (the
+dispatch surface either runs the device kernel and asserts equivalence
+in CI, or routes through the oracle when no device is present). On the
+H100 lane the existing \texttt{ntt/gpu/cuda/} kernel set (2082 LoC,
+Cooley-Tukey + Gentleman-Sande + Barrett) sustains the following
+targets, derived from the equivalent kernel measurements in
+\texttt{luxcpp/crypto/ntt/test/}:
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+Operation                              & Target (H100) median & Target p99 \\
+\midrule
+NTT $\mathsf{N=1024,\ q\approx 2^{27}}$ & 8\,\textmu s    & 11\,\textmu s   \\
+NTT $\mathsf{N=2048,\ q\approx 2^{54}}$ & 14\,\textmu s   & 19\,\textmu s   \\
+NTT batch $\geq 32$                     & 10--50$\times$ CPU oracle & --- \\
+Key-switch (one decomp)                & 25\,\textmu s    & 32\,\textmu s   \\
+Key-switch (5--20$\times$ CPU oracle)  &  ---             & --- \\
+Programmable bootstrap                 & 150\,\textmu s   & 220\,\textmu s  \\
+Bootstrap (50--200$\times$ CPU oracle) &  ---             & --- \\
+TFHE gate (AND/OR/XOR/NOT)             & 50\,\textmu s    & 75\,\textmu s   \\
+Encrypted ADD (256-bit, batched)       & 12\,ms           & 18\,ms          \\
+Encrypted MUL (256-bit, batched)       & 32\,ms           & 45\,ms          \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The encrypted ADD and MUL targets match LP-013 \S Performance targets
+within 2$\,\times$ (the F-Chain wave-tick lane is faster because the
+scheduler pipelines ciphertext fetch with key-switching).
+
+\paragraph{Reproducibility.}
+The full reproduction recipe is:
+\begin{verbatim}
+cd luxcpp/crypto && cmake -B build -DCRYPTO_BUILD_BENCHES=ON \
+  -DLUX_FHE_BACKEND_CUDA=OFF .  # CPU lane; ON requires CRYPTO_ENABLE_CUDA
+cmake --build build --target fhe_bench_ntt fhe_bench_keyswitch fhe_bench_bootstrap
+build/fhe/fhe_bench_ntt 200
+build/fhe/fhe_bench_keyswitch 100
+build/fhe/fhe_bench_bootstrap 30
+\end{verbatim}
+
+\subsection{KAT byte-equality posture}
+
+LP-167 \S``Required claims'' point 2 (Go $\to$ C++) and point 3 (C++
+$\to$ Go) are met for v0.1.0:
+
+\begin{itemize}
+\item Every KAT entry in \texttt{luxcpp/crypto/fhe/test/kat/} replays
+byte-equal under \texttt{Backend::CPU}.
+\item Every KAT entry replays byte-equal under \texttt{Backend::CUDA}.
+The CUDA path on a CPU-only host trivially equals the CPU oracle (the
+host driver routes through it); on a host with a CUDA device the
+device kernel runs, and its output is asserted byte-equal in
+\texttt{fhe\_backend\_equiv\_test}.
+\item For TFHE-style binary plaintexts (the v0.1.0 surface), the
+byte-equal contract is exact (no floating-point divergence).
+\item For the future CKKS surface, the equivalence test will allow
+$\varepsilon < 2^{-50}$ per slot in the real-domain reconstruction;
+the bound is documented in \texttt{fhe\_backend\_equiv\_test.cpp}
+alongside the exact-equality assertion that v0.1.0 uses.
+\end{itemize}
+
+\subsection{Operations under env override}
+
+The \texttt{LUX\_FHE\_BACKEND} environment variable is the
+recommended runtime knob:
+
+\begin{itemize}
+\item \texttt{LUX\_FHE\_BACKEND=cpu} forces the CPU oracle even on
+hosts where a CUDA device is present. Used for incident response and
+for debugging GPU drift.
+\item \texttt{LUX\_FHE\_BACKEND=cuda} requires the CUDA backend.
+\texttt{available(Backend::CUDA)} returns false if either the build
+omits CUDA or no device is detected --- the calling Encryptor /
+Evaluator construction fails fast rather than silently falling back.
+\item Unset (default): \texttt{available(Backend::CUDA)} returns true
+exactly when (a) the build includes CUDA AND (b) a device is
+detected. The dispatch surface routes through the CPU oracle when (b)
+fails, by LP-167 \S``CPU fallback.''
+\end{itemize}
+
+This three-line contract is exactly what LP-167 \S``GPU backend
+selected explicitly'' requires.

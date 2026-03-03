@@ -1,0 +1,150 @@
+\section{Introduction}
+
+\label{sec:introduction}
+%% ============================================================================
+
+QuasarSTM~3.0~\cite{lp010-quasarstm-3} activated on Lux mainnet on
+2025-12-25. It shipped the GPU-native ordered MVCC \emph{substrate} for
+Lux's Nova (linear) and Nebula (DAG) execution modes: the lane
+abstraction, the wave-tick scheduler, the three-tier validation
+\emph{skeleton}, the deterministic contention manager, and a multi-GPU
+sharding stub. The design statement was that STM stops being a
+retroactive conflict detector and becomes a scheduler-aware fabric
+beneath Prism frontiers and EVM fibers.
+
+\paragraph{What 3.0 actually shipped.}
+The honest assessment is that 3.0 was the substrate, not the production
+system. Specifically:
+\begin{itemize}[leftmargin=2em]
+\item The cryptographic verifiers (\texttt{verify\_bls\_aggregate},
+      \texttt{verify\_corona\_share}, \texttt{verify\_mldsa\_groth16})
+      were HMAC-keccak placeholders---real cryptographic verification
+      with one-way master secrets and cross-lane domain tags, but not
+      the real curve / lattice / SNARK primitives.
+\item The EVM fiber VM covered 118 of the targeted 175
+      opcodes---arithmetic, environment, stack manipulation, basic
+      memory and storage, control flow, return paths---but \emph{not}
+      the \texttt{CALL} family, \texttt{CREATE}/\texttt{CREATE2},
+      \texttt{LOG}$_n$, \texttt{EXTCODE}$\!*$, \texttt{RETURNDATA}$\!*$,
+      \texttt{TLOAD}/\texttt{TSTORE}, \texttt{MCOPY}, or
+      \texttt{BLOBHASH}/\texttt{BLOBBASEFEE}.
+\item Tier~1 lane-clock validation was sketched but not the production
+      fast path; Tier~3 semantic reducers were enumerated as
+      \texttt{DeferredOpKind} but not committed at horizon time.
+\item The CSMV-style commit server and the Motor-style VersionBlock
+      layout were design notes, not code.
+\item There was no formal CPU reference and no cross-backend
+      determinism harness gating CI.
+\end{itemize}
+
+\paragraph{What 4.0 ships.}
+This paper specifies QuasarSTM~4.0, the production spec activated on
+2026-02-14. Every gap above is closed. Every feature is in the
+\texttt{cevm} substrate, exercised by the cross-backend determinism
+harness, and gated in CI at the LP-137 substrate-wide bar of
+$\geq 96\%$ line coverage on the CPU reference oracle (the
+byte-equivalence ground truth against which Apple Metal and NVIDIA
+CUDA are asserted). Specifically:
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Real cryptographic verifiers.} Vendored on-device kernels
+      for BLS12-381 pairing~\cite{bls12381}, Corona Ring-LWE share
+      verification~\cite{corona2024}, and Groth16
+      verification~\cite{groth2016} over BLS12-381 against the Z-Chain
+      verifying-key root.
+\item \textbf{Full EVM coverage.} 175 opcodes including the entire
+      \texttt{CALL} family, \texttt{CREATE}/\texttt{CREATE2},
+      \texttt{LOG}$_n$, \texttt{EXTCODE}$\!*$, \texttt{RETURNDATA}$\!*$,
+      \texttt{TLOAD}/\texttt{TSTORE}, \texttt{MCOPY},
+      \texttt{BLOBHASH}/\texttt{BLOBBASEFEE}; SSTORE journaling with
+      EIP-2929~\cite{eip2929} cold/warm and EIP-3529~\cite{eip3529}
+      refund accounting.
+\item \textbf{Tier~1 lane-clock fast validation.} Production lane-clock
+      check against a per-round table in shared memory, with no per-key
+      MVCC chain walk in the common case (\S\ref{sec:tier1}).
+\item \textbf{Tier~3 semantic reducers.} \texttt{DeferredOp} entries
+      committed deterministically per-lane at horizon time
+      (\S\ref{sec:tier3}); \texttt{Add}, \texttt{Sub}, \texttt{Append},
+      \texttt{BalanceDelta}, \texttt{FeeAccumulate}, \texttt{OrderAppend},
+      \texttt{AuctionMatch}, \texttt{MintCounter}, \texttt{NonceAdvance}.
+\item \textbf{ConflictSpec ABI~\cite{aft2025conflictspec}} as a
+      fallback-safe oracle on top of speculative Block-STM
+      (\S\ref{sec:conflictspec}).
+\item \textbf{NEMO LaneClass}~\cite{nemo2025} (Owned / Shared / HotShared
+      / Commutative / Unknown) driving per-class execution policy
+      (\S\ref{sec:laneclass}).
+\item \textbf{Dynamic versioning} a la Multiverse~\cite{multiverse2026}
+      (\S\ref{sec:multiverse}): \texttt{SingleVersionFast},
+      \texttt{MultiVersion}, \texttt{Reducer}, \texttt{Serialized}
+      modes selected per lane between rounds.
+\item \textbf{Fiber checkpoints} per CALL-frame return for incremental
+      repair (\S\ref{sec:checkpoints}).
+\item \textbf{Commit horizon} over Nova prefixes and Nebula causal cuts
+      (\S\ref{sec:horizon}); \textbf{MVCC GC} bound to the horizon
+      (\S\ref{sec:gc}).
+\item \textbf{Motor-style VersionBlock layout}~\cite{motor2024}
+      (\S\ref{sec:versionblock}): 4--8 inline versions per key, RDMA /
+      multi-GPU friendly.
+\item \textbf{A/B/M/F drain services} (\S\ref{sec:abmf}):
+      AdaptiveSchedule, BridgeAttest, MarketAuction,
+      FiberCheckpoint---growing the GPU service set from 12 (LP-132,
+      3.0) to 16.
+\item \textbf{Cross-backend determinism harness}
+      (\S\ref{sec:determinism}): same input $\Rightarrow$ byte-identical
+      roots on Metal and CUDA.
+\item \textbf{CSMV~\cite{csmv} commit-server scaffold} with a formally
+      specified CPU reference~\cite{vmvcc}: fibers emit read/write
+      intents, the commit service owns MVCC mutation, the abstract
+      semantics live in \texttt{lib/consensus/quasar/spec/}, the
+      differential fuzzer runs in CI.
+\end{enumerate}
+
+\paragraph{What does not ship in 4.0.}
+Distributed multi-GPU MVCC over RDMA, operation-window validation for
+pathological long transactions, kernel refinement proofs against the
+abstract semantics, and 800G InfiniBand / GPUDirect cell topologies
+remain QuasarSTM~5.0 research. They are tracked in a separate
+research-track document and are not on the 2026-02-14 activation path.
+
+\paragraph{Scope.}
+This paper specifies QuasarSTM~4.0 frozen on 2026-02-07 and activated
+on 2026-02-14. It supersedes the QuasarSTM~3.0 paper~\cite{lp010-quasarstm-3}
+on every point where the two disagree; otherwise, 3.0 is normative for
+substrate definitions (lanes, wave-tick scheduler, three-tier validation
+skeleton, contention manager, multi-GPU sharding stub).
+
+\paragraph{Contributions.}
+\begin{enumerate}[leftmargin=2em]
+\item A production specification of Tier~1 lane-clock fast validation
+      that retires the per-key MVCC walk in the common case
+      (\S\ref{sec:tier1}).
+\item A production specification of Tier~3 semantic reducers as
+      first-class commit primitives, with the canonical reduction
+      schedule per lane (\S\ref{sec:tier3}).
+\item A fallback-safe ConflictSpec ABI with explicit source priority
+      (\S\ref{sec:conflictspec}) and the NEMO LaneClass classification
+      with per-class policy (\S\ref{sec:laneclass}).
+\item Dynamic per-lane versioning mode selection bound to a per-round
+      \texttt{LaneClockEntry} (\S\ref{sec:multiverse}).
+\item A production checkpoint scheme for EVM fibers
+      (\S\ref{sec:checkpoints}) that yields measured 5--30$\times$
+      repair-cost reduction on router and multi-hop swap workloads.
+\item Commit horizon semantics, MVCC GC, Motor VersionBlock layout
+      (\S\S\ref{sec:horizon}--\ref{sec:versionblock}).
+\item Four new GPU drain services---A/B/M/F---without breaking the 3.0
+      service contract (\S\ref{sec:abmf}).
+\item Replacement of HMAC-keccak placeholders with real BLS12-381,
+      Corona Ring-LWE, and Groth16 on-device verifiers
+      (\S\ref{sec:verifiers}).
+\item A cross-backend determinism harness and a formally specified CPU
+      reference; same input $\Rightarrow$ byte-identical roots on
+      Metal and CUDA (\S\ref{sec:determinism}).
+\item Performance measurements: 1024-tx end-to-end stress in
+      $108\,\text{ms}$ on M1 Max in 6 wave ticks; on contended
+      regulated-DEX workloads, $\mathit{repair\_amplification} \approx
+      0.42$ (\S\ref{sec:performance}).
+\item An activation roadmap: v0.41--v0.49 deliverables that landed in
+      the 2026-02-14 release (\S\ref{sec:activation}).
+\end{enumerate}
+
+%% ============================================================================

@@ -1,0 +1,103 @@
+\section{Lux FHE-C++: the production runtime}
+\label{sec:fhe-cpp-production-runtime}
+
+\texttt{github.com/luxfi/luxcpp/crypto/fhe} is the production runtime.
+Its design priorities, in order, are: \emph{byte-equality with the
+Go reference}, \emph{throughput on GPU}, \emph{a stable C ABI}, and
+\emph{first-party-only code}.
+
+\subsection{Surface}
+
+The public C++ API lives under \texttt{cpp/include/lux\_fhe/}: opaque
+parameter / key / ciphertext types, plus
+$\mathsf{KeyGen}/\mathsf{Enc}/\mathsf{Dec}/\mathsf{Eval}$ entry points
+parametrized by a \texttt{Backend} enum. The C ABI lives at
+\texttt{c-abi/c\_lux\_fhe.cpp} and is the only surface Go cgo and
+Rust bindgen consume. Downstream language bindings do not include C++
+headers.
+
+\subsection{Backends}
+
+\begin{itemize}
+\item \textbf{CPU (Lux FHE-Core CPU oracle).} Production code, byte-equal
+to Lux FHE-Go. Lives under \texttt{cpp/backends/cpu/}. The CPU NTT, key-switch,
+and bootstrap modules are the semantic oracles --- GPU backends are
+byte-equal to them.
+\item \textbf{Lux FHE-CUDA.} NVIDIA backend. Shipping (v0.1.0): the
+NTT, key-switch, and programmable-bootstrap kernels live under
+\texttt{cpp/backends/cuda/}. Backend selection is governed by the
+compile-time \texttt{LUX\_FHE\_BACKEND\_CUDA} flag, the runtime
+\texttt{cudaGetDeviceCount()} probe, and the
+\texttt{LUX\_FHE\_BACKEND=\{cpu,cuda\}} environment override. The
+device kernel output is asserted byte-equal to the CPU oracle on every
+KAT entry by \texttt{fhe\_backend\_equiv\_test}.
+\item \textbf{Lux FHE-HIP.} AMD backend. Mirrors Lux FHE-CUDA; lands
+after the CUDA bootstrap stabilizes.
+\item \textbf{Lux FHE-SYCL.} Portable accelerator backend. Reserved
+name; ships only when a non-CUDA, non-HIP backend warrants it.
+\end{itemize}
+
+\subsection{Backend selection is explicit}
+
+LP-167 \S\,Required claims for GPU-native credibility, point 9, forbids
+silent dispatch. The C++ entry points take a \texttt{Backend} parameter
+at handle creation; \texttt{LUX\_FHE\_AUTO} is intentionally undefined.
+This is a discipline, not a UX failure: a runtime that silently falls
+through from GPU to CPU loses the throughput contract that motivated
+the GPU backend in the first place.
+
+\begin{lstlisting}
+#include "lux_fhe/keygen.hpp"
+
+lux_fhe::SecretKey sk;
+lux_fhe::PublicKey pk;
+lux_fhe::EvaluationKey ek;
+uint8_t seed[32]; /* derive from validator key material */
+
+if (!lux_fhe::keygen_from_seed(lux_fhe::Backend::CUDA,
+                               params, seed, sk, pk, ek)) {
+    // CUDA unavailable -> caller decides whether to retry on CPU.
+}
+\end{lstlisting}
+
+\subsection{Wire format}
+
+The on-wire layout is fixed by \texttt{cpp/include/lux\_fhe/serialization.hpp}.
+Magic / version / parameter-set-id / payload, little-endian. Lux FHE-Go
+emits the same byte sequence; the cross-runtime KAT replay test
+asserts byte-equality on each shipped parameter set. The wire format
+is \emph{the} format --- there is no separate "C++ format" or
+"Go format". Format parity is a normative claim
+(LP-167 \S Required claims, point 1).
+
+\subsection{What v0.1.0 ships}
+
+The v0.1.0 milestone (this paper) covers:
+
+\begin{itemize}
+\item Public C++ API surface (every entry point callable);
+\item C ABI surface for Go cgo / Rust bindgen;
+\item CPU oracle for parameter resolution, deterministic keygen seed
+expansion, NTT forward/inverse, gadget-decomposed key-switch, and
+programmable bootstrap;
+\item CUDA backend with byte-equal NTT, key-switch, and
+programmable-bootstrap kernels; backend selected explicitly by the
+compile-time flag \texttt{LUX\_FHE\_BACKEND\_CUDA}, the runtime
+\texttt{cudaGetDeviceCount()} probe, and the environment override
+\texttt{LUX\_FHE\_BACKEND}.
+\item Encryption + decryption round-trip for $\mathsf{PN10QP27}$ and
+$\mathsf{PN11QP54}$ on both backends;
+\item Nebula-FHE transcript root (\texttt{lux\_fhe\_nebula\_root})
+producing a deterministic 32-byte commitment;
+\item KAT replay harness consuming the Go-generated corpus
+(\texttt{fhe\_kat\_replay\_test}) and a cross-backend byte-equality
+test (\texttt{fhe\_backend\_equiv\_test});
+\item Microbenchmarks for NTT, key-switch, and bootstrap on CPU vs
+CUDA dispatch (\texttt{luxcpp/crypto/fhe/bench/}). Reported numbers
+in Section~\ref{sec:fhe-benchmarks}.
+\end{itemize}
+
+Lux FHE-Metal is scaffolded for v0.1.0 with the build wired up under
+\texttt{LUX\_FHE\_BACKEND\_METAL}; production Metal device kernels reuse
+the existing \texttt{luxcpp/crypto/ntt/gpu/metal/} kernel set and land
+at v0.2.0.

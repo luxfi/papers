@@ -1,0 +1,159 @@
+\section{Wire Format}
+\label{sec:wire-format}
+
+This section is normative. The byte stream produced by the Go canonical's $\textsc{WriteTo}$ methods is the reference; every C++, Metal, CUDA, and WGSL port \cite{lp137} MUST emit byte-identical output for cross-implementation Known-Answer-Test acceptance.
+
+\subsection{Endianness and primitive widths}
+
+All multi-byte integers in the polynomial / vector / matrix payloads are encoded little-endian via \texttt{encoding/binary.LittleEndian} \cite{lattigov7} (\texttt{lattice/utils/buffer/writer.go:325}). Coefficients are stored as \texttt{uint64} regardless of the modulus' bit-width: the 18-bit and 19-bit moduli of $R_\xi$ and $R_\nu$ are zero-padded to 8 bytes per coefficient.
+
+The MAC and transcript inputs use \emph{big-endian} encodings via \texttt{binary.Write(BigEndian, \ldots)} for integer fields ($\mathit{sid}$, $|T|$, $T_k$, party ids). This is a deliberate split: ring-domain payloads are little-endian (matches \texttt{x86\_64} memory layout for fast \texttt{memcpy}-style serialization); transcript metadata is big-endian (matches network-byte-order convention for cross-host transcripts).
+
+\subsection{Polynomial}
+
+A single $\texttt{ring.Poly}$ at one RNS level has shape $1 \times \varphi$. Its \textsc{WriteTo} output (\texttt{lattice/ring/poly.go:117}, \texttt{utils/structs/matrix.go:82}, \texttt{utils/structs/vector.go:82}) is:
+
+\begin{lstlisting}[caption={Polynomial wire format ($\varphi = 256$).}]
+uint64_LE  row_count    = 1
+uint64_LE  col_count    = 256
+uint64_LE  coeff[0..255]               # row-major
+# total: 8 + 8 + 8*256 = 2064 bytes
+\end{lstlisting}
+
+A zero polynomial therefore serializes to \texttt{01 00 00 00 00 00 00 00 \textbar\ 00 01 00 00 00 00 00 00 \textbar\ (256 zero u64)}.
+
+\subsection{Vector and Matrix}
+
+\begin{lstlisting}[caption={Vector and Matrix wire formats.}]
+Vector[Poly] of length n:
+    uint64_LE  length = n
+    Poly * n                    # each as above
+
+Matrix[Poly] of shape m * n:
+    uint64_LE  row_count = m
+    Vector[Poly] * m            # each as above
+\end{lstlisting}
+
+A $1 \times 1$ matrix containing a zero polynomial is $8 + 8 + 2064 = 2080$ bytes.
+
+\subsection{Signature}
+
+\begin{lstlisting}[caption={Signature $\sigma = (c, z, \Delta)$ with $n_{\textrm{vec}} = 7$, $m_{\textrm{pk}} = 8$.}]
+sigma = c || z || Delta
+c     : Poly                              # 2064 bytes
+z     : Vector[Poly] length 7             # 8 + 7*2064 = 14456 bytes
+Delta : Vector[Poly] length 8             # 8 + 8*2064 = 16520 bytes
+                                          # total: 33040 bytes
+\end{lstlisting}
+
+\subsection{Group Key}
+
+\begin{lstlisting}[caption={Group key $(A, \tilde b)$.}]
+A     : Matrix[Poly] shape 8 x 7          # 8 + 8*(8 + 7*2064) = 116232 bytes
+b_til : Vector[Poly] length 8             # 8 + 8*2064 = 16520 bytes
+\end{lstlisting}
+
+\subsection{MAC input}
+
+\textsc{GenerateMAC} (\texttt{primitives/hash.go:34}) hashes the following stream with BLAKE3 and truncates to 32 bytes:
+
+\begin{lstlisting}[caption={MAC input layout.}]
+mac_input =
+    int64_BE(prover_or_verifier_id)       # partyID when generating;
+                                          # otherPartyID when verifying
+ || MACKey[32]
+ || Matrix[Poly].WriteTo(D_i)
+ || int64_BE(sid)
+ || int32_BE(|T|)
+ || int32_BE(T_k) for k = 0..|T|-1        # in T's order
+MAC = BLAKE3(mac_input)[:32]
+\end{lstlisting}
+
+The asymmetric ``identity in slot 0'' ($\mathit{partyID}$ on generate, $\mathit{otherPartyID}$ on verify) is intentional and prevents reflection of $\textsc{MAC}_{i \to j}$ as $\textsc{MAC}_{j \to i}$.
+
+\subsection{Transcript hashes}
+
+\paragraph{\textsc{Hash} (\texttt{primitives/hash.go:128}).} Round 2 transcript hash:
+
+\begin{lstlisting}
+Hash_input =
+    Matrix[Poly].WriteTo(A)
+ || Vector[Poly].WriteTo(b)
+ || int64_BE(sid)
+ || int32_BE(|T|)
+ || int32_BE(T_k) for k = 0..|T|-1
+ || Matrix[Poly].WriteTo(D_j) for j = 0..|T|-1   # ascending j
+hash = BLAKE3(Hash_input)[:32]
+\end{lstlisting}
+
+This requires every implementation to populate the $D$ map with contiguous integer keys $\{0, \ldots, |T|-1\}$ before hashing. Non-contiguous keys produce a different transcript and the round will not converge.
+
+\paragraph{\textsc{LowNormHash} (line 167).} Challenge derivation:
+
+\begin{lstlisting}
+LNH_seed = BLAKE3(
+    Matrix[Poly].WriteTo(A)
+ || Vector[Poly].WriteTo(b_til)
+ || Vector[Poly].WriteTo(h_til)
+ || []byte(mu)
+)[:32]
+prng = BLAKE2-XOF(LNH_seed)
+c = TernarySampler(prng, R, Ternary{H: kappa}).Read()
+c = NTT(c); c = MForm(c)
+\end{lstlisting}
+
+\paragraph{\textsc{GaussianHash} (line 75).} Challenge-side $u'$ vector:
+
+\begin{lstlisting}
+GH_seed = BLAKE3(hash || []byte(mu))[:32]
+prng = BLAKE2-XOF(GH_seed)
+u' = SamplePolyVector(prng, R, DiscreteGaussian{sigma_U, B_U},
+                      length=Dbar, NTT=true, Mont=true)
+\end{lstlisting}
+
+\paragraph{\textsc{PRF} (line 99).} Pairwise mask:
+
+\begin{lstlisting}
+PRF_seed = BLAKE3(k_PRF || sd_ij || hash || []byte(mu))[:32]
+prng = BLAKE2-XOF(PRF_seed)
+mask = SamplePolyVector(prng, R, UniformSampler,
+                        length=n_vec, NTT=true, Mont=true)
+\end{lstlisting}
+
+\subsection{Discrete-Gaussian sampler (Ziggurat)}
+
+The Discrete-Gaussian sampler is Marsaglia's Ziggurat \cite{ziggurat,lattigov7} with 128 strata over a BLAKE2-XOF byte stream (\texttt{lattice/ring/sampler\_gaussian.go:48}). The pre-computed tables $\textsc{kn}, \textsc{wn}, \textsc{fn}$ in the Lattigo source MUST be reproduced bit-exactly by every port.
+
+Per coefficient: one 8-byte read for the strata index and sign (only the low 4 bytes are used; the next 4 bytes are skipped to maintain 8-byte buffer alignment, \texttt{sampler\_gaussian.go:212}). On the rare strata-0 tail or inter-strata reject path, additional 8-byte reads draw a uniform $\mathbb{R} \in (0, 1)$ via \texttt{randF64}, masking 53 bits of the lower 8 bytes \cite{lattigov7}. A constant-bound C++/GPU port MUST treat the 1024-byte internal buffer as a sliding window with the same refill discipline (one BLAKE2-XOF \texttt{Read(buf[0:1024])} when the buffer is exhausted).
+
+\subsection{Ternary sampler}
+
+For $\textsc{LowNormHash}$ challenges with $\mathrm{Ternary}\{H: \kappa\}$, $\textsc{TernarySampler.sampleSparse}$ (\texttt{lattice/ring/sampler\_ternary.go:198}) implements rejection sampling of $\kappa$ distinct positions plus pairwise sign bits:
+
+\begin{enumerate}
+\item Initialize $\mathrm{idx} = [0, 1, \ldots, \varphi-1]$.
+\item Read $\lceil \kappa/8 \rceil$ random bytes for sign bits.
+\item For $k = 0, \ldots, \kappa - 1$:
+\begin{enumerate}
+  \item Choose the smallest power-of-two mask $\ge \varphi - k$ (one byte at $\varphi = 256$).
+  \item Rejection-sample a position $p \in [0, \varphi - k)$, consuming bytes from the PRNG until a candidate $\le \varphi - k - 1$ appears.
+  \item Set $\mathrm{coeff}[\mathrm{idx}[p]] \leftarrow \mathit{sign}_k \,?\, q-1 : 1$.
+  \item Swap $\mathrm{idx}[p]$ with $\mathrm{idx}[\varphi - k - 1]$ to prevent re-selection.
+\end{enumerate}
+\item All other positions remain zero.
+\end{enumerate}
+
+The output is in standard form; the protocol then applies $\textsc{NTT} + \textsc{MForm}$. C++/GPU ports MUST mirror the byte-stripe ordering of sign bits (MSB-first within byte) and the rejection-sampling loop.
+
+\subsection{Cross-implementation Known-Answer-Test contract}
+
+The reference KAT manifest is \texttt{corona/test/kat/manifest.sha256} in the Go canonical \cite{coronago}. The contract is:
+
+\begin{enumerate}
+\item Fixed $k_{\mathrm{TD}} \in \{\texttt{0x00...00}, \texttt{0x01...01}, \ldots, \texttt{0x0F...0F}\}$ (16 vectors).
+\item Active set sizes $(t, n) \in \{(2,3), (3,5), (5,7), (7,10)\}$.
+\item For each $(k_{\mathrm{TD}}, t, n)$ produce: $A$, $\tilde b$, every $\mathrm{sk}_i$, every $D_i$, every $\textsc{MAC}_{i \to j}$, the transcript $h_{\mathrm{tx}}$, every $z_i$, the final $\sigma = (c, z, \Delta)$, and the $\textsc{Verify}$ accept bit.
+\item The SHA-256 of every payload (each individually serialized via \textsc{WriteTo}) MUST match across the Go canonical, the C++ port, and any GPU kernel claiming Corona compatibility.
+\end{enumerate}
+
+A C++ implementer reading \S\ref{sec:parameters}--\ref{sec:wire-format} alone should produce a byte stream that hashes byte-equal to the Go canonical's $\textsc{WriteTo}$ output without consulting any Go source.

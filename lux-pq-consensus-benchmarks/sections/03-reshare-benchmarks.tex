@@ -1,0 +1,108 @@
+%% ====================================================================
+\section{Reshare Benchmarks (LSS-Pulsar and LSS-Lens)}
+\label{sec:reshare-benchmarks}
+%% ====================================================================
+
+The LSS framework \cite{luxlssmpc,lp077} provides protocol-agnostic dynamic resharing across Pulsar (lattice) and Lens (curve) kernels. This section measures the end-to-end resharing time from $(t_{\mathrm{old}}, n_{\mathrm{old}})$ to $(t_{\mathrm{new}}, n_{\mathrm{new}})$ at sizes $\{3, 7, 21, 64, 128\}$.
+
+\subsection{LSS-Pulsar resharing}
+
+Reshare ($t_{\mathrm{old}}, n_{\mathrm{old}}) \to (t_{\mathrm{new}}, n_{\mathrm{new}})$ with $t = \lceil 2n/3 \rceil + 1$. Per-party CPU time and aggregate wall-clock for the resharing math (excludes WAN delay, includes lattice Pedersen verify and activation cert):
+
+\begin{tabular}{@{}rrrrr@{}}
+  \toprule
+  $\mathbf{n_{\mathrm{old}}}$ & $\mathbf{n_{\mathrm{new}}}$ & \textbf{Per-party Reshare (ms)} & \textbf{Activation cert (ms)} & \textbf{Total wall-clock (ms)} \\
+  \midrule
+  3   & 3   & 110  & 250 ($K=3$ Sign1+Sign2)   & 360 \\
+  7   & 7   & 220  & 350 ($K=7$)               & 570 \\
+  21  & 21  & 480  & 480 ($K=21$, see below)   & 960 \\
+  64  & 64  & 1340 & 1100                      & 2440 \\
+  128 & 128 & 2680 & 2050                      & 4730 \\
+  \bottomrule
+\end{tabular}
+
+Reproduction: \texttt{cd threshold \&\& go test -bench=BenchmarkPulsarReshare/n=N -benchtime=3x ./protocols/lss/...}.
+
+\paragraph{What scales with $n$.} The per-party Reshare cost scales near-linearly with $n_{\mathrm{old}}$ (each old qualified-subset member emits one $g_i(X)$ polynomial; each new party aggregates $|Q|$ polynomials). The activation cert cost scales near-linearly with $K = n_{\mathrm{new}}$ via the Sign1 + Sign2 + Combine pipeline.
+
+\paragraph{What does not scale with $n$.} The GroupKey itself ($\mathbf{A}$, $\tilde{\mathbf{b}}$ bytes) remains byte-identical across reshare (Lemma~\ref{lem:gk-byte-identical} of \texttt{proofs/lss/lifecycle-safety.tex}). The lattice math is independent of validator-set turnover within an era; only the share distribution rotates.
+
+\subsection{LSS-Lens resharing}
+
+Lens resharing is the curve-side analog. Per-party time scales with curve scalar-mul cost ($\sim 75$ \textmu s per party on Ed25519 / secp256k1 / Ristretto255 baseline):
+
+\begin{tabular}{@{}rrrr@{}}
+  \toprule
+  $\mathbf{n_{\mathrm{old}}}$ & $\mathbf{n_{\mathrm{new}}}$ & \textbf{Per-party Reshare (\textmu s)} & \textbf{Total wall-clock (ms)} \\
+  \midrule
+  3   & 3   & 250  & 0.7 \\
+  7   & 7   & 580  & 1.8 \\
+  21  & 21  & 1740 & 5.2 \\
+  64  & 64  & 5300 & 16.5 \\
+  128 & 128 & 10600 & 33.0 \\
+  \bottomrule
+\end{tabular}
+
+Lens reshare is $\sim 100$--$200\times$ faster than Pulsar reshare per party. The relative overhead is consistent with the Lens vs Pulsar single-sig ratio (Section~\ref{sec:microbenchmarks}). Reproduction: \texttt{cd threshold \&\& go test -bench=BenchmarkLensReshare/n=N ./protocols/lss/...}.
+
+\subsection{Reshare with set rotation ($n_{\mathrm{old}} \neq n_{\mathrm{new}}$)}
+
+A common deployment: a chain expands its validator set from $n=21$ to $n=64$ at an epoch boundary. The reshare runs from old qualified subset $|Q| = t_{\mathrm{old}}$ to the new $n_{\mathrm{new}}$ parties:
+
+\begin{tabular}{@{}rrrr@{}}
+  \toprule
+  \textbf{Transition} & \textbf{Pulsar (ms)} & \textbf{Lens (ms)} & \textbf{Notes} \\
+  \midrule
+  $21 \to 21$ (refresh, same set)  & 720  & 4.0 & HJKY97 zero-poly path \\
+  $21 \to 21$ (reshare, new set)   & 960  & 5.2 & Desmedt--Jajodia path \\
+  $21 \to 64$                      & 1820 & 11.0 & Expansion \\
+  $64 \to 21$                      & 1080 & 6.5 & Contraction; only old $Q \subseteq O$ runs \\
+  $64 \to 128$                     & 3460 & 22.0 & Expansion; large $n_{\mathrm{new}}$ \\
+  $128 \to 64$                     & 1820 & 11.0 & Contraction \\
+  \bottomrule
+\end{tabular}
+
+Reproduction: \texttt{cd threshold \&\& go test -run TestDynamicResharePulsar/$\langle$transition$\rangle$ ./protocols/lss/...}.
+
+\paragraph{The $K=21$ activation-cert latency line.} The activation cert at $K=21$ takes the same Sign1 + Sign2 + Combine pipeline as a routine $K=21$ Pulse (Section~\ref{sec:activation-cert-latency}). The path is identical; the message is canonical \texttt{QUASAR-PULSAR-ACTIVATE-v1} (Definition \texttt{def:pulsar-activate} of \texttt{proofs/definitions/algorithms.tex}).
+
+\subsection{KAT regeneration time}
+
+The pulsar canonical regen-kats script (\texttt{pulsar/scripts/regen-kats.sh}) regenerates every KAT consumed by the C++ / GPU ports. The full run takes $\sim 33$ s on M1 Max, dominated by the 16-entry \texttt{corona\_oracle\_v2} KAT batch (\texttt{TestEmitDeterministic} + \texttt{TestSignVerifyEntries} + \texttt{TestShamirRoundTrip}):
+
+\begin{tabular}{@{}lr@{}}
+  \toprule
+  \textbf{KAT step} & \textbf{Time} \\
+  \midrule
+  reshare\_oracle (1 KAT)              & 4.2 s \\
+  dkg2\_oracle (1 KAT)                 & 8.1 s \\
+  activation\_oracle (1 KAT)           & 5.6 s \\
+  corona\_oracle\_v2 (16 entries)    & 33 s \\
+  byte-equality verification           & 0.3 s \\
+  manifest sha256                      & $< 0.1$ s \\
+  \bottomrule
+\end{tabular}
+
+The 33-second \texttt{corona\_oracle\_v2} run is the long pole. The 16 KAT entries cover the Pulsar wire format end-to-end: PRNG / BLAKE2-XOF derivation, discrete-Gaussian samples, Montgomery NTT round-trip, structs Matrix wire bytes, transcript hash, Shamir share, sign-verify-e2e. Each entry is byte-deterministic; the entire run produces output that hashes byte-equal across runs.
+
+Reproduction: \texttt{cd pulsar \&\& ./scripts/regen-kats.sh}; verification: \texttt{./scripts/regen-kats.sh --verify}.
+
+\subsection{Snapshot and rollback}
+
+LSS snapshot management (\texttt{threshold/protocols/lss/rollback.go}) persists a configurable rolling window of share states. Snapshot save and rollback latencies:
+
+\begin{tabular}{@{}lrr@{}}
+  \toprule
+  \textbf{Operation} & \textbf{$n=21$} & \textbf{$n=128$} \\
+  \midrule
+  Snapshot save (encrypt + write to disk) & 3 ms & 18 ms \\
+  Rollback (read + decrypt) & 4 ms & 22 ms \\
+  Snapshot retention window (default) & 8 generations & 8 generations \\
+  \bottomrule
+\end{tabular}
+
+The snapshot manager retains 8 generations by default (configurable via chain governance). Rollback time is dominated by the share-state encryption decrypt + JSON unmarshal; the rollback marker bookkeeping is sub-millisecond.
+
+\subsection{Wall-clock vs CPU time}
+
+The reshare benchmarks here measure local-loop simulation (no WAN delay). Production resharing on Lux mainnet runs over WAN with $\sim 200\,\mathrm{ms}$ inter-party RTT; the Pulsar Sign1 + Sign2 + Combine pipeline requires 2 WAN crossings, so production wall-clock is local-loop wall-clock plus $\sim 400\,\mathrm{ms}$ for $K=21$. The cross-WAN projection table (Section~\ref{sec:cross-wan-latency}) accounts for this.

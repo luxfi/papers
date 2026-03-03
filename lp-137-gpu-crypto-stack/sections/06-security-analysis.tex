@@ -1,0 +1,50 @@
+\section{Security Analysis}
+\label{sec:security}
+
+\subsection{Side-channel posture}
+
+Every LP-137 algorithm targets constant-time CPU and branchless GPU. Specifically:
+
+\begin{itemize}
+\item Field arithmetic (Fp/Fr Montgomery REDC) is constant-time on CPU.
+\item Scalar multiplication on every supported curve uses windowed scalar mul with constant-time table lookup or branchless conditional point selection (\texttt{pt\_cmov\_affine} on Metal, \texttt{cmov\_*} on CUDA).
+\item Hash and AEAD primitives have data-independent control flow on CPU; GPU kernels process independent blocks per warp / thread group.
+\item Threshold-scheme nonce generation uses an explicitly seeded deterministic stream during testing and a CSPRNG (\texttt{getrandom(2)} on Linux, \texttt{Security.framework} on Darwin) in production.
+\end{itemize}
+
+\subsection{GPU memory hygiene}
+
+The GPU-residency invariant (\S\ref{sec:introduction}) requires that secret-state never leaves attested GPU memory during a chain-local hot path. We enforce this in three layers:
+
+\begin{enumerate}
+\item \textbf{Memory model.} Secret buffers are declared in \texttt{private} or \texttt{threadgroup} address space, not \texttt{constant} or \texttt{device}, so that the host cannot read them back without an explicit copy.
+\item \textbf{Static check.} The per-kernel disassembly check (\S\ref{sec:determinism-harness}) verifies that no host-bound symbol writes a secret buffer onto a host-readable region.
+\item \textbf{Runtime attestation.} The GPU device must present an attestation envelope (NV-NRAS, SEV-SNP, TDX) before the dispatcher will route hot-path work to it. The envelope verification path is in \texttt{luxd/cc/attest/}; the C++ side parses only.
+\end{enumerate}
+
+\subsection{Test-oracle isolation}
+
+The attack model has two adversaries:
+
+\begin{enumerate}
+\item An external attacker who exploits a vulnerability in the production library.
+\item An internal mistake (regression, port error) that diverges the production library from the spec.
+\end{enumerate}
+
+The vendored test oracle defends against (2). If the CPU canonical and the test oracle came from the same upstream family, a bug in that upstream would propagate through both sides of the byte-equality check; the test would pass while production is broken. Lux first-party CPU plus an independent vendored oracle is the only structure that catches (2) reliably. This is why the substrate keeps the audited upstreams (\texttt{blst}, \texttt{c-kzg-4844}, \texttt{gnark-crypto}, \texttt{PQClean}, \texttt{mcl}) at the test boundary only.
+
+\subsection{Brand neutrality}
+
+No public symbol in the C-ABI or in any header file uses the prefix \texttt{LUX\_}, \texttt{LUXFI\_}, or \texttt{HANZO\_}. The algorithm name is the namespace. This serves three purposes:
+
+\begin{itemize}
+\item Prevents linker-level conflicts when consuming Lux libraries alongside other crypto libraries.
+\item Eliminates ``vendor symbol leak'' --- the production binary's symbol table cannot be used to fingerprint the substrate.
+\item Aligns with the formal verification posture: the algorithm's spec is the contract, not Lux's branding.
+\end{itemize}
+
+\subsection{Quantum posture}
+
+Lux's post-quantum substrate (ML-DSA \cite{fips204}, ML-KEM \cite{fips203}, SLH-DSA \cite{fips205}, FALCON, Corona) is documented per-algorithm in its own LP. In aggregate: the consensus pipeline operates in \emph{triple} mode (BLS + Corona + ML-DSA), with each layer independently toggleable. A break of any single layer does not break consensus; only the simultaneous compromise of all three does.
+
+Hash-based signatures (SLH-DSA, Lamport \cite{lamport79}) provide a quantum-secure fallback path that depends only on hash preimage resistance. Grover halves effective security, so a $256$-bit hash drops to $128$-bit quantum security --- still more than adequate for current attacker models.

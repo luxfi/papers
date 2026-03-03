@@ -1,0 +1,145 @@
+%% ====================================================================
+\section{Implementation}
+\label{sec:implementation}
+%% ====================================================================
+
+The shipping consensus implementation is in \texttt{github.com/luxfi/consensus} \cite{consensusgo}. This section locates the Horizon composition in that code base and points at the test surface that witnesses the composition argument.
+
+\subsection{Repository layout}
+
+\begin{tabular}{@{}p{0.30\textwidth}p{0.65\textwidth}@{}}
+  \toprule
+  \textbf{Path} & \textbf{Role} \\
+  \midrule
+  \texttt{protocol/photon} & K-of-N committee selection, luminance tracking \\
+  \texttt{protocol/wave} & Threshold voting + FPC \\
+  \texttt{protocol/focus} & Beta consecutive-successes counter \\
+  \texttt{protocol/prism} & DAG geometry: cuts, frontiers, uniform sampling \\
+  \texttt{protocol/horizon} & DAG reachability, LCA, transitive closure, skip lists \\
+  \texttt{protocol/flare} & DAG cert/skip via 2f+1 quorum \\
+  \texttt{protocol/ray} & Linear chain finality driver \\
+  \texttt{protocol/field} & DAG finality driver with safe-prefix commit \\
+  \texttt{protocol/nova} & Linear chain mode (wraps \texttt{ray}) \\
+  \texttt{protocol/nebula} & DAG mode (wraps \texttt{field}) \\
+  \texttt{protocol/quasar} & BLS Beam + ML-DSA cert set + Pulsar Pulse composition \\
+  \bottomrule
+\end{tabular}
+
+The Horizon composition lives in \texttt{protocol/quasar/horizon.go} (Prism predicate) and \texttt{protocol/quasar/quasar.go} (lifecycle: bundle interval, Beam-final, Pulse-sealed, Horizon-final state transitions). The Pulse signing path is wired through \texttt{epoch.go} and \texttt{reshare\_epoch.go} to the LSS-Pulsar adapter at \texttt{threshold/protocols/lss/lss\_pulsar.go} \cite{thresholdgo}, which delegates to the Pulsar kernel at \texttt{github.com/luxfi/pulsar} \cite{coronago}.
+
+\subsection{The Quasar engine flow}
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item Photons (validator votes) arrive over the Lumen transport (forthcoming Lumen LP). The transport is ZAP \cite{lp020} (zero-copy wire protocol; not p2p / gRPC).
+  \item Wave threshold-voting runs per-vertex on the DAG frontier (\texttt{protocol/wave}). Vertices that gather $\geq 2/3$-weight Wave votes become Wave-final.
+  \item Focus tracks consecutive-successes counters for each vertex; once Focus's $\beta$ threshold is met, the vertex is Focus-final (\texttt{protocol/focus}).
+  \item The DAG safe-prefix commit (\texttt{protocol/field} / \texttt{protocol/nebula}) collects Focus-final vertices into a bundle; the bundle root is the canonical NebulaRoot.
+  \item The BLS Beam aggregates over the bundle's $\geq 2/3$-weight signers. Bundle moves to Beam-final.
+  \item The ML-DSA cert set assembles per-validator FIPS-204 attestations over the same NebulaRoot transcript $\tau$. Bundle moves to PQ-attested.
+  \item The Pulsar engine signs $\tau$ via Sign1/Sign2/Combine under the active key era's GroupKey. Bundle moves to Pulse-sealed.
+  \item Prism (\texttt{protocol/quasar/horizon.go}) verifies the composite. Bundle moves to Horizon-final.
+\end{itemize}
+
+\subsection{Test surface: 258 tests}
+
+The Quasar test suite at \texttt{protocol/quasar/} contains 258 tests as of the v0.1.0-rc1-pq-consensus-freeze tag (\texttt{git log --oneline | grep "rc1-pq-consensus-freeze"}). The suite breaks down as:
+
+\begin{tabular}{@{}p{0.50\textwidth}p{0.45\textwidth}@{}}
+  \toprule
+  \textbf{File} & \textbf{Coverage} \\
+  \midrule
+  \texttt{adversarial\_test.go} & Byzantine adversary cases on Beam aggregation \\
+  \texttt{bls\_test.go} & BLS Beam component \\
+  \texttt{comprehensive\_test.go} & End-to-end multi-lane Horizon \\
+  \texttt{core\_test.go} & Core engine state machine \\
+  \texttt{dual\_threshold\_test.go} & BLS + Pulse without ML-DSA \\
+  \texttt{dynamic\_test.go} & Validator rotation across bundles \\
+  \texttt{engine\_test.go} & The Quasar engine driver \\
+  \texttt{epoch\_test.go} & Epoch / KeyEra transitions \\
+  \texttt{grouped\_threshold\_test.go} & Grouped Pulsar quorum-of-groups path \\
+  \texttt{horizon\_test.go} & Prism predicate, lane composition \\
+  \texttt{quantum\_block\_test.go} & PQ-only mode regression \\
+  \texttt{corona\_death\_test.go} & Pulse failure / rollback paths \\
+  \texttt{security\_fixes\_test.go} & Specific known issues \\
+  \texttt{security\_regression\_test.go} & Soundness regressions \\
+  \texttt{threshold\_compat\_test.go} & LSS-Pulsar adapter contract \\
+  \texttt{triple\_sign\_test.go} & Beam + ML-DSA + Pulse all together \\
+  \texttt{witness\_test.go} & Slashing-evidence witness production \\
+  \bottomrule
+\end{tabular}
+
+The build / test gate is \texttt{GOWORK=off go test -count=1 -short -timeout 300s ./protocol/quasar/...}. All 258 tests pass on the v0.1.0-rc1-pq-consensus-freeze tag (the one known flake, \texttt{TestQuantumBundle\_ChainIntegrity}, is a Pulsar threshold-signing nondeterminism artifact that passes on retry; the underlying signing is correct, the test asserts a non-canonical structural property that the retry exercises).
+
+\subsection{Quasar certificate}
+
+The on-wire \texttt{QuasarCert} (the Horizon composite, with the legacy Quasar 3.0 type name retained for compatibility) is at \texttt{protocol/quasar/types.go:40}:
+
+\begin{verbatim}
+type QuasarCert struct {
+    BLS        []byte  // BLS12-381 aggregate, 48 bytes
+    Corona   []byte  // Pulsar Pulse (variable size)
+    MLDSAProof []byte  // Z-Chain Groth16 over N x ML-DSA, ~192 bytes
+    Epoch      uint64
+    Finality   time.Time
+    Validators int
+}
+\end{verbatim}
+
+The newer canonical type at \texttt{warp/pulsar/HorizonCertificate} (cf.\ Section~\ref{sec:prism-composition}) carries the explicit transcript-binding fields ($\mathsf{NebulaRoot}$, $\mathsf{KeyEraID}$, $\mathsf{Generation}$, $\mathsf{HashSuiteID}$) introduced in LP-105. Older callers see the legacy three-byte-blob layout; new callers see the explicit-field layout. Both bind to the same canonical $\tau$.
+
+\subsection{Quasar mode toggles}
+
+Each lane is independently toggleable:
+\begin{itemize}[leftmargin=2em,nosep]
+  \item BLS-only: classical fast path. Beam-final is the strongest state. Used in development and on chains that explicitly accept the classical-only threat model.
+  \item BLS + Pulse: dual PQ. Pulse-sealed is the strongest single-lane state. Used when ML-DSA cert-set bandwidth is impractical.
+  \item BLS + Pulse + ML-DSA: full Quasar Horizon. The production mode on Lux mainnet.
+  \item BLS + Pulse + ML-DSA + Z-Chain Groth16: production mode with succinct ML-DSA cert-set compression. The wrapper is classical (Remark~\ref{rem:groth16-wrapper-horizon}); the underlying PQ root of trust is unchanged.
+\end{itemize}
+
+\texttt{IsTripleMode()} on the engine returns true when all three signing layers are configured.
+
+\subsection{Domain separation registry}
+
+Every ML-DSA / SLH-DSA caller in the Lux stack binds signatures to a context string per FIPS 204/205:
+
+\begin{tabular}{@{}p{0.30\textwidth}p{0.30\textwidth}p{0.35\textwidth}@{}}
+  \toprule
+  \textbf{Context} & \textbf{Used by} & \textbf{File} \\
+  \midrule
+  \texttt{lux-x-chain-utxo-v1} & UTXO Fx plugins & \texttt{utxo/mldsafx}, \texttt{utxo/slhdsafx} \\
+  \texttt{lux-evm-precompile-mldsa-v1} & EVM precompile & \texttt{precompile/mldsa/contract.go} \\
+  \texttt{lux-evm-precompile-slhdsa-v1} & EVM precompile & \texttt{precompile/slhdsa/contract.go} \\
+  \texttt{lux-reshare-v1} & Key resharing HKDF & \texttt{threshold/mpc} \\
+  \texttt{lux-wave-v1} & Wave voting & \texttt{consensus/protocol/wave} \\
+  \texttt{lux-quasar-horizon-v1} & ML-DSA cert set on Horizon transcript & \texttt{protocol/quasar/horizon.go} \\
+  \bottomrule
+\end{tabular}
+
+No collisions. The full registry, with normative wire encodings for each context, is in the NIST submission package (\cite{luxbenchmarks}; companion to this paper).
+
+\subsection{Performance summary}
+
+Per-component CPU costs for \texttt{QuasarCert} verification on Apple M1 Max, single core (full numbers in the benchmark report \cite{luxbenchmarks}):
+
+\begin{tabular}{@{}lr@{}}
+  \toprule
+  Operation & Time \\
+  \midrule
+  BLS aggregate verify ($n=100$) & $875\,\mu\mathrm{s}$ \\
+  ML-DSA-65 verify (single, Fx context) & $254\,\mu\mathrm{s}$ \\
+  ML-DSA-65 verify (cached) & $3\,\mu\mathrm{s}$ \\
+  Pulsar threshold verify & variable, amortized $\mathcal{O}(1)$ after DKG \\
+  Quasar full block (BLS + ML-DSA + Pulse) & $1.85\,\mathrm{ms}$ \\
+  \bottomrule
+\end{tabular}
+
+The benchmark report \cite{luxbenchmarks} carries the full microbenchmark table, the LSS resharing benchmarks, the activation-cert latency, and the cross-WAN $K=21$ Pulse-latency projection.
+
+\subsection{Cross-implementation parity}
+
+The Go canonical \cite{consensusgo, coronago, thresholdgo, lensgo, warpgo} is the byte oracle. The C++ port at \texttt{luxcpp/crypto/corona/cpp/} \cite{lp137} mirrors the Go canonical layer for layer; KAT vectors gate every release. SDK status (honest assessment): Go is production-ready; Python (\texttt{pkg/python/}) is the only complete non-Go SDK with real consensus logic; C, Rust (FFI wrapper around C), and C++ are at varying levels of completion. We do not ship cross-language production paths beyond Go.
+
+\subsection{Wire transport}
+
+Inter-node communication uses ZAP (\texttt{github.com/luxfi/zap}; LP-022). Not p2p, not gRPC/protobuf. ZAP delivers $\sim 114\,\mathrm{K}$ TPS single-connection, $\sim 376\,\mathrm{K}$ TPS at 20 parallel connections, and $\sim 20.26\,\mathrm{M}$ TPS at 50 connections + batch 1000 (\texttt{bench/}; full numbers in \cite{luxbenchmarks}). The ZAP design is not the focus of this paper; the relevant fact is that Beam aggregation and Pulse signing are not network-bound on Lux mainnet at $n = 21$.

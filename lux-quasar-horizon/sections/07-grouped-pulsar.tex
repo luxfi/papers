@@ -1,0 +1,78 @@
+%% ====================================================================
+\section{Grouped Pulsar for Large Validator Sets}
+\label{sec:grouped-pulsar}
+%% ====================================================================
+
+A single global threshold key over thousands of validators is operationally brittle: every rotation requires every validator to participate in JVSS broadcasts, Pedersen-commit verification, and activation. Pulsar supports \emph{grouped} certificates as the deployment shape for large validator sets. This section composes grouped Pulsar with Prism, so that a Horizon certificate over a large validator set carries one Pulse per group rather than one Pulse over all signers.
+
+\subsection{Group construction}
+
+Validators are partitioned into $G$ groups of (approximate) size $k = N / G$. Each group has its own GroupKey lineage, its own KeyEraID, its own resharing schedule. A Pulsar bundle certificate at the consensus layer is a quorum of group certificates:
+\begin{equation}
+  \mathsf{HorizonCert}.\mathsf{Pulsar} \;=\; \bigl\{ (\mathsf{group}_j, \sigma_{\mathrm{Pulsar},j}) \,:\, j \in \mathsf{quorum}(G) \bigr\}
+\end{equation}
+with $|\mathsf{quorum}(G)| \geq \lfloor 2G/3 \rfloor + 1$ for the standard Byzantine bound, or a tighter quorum if individual groups are known to be more reliable. Each group's $\sigma_{\mathrm{Pulsar},j}$ is a per-group threshold signature signed under $\mathsf{group}_j$'s GroupKey.
+
+\subsection{What grouping buys}
+
+\paragraph{Local resharing.} A group rotates its shares only when its own validators rotate; cross-group churn does not force every group to reshare. JVSS bandwidth scales as $\mathcal{O}(k^2)$ per rotation rather than $\mathcal{O}(N^2)$.
+
+\paragraph{Independent failure domains.} A failed activation in group $j$ does not block other groups. The chain emits a Pulsar quorum-of-groups certificate from the surviving groups; group $j$ rolls back independently via the LSS rollback ladder (\cite{luxlssmpc,lp077}).
+
+\paragraph{Compact bundle pulses.} Each group emits one Pulsar pulse (size on the order of the canonical Corona signature). $G$ groups produce $G$ pulses; aggregating across groups via Merkle is straightforward. Total bundle-cert overhead is $\mathcal{O}(G)$, not $\mathcal{O}(N)$.
+
+\subsection{Composition with Prism}
+
+The Prism predicate (Definition~\ref{def:prism-quasar-horizon}) extends to grouped Pulsar by replacing the single Pulse verify step with a quorum-of-groups verify:
+
+\paragraph{Step 4 (revised, grouped form).} For each $\mathsf{group}_j$ in the certificate's group quorum, $\mathsf{Pulsar.Verify}(\mathsf{GroupKey}_{\mathsf{group}_j, \eta_j}, \tau, \sigma_{\mathrm{Pulsar},j}) = 1$, where $\mathsf{GroupKey}_{\mathsf{group}_j, \eta_j}$ is the group's active key-era GroupKey at the chain's bound state for $(\eta_j, g_j)$. The number of accepting groups must be $\geq \lfloor 2G/3 \rfloor + 1$, and each accepting group's $(\eta_j, g_j)$ must match the chain's epoch state for that group.
+
+\paragraph{Steps 1, 2, 3, 5, 6} are unchanged. The transcript $\tau$ is unchanged: every group signs the same Nebula bundle root.
+
+\subsection{Soundness in the grouped form}
+
+\begin{theorem}[Grouped Horizon soundness]
+\label{thm:grouped-horizon-soundness}
+Let $\mathsf{cert}$ be a grouped Horizon certificate with $\mathsf{Prism}(\mathsf{cert}) = 1$ in the form just specified. Suppose validators are assigned to groups by a process $\mathcal{G}$ with the property that, for any subset $S$ of corrupted validators with $|S| \leq f$ and group size $k$, the probability that $\mathcal{G}$ assigns $\geq t_{\mathrm{group}}$ corrupted validators to any single group is bounded by a function $p_{\mathrm{group}}(f, n, k, t_{\mathrm{group}})$. Then forging conflicting Horizon-final certificates requires:
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item Forging $\geq \lfloor 2G/3 \rfloor + 1$ group Pulses: each requires either Pulsar SUF-CMA (Theorem~\ref{thm:pulsar-suf-cma}) on that group, or a corruption density that exceeds the group threshold (probability bounded by $p_{\mathrm{group}}$); AND
+  \item Forging the Beam aggregate: requires BLS forgery or $> 2/3$-weight corruption; AND
+  \item Forging the ML-DSA cert set: requires $> 2/3$-weight ML-DSA forgery.
+\end{enumerate}
+\end{theorem}
+
+The argument is by per-group reduction: the conjunctive Prism predicate reduces a forgery to a forgery in some group; the per-group SUF-CMA reduction completes the lattice argument. Cross-group independence holds because each group has its own GroupKey and its own resharing schedule; a corruption-quorum in one group does not propagate to another.
+
+\subsection{Open systems-research questions}
+
+Grouped Pulsar is where dynamic-PQ-threshold consensus becomes a research contribution rather than an engineering exercise. The open questions, in priority order:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item Given validator corruption fraction $f$, and group assignment process $\mathcal{G}$, what is the closed form of $p_{\mathrm{group}}(f, n, k, t_{\mathrm{group}})$? Hypergeometric vs binomial; balanced vs adversarial assignment.
+  \item How should group assignment respond to validator churn while preserving in-group share integrity?
+  \item How does group resharing interact with epoch transitions? Per-group epochs vs chain-global epochs; leader staleness.
+  \item How many group certificates are required for a Horizon-final boundary at a given safety target ($2^{128}$, $2^{142}$, etc.)?
+  \item What is the bandwidth/latency curve of Pulsar pulses as a function of $k$ and $G$, under wide-area churn? (Section~\ref{sec:implementation} cites measured numbers from the benchmark report \cite{luxbenchmarks}; the open work is the closed-form trade-off curve.)
+\end{enumerate}
+
+These questions connect cryptographic threshold assumptions to consensus-level quorum assumptions, and are the natural follow-on formal-systems paper to this one.
+
+\subsection{Comparison to unscaled threshold schemes}
+
+\paragraph{Threshold Raccoon \cite{thresholdraccoon}.} Reports practical thresholds up to $1024$ signers with $\sim 13\,\mathrm{KiB}$ signatures and $\sim 40\,\mathrm{KiB}$ communication per user. Targets the cryptographic-primitive layer.
+
+\paragraph{Hermine \cite{hermine}.} DKG, identifiable aborts, and proactive refresh in a single package. Targets the cryptographic-primitive layer, with broader lifecycle coverage than Threshold Raccoon.
+
+\paragraph{Grouped Pulsar.} Composes the underlying lattice threshold scheme into a deployment shape that scales across permissionless validator sets where committee membership is not fixed at protocol design time. The contribution is the system-level composition.
+
+The three approaches are complementary, not substitutes: Hermine's primitive could in principle be the kernel that grouped Pulsar deploys (Hermine's lattice math + LSS lifecycle + grouped Horizon composition). The Lux production stack uses Pulsar's Corona-derived primitive, but the composition argument is kernel-agnostic.
+
+\subsection{Default deployment}
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \textbf{Lux mainnet ($n = 21$).} $G = 1$ (no grouping needed). One global Pulsar key era; Pulse latency dominated by the WAN $K = 21$ signing path.
+  \item \textbf{Mid-scale ($n \sim 100$).} $G = 5$, $k = 20$. Quorum-of-groups $\geq 4$.
+  \item \textbf{Large-scale ($n \sim 1000$).} $G = 50$, $k = 20$. Quorum-of-groups $\geq 34$.
+\end{itemize}
+
+The Go canonical (\cite{coronago}) parameterizes the group construction; the consensus engine (\cite{consensusgo}, \texttt{protocol/quasar/grouped\_threshold.go}) consumes group-level signatures and assembles the quorum-of-groups Horizon Pulse. The 258-test \texttt{protocol/quasar} suite includes \texttt{grouped\_threshold\_test.go} exercising the assembly path; production $G > 1$ deployments are gated on the open-research questions listed above.

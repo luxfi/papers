@@ -1,0 +1,210 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{../../shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}
+
+\title{Lux MPTC Technical Specification\\(NIST IR 8214C-style)}
+\author{
+Zach Kelling\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+\date{2026-03-03}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+\noindent We present Lux, a hybrid post-quantum consensus architecture for DAG-native chains. Lux separates fast operational finality from durable post-quantum finality. Validators emit Photons over a Nebula DAG substrate; classical BLS aggregates form Beams for low-latency confirmation, while ML-DSA attestations and Pulsar lattice-threshold Pulses provide post-quantum finality over Nebula roots. Prism binds all certificate lanes to the same transcript, and Quasar reaches Horizon finality when the bound lanes verify.
+
+\textbf{This document.} The high-level mathematical specification of the Lux MPTC stack: Pulsar (Module-LWE two-round threshold signature with key-era lifecycle), Lens (FROST 2-round Schnorr threshold signature), LSS (protocol-agnostic dynamic-resharing lifecycle framework), Quasar Horizon (consensus-side Prism-bound finality), and Warp 2.0 (cross-chain Pulse-backed envelope). The document follows the NIST IR 8214C submission structure; mathematical detail is summarized to the level needed for review, with pointers to the canonical proof-bucket files for full proofs.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Pulsar (lattice threshold)}
+\label{sec:spec-pulsar}
+
+Pulsar is a $(t, n)$ post-quantum threshold signature scheme over the cyclotomic ring $R_q = \mathbb{Z}_q[X]/(X^{256}+1)$ with $q = \texttt{0x1000000004A01}$ (48-bit NTT-friendly prime). The signing math is derived byte-equal from Corona (\cite{corona2025}, IEEE S\&P 2025); Lux's contribution is the key-era lifecycle that wraps the static signing primitive with permissionless validator-set rotation, activation-gated resharing, and rollback. The full mathematical specification is in the LP-073 paper \cite{luxpulsar}; here we summarize the externally-visible surface.
+
+\subsection{Public algorithms}
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item $\mathsf{Pulsar.Setup}(1^\lambda) \to \mathsf{params}$: deterministic parameter derivation. (See \texttt{proofs/definitions/algorithms.tex} Definition \texttt{def:pulsar-setup}.)
+  \item $\mathsf{Pulsar.Gen}(\mathsf{params}, t, n; \rho) \to (\mathsf{GroupKey}, \{\mathsf{Share}_i\})$: trusted-dealer key generation (foundation MPC ceremony at chain genesis), or $\mathsf{Pulsar.DKG2}(\mathsf{params}, t, n)$: Pedersen-style DKG over $R_q$, producing the same output without a trusted dealer.
+  \item $\mathsf{Pulsar.Sign1}, \mathsf{Pulsar.Sign2}, \mathsf{Pulsar.Combine}$: two-round MAC-authenticated signing protocol; see Definition \texttt{def:pulsar-sign}.
+  \item $\mathsf{Pulsar.Verify}(\mathsf{GroupKey}, m, \sigma) \to \{0, 1\}$: standalone verification under the persistent group public key.
+  \item $\mathsf{Pulsar.Refresh}(\{\mathsf{Share}_j\}, t)$: HJKY97 same-set zero-poly refresh (Definition \texttt{def:pulsar-refresh}).
+  \item $\mathsf{Pulsar.Reshare}(\{\mathsf{Share}_i\}_{i \in Q}, t_{\mathrm{old}}, V_{\mathrm{new}}, t_{\mathrm{new}})$: Desmedt-Jajodia old-qualified-subset resharing (Definition \texttt{def:pulsar-reshare}).
+  \item $\mathsf{Pulsar.Activate}$: new committee threshold-signs the canonical $\mathsf{ActivationMsg}$ under the unchanged GroupKey (Definition \texttt{def:pulsar-activate}); the chain accepts the new generation iff the activation cert verifies.
+\end{itemize}
+
+\subsection{Key-era lifecycle}
+
+A Pulsar share state carries three lineage scalars: $\mathsf{KeyEraID}$ ($\eta$, persistent group-key lineage), $\mathsf{Generation}$ ($g$, LSS resharing version within an era), $\mathsf{RollbackFrom}$ ($r$, audit lineage; $0$ on forward transitions, $> 0$ records prior generation reverted from). The GroupKey $(\mathbf{A}, \tilde{\mathbf{b}})$ is byte-identical for every $g$ within $\eta$ (Lemma~\ref{lem:gk-byte-identical-spec}, \texttt{proofs/lss/lifecycle-safety.tex}); $\eta$ increments only on Reanchor.
+
+\subsection{Security}
+
+\begin{theorem}[Pulsar SUF-CMA under MLWE/MSIS]
+\label{thm:pulsar-suf-cma-spec}
+Let $\mathcal{A}$ be a probabilistic polynomial-time adversary against Pulsar with at most $q_S$ signing queries and at most $t-1$ corrupted parties. Then
+\[
+  \mathrm{Adv}^{\mathsf{SUF\text{-}CMA}}_{\mathsf{Pulsar}}(\mathcal{A})
+  \;\leq\; q_S \cdot \mathrm{Adv}^{\mathsf{MLWE}}_{q, \sigma_E}(\mathcal{B}_1)
+  + \mathrm{Adv}^{\mathsf{MSIS}}_{q, [\mathbf{A}|-c\tilde{\mathbf{b}}], 2B}(\mathcal{B}_2)
+  + \mathrm{negl}(\lambda).
+\]
+\end{theorem}
+
+The full proof lives in \texttt{proofs/pulsar/unforgeability.tex}; concrete parameters give classical security $\geq 2^{142}$ and quantum security $\geq 2^{130}$ via BDGL sieving plus Grover speedup (\texttt{quasar-cert-soundness.tex} App.~E). Lean mechanization: \texttt{Crypto.Corona.corona\_pq\_unforgeability} \cite{leancrypto}.
+
+\section{Lens (curve threshold)}
+\label{sec:spec-lens}
+
+Lens is the FROST 2-round Schnorr threshold signature \cite{rfc9591} over a prime-order group $\mathbb{G}$ of order $\ell$. Lux supports three groups: Ed25519, secp256k1, Ristretto255. Lens inherits the RFC 9591 algorithm byte-equal; the Lux contribution is the key-era lifecycle wrapping (identical in shape to Pulsar's, with $R_q$ replaced by $\mathbb{Z}_\ell$ and lattice Pedersen replaced by curve Pedersen $g^s \cdot h^r$).
+
+\subsection{Public algorithms}
+
+$\mathsf{Lens.Sign1}, \mathsf{Lens.Sign2}, \mathsf{Lens.Aggregate}, \mathsf{Lens.Verify}, \mathsf{Lens.Refresh}, \mathsf{Lens.Reshare}, \mathsf{Lens.Activate}$, all mirroring Pulsar's lifecycle (Definition~\texttt{def:lens-sign} of \texttt{proofs/definitions/algorithms.tex}). The LSS-Lens adapter (\texttt{lss\_lens.go}) shares the contract with LSS-Pulsar; 10/10 acceptance tests pass.
+
+\subsection{Security}
+
+Standard FROST EUF-CMA reductions to the discrete-log assumption on $\mathbb{G}$ \cite{rfc9591}. Lens is classical (curve discrete log), broken in polynomial time by Shor; Lens is the right primitive for control-plane operations and cross-rail compatibility, not for the consensus PQ floor.
+
+\section{LSS (lifecycle framework)}
+\label{sec:spec-lss}
+
+LSS (Linear Shamir Secret Sharing, LP-077 \cite{lp077}) is the protocol-agnostic dynamic-resharing lifecycle framework. LSS owns generations, snapshots, rollback, and dealer / coordinator roles; the underlying threshold kernels (Pulsar, Lens, ECDSA-CMP) own their own signing math. The contract is documented in \texttt{proofs/lss/adapter-contract.tex}.
+
+\subsection{Adapter contract}
+
+\begin{definition}[LSS adapter contract]
+\label{def:lss-adapter-contract-spec}
+An LSS adapter MUST satisfy:
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item Lifecycle delegation: the adapter does not implement share-secret arithmetic; it calls the kernel ($\mathsf{Pulsar.Reshare}$, $\mathsf{Lens.Reshare}$, etc.) and wraps the output.
+  \item Generation increment: $g \mapsto g + 1$ on every successful $\mathsf{DynamicReshare}$. On $\mathsf{Rollback}(g_{\mathrm{target}})$, $g \mapsto g_{\mathrm{current}} + 1$ with $\mathsf{rb} = g_{\mathrm{current}}$.
+  \item KeyEraID preservation: $\eta$ is read-only across $\mathsf{DynamicReshare}$. $\eta$ increments only on $\mathsf{Reanchor}$.
+  \item GroupKey identity: the kernel's GroupKey pointer flows through unmodified.
+  \item Failure-mode containment: on any verification failure (commit mismatch, activation rejection), return an error and retain the previous state.
+  \item No ECDSA-specific assumptions inherited beyond what the underlying kernel actually uses.
+\end{enumerate}
+\end{definition}
+
+\subsection{Lifecycle invariants}
+
+Three lemmas hold for any LSS-managed kernel (\texttt{proofs/lss/lifecycle-safety.tex}):
+
+\begin{lemma}[Generation monotonicity]
+$g$ increases monotonically by exactly $1$ per $\mathsf{DynamicReshare}$ or $\mathsf{Refresh}$ within an era. On $\mathsf{Rollback}$, the restored state carries $g = g_{\mathrm{current}}+1$ and $\mathsf{rb} = g_{\mathrm{current}}$.
+\end{lemma}
+
+\begin{lemma}[KeyEraID stability]
+$\eta$ is unchanged by $\mathsf{Refresh}$, $\mathsf{Reshare}$, or $\mathsf{Rollback}$. $\eta$ increments only on $\mathsf{Reanchor}$.
+\end{lemma}
+
+\begin{lemma}[GroupKey byte-identity]
+\label{lem:gk-byte-identical-spec}
+The GroupKey pointer is byte-identical across every $\mathsf{Refresh}$ and $\mathsf{Reshare}$ within a key era. (Reduces to master-secret preservation, Theorem~\ref{thm:reshare-preserves-secret}.)
+\end{lemma}
+
+\begin{theorem}[Reshare preserves master secret]
+\label{thm:reshare-preserves-secret}
+The new shares $\{\mathsf{Share}'_j = G(\beta_j)\}$ are valid $(t_{\mathrm{new}}, |V_{\mathrm{new}}|)$-Shamir shares of the same master secret $\mathbf{s}$, where $G(X) = \sum_{i \in Q} \lambda^Q_i \cdot g_i(X)$ and $g_i(0) = \mathbf{s}_i$. (Lagrange identity; full proof in \texttt{proofs/pulsar/reshare-preservation.tex}.)
+\end{theorem}
+
+\section{Quasar Horizon (consensus composition)}
+\label{sec:spec-horizon}
+
+Quasar Horizon (\cite{luxquasarhorizon}) is the consensus-side composition of three independent threshold artifacts under transcript binding:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item Beam: BLS12-381 aggregate over independent validator BLS keypairs (LP-075 \cite{lp075}); classical fast-path finality.
+  \item ML-DSA cert set: per-validator FIPS-204 ML-DSA-65 attestations (LP-070 \cite{lp070}); PQ accountability.
+  \item Pulse: one Pulsar threshold signature over the canonical $\mathsf{QuasarTranscript}$; PQ threshold finality.
+\end{itemize}
+
+The certificate-composition verifier is \emph{Prism} (LP-105 \cite{lp105}), which checks that all lanes refract from the same Nebula transcript (Definition~\ref{def:horizon-transcript-spec}).
+
+\begin{definition}[Quasar transcript]
+\label{def:horizon-transcript-spec}
+$\mathsf{QuasarTranscript} := H_T(\text{``QUASAR-TRANSCRIPT-v1''}, \mathsf{NebulaRoot}, \mathsf{chain\_id}, \mathsf{network\_id}, \mathsf{epoch}, \mathsf{round}, \mathsf{validator\_set\_hash}, \mathsf{KeyEraID}, \mathsf{Generation}, \mathsf{HashSuiteID})$, where $H_T = \mathrm{TupleHash256}$.
+\end{definition}
+
+\begin{theorem}[Horizon soundness]
+\label{thm:horizon-soundness-spec}
+A Prism-accepted Horizon certificate cannot exist for two distinct $\mathsf{NebulaRoot}$s at the same $(\mathsf{epoch}, \mathsf{round})$ except with negligible probability under (i) BLS12-381 co-CDH, (ii) Module-LWE / Module-SIS, and (iii) FIPS 204 EUF-CMA. The lanes are independent (different hardness assumptions); a quantum break of one does not break the others. (Full proof: \texttt{proofs/quasar/horizon-soundness.tex}.)
+\end{theorem}
+
+\section{Warp 2.0 (cross-chain envelope)}
+\label{sec:spec-warp}
+
+Warp 2.0 (\cite{luxwarpv2}) is the cross-chain envelope carrying source-chain Horizon finality. Wire format:
+
+\begin{verbatim}
+0x02 || RLP([
+    Message,                       // v1 Beam (BLS aggregate)
+    SourceNebulaRoot   [32]byte,
+    SourceKeyEraID     uint64,
+    SourceGeneration   uint64,
+    HashSuiteID        string,
+    PulsarPulse        []byte,     // empty if absent
+    MLDSACertSet       []byte,     // empty if absent
+])
+\end{verbatim}
+
+The Pulse signs $H_T(\text{``WARP-PULSAR-ENVELOPE-v1''}, \mathsf{sourceChainID}, \mathsf{payload}, \mathsf{sourceNebulaRoot}, \mathsf{sourceKeyEraID}, \mathsf{sourceGeneration})$. The destination resolves $(\mathsf{sourceChainID}, \mathsf{sourceKeyEraID}, \mathsf{sourceGeneration})$ to the source's GroupKey + HashSuiteID via the destination's source-chain key registry.
+
+\begin{theorem}[Warp 2.0 envelope unforgeability]
+A successful $\mathsf{Verify}_{V2}$ implies any forgery on the same $(\mathsf{sourceChainID}, \mathsf{sourceNebulaRoot}, \mathsf{sourceKeyEraID}, \mathsf{sourceGeneration})$ tuple with a different $\mathsf{payload}$ requires breaking either co-CDH (Beam) or MLWE/MSIS (Pulse). (Full proof: \texttt{proofs/quasar/warp-pq-soundness.tex}.)
+\end{theorem}
+
+\section{Composition under transcript binding}
+\label{sec:spec-composition}
+
+The unifying structural fact: all three certificate lanes (Beam, ML-DSA, Pulse) and the cross-chain Pulse share one canonical transcript. Domain-separation tags (Section \texttt{spec/domain-separation-registry.tex}) prevent cross-protocol replay. Hash-suite identifiers (\texttt{Pulsar-SHA3} default) prevent cross-suite forgery (\texttt{proofs/pulsar/hash-suite-separation.tex} Theorem~\ref{thm:hash-suite-separation-spec}):
+
+\begin{theorem}[Hash-suite separation]
+\label{thm:hash-suite-separation-spec}
+A Pulsar signature under one hash suite does not verify under a different hash suite, with overwhelming probability over the verifier's hash function.
+\end{theorem}
+
+\section{Network tier model}
+
+Lux defines L1 / L2 / L3 by validator co-validation, not by rollup vs settlement (Definition~\texttt{def:network-tiers} of \texttt{proofs/definitions/finality-definitions.tex}):
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item L1: sovereign; own validator set, own KeyEraID lineage.
+  \item L2: declares $\mathsf{primary\_network\_id} = N_P$; validator set $\subseteq V_{N_P}$. Activation cert binds $\mathsf{primary\_nebula\_root}$. Inheritance via Theorem~\ref{thm:l2-covalidation-spec}.
+  \item L3: settles via succinct proof; PQ finality inherits from underlying L1/L2.
+\end{itemize}
+
+\begin{theorem}[L2 co-validation security inheritance]
+\label{thm:l2-covalidation-spec}
+An L2's safety bound is at least the minimum of its primary's safety bound and its own validator-set safety bound. (Full proof: \texttt{proofs/quasar/l1-l2-covalidation.tex}.)
+\end{theorem}
+
+\section{Honest classification of the Groth16 wrapper}
+
+The optional Z-Chain Groth16 rollup proof of ML-DSA cert-set verification (LP-307 \cite{lp307}) is a \emph{classical succinct proof of post-quantum signature verification}. Pairing-based SNARKs over BLS12-381 break under Shor; the Groth16 wrapper is a compatibility / compression / privacy adapter, not a PQ root of trust. PQ finality lives in ML-DSA + Pulsar.
+
+This classification is enforced in code: \texttt{warp/pulsar/IsPQRootOfTrust} returns false for Groth16-wrapped lanes (\texttt{warp/pulsar/groth16\_classification\_test.go}).
+
+\bibliographystyle{plain}
+\bibliography{../references}
+
+\end{document}

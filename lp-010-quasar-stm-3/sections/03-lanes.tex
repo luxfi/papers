@@ -1,0 +1,149 @@
+\section{The Lane Abstraction}
+
+\label{sec:lanes}
+%% ============================================================================
+
+The primary innovation of QuasarSTM is replacing the storage key as
+the unit of independence with the \emph{lane}. A lane is a
+deterministic projection of the touched state onto a domain that is
+intuitive to the application, observable to the scheduler, and
+finer-grained than the contract address yet coarser than the storage
+slot. Lanes make contention \emph{predictable} before execution.
+
+\subsection{Definition}
+
+\begin{definition}[Lane]
+\label{def:lane}
+A \emph{lane} is the smallest independently schedulable state domain.
+Each lane has an identifier
+\[
+\mathit{lane\_id} =
+H\bigl(\mathit{domain},\; \mathit{contract},\; \mathit{account},\;
+       \mathit{asset},\; \mathit{market},\; \mathit{nonce\_lane},\;
+       \mathit{storage\_prefix}\bigr)
+\]
+where $H$ is a 256-bit collision-resistant hash. The components are
+concrete fields of the touched state; missing components are encoded
+as a fixed sentinel.
+\end{definition}
+
+\begin{definition}[Lane Hint]
+\label{def:lane-hint}
+A \emph{lane hint} is a tuple
+$\mathit{StmLaneHint} = (\mathit{lane\_id},\, \mathit{access\_kind},\,
+\mathit{confidence})$ where
+$\mathit{access\_kind} \in \{\textsc{Read},\, \textsc{Write},\,
+\textsc{Append},\, \textsc{Reduce},\, \textsc{Unknown}\}$ and
+$\mathit{confidence} \in [0,255]$ is the predictor's a priori
+estimate that the access will occur.
+\end{definition}
+
+A transaction's lane hint vector is computed during admission: by
+static ABI declaration when available, by historical observation of
+the contract/selector pair otherwise, and by Tier-3 reducer
+registration for known commutative operations.
+
+\subsection{Canonical Lane Examples}
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Lane} & \textbf{Definition} \\
+\midrule
+sender nonce lane         & $H(\textsf{``nonce''},\, \mathit{account\_id},\, \mathit{nonce\_idx})$ \\
+account balance lane      & $H(\textsf{``acct''},\, \mathit{account\_id})$ \\
+ERC-20 holder lane        & $H(\textsf{``erc20''},\, \mathit{token},\, \mathit{holder})$ \\
+order-book price-level    & $H(\textsf{``ob''},\, \mathit{market\_id},\, \mathit{price\_level})$ \\
+margin account lane       & $H(\textsf{``margin''},\, \mathit{account\_id})$ \\
+pool reserve lane         & $H(\textsf{``pool''},\, \mathit{pool\_id})$ \\
+audit append lane         & $H(\textsf{``audit''},\, \mathit{chain\_id},\, \mathit{epoch})$ \\
+fee accumulator lane      & $H(\textsf{``fee''},\, \mathit{token})$ \\
+\bottomrule
+\end{tabular}
+\caption{Canonical lane definitions for the regulated-DEX workload
+class. Each lane is a deterministic projection; lane membership is
+computable without executing the transaction.}
+\label{tab:lane-examples}
+\end{table}
+
+\subsection{Lane Clocks}
+
+\begin{definition}[Lane Clock]
+\label{def:lane-clock}
+A \emph{lane clock} is a monotonic counter
+$\mathit{StmLaneClock} = (\mathit{version},\, \mathit{hotness},\,
+\mathit{conflict\_count})$ associated with each $\mathit{lane\_id}$.
+The \texttt{version} component increments on every committed write
+to the lane; the other components are telemetry.
+\end{definition}
+
+The clock is a per-lane shard of the TL2 idea. Lane clocks are stored
+contiguously in a device-resident hash arena keyed by
+$\mathit{lane\_id}$, with collision handling by linear probing under
+$\geq 4 \times$ load-factor headroom. There is no global clock
+\emph{anywhere} in QuasarSTM.
+
+\subsection{Lane Snapshot}
+
+At execution start a transaction $T$ snapshots the current
+\texttt{version} of every lane it touches:
+\[
+\mathit{LaneSnapshot}(T) = \{(L_i,\, c_i)\}_{i=1}^{m}
+\quad \text{where} \quad
+c_i = \mathit{LaneClock}[L_i].\mathit{version}.
+\]
+The snapshot is the precondition for the Tier-1 fast validation
+(\S\ref{sec:validation}): if at validation time
+$\mathit{LaneClock}[L_i].\mathit{version} = c_i$ for all $i$, the
+transaction is committable without further checks.
+
+\subsection{Why Lanes (Not Keys) Are the Right Unit}
+
+\paragraph{Predictability.}
+Lane membership is computable from the transaction envelope without
+executing the transaction. A scheduler can therefore partition the
+ready frontier by lane conflict before any work hits the EVM. Storage
+keys are not generally known until execution; they are an outcome,
+not a precondition.
+
+\paragraph{Aggregation.}
+A single hot lane (\textsc{erc20.totalSupply}, AMM reserve, fee
+counter) often subsumes thousands of distinct storage keys whose
+semantics commute. Treating these as a single lane and applying a
+semantic reducer (\S\ref{sec:validation}) extracts orders of
+magnitude more parallelism than per-key MVCC.
+
+\paragraph{Multi-GPU sharding.}
+Cross-GPU coherence on storage keys is intractable at scale; the
+working set is too fragmented. Lanes give a stable hash domain:
+$\mathit{gpu\_id} = H(\mathit{lane\_id}) \bmod \mathit{num\_gpus}$
+(\S\ref{sec:gc}) yields a deterministic, well-balanced sharding
+plan that survives recompilation.
+
+\paragraph{Telemetry.}
+Hot-lane detection
+($\mathit{hotness} = \mathit{reads} + 4{\cdot}\mathit{writes} +
+8{\cdot}\mathit{conflicts} + 16{\cdot}\mathit{repairs}$)
+is naturally per-lane. Per-key hotness aggregates across thousands of
+keys before producing a useful signal; per-lane hotness is actionable
+within a single round.
+
+\paragraph{Repair priority.}
+Cold-lane repairs are background work; hot-lane repairs preempt the
+queue. Without a lane abstraction, the scheduler has no signal to
+distinguish them.
+
+\begin{remark}[Lane is necessary, not sufficient]
+\label{rem:lane-not-sufficient}
+Lane prediction does not eliminate MVCC. Misprediction must remain
+\emph{safe}: a transaction whose actual access pattern differs from
+its hint must still commit a result equivalent to its serial
+execution under $\preceq_{\mathrm{can}}$. The Tier-2 key-MVCC
+validator (\S\ref{sec:validation}) is the safety net. Lanes are how
+QuasarSTM gets fast on the common case; key-MVCC is how it stays
+correct on the uncommon case.
+\end{remark}
+
+
+%% ============================================================================

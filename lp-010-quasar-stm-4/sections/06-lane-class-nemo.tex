@@ -1,0 +1,89 @@
+\section{LaneClass (NEMO)}
+
+\label{sec:laneclass}
+%% ============================================================================
+
+\subsection{Classes}
+
+NEMO~\cite{nemo2025} observes that, post-consensus, the bottleneck is
+execution and that blockchain workloads have heavy access skew. The
+prescription is to classify state by ownership and contention pattern,
+and to drive validation policy from the class:
+
+\begin{lstlisting}[language=C++]
+enum class LaneClass : uint8_t {
+    Owned       = 0,   // account-local / nonce-local / private state
+    Shared      = 1,   // shared contract state, ordinary contention
+    HotShared   = 2,   // AMM reserves, order-book level, fee counter
+    Commutative = 3,   // additive / append / reducer lane
+    Unknown     = 4,   // fall through to ordinary speculative path
+};
+\end{lstlisting}
+
+\subsection{Per-class policy}
+
+Table~\ref{tab:laneclass-policy} shows the production policy mapping.
+
+\begin{table}[ht]
+\centering
+\small
+\caption{LaneClass execution and validation policy (4.0 production).}
+\label{tab:laneclass-policy}
+\begin{tabular}{p{0.18\linewidth}p{0.40\linewidth}p{0.32\linewidth}}
+\toprule
+\textbf{Class} & \textbf{Validation policy} & \textbf{Versioning mode} \\
+\midrule
+\texttt{Owned}       & no validation against unrelated txs; fast commit if owner / nonce match               & \texttt{SingleVersionFast} \\
+\texttt{Shared}      & ordered MVCC (Tier~2)                                                                  & \texttt{MultiVersion} \\
+\texttt{HotShared}   & semantic reducer / serialized lane / precompile path                                  & \texttt{Reducer} or \texttt{Serialized} \\
+\texttt{Commutative} & Tier~3 reducer commit (\S\ref{sec:tier3})                                              & \texttt{Reducer} \\
+\texttt{Unknown}     & ordinary speculative Block-STM (Tier~1 + Tier~2) per 3.0~\cite{lp010-quasarstm-3}     & \texttt{MultiVersion} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Classification sources}
+
+Per round, every lane has a class. Classes are derived from:
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Static ABI annotations} on contracts (e.g. a Solidity
+      \texttt{lane\_class("Commutative")} attribute on a state
+      variable).
+\item \textbf{Precompile self-declaration}: precompiles declare the
+      lane class of every state variable they touch. The DEX matching
+      precompile, for example, declares its order book level lanes
+      \texttt{HotShared}.
+\item \textbf{Hot-lane telemetry promotion}: a lane that exceeds
+      \texttt{HOT\_LANE\_CONFLICT\_THRESHOLD} mismatches in round $n$
+      is promoted to \texttt{HotShared} for round $n+1$
+      (\S\ref{sec:tier1}).
+\item \textbf{Predictor}~\cite{foresight2025}: classified by
+      observed-conflict-rate quantile.
+\item \textbf{Default}: \texttt{Unknown}---falls through to speculative
+      Block-STM, exactly as in 3.0.
+\end{enumerate}
+
+Classification is finalised at the start of the round and frozen for
+the round's duration.
+
+\subsection{Why this matters for throughput}
+
+NEMO's central observation is that the throughput ceiling is bounded by
+the share of \texttt{Owned} and \texttt{Commutative} traffic. Skewed
+regulated-DEX workloads (per-account orders, fee accumulation, balance
+deltas) have a heavy \texttt{Owned} and \texttt{Commutative} tail, so
+Tier~1 fast path and Tier~3 reducer commit each absorb a large
+fraction of the load:
+
+\begin{itemize}[leftmargin=2em]
+\item \texttt{Owned}: Tier~1 passes always (no cross-tx validation)
+      $\Rightarrow$ commits in O$(1)$.
+\item \texttt{Commutative}: Tier~3 reducer commit at horizon
+      $\Rightarrow$ no MVCC contention.
+\item \texttt{HotShared}: routed to a serialized lane or to a
+      reducer-mode lane $\Rightarrow$ no speculative repair storm.
+\item \texttt{Shared} and \texttt{Unknown}: ordinary Block-STM
+      $\Rightarrow$ inherits 3.0 behaviour~\cite{lp010-quasarstm-3}.
+\end{itemize}
+
+%% ============================================================================

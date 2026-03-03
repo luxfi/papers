@@ -1,0 +1,172 @@
+\section{Three-Tier Validation}
+
+\label{sec:validation}
+%% ============================================================================
+
+QuasarSTM validates a speculatively executed transaction in three
+tiers, falling through only when the previous tier cannot prove
+serializability. The tiers are ordered by cost: Tier~1 touches only
+lane clocks, Tier~2 walks the read set against per-key MVCC chains,
+Tier~3 invokes a registered semantic reducer.
+
+\subsection{Tier 1: Lane-Clock Fast Validation}
+
+\begin{definition}[Tier-1 validation predicate]
+\label{def:tier1}
+Let $T$ be a speculatively executed transaction with lane snapshot
+$\mathit{LaneSnapshot}(T) = \{(L_i, c_i)\}_{i=1}^{m}$. Tier-1
+validation succeeds for $T$ iff
+\[
+\forall i \in [m]:\quad
+\mathit{LaneClock}[L_i].\mathit{version} = c_i.
+\]
+\end{definition}
+
+\begin{lemma}[Tier-1 sufficiency]
+\label{lem:tier1-sufficient}
+If $T$ passes Tier-1 validation under
+$\preceq_{\mathrm{can}}$, then every read recorded by $T$ observed the
+visible version under $\preceq_{\mathrm{can}}$, and every write of $T$
+is the next visible version on its key.
+\end{lemma}
+
+\begin{proof}[Sketch]
+Lane clocks advance only on committed writes to the lane
+(\S\ref{sec:lanes}). The snapshot $c_i$ was taken before $T$ began;
+the equality at validation implies no committed write to $L_i$ has
+intervened. Each storage key $k$ touched by $T$ belongs to exactly
+one lane $L(k)$; if $\mathit{LaneClock}[L(k)]$ is unchanged, the
+visible version of $k$ under $\preceq_{\mathrm{can}}$ at $T$'s
+canonical position is unchanged, so $T$'s observed version is
+correct.
+\end{proof}
+
+Tier-1 is the design's fast path. On the disjoint-lane workload
+(\S\ref{sec:performance} bench A), Tier-1 hit rate exceeds 95\%.
+
+\subsection{Tier 2: Key-Level MVCC Validation}
+
+When a lane clock has advanced, Tier-1 cannot prove the read was
+unaffected. Tier-2 walks the read set entry-by-entry against the
+canonical MVCC chain.
+
+\begin{definition}[Read record]
+\label{def:read-record}
+Each read recorded by $T$ is a tuple
+$\mathit{StmRead} = (\mathit{tx\_id},\, \mathit{key},\,
+\mathit{version\_id},\, \mathit{observed\_write\_ts},\,
+\mathit{observed\_lane\_clock})$.
+\end{definition}
+
+\begin{definition}[Tier-2 validation predicate]
+\label{def:tier2}
+Tier-2 validation succeeds for $T$ iff for every read record
+$(\cdot, k, v, \cdot, \cdot)$ recorded by $T$, the version $v$ is
+the visible version of $k$ under $\preceq_{\mathrm{can}}$ at $T$'s
+canonical position (\S\ref{sec:visibility}, Definition~\ref{def:visible}).
+\end{definition}
+
+A Tier-2 mismatch sends $T$ either to Tier-3 (if all mismatched writes
+are in commutative ops) or directly to the repair queue
+(\S\ref{sec:repair}).
+
+\subsection{Tier 3: Semantic Commutativity Validation}
+
+Many writes commute deterministically. Treating them as ordinary
+\textsc{Set} operations is correct but conservative: it produces
+spurious conflicts whenever two transactions \texttt{Add} to the same
+counter. Tier-3 admits these commits semantically.
+
+\begin{definition}[Semantic write op]
+\label{def:semantic-op}
+A write is tagged with a \emph{semantic op}
+$\mathit{StmWriteOp} \in \{\textsc{Set},\, \textsc{Add},\, \textsc{Sub},\,
+\textsc{Min},\, \textsc{Max},\, \textsc{Append},\, \textsc{BitOr},\,
+\textsc{BalanceDelta},\, \textsc{OrderAppend},\,
+\textsc{FeeAccumulate}\}$.
+\end{definition}
+
+\begin{definition}[Commutative on lane]
+\label{def:commutative}
+A pair of semantic ops $(o_1, o_2)$ \emph{commutes on lane $L$}
+iff applying $o_1$ then $o_2$ to the lane state yields the same
+post-state as $o_2$ then $o_1$, for all valid pre-states.
+\end{definition}
+
+The commutativity matrix is fixed by specification:
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{@{}lc@{}}
+\toprule
+\textbf{Op pair} & \textbf{Commutes?} \\
+\midrule
+$\textsc{Append} + \textsc{Append}$  & yes (deterministic by canonical index) \\
+$\textsc{Add}    + \textsc{Add}$      & yes (sum reducer) \\
+$\textsc{FeeAccumulate}$              & yes (sum reducer) \\
+$\textsc{BalanceDelta} + \textsc{BalanceDelta}$ & yes if no overdraft, canonical netting \\
+$\textsc{OrderAppend}$                & yes within batch-auction lane \\
+$\textsc{Min}/\textsc{Max}/\textsc{BitOr}$ & yes (idempotent reducers) \\
+$\textsc{Set} + \text{anything}$      & no \\
+\bottomrule
+\end{tabular}
+\caption{Semantic commutativity matrix. Tier-3 admits a transaction
+whose conflicting writes are all in commuting cells.}
+\label{tab:commutativity}
+\end{table}
+
+\begin{definition}[Tier-3 validation predicate]
+\label{def:tier3}
+Tier-3 validation succeeds for $T$ iff every Tier-2 mismatch is
+attributable to a write whose semantic op commutes (under
+Definition~\ref{def:commutative}) with every other transaction's
+mismatching write on the same lane, and the lane has a registered
+\emph{reducer} that combines the contributions deterministically by
+canonical index.
+\end{definition}
+
+\paragraph{Reducers.}
+A lane reducer is a per-lane function $r_L$ with type
+$\mathit{Value} \times \mathit{Op}^* \to \mathit{Value}$ that consumes
+the lane's pre-state and the canonical-order sequence of contributing
+ops to produce the post-state. Reducers are pure, deterministic, and
+gas-metered. They run in the
+\texttt{StmSemanticValidate} workgroup (service ID \texttt{0x0432})
+ahead of commit.
+
+\paragraph{Why Tier-3 is mandatory for regulated DEX.}
+The order-book \texttt{Append}, fee accumulation, balance
+delta, and audit append lanes dominate exchange workloads.
+Without Tier-3, these become hot-key conflicts that repeatedly
+abort. With Tier-3, they collapse to a single deterministic reduction
+per lane per round. The performance gap is the difference between a
+fast blockchain and a fast regulated DEX.
+
+\subsection{Tier Cascade}
+
+\begin{algorithm}[H]
+\caption{Validate transaction $T$}
+\label{alg:validate}
+\begin{algorithmic}[1]
+\State \textbf{if} Tier-1 succeeds for $T$ \textbf{then} \Return
+       \textsc{LaneValidated}
+\State \textbf{if} Tier-2 succeeds for $T$ \textbf{then} \Return
+       \textsc{KeyValidated}
+\State \textbf{if} Tier-3 succeeds for $T$ \textbf{then} \Return
+       \textsc{SemanticallyValidated}
+\State \Return \textsc{RepairPending}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{remark}[Cost monotonicity]
+\label{rem:tier-cost}
+Tier-1 inspects $|m|$ lane clocks (typically $m \leq 4$). Tier-2
+walks $|R(T)|$ read records (typically tens). Tier-3 dispatches a
+reducer on the affected lanes. The cost cascade is exactly inverted
+from frequency: most transactions stop at Tier~1, which is the
+cheapest. The pathology Block-STM~2.0 suffered---always running the
+expensive validator---is eliminated by structure.
+\end{remark}
+
+
+%% ============================================================================

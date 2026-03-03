@@ -1,0 +1,114 @@
+%% ====================================================================
+\section{Microbenchmarks}
+\label{sec:microbenchmarks}
+%% ====================================================================
+
+This section covers per-operation sign and verify costs for every signing primitive in the Lux production stack. Numbers are from \texttt{github.com/luxfi/consensus} \cite{consensusgo}, \texttt{github.com/luxfi/crypto/$\langle$bls,mldsa,slhdsa$\rangle$}, \texttt{github.com/luxfi/pulsar} \cite{coronago}, and \texttt{github.com/luxfi/lens} \cite{lensgo}, on Apple M1 Max single core.
+
+\subsection{Single-signature primitives}
+
+\begin{tabular}{@{}lrrr@{}}
+  \toprule
+  \textbf{Scheme} & \textbf{Sign} & \textbf{Verify} & \textbf{Verify (cached)} \\
+  \midrule
+  secp256k1 (C, native)            & 658 ns        & 658 ns        & --- \\
+  Ed25519 (Go stdlib)              & ---           & 205 \textmu s & 1.1 \textmu s \\
+  P-256 (Go stdlib)                & ---           & 121 \textmu s & 1.0 \textmu s \\
+  ML-DSA-44                        & ---           & 140 \textmu s & --- \\
+  ML-DSA-65                        & 495 \textmu s & 250 \textmu s & 3.0 \textmu s \\
+  ML-DSA-65 (via UTXO Fx context)  & ---           & 254 \textmu s & 3.0 \textmu s \\
+  ML-DSA-87                        & ---           & 420 \textmu s & --- \\
+  SLH-DSA-SHA2-192f                & ---           & 1.92 ms       & 131 \textmu s \\
+  BLS12-381 (single)               & 350 \textmu s & 820 \textmu s & --- \\
+  \bottomrule
+\end{tabular}
+
+Reproduction: \texttt{cd consensus \&\& GOWORK=off go test -bench=. -benchtime=1s ./crypto/bls/...} (and analogous for \texttt{mldsa}, \texttt{slhdsa}). Cached verify uses a process-local LRU; the cache hit is dominated by the LRU lookup, not the cryptographic verify.
+
+\subsection{BLS aggregate verify}
+
+\begin{tabular}{@{}lrr@{}}
+  \toprule
+  \textbf{Operation} & \textbf{Time} & \textbf{Source} \\
+  \midrule
+  BLS aggregate (100 sigs) & 5.3 ms & \texttt{protocol/quasar BenchmarkBLSAggregation/100} \\
+  BLS aggregated verify (100 signers) & 875 \textmu s & \texttt{protocol/quasar BenchmarkBLSAggregatedVerification/100} \\
+  \bottomrule
+\end{tabular}
+
+The aggregated verify is constant in signer count (the aggregate signature is 96 bytes regardless of $n$); the cost is dominated by the pairing computation. Reproduction: \texttt{GOWORK=off go test -bench=BLSAggregat -benchtime=2s ./protocol/quasar/...}.
+
+\subsection{Pulsar (lattice threshold) per-party costs}
+
+Indicative timings on a single Apple M2 Ultra core, Go canonical, $K = 5$ end-to-end via \texttt{LocalRun(10)} median (\texttt{pulsar/sign/local.go:21}):
+
+\begin{tabular}{@{}lr@{}}
+  \toprule
+  \textbf{Phase} & \textbf{Median (ms)} \\
+  \midrule
+  \texttt{Gen}                        & 95 \\
+  \texttt{SignRound1} (per party)     & 185 \\
+  \texttt{SignRound2Preprocess} (per party) & 35 \\
+  \texttt{SignRound2}  (per party)    & 22 \\
+  \texttt{SignFinalize}               & 8 \\
+  \texttt{Verify}                     & 9 \\
+  \bottomrule
+\end{tabular}
+
+Round 1 dominates the per-party cost. Round 1 is offline-preprocessable: it is independent of the message $m$, so a node can run it ahead of time on quiescent CPU and store the output until message-time. The C++ port at LP-137 \cite{lp137} closes the bulk of the matrix-multiply gap; GPU acceleration is targeted to bring Round 1 below 50 ms at $K = 21$ (Section~\ref{sec:gpu-headroom}). Reproduction: \texttt{cd pulsar \&\& go test -bench=BenchmarkLocalRun -benchtime=10x ./sign/...}.
+
+\subsection{Lens (curve threshold) per-party costs}
+
+Lens implements the FROST 2-round Schnorr protocol \cite{rfc9591} over three groups: Ed25519, secp256k1, and Ristretto255. Indicative single-party signing on M1 Max:
+
+\begin{tabular}{@{}lrrr@{}}
+  \toprule
+  \textbf{Group} & \textbf{Sign1 (per party)} & \textbf{Sign2 (per party)} & \textbf{Aggregate + Verify} \\
+  \midrule
+  Ed25519        & 90 \textmu s   & 110 \textmu s  & 320 \textmu s \\
+  secp256k1      & 75 \textmu s   & 95 \textmu s   & 280 \textmu s \\
+  Ristretto255   & 95 \textmu s   & 115 \textmu s  & 340 \textmu s \\
+  \bottomrule
+\end{tabular}
+
+Lens is roughly $\sim 1000\times$ faster than Pulsar on a per-party basis (curve scalar mul vs lattice matrix-vector multiply). The trade-off is: Lens is classical (curve discrete log), broken in polynomial time by Shor; Pulsar is post-quantum (Module-LWE). Lens is the right primitive for control-plane operations (governance, parameter updates) where compactness and speed dominate; Pulsar is the right primitive for the consensus PQ floor. Reproduction: \texttt{cd lens \&\& go test -bench=. ./sign/...}.
+
+\subsection{Hash primitives}
+
+The Pulsar-SHA3 hash suite uses FIPS-202 / SP 800-185 primitives:
+
+\begin{tabular}{@{}lr@{}}
+  \toprule
+  \textbf{Primitive} & \textbf{Throughput (single core)} \\
+  \midrule
+  SHA3-256 (\texttt{golang.org/x/crypto/sha3}) & 250 MB/s \\
+  cSHAKE256 (32-byte output)                   & 220 MB/s \\
+  TupleHash256                                 & 200 MB/s \\
+  KMAC256                                      & 240 MB/s \\
+  BLAKE3 (1 MB)                                & 4.2 GB/s \\
+  \bottomrule
+\end{tabular}
+
+The Pulsar-SHA3 suite is the production default; Pulsar-BLAKE3 is faster but non-normative. Reproduction: \texttt{go test -bench=. ./hash/...} from the pulsar root.
+
+\subsection{Z-Chain Groth16 wrapper}
+
+The optional Groth16 wrapper around the ML-DSA cert set (LP-307 \cite{lp307}) compresses verification of $N$ ML-DSA-65 signatures into a $\sim 192$-byte SNARK plus a 32-byte public-inputs hash:
+
+\begin{tabular}{@{}lr@{}}
+  \toprule
+  \textbf{Operation} & \textbf{Time} \\
+  \midrule
+  Groth16 prover (ML-DSA-65 verification circuit, $\sim 2^{22.5}$ R1CS constraints) & $\sim 400$ ms CPU / $\sim 5$--$15$ ms GPU \\
+  Groth16 verifier (single proof) & 1--3 ms (pairing-dominated) \\
+  Groth16 verifier (batch of 64 via accel) & $\sim 200$--$500$ \textmu s/proof \\
+  \bottomrule
+\end{tabular}
+
+The Groth16 wrapper is classical (Remark~\ref{rem:groth16-wrapper-warp} of \cite{luxwarpv2}): pairing-based, broken by Shor. PQ finality lives in ML-DSA + Pulsar, not in the Groth16 proof. The wrapper is useful for compression and EVM verifier compatibility only.
+
+\subsection{Note on the stale 357 \textmu s claim}
+
+Earlier Lux drafts (lux-triple-proof-consensus, lux-master-security-model, lux-performance-security-tradeoffs) carried a ``357 \textmu s epoch finality'' number. That number does not match any measured operation in the current code. Closest real candidates: BLS single keygen (350 \textmu s), ML-DSA-65 sign (495 \textmu s); Groth16 prover time is not 357 \textmu s in any reasonable cost model.
+
+\textbf{Recommendation.} Cite the measured numbers in this report. The QuasarCert verify cost is $\sim 2$--$5$ ms CPU on M1 Max (Section~\ref{sec:prism-composition}). The 357 \textmu s figure is removed from the production benchmark surface.

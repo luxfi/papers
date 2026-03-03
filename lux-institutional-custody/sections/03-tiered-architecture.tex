@@ -1,0 +1,152 @@
+\section{Tiered Architecture}
+
+\label{sec:tiers}
+%% =====================================================================
+
+The portfolio is partitioned into three signing tiers. Each tier has
+a fixed AUM allocation, a fixed threshold structure, and a fixed
+latency profile. The boundaries are enforced by independent rebalancing
+rules and by the M-Chain custody ledger (LP-006 \cite{lp006}); no
+operational action can move funds between tiers without an explicit
+inter-tier transfer that itself goes through the source tier's
+signing flow.
+
+\subsection{Tier 1 -- Cold (95\%, \$7.6B)}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{cllll}
+\toprule
+\textbf{Share} & \textbf{HSM} & \textbf{Vendor / Model} &
+\textbf{Location} & \textbf{Cert} \\
+\midrule
+$\mathbf{c}_1$ & On-prem & Thales Luna Network HSM 7
+  & Fund HQ DC (Tier IV) & FIPS 140-2 L3 \\
+$\mathbf{c}_2$ & On-prem & Utimaco u.trust SR-Se200 Gen2
+  & DR DC, $\geq$500 mi from HQ & FIPS 140-2 L3 (L4 phys) \\
+$\mathbf{c}_3$ & Cloud   & AWS CloudHSM (Marvell LiquidSecurity)
+  & Multi-region (us-east-1 + eu-west-1) & FIPS 140-2 L3 \\
+$\mathbf{c}_4$ & Cloud   & GCP Cloud HSM (Marvell LiquidSecurity)
+  & Multi-region (us-central1 + europe-west1) & FIPS 140-2 L3 \\
+$\mathbf{c}_5$ & Airgap  & YubiHSM 2 in offline vault
+  & Underground vault, separate continent & FIPS 140-2 L3 \\
+\bottomrule
+\end{tabular}
+\caption{Cold-tier share placement (3-of-5 threshold).}
+\label{tab:cold}
+\end{table}
+
+\paragraph{Default signing path.} Routine cold-tier movements (e.g.\
+quarterly rebalances, large client redemptions) sign with shares
+$\mathbf{c}_3 + \mathbf{c}_4 + \mathbf{c}_5$. The two on-prem shares
+$\mathbf{c}_1$ and $\mathbf{c}_2$ are reserved for catastrophic
+recovery and are not exercised on the default path; this minimises
+their exposure surface.
+
+\paragraph{Recovery path.} If any one of $\mathbf{c}_3, \mathbf{c}_4,
+\mathbf{c}_5$ is unavailable, signing falls back to $\mathbf{c}_1$
+or $\mathbf{c}_2$ as the third share. If three cloud/airgap shares
+are unavailable, the on-prem pair plus the airgap share form the
+quorum.
+
+\paragraph{Latency.} The airgapped share contributes via the LP-137
+\cite{lp137} four-round file/QR airgap protocol; signing turnaround
+is dominated by ceremony scheduling and is contractually 1--24 hours.
+This is acceptable for cold reserves and intentionally creates a
+human-in-the-loop checkpoint on every cold movement.
+
+\subsection{Tier 2 -- Warm (4\%, \$320M)}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{cllll}
+\toprule
+\textbf{Share} & \textbf{HSM} & \textbf{Vendor / Model} &
+\textbf{Region} & \textbf{Cert} \\
+\midrule
+$\mathbf{w}_1$ & AWS CloudHSM (separate cluster from $\mathbf{c}_3$) &
+  Marvell LiquidSecurity & us-west-2 & FIPS 140-2 L3 \\
+$\mathbf{w}_2$ & GCP Cloud HSM (separate project from $\mathbf{c}_4$) &
+  Marvell LiquidSecurity & asia-east1 & FIPS 140-2 L3 \\
+$\mathbf{w}_3$ & Azure Dedicated HSM &
+  Thales Luna 7 (managed) & North Europe & FIPS 140-2 L3 \\
+\bottomrule
+\end{tabular}
+\caption{Warm-tier share placement (2-of-3 threshold).}
+\label{tab:warm}
+\end{table}
+
+\paragraph{Signing.} Programmatic, mTLS-authenticated, sub-second
+turnaround. The Lux MPC orchestrator (\texttt{luxfi/mpc}) issues
+parallel partial-signing requests to two of three shares; the third
+is held in reserve.
+
+\paragraph{Policy enforcement.} Every warm signing request is
+gated by an HSM-resident policy module (Section~\ref{sec:hsm}):
+daily withdrawal cap, destination allowlist, per-transaction limit,
+and Chainalysis/TRM screening of the destination
+\cite{chainalysis,trm}.
+
+\paragraph{Use cases.} Daily client redemptions below \$5M, quarterly
+rebalancing legs that exceed the hot tier cap, and pre-funded movements
+into the hot tier.
+
+\subsection{Tier 3 -- Hot (1\%, \$80M)}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{cllll}
+\toprule
+\textbf{Share} & \textbf{Backend} & \textbf{Region} &
+\textbf{Cert} \\
+\midrule
+$\mathbf{h}_1$ & AWS KMS (HSM-backed CMK) & us-east-1 &
+  FIPS 140-2 L3 (KMS HSM) \\
+$\mathbf{h}_2$ & GCP Cloud KMS (HSM-backed) & us-central1 &
+  FIPS 140-2 L3 \\
+\bottomrule
+\end{tabular}
+\caption{Hot-tier share placement (2-of-2 threshold).}
+\label{tab:hot}
+\end{table}
+
+\paragraph{Time-lock.} Every hot signing request enters a 24-hour
+delay queue by default. The trading desk may override with a signed
+codeword (separate authentication, separate ops shift) for
+time-critical actions, subject to a per-day override budget.
+
+\paragraph{Cap.} Daily withdrawal cap of \$10M (configurable, default
+above) at the policy layer. Exceeding the cap requires a warm-tier
+top-up.
+
+\paragraph{Use cases.} Market-maker rebates, exchange-rebalancing
+flows, on-chain liquidity provision, and any near-real-time order
+flow.
+
+\subsection{Tier-Boundary Transfers}
+
+Any transfer that crosses a tier boundary (cold-to-warm, warm-to-hot,
+hot-to-warm, warm-to-cold) must be signed by the source tier's
+threshold. The destination tier credit is conditional on the source
+tier's signature being final on chain. The M-Chain custody ledger
+(LP-006 \cite{lp006}) records the inter-tier transfer with the source
+threshold's BLS aggregate as proof.
+
+\begin{theorem}[Tier Authority Independence]
+\label{thm:tier-indep}
+The compromise of all parties at one tier does not yield authority
+over assets at any other tier.
+\end{theorem}
+
+\begin{proof}
+Each tier has a distinct threshold key with disjoint share sets and
+disjoint HSM custodians. The threshold protocols are unforgeable
+\cite{cggmp21}, so signing one tier's key requires that tier's
+quorum. No tier's quorum is a subset of another tier's quorum.
+Therefore signing authority is tier-local.
+\end{proof}
+
+%% =====================================================================

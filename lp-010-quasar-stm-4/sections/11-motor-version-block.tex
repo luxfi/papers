@@ -1,0 +1,97 @@
+\section{Motor VersionBlock layout}
+
+\label{sec:versionblock}
+%% ============================================================================
+
+\subsection{Why one round trip matters}
+
+Motor~\cite{motor2024} (OSDI 2024) demonstrated that, on disaggregated
+memory over RDMA, MVCC reads dominated by linked-chain pointer-chases
+across the network become the throughput bottleneck. The remedy is to
+lay versions out as consecutive tuples so that the likely-visible read
+fetches in \emph{one} round trip. The same reasoning applies inside a
+GPU memory hierarchy: chained MVCC reads stall on uncoalesced loads,
+costing memory bandwidth and L1 hit rate.
+
+QuasarSTM~3.0 used a chain layout~\cite{lp010-quasarstm-3}. 4.0 ships
+the Motor VersionBlock layout.
+
+\subsection{Layout}
+
+\begin{lstlisting}[language=C++]
+constexpr int MAX_INLINE_VERSIONS = 8;   // 4 in 3.0; 8 in 4.0
+
+struct StmVersion {
+    uint32_t writer_tx;             // canonical-order index of writer
+    uint32_t commit_round;
+    uint64_t value_lo;              // 256-bit value, low limbs
+    uint64_t value_hi;              // 256-bit value, high limbs
+    uint64_t pad[2];                // 64 bytes total
+};
+
+struct VersionBlock {
+    Hash       key;                 // storage slot key (32 B)
+    uint16_t   count;               // populated versions, 0..MAX_INLINE_VERSIONS
+    uint16_t   capacity;            // == MAX_INLINE_VERSIONS
+    uint8_t    pad[28];             // align versions to 64 B
+    StmVersion versions[MAX_INLINE_VERSIONS];   // 8 * 64 = 512 B
+};
+\end{lstlisting}
+
+A VersionBlock fits in a single 576-byte cache-line-multiple region;
+on Apple Metal the device shared-memory page is 1024 B and on NVIDIA
+H100 the L1 line is 128 B with 4-line coalesced loads, so a single
+load instruction reaches at least the first 4 versions in either case.
+
+\subsection{Visibility lookup}
+
+Tier~2 visibility lookup walks the inline array linearly:
+
+\begin{algorithm}[ht]
+\caption{\texttt{visible\_version}($\mathit{vb}$, $t$)}
+\label{alg:visible}
+\begin{algorithmic}[1]
+\State $v^* \gets \bot$
+\For{$i \gets 0$ to $\mathit{vb.count}-1$}
+  \If{$\mathit{vb.versions[i].writer\_tx} \prec_{\mathrm{can}} t$ \textbf{and} \texttt{committed}($\mathit{vb.versions[i]}$)}
+    \If{$v^* = \bot$ \textbf{or} $\mathit{vb.versions[i].writer\_tx} \succ_{\mathrm{can}} v^*.\mathit{writer\_tx}$}
+      \State $v^* \gets \mathit{vb.versions[i]}$
+    \EndIf
+  \EndIf
+\EndFor
+\State \Return $v^*$
+\end{algorithmic}
+\end{algorithm}
+
+The loop is unrolled (compile-time fixed bound 8) and runs in shared
+memory with no pointer chasing. On the regulated-DEX workload mix, the
+average key has 1--2 visible versions; the inline-8 layout almost
+always avoids the spill case.
+
+\subsection{Spill}
+
+If a key accumulates more than 8 versions within a round (rare, since
+GC reaps last-round versions at \texttt{begin\_round}, see
+\S\ref{sec:gc}), the VersionBlock spills into a per-key overflow chain
+in the long-lived arena. The spill path is the chain layout from 3.0;
+correctness is unchanged.
+
+\subsection{RDMA / multi-GPU readiness}
+
+The VersionBlock layout is the unit of message between fiber clients
+and the CSMV~\cite{csmv} commit server (\S\,16) in the 4.0
+single-GPU production deployment, and it remains the unit of message
+in the 5.0 multi-GPU research deployment. By making the layout
+RDMA-friendly today, the 4.0 substrate is ready for the multi-GPU
+commit-server pattern without a layout-layer rewrite.
+
+\subsection{Alignment with 3.0 wire compatibility}
+
+VersionBlock is an \emph{on-device} structure. The wire format
+(\texttt{QuasarRoundDescriptor}, \texttt{QuasarRoundResult}) does not
+expose VersionBlock layout to validators. So the 3.0 $\rightarrow$ 4.0
+inline-version count change is forward-compatible at the consensus
+layer: 3.0 validators that are upgraded read 4.0 blocks; 4.0 reads
+3.0 blocks (capacity is metadata, not in the cert).
+
+%% ============================================================================

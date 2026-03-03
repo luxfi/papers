@@ -1,0 +1,99 @@
+\section{Implementation}
+
+\label{sec:implementation}
+%% ============================================================================
+
+Quasar 3.0 ships in the \texttt{github.com/luxfi/consensus} package on
+25 December 2025. Implementation highlights:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Language}: Go 1.24. Single binary, explicit error handling,
+      no runtime panics on the consensus path.
+\item \textbf{Wire protocol}: ZAP (\texttt{github.com/luxfi/zap}), a
+      zero-allocation binary protocol with optional PQ-TLS~1.3
+      (X25519MLKEM768) transport encryption~\cite{lux-zap}.
+\item \textbf{Storage}: SQLite WAL mode via ZapDB for consensus state.
+      Epoch-based pruning removes state older than 6 epochs.
+\item \textbf{Cryptography}: \texttt{luxfi/crypto/bls} for BLS12-381,
+      \texttt{luxfi/crypto/mldsa} for ML-DSA-44/65/87,
+      \texttt{luxfi/corona} for Ring-LWE threshold signing,
+      \texttt{luxfi/zk} for the Z-Chain Groth16 prover/verifier.
+\item \textbf{QuasarGPU adapter}: LP-132~\cite{lp132-quasargpu} provides
+      a GPU-native verification substrate that schedules BLS, Corona,
+      and Groth16 verifies onto the same kernel stream as EVM execution.
+      Verification consumes no incremental host-CPU budget on the hot
+      path.
+\item \textbf{Three-lane signing}: \texttt{TripleSignRound1}
+      (\texttt{consensus/protocol/quasar/quasar.go}) dispatches
+      BLS, Corona, and ML-DSA signing in separate goroutines.
+      $\sigma_i^{\mathrm{ML}}$ is submitted to Z-Chain rather than
+      gossipped, so the mainnet message size remains
+      $\mathcal{O}(96 + 56\text{KB})$ rather than
+      $\mathcal{O}(N \cdot 3{,}309)$.
+\item \textbf{Fail-closed Corona}: if Q-Chain's threshold round fails
+      (insufficient shares, rejection sampling failure, network
+      partition during DKG), the protocol is specified to fall back to
+      Mode 2 (BLS + MLDSAGroth16). The current wire layer
+      (\texttt{PolicyQuantum}) requires Corona by default
+      (\texttt{requireRT = true}); the Mode\,2 fallback is governed by
+      this flag and an out-of-band operator decision rather than an
+      automatic in-protocol degradation. It does not degrade to
+      BLS-only without explicit operator action.
+\item \textbf{Z-Chain prover degradation}: if the Z-Chain prover misses
+      $T_{\mathrm{ZK}}$, the proposer broadcasts the raw
+      $\geq t$ ML-DSA-65 signatures (the post-quantum ``signal flare''
+      fallback referenced in Theorem~\ref{thm:pq-safety}) instead of the
+      Groth16 proof.
+\item \textbf{FPC integration}: the Wave FPC threshold selector
+      (\texttt{protocol/wave/fpc/fpc.go}) uses SHA-256-based PRF for
+      deterministic phase-dependent threshold selection.
+\item \textbf{DAG finalization}: pre-allocated ring buffers for vote
+      counting, frontier-set reuse for DAG traversal, zero GC pressure
+      during consensus rounds. Finalization check 13.75\,ns at depth 10,
+      113\,ns at depth 100 (sub-linear via frontier caching).
+\end{itemize}
+
+\subsection{Module Structure}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Package} & \textbf{Function} \\
+\midrule
+\texttt{protocol/photon/}  & Proposal emission \\
+\texttt{protocol/wave/}    & FPC voting, confidence tracking \\
+\texttt{protocol/wave/fpc/} & PRF-based threshold selector \\
+\texttt{protocol/focus/}   & Certificate-subject derivation \\
+\texttt{protocol/ray/}     & Three-lane signing dispatch \\
+\texttt{protocol/quasar/}  & QuasarCert construction \& verification \\
+\texttt{protocol/nova/}    & Linear-chain consensus mode \\
+\texttt{protocol/nebula/}  & DAG consensus mode \\
+\texttt{protocol/prism/}   & DAG geometry and cutting \\
+\texttt{protocol/flare/}   & Nebula proposer (DAG variant of Photon) \\
+\texttt{protocol/horizon/} & Nebula DAG voting \\
+\texttt{protocol/field/}   & Nebula finalization \\
+\texttt{core/dag/}         & Horizon, flare, frontier algorithms \\
+\texttt{engine/chain/}     & Linear-chain engine \\
+\texttt{engine/dag/}       & DAG engine \\
+\texttt{engine/pq/}        & Post-Quasar certificate engine \\
+\texttt{types/}            & Bag, config, consensus types \\
+\bottomrule
+\end{tabular}
+\caption{Package structure of the Quasar 3.0 implementation.}
+\label{tab:packages}
+\end{table}
+
+\subsection{Configuration}
+
+Quasar 3.0 auto-configures consensus parameters from validator count:
+\texttt{GetConfig(nodeCount)} computes $k$, $\alpha$, and $\beta$ to
+satisfy safety and liveness for the given $n$. Three presets:
+\texttt{Config.SingleValidator()}, \texttt{Config.Testnet()}, and
+\texttt{Config.Mainnet()}. The 25 December 2025 mainnet activates with
+\texttt{Config.Mainnet()} at $n=21$ and Mode~$\mu = 3$ (Quantum, all
+three lanes).
+
+
+%% ============================================================================

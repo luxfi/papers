@@ -1,0 +1,165 @@
+\section{Deterministic Contention Manager}
+
+\label{sec:contention}
+%% ============================================================================
+
+GPU-STM literature~\cite{cederman2010,holey2014} catalogues SIMT
+livelock and unbounded retry as the dominant failure modes of
+naive ports. QuasarSTM's contention manager is deterministic by
+construction: there is no randomised victim selection, no spinlock,
+no retry-until-success loop.
+
+\subsection{Conflict Policies}
+
+\begin{definition}[Conflict policy set]
+\label{def:policy-set}
+The contention manager has six fixed policies:
+\[
+\mathit{StmConflictPolicy} \in \{
+\textsc{EarlierWins},\,
+\textsc{HotLaneSerialize},\,
+\textsc{RefractionSplit},\,
+\textsc{IncarnationBackoff},\,
+\textsc{SemanticReducer},\,
+\textsc{ColdQueueDemotion}\}.
+\]
+Policies are applied in a fixed cascade.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Contention manager: dispatch policy for conflict $C$
+between $T_a$ and $T_b$}
+\label{alg:contention}
+\begin{algorithmic}[1]
+\State $(T_a, T_b)$ ordered so $\mathit{idx}(T_a) <
+       \mathit{idx}(T_b)$.
+\State \textbf{Apply \textsc{EarlierWins}}: $T_a$ keeps its
+       speculative result; $T_b$ enters \textsc{RepairPending}.
+\State \textbf{if} same lane $L$ has produced
+       $> \theta_{\mathrm{hot}}$ conflicts in this round \textbf{then}
+       apply \textsc{HotLaneSerialize}: lane $L$ promoted to
+       hot-isolated; subsequent transactions on $L$ run in canonical
+       order.
+\State \textbf{if} a registered Tier-3 reducer exists for $L$
+       \textbf{then} apply \textsc{SemanticReducer}: route $T_b$
+       through the reducer instead of re-executing.
+\State \textbf{if} frontier-wide conflict density exceeds
+       $\theta_{\mathrm{frontier}}$ \textbf{then} apply
+       \textsc{RefractionSplit}: future Prism cuts narrow.
+\State \textbf{if} $T_b.\mathit{incarnation} >
+       \mathtt{MAX\_FAST\_REPAIRS}$ \textbf{then} apply
+       \textsc{IncarnationBackoff}: $T_b$ moved to a slower service
+       queue with extended budget.
+\State \textbf{if} $T_b.\mathit{incarnation} >
+       \mathtt{MAX\_TOTAL\_REPAIRS}$ \textbf{then} apply
+       \textsc{ColdQueueDemotion}: $T_b$ removed from this round and
+       deferred to the next.
+\end{algorithmic}
+\end{algorithm}
+
+\begin{lemma}[Determinism of contention manager]
+\label{lem:contention-deterministic}
+Algorithm~\ref{alg:contention} produces the same policy decision
+under any two GPU executions on the same input frontier and the
+same lane state. There is no degree of freedom for tie-breaking
+beyond canonical-index ordering.
+\end{lemma}
+
+\begin{proof}[Sketch]
+Every branch condition is a deterministic function of
+$(T_a, T_b, \mathit{LaneClock}, \mathit{TelemetryCounters})$, all of
+which are device-resident structures updated by deterministic
+write paths. The cascade is total: at most one policy fires for any
+given $(T_a, T_b, L)$ tuple. The choice of $T_b$ as the victim is
+forced by canonical-index ordering, not by GPU thread ID.
+\end{proof}
+
+\subsection{Hard Limits}
+
+\begin{definition}[Repair hard limits]
+\label{def:hard-limits}
+The contention manager enforces three constants:
+\begin{align*}
+\mathtt{MAX\_FAST\_REPAIRS}        &= 3 \\
+\mathtt{MAX\_TOTAL\_REPAIRS}       &= 8 \\
+\mathtt{HOT\_LANE\_CONFLICT\_THRESHOLD} &= 16
+\end{align*}
+\end{definition}
+
+\begin{lemma}[No unbounded retry]
+\label{lem:bounded-retry}
+For any transaction $T$ and any sequence of conflicts involving $T$,
+the number of repairs $T$ undergoes within a single Quasar round is
+bounded by $\mathtt{MAX\_TOTAL\_REPAIRS}$. After this point $T$ is
+demoted to the cold queue and runs in the next round.
+\end{lemma}
+
+\begin{proof}
+Algorithm~\ref{alg:contention} step~7 applies
+\textsc{ColdQueueDemotion} when $T_b.\mathit{incarnation} >
+\mathtt{MAX\_TOTAL\_REPAIRS}$. The incarnation counter is
+monotonically increasing under repair monotonicity
+(\S\ref{sec:correctness}, Invariant~\ref{inv:repair-monotone}), so the
+predicate eventually fires within finitely many repair rounds.
+\end{proof}
+
+\subsection{Hot-Lane Modes}
+
+\begin{definition}[Hot-lane mode]
+\label{def:hot-lane-mode}
+A lane promoted by \textsc{HotLaneSerialize} or by hotness threshold
+acquires one of four modes:
+\[
+\mathit{HotLaneMode} \in \{
+\textsc{Serialize},\,
+\textsc{Reduce},\,
+\textsc{Precompile},\,
+\textsc{Defer}\}.
+\]
+\end{definition}
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Hot lane} & \textbf{Mode} \\
+\midrule
+\textsc{erc20.totalSupply} & \textsc{Reduce} or \textsc{Serialize} \\
+AMM reserves               & \textsc{Precompile} (batch auction) \\
+order-book price level     & \textsc{Reduce} (\textsc{Append} + match) \\
+fee counter                & \textsc{Reduce} (sum reducer) \\
+sender nonce               & \textsc{Serialize} per sender \\
+compliance identity        & \textsc{Serialize} or snapshot \\
+\bottomrule
+\end{tabular}
+\caption{Hot-lane mode assignments for the canonical regulated-DEX
+contract set.}
+\label{tab:hot-lane-modes}
+\end{table}
+
+Hot lanes are not pathologies; they are where application economics
+live. QuasarSTM~3.0 makes them explicit primitives.
+
+\subsection{Forbidden Patterns}
+
+The QuasarSTM specification prohibits the patterns documented as
+fatal in the GPU-STM literature:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item one global STM clock;
+\item one global version map lock;
+\item retry-until-success GPU loops;
+\item nondeterministic conflict victim selection;
+\item opcode-level STM (QuasarSTM is transaction-level);
+\item CPU-side conflict manager;
+\item host-side repair scheduler;
+\item per-version \texttt{malloc} (the per-round arena is mandatory);
+\item global hot-key spinlocks.
+\end{itemize}
+
+These either break determinism or collapse GPU throughput. Compliance
+with this list is a build-time invariant: the round path on Metal and
+CUDA is statically inspected for these patterns.
+
+
+%% ============================================================================

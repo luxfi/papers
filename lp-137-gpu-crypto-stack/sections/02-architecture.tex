@@ -1,0 +1,70 @@
+\section{Architecture}
+\label{sec:architecture}
+
+LP-137 organizes every algorithm under a uniform directory layout in \texttt{luxcpp/crypto}:
+
+\begin{lstlisting}[language=bash,caption={Per-algorithm directory layout}]
+luxcpp/crypto/<alg>/
+  cpp/                # First-party C++23 CPU body
+  c-abi/              # C ABI shim (header + .cc)
+  gpu/
+    metal/            # First-party .metal kernel
+    cuda/             # First-party .cu kernel
+    wgsl/             # First-party .wgsl kernel
+  test/
+    cmake/            # FetchContent integration of test oracles
+    kat_*.json        # Known-answer test vectors
+    <alg>_test.cpp    # CPU canonical correctness test
+    <alg>_metal_test.cpp # CPU<->GPU byte-equality test
+    <alg>_cuda_test.cu
+    <alg>_wgpu_test.cpp
+  CMakeLists.txt      # Builds lib<alg>.a, no vendor link
+\end{lstlisting}
+
+\subsection{Three layers, one byte-equality contract}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  node distance=0.9cm,
+  every node/.style={font=\small},
+  box/.style={rectangle, draw, rounded corners=2pt, minimum width=3.4cm, minimum height=0.8cm, align=center},
+  byte/.style={->, thick, dashed},
+]
+\node[box] (ref) at (0,0) {Reference (Go)\\\texttt{gnark-crypto}, \texttt{blst}};
+\node[box, below=of ref] (cpu) {CPU canonical\\(Lux first-party C++23)};
+\node[box, below left=of cpu, xshift=-1cm] (metal) {Metal\\(first-party)};
+\node[box, below=of cpu] (cuda) {CUDA\\(first-party)};
+\node[box, below right=of cpu, xshift=1cm] (wgsl) {WGSL\\(first-party)};
+\draw[byte] (ref) -- node[right] {byte-equal} (cpu);
+\draw[byte] (cpu) -- node[left] {byte-equal} (metal);
+\draw[byte] (cpu) -- node[right] {byte-equal} (cuda);
+\draw[byte] (cpu) -- node[right] {byte-equal} (wgsl);
+\end{tikzpicture}
+\caption{Three-hop byte-equality contract. The CPU canonical is byte-equal to the Go reference; each GPU backend is byte-equal to the CPU canonical; transitively, every backend is byte-equal to the Go reference. One contract, three hops, every backend coupled to the same ground truth.}
+\label{fig:byte-equality}
+\end{figure}
+
+\paragraph{Why CPU first-party is the canonical.} If the CPU body came from the same algorithm family as the test oracle (e.g.\ both vendored from \texttt{gnark-crypto}, or both from \texttt{blst}), the oracle would lose its adversarial-distance property: a bug in the upstream would propagate through both sides of the byte-equality check. First-party CPU plus a vendored audited test-oracle is the correct adversarial structure; a bug on either side fails the test. The vendor-as-canonical alternative was specifically rejected on 2026-04-27 (LP-137 \texttt{Rejected proposals}).
+
+\subsection{Build topology}
+
+C++ deps come exclusively via CMake \texttt{FetchContent} from the \texttt{luxcpp/*} fork organization. Conan was rejected as a build dependency. Forks: \texttt{luxcpp/intx}, \texttt{luxcpp/evmmax}, \texttt{luxcpp/blst}, \texttt{luxcpp/pqclean}, \texttt{luxcpp/ed25519-donna}, \texttt{luxcpp/blake3-reference}. All track upstream verbatim with strict semver tags (no prerelease suffixes; no \texttt{-luxfi}, no \texttt{-alpha}); divergence (if ever needed) signaled by next-minor bump.
+
+\subsection{C-ABI surface}
+
+The \texttt{c-abi/} layer exposes a minimal, brand-neutral C entry point per algorithm. Public symbols use the algorithm name verbatim:
+
+\begin{lstlisting}[language=C,caption={Sample C-ABI signature (BN254 / EIP-196 + EIP-197 \cite{eip196,eip197})}]
+int  bn254_g1_add(uint8_t out[64], const uint8_t a[64], const uint8_t b[64]);
+int  bn254_g1_scalar_mul(uint8_t out[64], const uint8_t p[64],
+                         const uint8_t s[32]);
+int  bn254_pairing(uint8_t out[384], const uint8_t* g1s, const uint8_t* g2s,
+                   size_t k);
+\end{lstlisting}
+
+\noindent No \texttt{LUX\_*}, \texttt{LUXFI\_*}, or \texttt{HANZO\_*} prefix appears anywhere in the public surface (LP-137 \texttt{Hard rules}). Where an entry point is unimplemented, it returns the documented sentinel \texttt{CRYPTO\_ERR\_NOTIMPL}; production paths that depend on it must check.
+
+\subsection{Test-oracle isolation}
+
+The vendored upstream library is included via \texttt{FetchContent} in \texttt{<alg>/test/cmake/<oracle>.cmake} and linked into the test binary only. The shipped \texttt{lib<alg>.a} library never depends on it. Verification: the production target's \texttt{ldd} output must contain none of \texttt{libblst.so}, \texttt{libgmp.so} (modexp non-test path), \texttt{libcrypto.so} (BoringSSL), etc. CI enforces this with a per-target audit step.

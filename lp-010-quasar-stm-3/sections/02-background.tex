@@ -1,0 +1,133 @@
+\section{Background}
+
+\label{sec:background}
+%% ============================================================================
+
+QuasarSTM borrows from four lines of work---ordered serializability,
+Block-STM, TL2, and TicToc---and rejects the failure modes documented in
+the GPU-STM literature.
+
+\subsection{Ordered Serializability under a Known Canonical Order}
+
+\begin{definition}[Canonical order]
+\label{def:canonical-order}
+A consensus mode supplies a total order
+$\preceq_{\mathrm{can}}$ over the transactions in a block (Nova) or a
+strict partial order with a deterministic linear extension over the
+ready cut (Nebula). The canonical order is fixed before execution and
+is independent of execution outcomes.
+\end{definition}
+
+\begin{definition}[Ordered serializability]
+\label{def:ordered-serializable}
+A history $H$ over committed transactions $T_1,\ldots,T_k$ is
+\emph{ordered-serializable} with respect to $\preceq_{\mathrm{can}}$
+iff there exists a serial schedule $S$ equivalent to $H$ such that
+$S$ respects $\preceq_{\mathrm{can}}$.
+\end{definition}
+
+Block-STM's central observation is that when a canonical order is
+already fixed by consensus, validation does not need to discover one.
+It only needs to verify that each committed read observed the version
+its canonical predecessor produced. This collapses the validation
+problem from $\Theta(k!)$ schedules to a per-read version equality.
+
+\subsection{Block-STM (Aptos)}
+
+Block-STM~\cite{gelashvili2022blockstm} maintains a per-key version
+chain $V(k) = \langle v_0, v_1, \ldots\rangle$ keyed by canonical
+transaction index. Transactions execute speculatively, recording reads
+and writes. Validation walks the read set: each read at canonical
+position $i$ must observe the version written by the largest $j < i$
+that wrote $k$, evaluated against the latest valid incarnation.
+Mismatches trigger re-execution at incarnation $\iota+1$. Convergence
+is by induction on $i$: once all $T_j$ for $j < i$ are stable,
+re-executing $T_i$ at most once produces a valid commit.
+
+QuasarSTM keeps this skeleton. It modifies what \emph{counts as a read
+mismatch} (lane clocks short-circuit it; semantic reducers redefine
+it) and what \emph{counts as a repair} (incremental rollback against
+fiber checkpoints replaces full re-execution).
+
+\subsection{TL2: Transactional Locking II}
+
+TL2~\cite{dice2006tl2} introduced commit-time locking with a global
+version clock. Each transaction snapshots the clock at start and
+validates by checking that no observed object's version exceeds the
+snapshot. The advantage is invisible reads on the fast path; the
+disadvantage is that a single global clock becomes a contention point
+under high write throughput.
+
+QuasarSTM \emph{shards} the TL2 idea. There is no global clock. Each
+lane has its own \emph{lane clock} (\S\ref{sec:validation}). A
+transaction that touches lanes $L_1,\ldots,L_m$ snapshots
+$\langle c_1,\ldots,c_m\rangle$ and validates by checking that no
+$c_i$ has advanced. This is the Tier~1 fast path: under low
+contention, transactions commit without touching the per-key MVCC
+chains at all.
+
+\subsection{TicToc: Per-Data-Item Timestamps}
+
+TicToc~\cite{yu2016tictoc} eliminates the centralised timestamp
+counter by storing a $(\mathit{read\_ts}, \mathit{write\_ts})$
+pair per data item and computing each transaction's commit timestamp
+\emph{lazily} as the smallest value compatible with its read and
+write footprint. The result is throughput close to ideal optimistic
+concurrency control without a global counter.
+
+QuasarSTM adopts the per-key $(\mathit{read\_ts},
+\mathit{write\_ts})$ pair (\S\ref{sec:tictoc}) as a tool for
+\emph{reducing false aborts}. The hard rule is that timestamps
+\emph{cannot} reorder consensus: the canonical order
+$\preceq_{\mathrm{can}}$ is supplied by Quasar and is non-negotiable.
+TicToc-style timestamps only prove that an observed version is
+serializable \emph{within} the canonical order---they never modify
+which transaction commits before which.
+
+\subsection{GPU-STM Literature: SIMT Livelock and Scalability}
+
+Cederman et al.~\cite{cederman2010} and Holey et al.~\cite{holey2014}
+report two recurrent pathologies on GPU-STM:
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \emph{SIMT livelock.} Hot-key contention causes warps to
+      repeatedly stomp on each other; nondeterministic victim
+      selection and exponential backoff transplanted from CPU STM
+      do not converge under the lockstep execution model.
+\item \emph{Scalability collapse.} A single global version map or
+      hot-key spinlock serialises the entire warp grid, collapsing
+      throughput by orders of magnitude under skewed (Zipfian)
+      access patterns.
+\end{enumerate}
+
+QuasarSTM rejects both root causes by construction:
+\begin{itemize}[leftmargin=2em]
+\item \textbf{Determinism is mandatory.} The contention manager has
+      six fixed policies (\S\ref{sec:contention}); there is no
+      randomised victim selection.
+\item \textbf{Bounded repair.} Constants \texttt{MAX\_FAST\_REPAIRS}
+      and \texttt{MAX\_TOTAL\_REPAIRS} (\S\ref{sec:contention})
+      cap repair attempts; transactions that exceed them are
+      promoted to a cold queue or routed through a semantic reducer.
+\item \textbf{Lane refraction.} Hot lanes are isolated by Prism
+      \emph{before} STM sees them
+      (\S\ref{sec:prism}); the GPU-STM hot-key pathology never
+      arises in steady state.
+\item \textbf{No global locks.} There is no global STM clock, no
+      global version map mutex, no per-key spinlock, no
+      retry-until-success loop.
+\end{itemize}
+
+\subsection{Aria, ESSN, and Multiversion Serialization Graphs}
+
+Aria~\cite{lu2020aria} executes a batch against a single snapshot
+and deterministically commits the maximal serializable subset. ESSN
+(epoch-serializable safe net)~\cite{adya2000essn} formalises validation
+against a multiversion serialization graph (MVSG). Both are
+relevant to QuasarSTM: \S\ref{sec:related} discusses how the 3.1
+evolution adopts Aria-style commit selection and an MVSG-derived
+validation rule. Within the 3.0 specification, validation is the
+simpler ``visible-version equality under canonical order'' form
+(\S\ref{sec:visibility}).
+
+
+%% ============================================================================
