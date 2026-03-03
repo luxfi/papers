@@ -1,0 +1,65 @@
+%% ====================================================================
+\section{Asynchronous PQ Finality}
+\label{sec:async-pq-finality}
+%% ====================================================================
+
+A naive composition would require Beam, ML-DSA cert set, and Pulse to all land in the same hot-path round before the bundle is finalized. That design fails liveness on a permissionless WAN-distributed validator set: the lattice two-round signing is structurally heavier than BLS aggregation, and forcing it into the hot path pushes consensus latency from $\sim 1\mathrm{s}$ to multiple seconds.
+
+The shipping discipline is different: \textbf{Beam fast, Pulse-sealed, Horizon-final on a delay}. The bundle is observable in the chain's API at three distinct states; clients consume the state appropriate to their threat model.
+
+\subsection{The state lattice}
+
+We restate Definition~\ref{def:finality-states} of \texttt{proofs/definitions/finality-definitions.tex}:
+\begin{equation}
+  \mathsf{Observed} \;\subset\; \mathsf{Beam\text{-}final}
+   \;\subset\; \mathsf{PQ\text{-}attested}
+   \;\subset\; \mathsf{Pulse\text{-}sealed}
+   \;\subset\; \mathsf{Horizon\text{-}final}
+\end{equation}
+where each containment is strict and each transition requires the additional certificate specified in Definition~\ref{def:horizon-cert}.
+
+\paragraph{Observed.} Photons (validator votes / attestations) on the bundle have been seen through the Lumen transport. No finality.
+
+\paragraph{Beam-final.} BLS aggregate over $\geq 2/3$-weight signers has formed and verified. Sub-second on Lux mainnet (target $\sim 250$--$500\,\mathrm{ms}$ from first photon). This is the state that a classical-only client (e.g., an EVM dApp on an L1 with classical-only threat model) acts on.
+
+\paragraph{PQ-attested.} The per-validator ML-DSA cert set has reached $\geq 2/3$ weight. Adds per-validator PQ accountability without yet adding the compact PQ threshold seal. Useful as evidence material for slashing / forensics if a Pulse is later disputed.
+
+\paragraph{Pulse-sealed.} A Pulsar Pulse over the same NebulaRoot has been formed and verified under the active GroupKey. This is the strongest single-lane PQ confirmation.
+
+\paragraph{Horizon-final.} Prism accepts the composite. This is the strongest finality state, and is the state that bridges, cross-chain settlement, and downstream chains depend on.
+
+\subsection{Bundle interval}
+
+A Quasar bundle aggregates several Beam-finalized blocks. The Lux mainnet bundle interval is $\sim 3\,\mathrm{s}$, grouping $\sim 6$ blocks. The bundle root signed by the Pulse is the canonical NebulaRoot for that interval.
+
+\paragraph{Why bundles, not blocks.} Two-round MAC-authenticated lattice threshold signing has a non-trivial online phase, even with Round 1 preprocessing. At $K = 21$ active validators per group, the median end-to-end signing time on the Go canonical is $\sim 250\,\mathrm{ms}$ (Section~\ref{sec:implementation}). At one Pulse per block (sub-second blocks), the signing phase would be the bottleneck. At one Pulse per bundle ($\sim 3\,\mathrm{s}$), the online phase comfortably fits within the bundle interval with order-of-magnitude headroom; preprocessing is amortized.
+
+\paragraph{Implementation: \texttt{protocol/quasar/quasar.go}.} The shipping engine triggers Pulse signing on the chain's bundle commit event, not on individual block commits. Sign1 is preprocessed off the hot path. Sign2 + Combine run as the bundle commit fires. The 258-test \texttt{protocol/quasar} suite (\cite{consensusgo}, \texttt{quasar\_bench\_test.go}) exercises this path.
+
+\subsection{The relationship between Beam latency and Pulse latency}
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \textbf{Beam latency.} Dominated by BLS aggregate signing + WAN $2/3$-weight collection. On Lux mainnet, $\sim 250\,\mathrm{ms}$ at $n=21$.
+  \item \textbf{Pulse latency.} Dominated by Pulsar Round 1 (offline-preprocessable) and Round 2 (online, message-dependent). At $K = 21$ on the Go canonical: Round 1 $\sim 185\,\mathrm{ms}$ per party, Round 2 + Combine $\sim 30\,\mathrm{ms}$, plus WAN coordination. Total $\sim 1$--$2\,\mathrm{s}$ end-to-end (cf.\ Section~\ref{sec:implementation}; full numbers in the benchmark report \cite{luxbenchmarks}).
+  \item \textbf{Horizon latency.} Pulse latency dominates. On Lux mainnet, Horizon-final lags Beam-final by $\sim 1$--$2\,\mathrm{s}$.
+\end{itemize}
+
+This delay is intentional. A client that needs sub-second finality acts on \texttt{Beam-final}, accepting the classical-only threat model. A client that needs PQ finality (e.g., a long-archival contract or a cross-chain bridge to a high-value chain) waits for \texttt{Horizon-final}. The delay is not a bug; it is the price of delivering compact PQ threshold finality on a permissionless WAN validator set.
+
+\subsection{Bundle re-anchoring under failed Pulse}
+
+If the Pulse coordinator times out or the threshold quorum cannot be assembled, the bundle stays at \texttt{PQ-attested} (or \texttt{Beam-final}) and the next bundle's NebulaRoot retroactively commits to the previous bundle's NebulaRoot via the chain's standard parent linkage. The next round's Pulse therefore covers \emph{both} bundles via transitive transcript inclusion. We do not require a successful per-bundle Pulse; we require successful Pulses on a sufficient density of bundles to bound how long a NebulaRoot can wait for Horizon-finality.
+
+The chain's governance configures the ``Pulse-sealing density bound'' --- e.g., ``Pulse must be observed within $K$ bundle intervals.'' Failure to meet the bound triggers an alert; persistent failure triggers the LSS rollback ladder (\texttt{proofs/lss/rollback-safety.tex}; \cite{luxlssmpc,lp077}) for the failing key era.
+
+\subsection{Why this is the right design}
+
+Three independent design pressures point to the asynchronous discipline:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item \textbf{Validator WAN topology.} Lux mainnet validators run in 5 regions across 3 continents. Cross-WAN p99 latency is $\sim 200\,\mathrm{ms}$. A single round of two-round threshold signing requires at least 2 WAN crossings; at 21 validators, the worst-case round-trip dominates and a per-block PQ Pulse would be the bottleneck.
+  \item \textbf{Heterogeneous client threat models.} Classical EVM dApps with low-value short-time-horizon transactions can act on Beam-final; high-value cross-chain bridges with long-time-horizon archival need Horizon-final. One state lattice serves both.
+  \item \textbf{Future-proofing for quantum.} If a quantum capability appears, classical-only clients can switch from Beam-final to Pulse-sealed or Horizon-final without a chain-level upgrade. The state lattice is forward-compatible with shifts in client risk tolerance.
+\end{enumerate}
+
+This is the consensus-level analogue of LP-105 \cite{lp105} \S``Quasar finality state machine'': finality is not a single bit. It is a lattice with public, observable, well-defined intermediate states.

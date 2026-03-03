@@ -1,0 +1,85 @@
+%% ====================================================================
+\section{Prism: Certificate Composition}
+\label{sec:prism-composition}
+%% ====================================================================
+
+Prism (LP-105 \cite{lp105}) is the certificate-composition verifier. It is a verifier, not a key, not a signature, not a kernel. Its single responsibility is to check that every certificate lane in a Horizon certificate refracts from the same Nebula transcript and verifies under the active validator set's keys. This section states the Prism predicate; Section~\ref{sec:horizon-soundness} states what predicate acceptance buys.
+
+\subsection{The Horizon certificate shape}
+
+A Horizon certificate is the canonical composite (Definition~\ref{def:horizon-cert} in \texttt{proofs/definitions/finality-definitions.tex}; equivalently \texttt{HorizonCertificate} in the Go canonical \cite{consensusgo}, \texttt{warp/pulsar/HorizonCertificate}):
+
+\begin{verbatim}
+type HorizonCertificate struct {
+    Beam        bls.AggregateCertificate    // LP-075
+    MLDSA       mldsa.CertificateSet        // LP-070; signer bitmap +
+                                            //   sigs (or Z-Chain Groth16
+                                            //   rollup of LP-307)
+    Pulsar      pulsar.Certificate          // LP-073; one Pulse
+    NebulaRoot  ids.ID                      // 32-byte canonical root
+    KeyEraID    pulsar.KeyEraID
+    GroupID     pulsar.GroupID              // partitioned-set deployments
+                                            //   (Section sec:grouped)
+    Generation  uint64
+    HashSuiteID string                      // e.g., "Pulsar-SHA3"
+}
+\end{verbatim}
+
+The optional Lens classical-threshold control-plane certificate (LP-103 \cite{lp103}) is carried alongside this shape on chains where governance and control-plane operations benefit from a Schnorr-family threshold; it does not enter the Prism predicate for ordinary Horizon finality but binds the same transcript when present.
+
+\subsection{The shared transcript}
+
+Each lane signs the same canonical \texttt{QuasarTranscript} value. We restate the canonical definition for reference:
+
+\begin{verbatim}
+QuasarTranscript = TupleHash256(
+    "QUASAR-TRANSCRIPT-v1",
+    NebulaRoot,
+    chain_id, network_id,
+    epoch, round,
+    validator_set_hash,
+    KeyEraID, Generation,
+    hash_suite_id
+)
+\end{verbatim}
+
+This is Definition~\ref{def:horizon-transcript} of \texttt{proofs/definitions/transcript-binding.tex}, repeated here only because it is load-bearing for the Prism predicate. The personalization tag is canonical and \emph{not} re-used across protocols; in particular, the Warp 2.0 envelope's Pulse uses \texttt{WARP-PULSAR-ENVELOPE-v1} (LP-021v2 \cite{lp021v2,luxwarpv2}), and the activation cert uses \texttt{QUASAR-PULSAR-ACTIVATE-v1} (\cite{luxpulsar}); a Pulse over a NebulaRoot cannot be replayed as a Pulse over a Warp envelope or an activation cert.
+
+\subsection{The Prism predicate}
+
+\begin{definition}[Prism]
+\label{def:prism-quasar-horizon}
+$\mathsf{Prism}(\mathsf{cert}) \to \{0, 1\}$ accepts a Horizon certificate iff all six conditions hold (this is Definition~\ref{def:prism} of \texttt{proofs/definitions/finality-definitions.tex} restated):
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item \textbf{Domain separation and transcript binding.} $\mathsf{HashSuiteID}$, $\mathsf{KeyEraID}$, $\mathsf{Generation}$, and $\mathsf{NebulaRoot}$ in the certificate match the values that each lane signed. Compute $\tau := \mathsf{QuasarTranscript}(\mathsf{cert})$; this $\tau$ is the message verified by every lane below.
+  \item \textbf{Beam.} BLS aggregate $\mathsf{cert.Beam}$ verifies under the BLS public-key registry of the validator set indicated by the certificate's $\mathsf{validator\_set\_hash}$, on message $\tau$, signer set indicated by the aggregate's signer bitmap with weight $\geq 2/3$.
+  \item \textbf{ML-DSA cert set.} For every signer in the cert-set's bitmap, the per-validator FIPS-204 ML-DSA-65 signature verifies on $\tau$ under the validator's registered ML-DSA public key (context string \texttt{lux-quasar-horizon-v1}); OR the optional Z-Chain Groth16 rollup proof verifies the per-validator signature batch against a public-inputs hash that commits to $\tau$ (LP-307 \cite{lp307}). Threshold $\geq 2/3$.
+  \item \textbf{Pulse.} $\mathsf{Pulsar.Verify}(\mathsf{GroupKey}_\eta, \tau, \mathsf{cert.Pulsar}) = 1$ where $\mathsf{GroupKey}_\eta$ is the active key-era GroupKey that the chain has on record at $(\eta, g)$ (Definition~\ref{def:coupled-state}).
+  \item \textbf{Validator-set binding.} The validator-set hash, BLS registry digest, and ML-DSA registry digest in $\mathsf{cert}$ match the chain's epoch state.
+  \item \textbf{Nebula linkage.} $\mathsf{NebulaRoot}$ is the canonical bundle root for the indicated $(\mathsf{epoch}, \mathsf{round})$ (Section~\ref{sec:formal-model}). Reorg / fork cases are rejected at this step.
+\end{enumerate}
+A bundle root is \emph{Horizon-final} iff $\mathsf{Prism}(\mathsf{cert}) = 1$ for some certificate carrying it.
+\end{definition}
+
+\subsection{Why ``no Beam-OR-Pulse'' is essential}
+
+A common informal reading is ``Horizon = (Beam $\lor$ Pulse).'' That reading is wrong, and removing it is one of this paper's contributions.
+
+\paragraph{If Horizon were $\mathsf{Beam} \lor \mathsf{Pulse}$.} Under a quantum adversary that breaks BLS in polynomial time, the adversary can produce a valid Beam over any chosen $(\tau, \tau')$ pair, including a $\tau'$ that disagrees with the actual chain history. If acceptance only required ``Beam OR Pulse,'' a quantum-induced Beam forgery would single-handedly produce a Horizon-final certificate over $\tau'$, and any honest Pulse-sealed certificate over $\tau$ would also be Horizon-final --- giving us conflicting Horizon-finals, i.e.\ a safety break. The disjunctive reading is non-PQ-safe.
+
+\paragraph{Horizon = $\mathsf{Beam} \land \mathsf{Pulse} \land \mathsf{MLDSA}$ over a shared $\tau$.} Under the conjunctive Prism predicate, a quantum adversary that breaks only BLS still has to produce a valid Pulse over the conflicting $\tau'$. By Pulsar SUF-CMA (Theorem~\ref{thm:pulsar-suf-cma}, \texttt{proofs/pulsar/unforgeability.tex}), this requires breaking Module-LWE / Module-SIS, not just discrete log. The conjunction is what makes the composite PQ-sound (Theorem~\ref{thm:horizon-soundness}, Section~\ref{sec:horizon-soundness}).
+
+\paragraph{The Beam-only and Pulse-only intermediate states are still useful.} They are public observable states (\texttt{Beam-final}, \texttt{Pulse-sealed}) in the canonical finality state lattice (Definition~\ref{def:finality-states} of \texttt{proofs/definitions/finality-definitions.tex}); the chain's API can return them as intermediate confirmations, and clients with classical-only threat models can choose to act on Beam-final alone. But \texttt{Horizon-final} is the strongest state and is the conjunctive one. Specifications that pretend the disjunctive reading is acceptable fail the post-quantum soundness check (\texttt{proofs/pq-finality-no-bls.tex}; \cite{pqfinalitynobls}).
+
+\subsection{Where Lens fits}
+
+Lens (LP-103 \cite{lp103}) is a curve-side threshold kernel sharing the LSS lifecycle with Pulsar (LP-077 \cite{lp077}). For the consensus-finality predicate, a Lens certificate is \emph{not} a substitute for a Pulse: Lens is classical (curve discrete log) and adds no PQ reduction. Lens earns its place in two production roles:
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \textbf{Control-plane / governance.} Validator-set updates, parameter-changes, fee-config votes can take a Lens threshold cert under a curve-side group key for compactness and cheap on-chain verification. Such certs ride the same LSS lifecycle (KeyEraID / Generation / RollbackFrom) as Pulsar, sharing the no-trusted-dealer-after-genesis story.
+  \item \textbf{Cross-rail compatibility.} Where downstream verifiers (EVM precompiles, light clients on classical-only chains) cannot afford a Pulse verify, a Lens cert is the natural classical companion --- compact, fast, and orthogonal to the BLS Beam.
+\end{itemize}
+Lens certs do \emph{not} contribute to the Horizon PQ reduction. They live in the Lux stack as an option, not a requirement; a chain may run Horizon with no Lens cert at all.
+
+\subsection{Prism as Go code}
+
+The shipping verifier is in \texttt{github.com/luxfi/consensus} \cite{consensusgo}, file \texttt{protocol/quasar/horizon.go}. The verifier returns explicit per-lane error codes (\texttt{ErrBeamFailed}, \texttt{ErrMLDSAFailed}, \texttt{ErrPulseFailed}, \texttt{ErrTranscriptDrift}, \texttt{ErrValidatorSetMismatch}) so callers can distinguish ``Beam OK, Pulse not yet arrived'' (in which case the bundle is \texttt{Beam-final} but not \texttt{Horizon-final}) from ``Pulse rejected, retransmit needed.'' This explicit per-lane error surface is the implementation expression of the conjunctive predicate; nothing in the shipping code lets a single lane carry the bundle to Horizon-final on its own.

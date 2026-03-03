@@ -1,0 +1,132 @@
+\section{Chain Separation: P / Q / Z / A / B / M / F}
+
+\label{sec:chain-sep}
+%% ============================================================================
+
+The Lux primary network distributes consensus, threshold cryptography,
+attestation, bridge, MPC, and FHE responsibilities across seven
+specialized chains. Each chain owns exactly one class of operation. This
+separation eliminates the operational and security coupling that any
+monolithic ``T-Chain'' design would impose: \emph{consensus signing
+(Q-Chain) shares no state and no key material with general-purpose MPC
+(M-Chain) or FHE (F-Chain).}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}llp{6.6cm}@{}}
+\toprule
+\textbf{Chain} & \textbf{Role} & \textbf{Detail} \\
+\midrule
+P-Chain & Validator/stake authority &
+  Holds the active validator set, stake table, BLS PoPs, and the
+  ML-DSA / Corona public-key registry. Emits
+  $P_\text{val} = \mathsf{pchain\_validator\_root}$. \\[3pt]
+Q-Chain & Corona consensus DKG &
+  Runs the Corona two-round threshold protocol (Module-LWE,
+  $t$-of-$n$) once per epoch and per block. Emits
+  $Q_\text{cer} = \mathsf{qchain\_ceremony\_root}$. Does \emph{not} run
+  CGGMP21, FROST, or general MPC. \\[3pt]
+Z-Chain & Groth16 rollup + verifying-key registry &
+  Each validator submits one ML-DSA-65 signature on
+  $\mathsf{cert\_subject}$. Z-Chain runs the Groth16 prover and emits
+  $(\pi_{\mathrm{ZK}}, h_x)$ with $\pi_{\mathrm{ZK}}$ at 192\,B and
+  $h_x$ at 32\,B. Also serves as a general-purpose ZK rollup
+  substrate~\cite{lux-zchain}. Emits
+  $Z_\text{vk} = \mathsf{zchain\_vk\_root}$. \\[3pt]
+A-Chain & Unified attestation chain &
+  Anchors genesis records, oracle commits, off-chain proofs, and other
+  attestations~\cite{lux-achain}. Emits
+  $A_\text{att} = \mathsf{achain\_attestation\_root}$. \\[3pt]
+B-Chain & Bridge messaging &
+  Source of truth for cross-chain messages and lock/mint records.
+  Emits $B_\text{br} = \mathsf{bchain\_bridge\_root}$. \\[3pt]
+M-Chain & MPC ceremonies &
+  CGGMP21 (threshold ECDSA), FROST (threshold Schnorr), and general
+  Corona (separate key material from Q-Chain consensus) for bridge
+  custody and external-chain signing. Emits
+  $M_\text{mpc} = \mathsf{mchain\_mpc\_root}$. \\[3pt]
+F-Chain & FHE compute &
+  TFHE / encrypted EVM for confidential smart contracts. Emits
+  $F_\text{fhe} = \mathsf{fchain\_fhe\_root}$. \\
+\bottomrule
+\end{tabular}
+\caption{Per-chain responsibilities in Quasar 3.0. M-Chain and F-Chain
+are operationally orthogonal; they share only the
+\texttt{lux/chains/thresholdvm} substrate library, which provides the
+common share-management primitives. There is no monolithic
+``T-Chain''.}
+\label{tab:chain-sep}
+\end{table}
+
+\subsection{Why Seven Chains, Not One}
+
+\paragraph{Q-Chain.}
+The consensus-finalization threshold protocol must complete in
+${\sim}55$ ms wall-clock per round. Pinning Q-Chain to Corona and
+nothing else (a) keeps the consensus latency budget independent of the
+custody and FHE subsystems, (b) limits the formal-analysis surface to
+one interactive subprotocol, and (c) prevents a stalled bridge or FHE
+ceremony from blocking finality.
+
+\paragraph{Z-Chain.}
+The Groth16 rollup substrate has different performance characteristics
+than threshold signing (prover wall-clock 200\,ms--1\,s on CPU; 5--15\,ms
+on GPU). Pushing this work to a dedicated chain decouples block time
+from prover time and lets Z-Chain validators be specialized
+prover-class machines.
+
+\paragraph{M-Chain vs F-Chain (the former T-Chain split).}
+A previous design considered a unified ``T-Chain'' running CGGMP21,
+FROST, Corona-general, and TFHE in one logical chain. Operational
+experience showed that MPC and FHE have qualitatively different liveness
+and resource profiles---MPC ceremonies are short, bursty, and
+network-bound; FHE compute is sustained, CPU-bound, and high-memory. We
+therefore split them: M-Chain for ceremonies, F-Chain for compute. They
+share the \texttt{thresholdvm} library substrate (share format,
+serialization, gossip), but each runs an independent consensus instance,
+validator set, and failure domain.
+
+\paragraph{X-Chain (verification only).}
+X-Chain remains the UTXO chain. It verifies signatures from
+multiple cryptographic families via the Fx credential plugin
+architecture (secp256k1, Ed25519, Corona, ML-DSA), but never initiates
+threshold signing. X-Chain is not part of the QuasarCert subject
+binding because it does not contribute a per-block root; UTXO state is
+recorded on chain via standard transactions.
+
+\subsection{Per-Block Pipeline}
+\label{sec:per-block}
+
+Lanes 1--3 of the QuasarCert run in parallel for each block $B$:
+
+\begin{enumerate}[nosep]
+  \item \textbf{BLS aggregation}: each validator signs
+    $\mathsf{cert\_subject}$ with BLS12-381. The proposer aggregates into
+    a single 48-byte $\sigma^{\mathrm{BLS}}_{\mathrm{agg}}$.
+    Wall-clock: ${\sim}3$\,ms (GPU) or ${\sim}100$\,ms (CPU) at
+    $n{=}21$.
+  \item \textbf{Q-Chain (Corona)}: validators run Corona Round~1
+    (commitments) and Round~2 (responses) on
+    $\mathsf{cert\_subject}$. The Q-Chain combiner produces
+    $\sigma^{\mathrm{RT}}$. Wall-clock: ${\sim}55$\,ms (48\,ms network
+    + 7\,ms combination).
+  \item \textbf{Z-Chain (Groth16)}: each validator signs
+    $\mathsf{cert\_subject}$ with ML-DSA-65 (254\,$\mu$s sign;
+    254\,$\mu$s verify cold; 3\,$\mu$s verify cached) and submits the
+    signature to Z-Chain. Z-Chain proves the batch via Groth16
+    ($\approx 2^{22.5}$ R1CS constraints per validator, App.~B
+    of~\cite{qcert-proof}); prover wall-clock 200\,ms (CPU) or 5--15\,ms
+    (GPU). Output is $(\pi_{\mathrm{ZK}}, h_x)$.
+\end{enumerate}
+
+The block is finalized when all three components are available:
+\[
+\mathsf{QuasarCert}(B) =
+\bigl(\sigma^{\mathrm{BLS}}_{\mathrm{agg}},\;
+\sigma^{\mathrm{RT}},\;
+\pi_{\mathrm{ZK}},\;
+h_x\bigr).
+\]
+
+%% ============================================================================

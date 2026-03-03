@@ -1,0 +1,155 @@
+\section{Airgapped Signing Protocol}
+
+\label{sec:airgap}
+%% =====================================================================
+
+The cold-tier airgap share $\mathbf{c}_5$ never participates in
+network-attached signing. Communication is by file or QR transport
+across an air gap. This section specifies the protocol; it
+implements LP-137 \cite{lp137}.
+
+\subsection{Threat Model for the Airgap}
+
+The airgap exists to defeat one specific class of adversary: a
+remote adversary that has compromised the orchestrator host and is
+capable of exfiltrating any keying material on a network-reachable
+machine. Against such an adversary, the airgap is sufficient and a
+network-attached cold HSM is not. Consequently the airgap is
+mandatory for cold-tier participation.
+
+We do \emph{not} claim the airgap defeats:
+
+\begin{itemize}[nosep]
+\item A physically present adversary at the vault site (mitigated by
+physical security and FIPS 140-2 Level 3 device tamper response).
+\item Side-channel emanations during signing (mitigated by Faraday
+shielding of the signing room).
+\item A compromised firmware in the airgap device itself (mitigated
+by the firmware-update policy in Section~\ref{sec:hsm}).
+\end{itemize}
+
+\subsection{Four-Round Protocol}
+
+Round numbering follows LP-137; we summarise here.
+
+\begin{enumerate}[nosep]
+\item \textbf{Request.} Online orchestrator produces a signing
+request containing: chain, transaction body, derivation path, share
+indices required, and a request-nonce. The request is encoded as a
+deterministic JSON object, hashed (SHA-256), and the hash is signed
+by the orchestrator's online HSM-resident key.
+\item \textbf{Transport-out.} The request and its signature are
+written to a single-use, write-locked storage medium. The medium of
+record is a QR-code printout for sub-2~kB requests and a USB drive
+in a tamper-evident bag for larger requests. The medium is hand-carried
+by the cold operator into the airgapped signing room.
+\item \textbf{Approval and partial-sign.} The airgap operator
+verifies the orchestrator signature against a locally cached
+public-key bundle. The operator independently displays the
+human-readable transaction summary on the airgap workstation and
+on a second printout. Two operators (four-eyes principle) confirm
+the displayed summary matches the printed summary. The airgap
+HSM emits its CGGMP21 partial signature.
+\item \textbf{Transport-back.} The partial signature is written to
+the return medium (QR or USB), carried out, and combined by the
+online orchestrator with the other partial signatures. The combined
+signature is broadcast to the chain.
+\end{enumerate}
+
+\subsection{Display, Verification, and the Confused-Deputy Defence}
+
+The most realistic remaining attack is a \emph{confused-deputy}
+attack: the online orchestrator presents a transaction that looks
+plausible to a hurried operator but in fact transfers funds to the
+adversary. The protocol counters this with three separate confirmation
+surfaces.
+
+\begin{enumerate}[nosep]
+\item \textbf{Independent printout.} The transaction summary is
+printed on the online side and read in the airgap room.
+\item \textbf{Independent decode.} The airgap workstation decodes
+the QR/USB and renders the same summary; the two displayed strings
+must match.
+\item \textbf{Allowlist.} Destination addresses are matched against
+a per-tier signed allowlist; non-allowlist destinations require an
+out-of-band escalation that itself runs through the airgap protocol.
+\end{enumerate}
+
+\subsection{Pseudocode for the Online and Airgap Sides}
+
+\begin{algorithm}
+\caption{Online orchestrator side}
+\begin{algorithmic}[1]
+\State $req \gets \{chain, tx, path, shares, nonce\}$
+\State $h \gets \mathrm{SHA256}(canonicalise(req))$
+\State $\sigma_o \gets \mathrm{HSMSign}(K_{online}, h)$
+\State emit $(req, \sigma_o)$ to QR or USB
+\State \textbf{wait} for return medium
+\State $\{\sigma_5\} \gets \mathrm{decode}(\textit{return medium})$
+\State $\sigma \gets \mathrm{CGGMP21.combine}(\sigma_3, \sigma_4, \sigma_5)$
+\State broadcast $(tx, \sigma)$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{Airgap side}
+\begin{algorithmic}[1]
+\State read $(req, \sigma_o)$ from inbound medium
+\State \textbf{verify} $\sigma_o$ against $\mathrm{PK}_{online}$
+\State render $human(req)$ to airgap display
+\State \textbf{require} two operators to confirm $human(req)$ matches printout
+\State \textbf{require} $req.dest \in allowlist$ or escalation token present
+\State $\sigma_5 \gets \mathrm{HSMPartialSign}(K_{share5}, req)$
+\State write $\sigma_5$ to outbound medium
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Operational Cadence}
+
+The airgap protocol is intentionally slow. The default service
+level is one ceremony per business day, with twenty-four-hour
+emergency turnaround for incidents. This is appropriate for
+ninety-five-percent-of-AUM cold storage and is not meant to be
+fast: the slowness is a feature that creates a human checkpoint on
+every cold movement.
+
+\subsection{Mapping to LP-137}
+
+The protocol implements LP-137 \cite{lp137} \S13 four-round flow
+verbatim, with the addition of:
+
+\begin{itemize}[nosep]
+\item Two-operator confirmation in step 3 (LP-137 specifies one
+operator).
+\item Per-tier allowlist matching in step 3.
+\item M-Chain audit log entry on every successful round trip
+(LP-006 \cite{lp006}).
+\end{itemize}
+
+\subsection{Failure Cases}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{p{6cm}p{8cm}}
+\toprule
+\textbf{Failure} & \textbf{Response} \\
+\midrule
+Inbound medium signature invalid &
+Abort, return medium unsigned; investigate orchestrator host \\
+Display does not match printout &
+Abort, refuse to sign; rotate orchestrator credentials and replay \\
+Destination not in allowlist &
+Abort, require escalation token from second airgap ceremony \\
+Two-operator quorum unreachable &
+Defer until quorum restored; cold-tier operations are not single-operator
+under any circumstance \\
+Inbound medium tamper-evident bag broken &
+Abort, destroy medium, reissue request from orchestrator \\
+\bottomrule
+\end{tabular}
+\caption{Airgap failure handling.}
+\label{tab:airgap-failures}
+\end{table}
+
+%% =====================================================================

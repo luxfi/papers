@@ -1,0 +1,90 @@
+%% ====================================================================
+\section{Activation Certificate Latency}
+\label{sec:activation-cert-latency}
+%% ====================================================================
+
+The Pulsar activation certificate is the consensus circuit-breaker for new generations: the new committee threshold-signs a canonical \texttt{QUASAR-PULSAR-ACTIVATE-v1} message under the unchanged GroupKey. The chain accepts the new generation iff the activation cert verifies. This section measures activation latency end-to-end.
+
+\subsection{The activation message and signing path}
+
+The activation message is the canonical TupleHash256 over the lifecycle transcript (Definition \texttt{def:pulsar-activation-msg} of \texttt{proofs/definitions/transcript-binding.tex}):
+
+\begin{verbatim}
+ActivationMsg := "QUASAR-PULSAR-ACTIVATE-v1"
+              || TranscriptHash(T)
+              || ReshareTranscript.Hash(R)
+\end{verbatim}
+
+The signing path is the standard $K$-of-$n$ Pulsar Sign1 + Sign2 + Combine over the activation message. Verification is $\mathsf{Pulsar.Verify}(\mathsf{GroupKey}, \mathsf{ActivationMsg}, \sigma_{\mathrm{act}}) = 1$ under the \emph{unchanged} GroupKey from the prior generation.
+
+\subsection{Local-loop activation cert latency}
+
+\begin{tabular}{@{}rrrr@{}}
+  \toprule
+  $\mathbf{K}$ & \textbf{Sign1 + Round1Pre (ms)} & \textbf{Sign2 + Combine (ms)} & \textbf{Verify (ms)} \\
+  \midrule
+  3   & 250  & 60   & 9 \\
+  5   & 280  & 75   & 9 \\
+  7   & 310  & 95   & 9 \\
+  21  & 480  & 280  & 9 \\
+  64  & 1100 & 740  & 9 \\
+  128 & 2050 & 1410 & 9 \\
+  \bottomrule
+\end{tabular}
+
+Reproduction: \texttt{cd pulsar \&\& go test -bench=BenchmarkActivation/K=N ./reshare/...}.
+
+\paragraph{Verify is constant in $K$.} The activation cert is verified as a single Pulsar threshold signature; the verifier's cost is independent of how many parties contributed (the threshold signature is a single $\sigma$ object). $\mathsf{Pulsar.Verify}$ takes $\sim 9$ ms on M1 Max regardless of $K$.
+
+\paragraph{Sign1 + Round1Pre is offline-preprocessable.} A node can run Round 1 in advance of the activation event; the online phase is Sign2 + Combine, which scales near-linearly in $K$. The offline / online split is what makes activation cert latency tractable for large $K$.
+
+\subsection{Production cross-WAN activation latency at $K=21$}
+
+Lux mainnet runs $K = 21$ with validators in 5 regions. Cross-WAN activation cert latency on the production path:
+
+\begin{tabular}{@{}lr@{}}
+  \toprule
+  \textbf{Phase} & \textbf{Wall-clock (ms)} \\
+  \midrule
+  Sign1 broadcast + WAN crossing 1   & $\sim 200$ \\
+  Sign1 verify (local) + Round1Pre   & 220 \\
+  Sign2 broadcast + WAN crossing 2   & $\sim 200$ \\
+  Sign2 verify (local) + Combine     & 250 \\
+  Activation cert verify (local)     & 9 \\
+  \textbf{Total}                     & \textbf{$\sim 880$} \\
+  \bottomrule
+\end{tabular}
+
+Activation completes in under one second on the production mainnet path. Reproduction: \texttt{cd consensus \&\& GOWORK=off go test -run TestActivationE2E ./protocol/quasar/...} (this is the local-loop version; cross-WAN measurement requires a multi-region staging cluster).
+
+\subsection{Activation cert size}
+
+The activation cert is one Pulsar signature: $\sim 33\,\mathrm{KB}$ (LP-073 \cite{lp073} \S``Wire Format''), regardless of $K$. The cert is bundled with the resharing transcript (Definition \texttt{def:pulsar-activation-msg}) which adds a small constant overhead ($\sim 256$ bytes for the transcript fields).
+
+\subsection{Failure paths}
+
+\paragraph{Activation cert fails to verify.} The chain stays at the old generation; the LSS RollbackManager retains the prior snapshot (Lemma~\ref{lem:activation-fail-safe} of \texttt{proofs/pulsar/activation-safety.tex}). Rollback is a constant-time operation on the snapshot manager (Section~\ref{sec:reshare-benchmarks}); the chain's signing capacity continues uninterrupted.
+
+\paragraph{Sign1 / Sign2 timeout.} If $\geq 2/3$-weight of new committee parties fail to respond, the activation cannot complete. The chain stays at the old generation; the LSS framework emits signed evidence and retries under fresh transcript binding next epoch.
+
+\paragraph{Multiple consecutive activation failures.} Triggers governance Reanchor: new $\eta$, fresh ceremony. This is the LSS no-slashing failure ladder (Section~\ref{sec:lifecycle:rollback} of \cite{luxpulsar}); none of the steps require identifying a malicious actor, and the chain's liveness and safety do not depend on attribution.
+
+\subsection{What activation does not buy}
+
+The activation cert proves: the new committee can produce verifying signatures under the unchanged GroupKey. That is all. It does not prove: which old party sent a bad contribution; which new party lied; whether all contributions were polynomial-consistent; whether a malicious old subset caused a failed activation. Those are the responsibilities of the complaint and disqualification pipeline (commit / share verification under lattice Pedersen) and the slashing-evidence pipeline. Activation is necessary but not sufficient for full Byzantine attribution. The benchmark numbers above measure the activation-success path only; the slashing-evidence path is measured separately under the LSS framework.
+
+\subsection{Mode comparison: Pulsar vs Lens activation}
+
+The Lens activation cert path is structurally identical (RFC 9591 FROST 2-round + the activation message). The latency profile differs by the per-primitive single-sig cost ratio:
+
+\begin{tabular}{@{}lrr@{}}
+  \toprule
+  \textbf{$K$} & \textbf{Pulsar activation (local-loop, ms)} & \textbf{Lens activation (Ed25519, local-loop, ms)} \\
+  \midrule
+  21 & 760 & 5.5 \\
+  64 & 1840 & 16.5 \\
+  128 & 3460 & 33.0 \\
+  \bottomrule
+\end{tabular}
+
+Lens activation is $\sim 100\times$ faster than Pulsar activation per $K$. Lens is the right primitive for control-plane operations where activation latency matters; Pulsar is the right primitive for the consensus PQ floor where activation latency is amortized over the key-era lifetime ($\sim$ days to weeks per Reanchor in production).

@@ -1,0 +1,178 @@
+\section{Performance (4.0 vs.\ 3.0)}
+
+\label{sec:performance}
+%% ============================================================================
+
+\subsection{Hardware and method}
+
+Measurements are reported on Apple~M1~Max (32~GPU cores, 64~GB unified
+memory) and NVIDIA~H100 PCIe (80~GB HBM3) over the same canonical-order
+trace inputs. The trace mix is the regulated-DEX workload from
+LP-005 / LP-007 (50\% per-account orders, 20\% cancels, 15\% fee
+accumulation, 10\% balance deltas, 5\% admin). Each measurement is
+the median of 11 runs; tails are reported as p99.
+
+\subsection{Headline numbers}
+
+\begin{table}[ht]
+\centering
+\small
+\caption{4.0 vs.\ 3.0 on Apple M1 Max. 1024-tx end-to-end stress on
+the regulated-DEX workload mix.}
+\label{tab:perf}
+\begin{tabular}{lll}
+\toprule
+\textbf{Metric} & \textbf{3.0 (2025-12-25)} & \textbf{4.0 (2026-02-14)} \\
+\midrule
+Wallclock time (median)        & $150\,\text{ms}$ & $\mathbf{108\,\text{ms}}$ \\
+Wallclock time (p99)           & $171\,\text{ms}$ & $\mathbf{124\,\text{ms}}$ \\
+Wave ticks                     & 8 & $\mathbf{6}$ \\
+Conflict / repair (16-key)     & 120 / 120 & 120 / 120 (unchanged) \\
+Repair amplification (DEX mix) & $\approx 0.97$ & $\mathbf{\approx 0.42}$ \\
+EVM coverage                   & 118 / 175 opcodes & $\mathbf{175 / 175}$ \\
+BLS verify (per cert)          & $9\,\mu\text{s}$ (HMAC-keccak) & $\mathbf{46\,\mu\text{s}}$ (real BLS12-381) \\
+Corona verify (per share)    & $7\,\mu\text{s}$ (placeholder) & $\mathbf{38\,\mu\text{s}}$ (real Ring-LWE) \\
+Groth16 verify (per cert)      & $8\,\mu\text{s}$ (placeholder) & $\mathbf{62\,\mu\text{s}}$ (real Groth16) \\
+Cert lanes per round           & 1 (BLS only) & $\mathbf{3}$ (BLS + Corona + Groth16) \\
+Coverage (line, oracle TOTAL)  & informal & $\mathbf{95.78\%}$ cevm TOTAL / $\mathbf{96.51\%}$ \texttt{quasar\_gpu\_engine.mm} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Why 4.0 is faster despite real cryptography}
+
+Real cryptography is more expensive than HMAC-keccak: cert verifier
+costs increase by 4--7$\times$. Yet 4.0 is 28\% faster end-to-end on
+the same workload. The wins come from elsewhere:
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Tier~1 lane-clock fast path} (\S\ref{sec:tier1}) commits
+      $> 80\%$ of transactions without an MVCC chain walk. 3.0 walked
+      the chain on every commit.
+\item \textbf{Tier~3 reducer commit} (\S\ref{sec:tier3}) absorbs fee /
+      balance / order-append writes that 3.0 turned into same-key
+      SSTORE conflicts. The repair-amplification drop from $0.97$ to
+      $0.42$ is almost entirely this effect.
+\item \textbf{Fiber checkpoints} (\S\ref{sec:checkpoints}) reduce repair
+      cost by 5--30$\times$ on the long-tx workload subset.
+\item \textbf{Motor VersionBlock} (\S\ref{sec:versionblock}) replaces
+      pointer-chase chains with inline 8-version arrays; cache hit
+      rate up, memory bandwidth saturation down.
+\item \textbf{6 wave ticks vs.\ 8} (\S\ref{sec:abmf}). The
+      AdaptiveSchedule drain hands ConflictSpec'd transactions
+      directly to Exec without a Decode$\rightarrow$ Crypto$\rightarrow$
+      Validate round-trip on simple paths, collapsing two ticks of
+      dependency.
+\end{enumerate}
+
+\subsection{Hot-key contention test}
+
+The canonical Block-STM hot-key test---16 same-key contending
+transactions---is unchanged in 4.0 because it doesn't use reducers
+(intentionally; the test exists to validate the speculative
+fallback). 4.0 produces the same exact 120 conflicts $\rightarrow$
+120 repairs $\rightarrow$ 16 commits as 3.0, on both Metal and CUDA,
+with byte-identical roots. This is textbook Block-STM running entirely
+on GPU and is the determinism harness's headline regression test.
+
+\subsection{Per-cert cost on H100}
+
+NVIDIA~H100 figures, for reference (the cevm pipeline targets Metal
+for development and CUDA for production validators):
+
+\begin{table}[ht]
+\centering
+\small
+\caption{4.0 cert verifier costs on NVIDIA H100.}
+\label{tab:perf-h100}
+\begin{tabular}{ll}
+\toprule
+\textbf{Cert lane} & \textbf{Per-verification cost (median)} \\
+\midrule
+BLS12-381 aggregate & $31\,\mu\text{s}$ \\
+Corona share (per share)     & $24\,\mu\text{s}$ \\
+Groth16 (full proof)& $42\,\mu\text{s}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Same-message BLS aggregate batching (cevm v0.47.1)}
+
+Quasar consensus rounds repeatedly verify $n$ signatures over the
+same 32-byte cert subject (the canonical leader-broadcast pattern).
+cevm v0.45 introduced a same-message batched aggregate verify;
+cevm v0.47.1 (commit \texttt{6bf0e232}) added a 2-way set-associative
+4096-slot pubkey-decompression cache (FNV1a-64 + 48-byte memcmp)
+that lifts this from $9.24\times$ to
+$\mathbf{16.51\times}$ at $n{=}1024$ vs the v0.44 unbatched baseline
+($\mathbf{15.46\times}$ vs the flat host-blst baseline),
+exceeding the $\geq 10\times$ target by 65\%. Pairing math itself
+remains host blst via the canonical \texttt{luxcpp/crypto/bls} c-abi;
+the batching plus cache amortization is what produces the published
+number.
+
+\subsection{Substrate-wide Metal cutover (cevm v0.46.1)}
+
+A wave-tick scheduler floor (${\sim}554\,\text{ms}$ / 256 epochs)
+dominates substrate-only Metal rounds at every $N$ in the 4096-tx
+ingress envelope: measured Metal at $0.003\times$--$0.011\times$ CPU.
+The threshold gate \texttt{kQuasarSubstrateMetalThreshold = 8192}
+sends every production-sized substrate-only round to CPU; the gated
+path matches direct CPU byte-equal within ${\sim}3\%$ noise. The
+Metal kernel still drives EVM bytecode interpretation and
+vote / state-page ingestion (\texttt{requires\_metal} hot paths).
+Verifier-layer batched pairings (\S above) live above the scheduler
+and are not affected.
+
+\subsection{Stage 5b BLS pairing structural ceiling}
+
+A measurement on luxcpp/crypto commit \texttt{9ff799fd} (Stage 5b,
+2026-04-27) showed Metal single-pairing at $N{=}1$ lands at
+${\sim}475\,\text{ms}$ on M1 Max vs ${\sim}510\,\mu\text{s}$ for host
+blst (${\sim}930\times$ slower). The cause is structural:
+${\sim}280$ dispatches per pairing (init / add+line / dbl+line /
+sqr\_ret / fold\_line / finalize for Miller; conj / inv / cyclo\_sqr /
+mul / frob for final exponentiation) at ${\sim}10\,\mu\text{s}$ each
+exceed host blst end-to-end. The serial Fp12 chain mismatches the
+SIMD GPU shape; per-dispatch GPU compute is ${\sim}770\,\mu\text{s}$
+for a single-thread Fp12 op. The architecture is proven byte-equal
+blst (2 746 vectors); the SoTA single-pairing path is Linux+CUDA,
+batched-N parallel kernel saturation, or Karabina compressed cyclo
+squarings.
+
+\subsection{Scalability claim ladder}
+
+The 4.0 production scaling formula is unchanged from
+3.0~\cite{lp010-quasarstm-3,lp132-quasarexec}:
+
+\[
+T \approx \min\!\left(
+E_{\mathit{gpu}},\;
+\frac{B_{\mathit{net}}}{\mathit{bytes/event}},\;
+\frac{B_{\mathit{state}}}{\mathit{bytes/access}},\;
+\frac{L_{\mathit{indep}}}{\mathit{conflict\_amp}},\;
+\frac{C_{\mathit{cert}}}{\mathit{cert\_cost}},\;
+\frac{D_{\mathit{da}}}{\mathit{da\_bytes}}
+\right)
+\]
+
+4.0 increases $L_{\mathit{indep}}$ via LaneClass and ConflictSpec,
+decreases $\mathit{conflict\_amp}$ via reducers and checkpoints, and
+increases $C_{\mathit{cert}}$ via on-device real cryptography while
+keeping $\mathit{cert\_cost}$ constant in TPS (validators sign
+\emph{roots}, not individual transactions).
+
+The throughput-tier claim ladder from LP-132~\cite{lp132-quasarexec}
+holds:
+
+\begin{itemize}[leftmargin=2em]
+\item \textbf{Tier~1 events/sec}: 1B aggregate, lane-isolated.
+\item \textbf{Tier~2 state transitions/sec}: 100M (cluster scale).
+\item \textbf{Tier~3 finalised settlement/sec}: 1--10M.
+\end{itemize}
+
+These are unchanged from the 3.0 ladder; 4.0 makes them executable
+end-to-end (real EVM, real cryptography, real Tier~3 reducers, real
+checkpoints) rather than substrate-only.
+
+%% ============================================================================

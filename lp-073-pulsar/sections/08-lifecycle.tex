@@ -1,0 +1,212 @@
+%% ====================================================================
+\section{Pulsar Key-Era Lifecycle}
+\label{sec:lifecycle}
+%% ====================================================================
+
+The static Corona signing primitive presupposes a one-shot key
+generation followed by a fixed signing committee. Permissionless chains
+do not have that luxury: validator sets rotate every epoch. Pulsar
+extends Corona with a \emph{key-era lifecycle} that supports
+validator rotation without reconstructing the master secret and
+without requiring a trusted dealer after genesis.
+
+The metaphor is load-bearing, not flavor. A pulsar (the cosmic object)
+is a rotating neutron star: the body persists, the beam direction
+rotates, observed pulses appear as the beam sweeps. In Pulsar:
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \textbf{Persistent body}: the group public key
+        $(\mathbf{A}, \tilde{\mathbf{b}})$ and the hidden master
+        secret $\mathbf{s}$ persist within a key era.
+  \item \textbf{Rotating beam}: the share distribution
+        $\{\mathbf{s}_i\}_{i \in V}$ rotates each epoch with
+        validator-set changes.
+  \item \textbf{Observed pulse}: each Quasar bundle emits one
+        threshold certificate (a Pulsar \emph{pulse}) signed under the
+        unchanged group public key.
+\end{itemize}
+
+\subsection{Three lineage fields, kept distinct}
+\label{sec:lifecycle:lineage}
+
+Every Pulsar share state carries three lineage scalars that must not be
+collapsed:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \textbf{KeyEraID} ($\eta$). The group-key lineage. Bumps
+        \emph{only} at Reanchor, when a new group public key is
+        established.
+  \item \textbf{Generation} ($g$). The LSS resharing version within a
+        key era. Bumps every Refresh or Reshare under the same
+        $(\mathbf{A}, \tilde{\mathbf{b}})$.
+  \item \textbf{RollbackFrom} ($r$). Audit lineage. $r=0$ on
+        ordinary forward transitions; $r > 0$ records the prior
+        generation reverted from when the chain rolls back.
+\end{itemize}
+
+A trajectory across one key era and one Reanchor:
+\begin{verbatim}
+KeyEraID=7, Gen=0, Rb=0     genesis state of era 7
+KeyEraID=7, Gen=1, Rb=0     reshared to a new validator set
+KeyEraID=7, Gen=2, Rb=0     refreshed (same set; HJKY zero-poly)
+KeyEraID=7, Gen=3, Rb=0     reshared again
+KeyEraID=7, Gen=4, Rb=2     activation @gen 3 failed; reverted to gen 2
+KeyEraID=8, Gen=0, Rb=0     reanchor: fresh group key, new era
+\end{verbatim}
+
+\subsection{Three layers, one shipping path}
+
+\begin{tabular}{@{}p{0.18\textwidth}p{0.32\textwidth}p{0.42\textwidth}@{}}
+  \toprule
+  \textbf{Layer} & \textbf{Operation} & \textbf{Trust} \\
+  \midrule
+  Bootstrap & Foundation MPC ceremony at chain launch, OR Pedersen DKG over $R_q$ (\S\ref{sec:lifecycle:dkg}) & One-time, observable; confined to one key era's launch. \\
+  Reshare   & Old qualified subset $Q \subseteq O$, $|Q| \geq t_{\text{old}}$, runs $g_i(x)$ with $g_i(0) = s_i$; new party $j$ computes $s'_j = \sum_{i \in Q} \lambda^Q_i \cdot g_i(\beta_j)$ \cite{desmedtjajodia97} & No new trust. Master secret preserved structurally. \\
+  Reanchor  & Fresh ceremony with new $\eta$ & Same as Bootstrap; rare governance event. \\
+  \bottomrule
+\end{tabular}
+
+\subsection{Refresh vs Reshare: distinct primitives}
+
+Two primitives, never collapsed:
+
+\paragraph{Refresh (HJKY97).}
+Same committee, same threshold. Each party $i$ samples a degree-$(t-1)$
+zero-polynomial $z_i(x)$ with $z_i(0) = 0$, distributes $z_i(\alpha_j)$,
+and updates $s'_j = s_j + \sum_i z_i(\alpha_j)$. Defends against
+mobile-adversary share accumulation across time \cite{hjky97}.
+
+\paragraph{Reshare (Desmedt--Jajodia).}
+New committee. Old qualified subset $Q$ samples $g_i(x)$ of degree
+$t_{\text{new}}-1$ with $g_i(0) = s_i$. Each new party $j$ aggregates
+contributions weighted by Lagrange coefficients evaluated at $0$ for
+$Q$. New polynomial $G(x) = \sum_{i \in Q} \lambda^Q_i \cdot g_i(x)$
+satisfies $G(0) = \sum_{i \in Q} \lambda^Q_i \cdot s_i = s$ by Lagrange
+identity \cite{desmedtjajodia97}. Verifiability per
+Wong--Wang--Wing \cite{wongwangwing02}.
+
+Both primitives leave the public key unchanged: the lattice
+Pedersen-style commits $\mathbf{C}_k = \mathbf{A}\cdot\mathrm{NTT}(c_k)
++ \mathbf{B}\cdot\mathrm{NTT}(r_k)$ bind shares to the polynomial
+without revealing $\mathbf{s}$.
+
+\subsection{Activation certificate: the consensus circuit-breaker}
+\label{sec:lifecycle:activation}
+
+After the resharing math finishes, the chain does \emph{not} accept the
+new generation on faith. The new committee threshold-signs an
+activation message under the \emph{unchanged} group public key:
+
+\begin{verbatim}
+QUASAR-PULSAR-ACTIVATE-v1 ||
+    chain_id || network_id ||
+    key_era_id || group_id ||
+    old_epoch || new_epoch ||
+    old_validator_set_hash || new_validator_set_hash ||
+    old_threshold || new_threshold ||
+    group_public_key_hash ||
+    reshare_transcript_hash ||
+    pairwise_material_commitment_hash ||
+    implementation_version
+\end{verbatim}
+
+If the threshold-aggregated signature verifies under
+$(\mathbf{A}, \tilde{\mathbf{b}})$, the new shares actually reconstruct
+$\mathbf{s}$ and the chain commits the new state. If verification
+fails, the chain stays at the old generation; the LSS rollback
+mechanism (\S\ref{sec:lifecycle:rollback}) restores the prior
+snapshot.
+
+\paragraph{What activation proves.}
+Successful new signing capability under the unchanged GroupKey. That
+is all.
+
+\paragraph{What activation does \emph{not} prove.}
+Which old party sent a bad contribution; which new party lied; whether
+all contributions were polynomial-consistent; whether a malicious old
+subset caused a failed activation. Those are responsibilities of the
+complaint and disqualification pipeline (commit / share verification
+under lattice Pedersen) and the slashing-evidence pipeline. Activation
+is necessary but \emph{not sufficient} for full Byzantine attribution.
+
+\subsection{Rollback and the no-slashing failure ladder}
+\label{sec:lifecycle:rollback}
+
+Pulsar's failure response is graded and \emph{non-punitive}. There is
+no slashing dependency:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item Coordinator timeout / unavailable
+        $\rightarrow$ next coordinator picked deterministically.
+  \item Resharing round fails (commit mismatch, bad share, etc.)
+        $\rightarrow$ emit signed evidence; retry under fresh
+        transcript binding next epoch.
+  \item Activation cert fails to verify under unchanged GroupKey
+        $\rightarrow$ \texttt{Rollback(targetGeneration = current - 1)};
+        chain stays at the previous generation; signing continues.
+  \item Multiple consecutive activation failures
+        $\rightarrow$ governance Reanchor: new $\eta$, fresh ceremony.
+\end{enumerate}
+
+This ladder works for chains, bridges, enterprise custody, and
+validator committees alike, because none of the steps require
+identifying a malicious actor. Slashing evidence is \emph{collected}
+during steps 2--3 (the framework persists signed messages from the
+failed run for forensic review), but the chain's liveness and safety
+do not depend on attribution.
+
+\subsection{Pedersen DKG over $R_q$: the trusted-dealer-free genesis path}
+\label{sec:lifecycle:dkg}
+
+The default Bootstrap path is a one-time foundation MPC ceremony, with
+toxic-waste assumption confined to genesis of one key era. As a
+parallel-track production option, Pulsar offers a Pedersen-style DKG
+over $R_q$ (\texttt{pulsar/dkg2/}):
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item Two uniform matrices $\mathbf{A}, \mathbf{B}$ derived
+        deterministically from public seeds.
+  \item Each party samples Gaussian polynomials $f_i, g_i$ and
+        broadcasts commits $\mathbf{C}_{i,k} = \mathbf{A}\cdot
+        \mathrm{NTT}(c_{i,k}) + \mathbf{B}\cdot\mathrm{NTT}(r_{i,k})$.
+  \item Hiding under MLWE on $\mathbf{B}$; binding under MSIS on
+        $[\mathbf{A}\,|\,\mathbf{B}]$.
+\end{itemize}
+
+This avoids the upstream Corona Feldman-style DKG, which is
+pseudoinverse-recoverable: $(\mathbf{A}^T\mathbf{A})^{-1}\mathbf{A}^T
+\cdot \mathbf{C}_k = c_k$ when commits omit the noise term. The
+Pedersen construction restores hiding by adding the
+$\mathbf{B}\cdot\mathrm{NTT}(r_k)$ mask.
+
+The Pedersen-DKG path solves an open distributed-construction problem:
+jointly sampling $\tilde{\mathbf{b}} = \lfloor \mathbf{A}\cdot
+\mathbf{s} + \mathbf{e} \rceil_\Xi$ with the correct small-noise
+distribution, without any party learning $\mathbf{s}$ or $\mathbf{e}$,
+and producing a publicly verifiable proof of public-key
+well-formedness. Threshold Raccoon \cite{thresholdraccoon} and Hermine
+\cite{hermine} are the closest related constructions; Pulsar's two
+production paths --- foundation MPC ceremony and Pedersen DKG --- are
+both viable, ship in parallel, and a chain operator chooses based on
+ceremony tolerance and validator-set provenance. Genesis ceremony is
+the lower-complexity path and ships first; Pedersen DKG eliminates the
+toxic-waste assumption entirely once its KAT vectors and constant-time
+verifier are pinned.
+
+\subsection{What is preserved, what changes}
+
+\begin{tabular}{@{}p{0.30\textwidth}p{0.65\textwidth}@{}}
+  \toprule
+  \textbf{Quantity} & \textbf{Status across resharing within an era} \\
+  \midrule
+  $\mathbf{A}$ (public matrix) & PRESERVED \\
+  $\mathbf{s}$ (master secret) & PRESERVED structurally; share distribution rotates \\
+  $\tilde{\mathbf{b}}$ (rounded public key) & PRESERVED \\
+  GroupKey pointer (byte-identical) & PRESERVED \\
+  $\mathbf{e}$ (LWE error) & NOT preserved; used at genesis to form $\tilde{\mathbf{b}}$, then erased with dealer state. Signers only need shares of $\mathbf{s}$. \\
+  Share distribution $\{\mathbf{s}_i\}$ & ROTATED \\
+  Pairwise PRF/MAC material & REGENERATED for the new committee via authenticated KEX (X25519 baseline; ML-KEM-768 hybrid recommended for PQ-aware deployments). \\
+  $\eta$ (KeyEraID) & PRESERVED until Reanchor \\
+  $g$ (Generation) & INCREMENTED \\
+  $r$ (RollbackFrom) & 0 on forward; $>0$ on rollback \\
+  \bottomrule
+\end{tabular}

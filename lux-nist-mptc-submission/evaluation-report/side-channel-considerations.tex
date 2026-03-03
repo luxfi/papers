@@ -1,0 +1,148 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{../../shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\title{Lux MPTC Side-Channel Considerations}
+\author{
+Zach Kelling\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+\date{2026-03-03}
+
+\begin{document}
+
+\luxcoverpage
+
+\section*{Abstract}
+
+\noindent We present Lux, a hybrid post-quantum consensus architecture for DAG-native chains. Lux separates fast operational finality from durable post-quantum finality. Validators emit Photons over a Nebula DAG substrate; classical BLS aggregates form Beams for low-latency confirmation, while ML-DSA attestations and Pulsar lattice-threshold Pulses provide post-quantum finality over Nebula roots. Prism binds all certificate lanes to the same transcript, and Quasar reaches Horizon finality when the bound lanes verify.
+
+\textbf{This document.} The side-channel considerations summary for the NIST MPTC submission. Detailed reviews live in the canonical \texttt{CONSTANT-TIME-REVIEW.md} files in each kernel repo (\texttt{pulsar/CONSTANT-TIME-REVIEW.md}, \texttt{lens/CONSTANT-TIME-REVIEW.md}); this document summarizes the posture and points at the production-stack hardening.
+
+\section{Constant-time review (Pulsar)}
+
+\paragraph{Reference.} \texttt{pulsar/CONSTANT-TIME-REVIEW.md}.
+
+\paragraph{Surface covered.}
+\begin{itemize}[leftmargin=2em,nosep]
+  \item Lattice ring arithmetic ($R_q$ multiplication, NTT / iNTT, Montgomery reduction).
+  \item Discrete-Gaussian samplers (Ziggurat tables, BLAKE3-XOF buffer-refill).
+  \item Pulsar Sign1, Sign2, Combine, Verify --- the core threshold signing protocol.
+  \item Lattice Pedersen commit / verify (used in resharing).
+  \item Pairwise PRF / MAC (KMAC256-based, constant-time per FIPS 202 hardware).
+\end{itemize}
+
+\paragraph{Posture.} The lattice math is constant-time at the Go-source level: no data-dependent branches, no data-dependent memory access patterns, no early termination based on secret values. The Lattigo \texttt{v7} fork (\cite{lattigov7}) inherits this posture from the upstream Lattigo project, with Lux-specific additions reviewed.
+
+\paragraph{What is not covered.}
+\begin{itemize}[leftmargin=2em,nosep]
+  \item Go runtime garbage-collection-induced timing variance: fundamental to Go; mitigated by tuning GOGC for deployments that need stricter constant-time guarantees.
+  \item Cache-timing on heterogeneous hardware: varies across deployment targets; Lux production stack runs on bare-metal x86 / ARM and assumes a benign cache-timing posture.
+  \item Constant-time GPU code paths: GPU code is research, not production.
+\end{itemize}
+
+\section{Constant-time review (Lens)}
+
+\paragraph{Reference.} \texttt{lens/CONSTANT-TIME-REVIEW.md}.
+
+\paragraph{Surface covered.}
+\begin{itemize}[leftmargin=2em,nosep]
+  \item Curve scalar multiplication on Ed25519, secp256k1, Ristretto255 (constant-time per curve).
+  \item FROST 2-round Schnorr threshold signing (Sign1, Sign2, Aggregate, Verify).
+  \item Curve Pedersen commit / verify.
+\end{itemize}
+
+\paragraph{Posture.} The curve math uses upstream constant-time implementations (\texttt{golang.org/x/crypto/ed25519}, \texttt{decred/dcrd/secp256k1}, \texttt{gtank/ristretto255}) without modifications that would compromise constant-time. The Lux-specific additions (key-era lifecycle wrapping, LSS adapter) operate on already-derived public values and do not introduce new secret-dependent code paths.
+
+\section{Lattigo deserializer hardening}
+
+\paragraph{Surface.} The lattigo \texttt{ReadUint64Slice} function recurses on length prefixes without bounding by available bytes. An attacker-crafted Pulse can trigger unbounded recursion and DoS the destination chain.
+
+\paragraph{Discovery.} Found by the Mar-3 fuzz harness at \texttt{warp/pulsar/fuzz\_pulse\_test.go} (FuzzPulseDeserialize) within a 60-second fuzz run. The exploit is a $\sim 30$-byte input.
+
+\paragraph{Mitigation.} Four-layer defense in \texttt{warp/pulsar/pulsar.go}:
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item \texttt{MaxPulseWireSize = 64 KB}: outer wire-size cap.
+  \item \texttt{MaxPulseFrameSize = 32 KB}: per-lane (C, Z, $\Delta$) cap.
+  \item \texttt{validatePolyFrame} / \texttt{validateVectorPolyFrame}: end-to-end frame walker that checks every length-prefix against \texttt{MaxLatticeUintSliceLen = 4096} before lattigo's \texttt{ReadFrom} is invoked.
+  \item \texttt{defer recover()}: defense-in-depth boundary that converts any escaping panic into a clean error.
+\end{enumerate}
+
+\paragraph{Test coverage.} The original $\sim 30$-byte exploit is in the fuzz corpus as a regression test; \texttt{FuzzPulseDeserialize}, \texttt{FuzzPulseSerialize}, \texttt{FuzzHorizonCertificate}, and \texttt{FuzzWarpEnvelopeV2} return zero panics in 60-second CI runs on the freeze tag. Full discussion: \cite{luxwarpv2} Section "Fuzz-Discovered Vulnerability".
+
+\section{Timing side-channels in production}
+
+\paragraph{Network timing.} Pulse signing is a 2-WAN-crossing protocol (Sign1 + Sign2). The chain's state machine does not act on signing-protocol timing differences; the consensus engine accepts a Pulse iff $\mathsf{Pulsar.Verify}$ succeeds, regardless of how long signing took. A network adversary who learns Pulse signing latency does not learn share secrets.
+
+\paragraph{Verifier timing.} The Pulsar verifier is constant-time at the Go-source level; its runtime depends on the public verification predicate ($\|z\|_2^2 \leq B^2$, $c$ recomputation, $\mathbf{A} \cdot z = D + c\cdot\tilde{\mathbf{b}} + \Delta$), not on secret values. A timing oracle on the verifier reveals public-input structure (signature size, validator-set size) but not share material.
+
+\paragraph{Memory access patterns.} The lattice ring arithmetic uses fixed-size buffers; vector and matrix operations iterate over their full domains regardless of the secret values they contain. Cache-timing leakage is bounded by the structural memory footprint, which is public.
+
+\section{Power side-channels}
+
+The Lux production stack runs on commodity cloud hardware (DigitalOcean DOKS K8s pods); power-side-channel attacks require physical access. The threat model excludes physical-access attacks.
+
+For deployments that run on private hardware (bare-metal validators), power-side-channel mitigations are deployment configuration: TEMPEST shielding, physical access controls, and HSM-backed key custody. The Lux stack supports HSM-backed key custody via the standard signer interface (\texttt{pulsar/sign/Signer}, \texttt{lens/sign/Signer}); an HSM that holds shares behind a hardware boundary mitigates the power-side-channel surface to whatever the HSM provides.
+
+\section{Fault-injection side-channels}
+
+\paragraph{Surface.} An adversary inducing faults during signing (rowhammer, voltage glitching) could force the Pulsar Sign2 path to produce malformed partial signatures that aggregate into a forgery.
+
+\paragraph{Mitigation.} The activation cert path (Section "Pulsar.Activate" of \cite{luxpulsar}) tests the new shares against the unchanged GroupKey before accepting a generation transition; a fault-injected share that does not actually correspond to the GroupKey will fail activation and trigger rollback.
+
+For per-Pulse fault-injection, the four-layer Pulse hardening (Section "Lattigo deserializer hardening") catches malformed wire bytes; the Pulsar verifier itself is structurally fault-tolerant via the $L_2$ acceptance bound and the rounding-hint correction. A successful per-Pulse fault-injection attack would need to forge an input that passes both the wire-format validators and the lattice acceptance predicate; we have no evidence of such an attack and do not claim formal fault-injection resistance.
+
+\section{Failure-mode containment}
+
+LSS's no-slashing-dependency rollback ladder (\cite{luxlssmpc}) is a structural mitigation against side-channel-induced share compromise. If a side-channel attack reveals enough share information to forge an activation cert, the chain's safety holds because the activation cert verification step itself catches the forgery (Theorem "Activation cert is necessary and sufficient" of \texttt{proofs/pulsar/activation-safety.tex}). If the attacker forges a routine bundle Pulse, the bundle stays at Pulse-sealed but the chain's other lanes (Beam, ML-DSA cert set) catch the inconsistency at the Prism layer.
+
+\section{What is out of scope}
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item Constant-time guarantees on GPU code paths (GPU production not enabled).
+  \item Constant-time guarantees against the Go runtime's GC-induced timing.
+  \item Power-side-channel resistance on commodity cloud hardware.
+  \item Formal fault-injection resistance.
+\end{itemize}
+
+These are tracked as known limitations (\texttt{known-limitations.md}). Production deployments that require stricter side-channel posture should deploy on bare metal with HSM-backed key custody and disable the GC-induced variance via Go runtime tuning.
+
+\section{Review status}
+
+\begin{tabular}{@{}p{0.40\textwidth}p{0.55\textwidth}@{}}
+  \toprule
+  \textbf{Component} & \textbf{Review status} \\
+  \midrule
+  Pulsar lattice math (Sign / Verify / Combine) & Internal constant-time review complete \\
+  Pulsar lifecycle (Bootstrap / Reshare / Refresh / Activate) & Internal constant-time review complete \\
+  Pulsar DKG2 (Pedersen DKG over $R_q$) & Internal review complete; production-research \\
+  Lens curve math (Sign / Verify / Combine) & Internal constant-time review complete \\
+  Lens lifecycle & Internal constant-time review complete \\
+  LSS framework & Internal review complete \\
+  Quasar Horizon composition & Internal review complete \\
+  Warp 2.0 envelope & Internal review complete + Mar-3 fuzz hardening \\
+  GPU paths & Constant-time review NOT complete; production NOT enabled \\
+  External third-party audit & Open work; production-research roadmap \\
+  \bottomrule
+\end{tabular}
+
+\section{Conclusion}
+
+The CPU production path on the freeze tag has been through internal constant-time review for both the lattice (Pulsar) and curve (Lens) kernels. The lattigo deserializer is hardened against attacker-controlled length-prefix DoS via four-layer defense. The fuzz harnesses run continuously and have surfaced one production vulnerability (the lattigo \texttt{ReadUint64Slice} DoS) which is fixed.
+
+External third-party audit and GPU constant-time review are open work. Production deployments that need stricter side-channel posture should follow the deployment-configuration recommendations above.
+
+\bibliographystyle{plain}
+\bibliography{../references}
+
+\end{document}

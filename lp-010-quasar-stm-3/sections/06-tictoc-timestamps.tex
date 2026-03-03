@@ -1,0 +1,122 @@
+\section{TicToc-Style Timestamps Without Breaking Determinism}
+
+\label{sec:tictoc}
+%% ============================================================================
+
+QuasarSTM borrows TicToc's per-data-item timestamp pair to reduce
+false aborts on the Tier-2 path. The hard rule
+(\S\ref{sec:background}) is that timestamps cannot reorder
+consensus---they only certify that an observed version is
+serializable within the canonical order $\preceq_{\mathrm{can}}$.
+
+\subsection{Per-Key Timestamps}
+
+\begin{definition}[Per-key timestamps]
+\label{def:per-key-ts}
+Each key header carries
+$(\mathit{read\_ts},\, \mathit{write\_ts}) \in \mathbb{N}^2$ where
+\begin{itemize}[leftmargin=2em,nosep]
+\item $\mathit{read\_ts}(k) = \max \{\, \mathit{ts}(T) :
+      T \text{ has read } k \,\}$;
+\item $\mathit{write\_ts}(k) = \mathit{ts}(T)$ for the most recent
+      committed writer $T$ of $k$.
+\end{itemize}
+Both fields are stored in the device-resident
+\texttt{StmKeyHeader}.
+\end{definition}
+
+\subsection{Per-Transaction Timestamps}
+
+\begin{definition}[Per-transaction timestamps]
+\label{def:per-tx-ts}
+For a transaction $T$ with read footprint $R(T)$ and write footprint
+$W(T)$,
+\[
+T.\mathit{read\_ts\_min} =
+\max \bigl\{\, \mathit{write\_ts}(k) \,:\, k \in R(T) \,\bigr\}
+\]
+\[
+T.\mathit{write\_ts} =
+\max \bigl\{\, \mathit{read\_ts}(k) \,:\, k \in W(T) \,\bigr\} + 1.
+\]
+A transaction \emph{passes the TicToc test} if there exists
+$\mathit{ts}(T) \in [T.\mathit{read\_ts\_min},\, T.\mathit{write\_ts}]$
+that is consistent with the canonical position
+$\mathit{idx}(T)$ supplied by the ordering oracle.
+\end{definition}
+
+\subsection{Reduction of False Aborts}
+
+\begin{lemma}[TicToc admits more commits than version-equality]
+\label{lem:tictoc-relax}
+Let $T$ be a transaction whose Tier-2 read-set check fails (some
+recorded $\mathit{version\_id}$ is no longer the
+$\mathit{visible\_version}_\mathcal{O}$). If $T$ passes the TicToc
+test (Definition~\ref{def:per-tx-ts}) and the canonical
+linearisation of the new visible version places it in a serial
+position equivalent to $T$'s observation, then $T$ commits.
+\end{lemma}
+
+\begin{proof}[Sketch]
+A version-equality failure is a sufficient but not necessary
+condition for an abort. If $T$'s read footprint is satisfied by some
+$\mathit{ts}(T)$ that respects the canonical-order envelope, then the
+serial schedule
+$T_1 \preceq_{\mathrm{can}} \cdots \preceq_{\mathrm{can}} T \preceq
+\cdots$ is equivalent to a schedule in which $T$ observes the new
+visible version, because the timestamp interval certifies no
+intervening write conflicts with $T$'s read.
+\end{proof}
+
+\subsection{Determinism Guard}
+
+\begin{invariant}[TicToc determinism]
+\label{inv:tictoc-determinism}
+For all transactions $T$ and all valid timestamp intervals
+$[\mathit{read\_ts\_min},\, \mathit{write\_ts}]$,
+\[
+\mathit{ts}(T) \text{ admissible} \implies
+\mathit{ts}(T) \text{ consistent with } \preceq_{\mathrm{can}}.
+\]
+That is: no choice of $\mathit{ts}(T)$ may move $T$ before any
+$T_j$ with $T_j \preceq_{\mathrm{can}} T$ in the committed result.
+\end{invariant}
+
+The implementation enforces Invariant~\ref{inv:tictoc-determinism}
+at the validator: when the TicToc test admits an interval, the
+chosen $\mathit{ts}(T)$ is the unique minimum that satisfies both
+the interval and $\preceq_{\mathrm{can}}$. There is no degree of
+freedom for the GPU to choose differently across runs.
+
+\begin{remark}[No reordering]
+\label{rem:tictoc-no-reorder}
+TicToc \emph{cannot} produce a committed schedule that violates
+$\preceq_{\mathrm{can}}$. It only avoids aborting transactions whose
+observations are still serializable under that order. This is the
+defining departure from canonical TicToc, which derives the order
+\emph{from} the timestamps. In QuasarSTM the order comes from
+Quasar; the timestamps only justify the absence of an abort.
+\end{remark}
+
+\subsection{Storage Cost}
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Field} & \textbf{Size} \\
+\midrule
+\texttt{StmKeyHeader.read\_ts}      & 8\,B \\
+\texttt{StmKeyHeader.write\_ts}     & 8\,B \\
+\texttt{StmRead.observed\_write\_ts}& 8\,B \\
+\texttt{StmRead.observed\_lane\_clock} & 8\,B \\
+\bottomrule
+\end{tabular}
+\caption{Timestamp storage overhead per key and per read record.
+The two key-header fields fit in the slack of the existing
+$32$-byte slot; the per-read fields cost $16$\,B each.}
+\label{tab:ts-storage}
+\end{table}
+
+
+%% ============================================================================

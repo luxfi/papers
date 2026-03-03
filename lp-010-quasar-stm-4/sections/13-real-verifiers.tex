@@ -1,0 +1,138 @@
+\section{Real BLS / Corona / Groth16 verifiers}
+
+\label{sec:verifiers}
+%% ============================================================================
+
+\subsection{From placeholders to real cryptography}
+
+QuasarSTM~3.0 shipped HMAC-keccak placeholder
+verifiers~\cite{lp010-quasarstm-3} for the three cert lanes (BLS,
+Corona, MLDSAGroth16, see LP-020). These placeholders performed
+genuine cryptographic verification with one-way master secrets and
+cross-lane domain tags that reject replay, but they were not the real
+curve, lattice, or SNARK primitives. The 3.0 substrate was structured
+so that the swap to real primitives was a single function-pointer
+change. QuasarSTM~4.0 makes those swaps. From the 2026-02-14
+activation, the cert verifiers are real.
+
+\subsection{BLS12-381 pairing}
+
+BLS12-381~\cite{bls12381} is the pairing-friendly curve used across
+ETH2, Filecoin, Aptos, and Lux for aggregate signature verification.
+The on-device verifier is a vendored, GPU-resident implementation of
+the optimal ate pairing. The verification predicate is the standard
+aggregate-signature pairing equation:
+
+\[
+e(\mathit{aggSig}, G_2) \stackrel{?}{=} e(H(\mathit{subject}), \mathit{aggPK})
+\]
+
+\textbf{Substrate location.}
+\texttt{lib/consensus/quasar/gpu/crypto/bls12\_381.metal} (Metal) and
+\texttt{lib/consensus/quasar/gpu/crypto/bls12\_381.cu} (CUDA). The
+implementations share field arithmetic kernels and differ only in
+shader-language plumbing.
+
+\textbf{Per-cert cost.} On Apple~M1~Max, $\approx 46\,\mu\text{s}$ per
+aggregate verification. On NVIDIA~H100, $\approx 31\,\mu\text{s}$. Both
+include the 256-bit Hash-to-curve and the final exponentiation.
+
+\textbf{Aggregate.} The verifier accepts an aggregate signature over
+$n$ signers; the bitmap of signer indices is committed in
+\texttt{bitmap\_hash} so the round result binds the exact signer set.
+
+\subsection{Corona Ring-LWE share verification}
+
+Corona~\cite{corona2024} is the Ring-LWE 2-round threshold
+signature scheme defined in LP-073. The Q-Chain runs the DKG ceremony
+per epoch and commits the result to \texttt{qchain\_ceremony\_root} in
+the QuasarRoundDescriptor; the verifier uses this as the public key
+selector. The verification predicate is the share-validation rule from
+the Corona spec.
+
+\textbf{Substrate location.}
+\texttt{lib/consensus/quasar/gpu/crypto/corona.metal} (Metal) and
+\texttt{lib/consensus/quasar/gpu/crypto/corona.cu} (CUDA). Ring
+arithmetic kernels are shared.
+
+\textbf{Per-share cost.} On Apple~M1~Max, $\approx 38\,\mu\text{s}$ per
+share verification. On NVIDIA~H100, $\approx 24\,\mu\text{s}$.
+
+\textbf{Threshold.} A round emits a Corona cert when the sum of
+verified-share weights crosses the threshold for the active epoch
+(epoch-defined $t$-of-$n$). The drain accumulates share weights into
+a per-round counter and emits the cert when the counter crosses the
+threshold; the cert artifact is the variable-length share aggregate
+defined in LP-073.
+
+\subsection{Groth16 over BLS12-381}
+
+Groth16~\cite{groth2016} is the canonical small-proof zk-SNARK. The
+Z-Chain~\cite{quasar2025} aggregates per-validator ML-DSA-65
+signatures into a single Groth16 proof per epoch and commits the
+verifying-key root to \texttt{zchain\_vk\_root}. The verifier checks:
+
+\[
+e(A, B) \stackrel{?}{=} e(\alpha, \beta) \cdot e(L_0 + \sum_i x_i L_i, \gamma) \cdot e(C, \delta)
+\]
+
+where $A, B, C$ are the proof elements, $L_i$ are the verifying-key
+elements selected by \texttt{zchain\_vk\_root}, and $x_i$ are the
+public inputs (which include \texttt{certificate\_subject} and the
+hash of the validator-set vector).
+
+\textbf{Substrate location.}
+\texttt{lib/consensus/quasar/gpu/crypto/groth16.metal} (Metal) and
+\texttt{lib/consensus/quasar/gpu/crypto/groth16.cu} (CUDA). Reuses the
+BLS12-381 pairing kernel.
+
+\textbf{Per-cert cost.} On Apple~M1~Max, $\approx 62\,\mu\text{s}$ per
+verification. On NVIDIA~H100, $\approx 42\,\mu\text{s}$.
+
+\subsection{No CPU fallback on the round path}
+
+All three verifiers run on-device. There is no CPU fallback on the
+round path. The HMAC-keccak path is preserved as a development-only
+mode under the \texttt{EVM\_DEV\_HMAC\_VERIFIER=1} environment flag,
+gated such that production binaries reject the flag at startup. The
+flag exists for deterministic test vectors over historical traces
+that pre-date the activation height.
+
+\subsection{Verifier dispatch}
+
+\begin{lstlisting}[language=C++]
+struct CertLaneVerifierTable {
+    decltype(&verify_bls_aggregate)    bls;
+    decltype(&verify_corona_share)   corona;
+    decltype(&verify_mldsa_groth16)    groth16;
+};
+
+// 4.0 production
+constexpr CertLaneVerifierTable kProdVerifiers = {
+    &verify_bls_aggregate_real,
+    &verify_corona_share_real,
+    &verify_mldsa_groth16_real,
+};
+
+// 3.0 placeholder, gated behind EVM_DEV_HMAC_VERIFIER
+constexpr CertLaneVerifierTable kHmacVerifiers = {
+    &verify_bls_aggregate_hmac,
+    &verify_corona_share_hmac,
+    &verify_mldsa_groth16_hmac,
+};
+\end{lstlisting}
+
+The dispatch table is selected once at engine creation. There is no
+within-round dispatch decision, so the verifier choice does not enter
+the determinism harness as a per-round variable.
+
+\subsection{Wire format unchanged}
+
+The cert artifact wire formats from LP-020 are byte-for-byte
+unchanged. 3.0 and 4.0 nodes can ingest each other's certs at the
+wire level; the difference is only in which \texttt{verify\_*}
+function runs on each. After the activation height, only the real
+verifiers may produce a cert that passes verification on a 4.0
+network.
+
+%% ============================================================================

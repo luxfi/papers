@@ -1,0 +1,78 @@
+\section{MVCC GC}
+
+\label{sec:gc}
+%% ============================================================================
+
+\subsection{Why GC matters}
+
+Without GC, a long-lived MVCC arena accumulates versions indefinitely
+and Tier~2 validation cost grows linearly in version count.
+QuasarSTM~3.0 deferred GC to a separate post-round host pass; 4.0
+moves it on-device, bound to the commit horizon.
+
+\subsection{Reaping rule}
+
+Versions are reapable when:
+\begin{enumerate}[leftmargin=2em]
+\item their \texttt{commit\_round} is strictly earlier than the current
+      horizon's \texttt{round\_index}, and
+\item no in-flight repair could re-read them (i.e.\ no transaction in
+      the active round has a checkpoint or read-set entry pointing at
+      the version).
+\end{enumerate}
+
+The second condition is satisfied for every version older than the
+\emph{previous-round horizon} because checkpoints and read-set entries
+do not survive \texttt{end\_round()}. So GC reaps versions older than
+the previous-round horizon at every \texttt{begin\_round}.
+
+\subsection{Implementation}
+
+\begin{lstlisting}[language=C++]
+void mvcc_gc(VersionBlock* vb, uint64_t horizon_round) {
+    uint16_t keep = 0;
+    for (uint16_t i = 0; i < vb->count; ++i) {
+        if (vb->versions[i].commit_round >= horizon_round - 1) {
+            vb->versions[keep++] = vb->versions[i];
+        }
+    }
+    vb->count = keep;
+}
+\end{lstlisting}
+
+GC runs at \texttt{begin\_round} on every VersionBlock that survived
+the previous round, in parallel across the GPU. It is a single pass
+over the inline version array (length $\le 8$, \S\ref{sec:versionblock}),
+no chain walk.
+
+\subsection{Per-round arena}
+
+Per-round allocations---DeferredOps, fiber checkpoints, dense lane-id
+arrays, ConflictSpec records---live in a per-round bump allocator
+arena that is reset on \texttt{end\_round}. There is no
+\texttt{free()} on the round path. Inter-round survivors
+(\texttt{LaneClockEntry}, \texttt{VersionBlock}, predictor state) live
+in dedicated long-lived arenas with their own GC rules.
+
+\subsection{Determinism}
+
+GC is deterministic in the per-round inputs because the horizon is.
+The reaping decision for any specific version is a function of
+\texttt{commit\_round} and the horizon's \texttt{round\_index}, both
+of which are agreed across validators. So two validators running 4.0
+against the same canonical-order trace agree on the surviving version
+set after GC.
+
+\begin{lemma}[GC determinism]
+\label{lem:gc-det}
+For any two validators executing the same canonical-order trace, the
+set of versions surviving GC after round $n$ is identical.
+\end{lemma}
+\begin{proof}[Proof sketch]
+Each version's \texttt{commit\_round} field is set deterministically
+at commit time. The horizon at end of round $n$ is deterministic by
+Theorem~\ref{thm:horizon-safety}. The reaping condition is a pure
+function of these two. Hence the surviving set is identical.
+\end{proof}
+
+%% ============================================================================

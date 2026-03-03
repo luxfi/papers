@@ -1,0 +1,100 @@
+\section{Semantic reducers Tier 3 (production)}
+
+\label{sec:tier3}
+%% ============================================================================
+
+\subsection{Why semantic commit}
+
+Block-STM~\cite{gelashvili2022blockstm} treats every write as a same-key
+SSTORE; under contention, the abort-and-repair amplification
+ratio~$\mathit{repair\_amplification} =
+\mathit{repair\_count}/\mathit{committed\_count}$ explodes on workloads
+where the contention is structurally commutative. The canonical
+example is a fee accumulator: 1024 concurrent transactions each adding
+to \texttt{fee} produce 1023 same-key SSTORE conflicts under
+unaugmented Block-STM, yet \emph{the result is the sum}, which is
+canonical regardless of execution order.
+
+QuasarSTM~3.0 enumerated this insight as
+\texttt{DeferredOpKind}~\cite{lp010-quasarstm-3} but did not commit
+deferred ops at horizon time. 4.0 ships the production reducer
+commit~\cite{rapidlane2025}.
+
+\subsection{DeferredOp record}
+
+\begin{lstlisting}[language=C++]
+enum class DeferredOpKind : uint8_t {
+    Add            = 0,
+    Sub            = 1,
+    Append         = 2,
+    BalanceDelta   = 3,
+    FeeAccumulate  = 4,
+    OrderAppend    = 5,
+    AuctionMatch   = 6,
+    MintCounter    = 7,
+    NonceAdvance   = 8,
+};
+
+struct DeferredOp {
+    uint32_t        tx_id;        // canonical-order index of the issuer
+    DeferredOpKind  kind;
+    Hash            lane_id;      // target Commutative lane
+    uint8_t         payload[48];  // value / delta / element / etc.
+};
+\end{lstlisting}
+
+A transaction $t$ executing in \texttt{Reducer}-mode lane $l$ does
+\emph{not} write the lane through MVCC. It pushes a \texttt{DeferredOp}
+into the per-lane reducer queue and continues. Validation against
+$l$'s clock is skipped in Tier~1 (which is one of the reasons Tier~1
+is so cheap on commutative lanes).
+
+\subsection{Reduction at horizon time}
+
+When the commit horizon (\S\ref{sec:horizon}) advances over a
+canonical-order range $[t_a, t_b]$, every lane $l$ in
+\texttt{Reducer} mode runs \texttt{deterministic\_reduce\_at\_commit($l$)}.
+The reduction order is canonical order over the issuer \texttt{tx\_id}:
+
+\begin{algorithm}[ht]
+\caption{\texttt{deterministic\_reduce\_at\_commit($l$)}}
+\label{alg:reduce}
+\begin{algorithmic}[1]
+\State sort $\mathit{Q}_l$ by \texttt{tx\_id} ascending
+\State $v \gets \mathit{lane\_state}(l)$
+\For{each $\mathrm{op} \in \mathit{Q}_l$ in order}
+  \State $v \gets \mathrm{apply}(\mathrm{op}, v)$
+\EndFor
+\State write $v$ back to lane state
+\State emit per-op receipt entries in the same order
+\State clear $\mathit{Q}_l$
+\end{algorithmic}
+\end{algorithm}
+
+\texttt{apply} is a per-kind pure function:
+\begin{itemize}[leftmargin=2em]
+\item \texttt{Add(x), Sub(x), FeeAccumulate(x), MintCounter(x)}: $v \mathrel{{+}{=}} x$ (mod field), or $v \mathrel{{-}{=}} x$.
+\item \texttt{Append(elem), OrderAppend(elem)}: $v \mathrel{{:}{:}} \mathrm{elem}$ (deterministic list append).
+\item \texttt{BalanceDelta(account, delta)}: $\mathit{balance}_{\mathit{account}} \mathrel{{+}{=}} \mathrm{delta}$.
+\item \texttt{AuctionMatch}: deterministic order book matching, applied as a single batched step at end-of-batch.
+\item \texttt{NonceAdvance}: per-account nonce monotone advance, with conflict aborting only the duplicate-nonce loser per canonical order.
+\end{itemize}
+
+\subsection{Repair amplification}
+
+On the regulated-DEX workload mix (order placements, cancels, fee
+accumulation, balance deltas, auction matches), 4.0 measures
+$\mathit{repair\_amplification} \approx 0.42$, vs. $\approx 0.97$ for
+3.0 on the same trace. The improvement is not because 4.0 is faster at
+repair; it is because reducer commit removes most of the contended
+writes from the MVCC validation path entirely.
+
+\begin{remark}[Reducers do not break determinism]
+The reduction order is canonical order over the issuer \texttt{tx\_id}.
+\texttt{tx\_id} is fixed by Quasar consensus
+(\cite{quasar2025,lp135-quasarstm-4}). Hence the reduced lane state is
+deterministic in the round inputs. This is the same argument as
+Lemma~\ref{lem:tier1-mono}.
+\end{remark}
+
+%% ============================================================================

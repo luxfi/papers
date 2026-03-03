@@ -1,0 +1,86 @@
+\section{Performance}
+\label{sec:performance}
+
+All numbers below are ratios against single-thread CPU baselines on the same host (Apple Silicon M2 Ultra unless noted). They are reproduced from the canonical bench ladder in \texttt{lux/crypto/bench} on commits attested in \texttt{LP-137 \#performance}; the same ladder runs in CI on every release tag.
+
+\subsection{Headline ratios}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrrl}
+\toprule
+\textbf{Operation} & \textbf{Backend} & \textbf{Ratio} & \textbf{Source} \\
+\midrule
+BLS aggregate verify (fused, $k=1024$) & Metal & $144.22\times$ & \cite{lp137benchmarks} \\
+FHE NTT (forward, $N=2^{14}$, 10-iter median) & Metal & $16.92\times$ & \cite{lp137benchmarks} \\
+Ed25519 RFC 8032 batch verify ($N=4096$) & Metal & $26.7\times$ & \cite{lp137benchmarks,lp124} \\
+BN254 G1 scalar mul (batched) & Metal & $11.8\times$ & \cite{lp146} \\
+secp256k1 ecrecover (batch) & Metal & $9.4\times$ & \cite{lp147} \\
+ML-KEM-768 encap (batch) & Metal & $6.3\times$ & \cite{fips203,lp137benchmarks} \\
+NTT throughput, $N=2^{20}$ six-step & CPU & 6--9 Mops/s & \cite{lp164} \\
+\bottomrule
+\end{tabular}
+\caption{Headline production performance ratios (Apple M2 Ultra, ratios vs single-thread CPU baseline; the NTT row is absolute throughput). All ratios verified against the bench ladder; full per-input-size sweep in LP-137 \texttt{\#performance} \cite{lp137benchmarks}. Note: an earlier draft reported ``ChaCha20-Poly1305 26.7$\times$ at $N{=}8192$''; the empirical audit (LP-137-ACTUAL-STATE \S3) flagged this as not currently reproducible (\texttt{aead\_metal\_bench} skips without \texttt{LUX\_CRYPTO\_AEAD\_METALLIB}); the 26.7$\times$ datum belongs to Ed25519 batch verify at $N{=}4096$ and has been corrected here.}
+\label{tab:performance}
+\end{table}
+
+\subsection{Methodology}
+
+\paragraph{CPU baseline.} Single-thread, no SIMD assist beyond what the compiler emits at \texttt{-O3 -march=native}. We deliberately do not multi-thread the CPU baseline; the GPU number is host-thread-counted (one CPU thread dispatches the GPU batch and waits). Multi-threading both sides changes the question to ``how many cores can you afford'' rather than ``what is the substrate's intrinsic GPU acceleration''; we keep it apples-to-apples.
+
+\paragraph{GPU timing.} We measure end-to-end including the input upload, kernel dispatch, and result download. Pinned memory + DMA reduce the host-to-GPU transfer to a fixed cost that amortizes over batch size. The crossover (GPU faster than CPU) is reported per algorithm in LP-137 \texttt{\#crossover}; it is typically between $N=64$ and $N=512$ inputs.
+
+\paragraph{Reproducibility.} Every number in Table~\ref{tab:performance} can be reproduced by:
+
+\begin{lstlisting}[language=bash]
+cd lux/crypto/bench
+go test -bench=BenchmarkBLSAggregateVerify_Metal/N=1024 -count=10
+\end{lstlisting}
+
+\subsection{Crossover thresholds}
+
+Below the crossover, CPU is faster (the GPU dispatch overhead dominates). Above the crossover, the GPU pulls ahead linearly. Per-algorithm crossovers from the bench ladder:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lr}
+\toprule
+\textbf{Algorithm} & \textbf{Crossover $N^*$} \\
+\midrule
+BLS aggregate verify    & 64 \\
+ChaCha20-Poly1305       & 256 \\
+SHA-256                 & 1024 \\
+ECDSA verify (secp256k1)& 256 \\
+EdDSA verify (Ed25519)  & 128 \\
+BN254 G1 scalar mul     & 64 \\
+ML-DSA verify           & 32 \\
+FHE NTT                 & 1 \\
+\bottomrule
+\end{tabular}
+\caption{Per-algorithm crossover thresholds: minimum batch $N$ at which the GPU kernel beats the single-thread CPU canonical.}
+\end{table}
+
+The dispatcher uses these thresholds to choose backend automatically: small batches stay on CPU, large batches go to GPU.
+
+\subsection{Acceleration kernels (LP-160 through LP-166)}
+
+Where the headline ratio depends on a fused or batched kernel, the kernel's own LP carries the per-platform breakdown:
+
+\begin{itemize}
+\item \textbf{Batched Montgomery inversion} (LP-160 \cite{lp160}): 10--20$\times$ over $N$ Fermat exponentiations at $N=1024$ on Apple M1 Max; consumed by every curve in the corpus.
+\item \textbf{Multi-curve Pippenger MSM} (LP-161 \cite{lp161}): one parameterized kernel for secp256k1, BN254, BLS12-381 G1/G2, Banderwagon. Headline win is code consolidation (3{,}200 LOC $\rightarrow{}$ $\sim$600 LOC + per-curve traits).
+\item \textbf{Combined-pair Miller loop} (LP-162 \cite{lp162}): 9.5$\times$ on Apple M1 Max for $k=1024$ BLS12-381 batch pairing verify.
+\item \textbf{Karatsuba modexp} (LP-163 \cite{lp163}): EIP-198 hot path ($M_{\text{len}} \le 256$) unaffected; Karatsuba kicks in at $M_{\text{len}} \ge 512$ and dominates at $M_{\text{len}} = 4096$.
+\item \textbf{Six-step NTT} (LP-164 \cite{lp164}): lifts the radix-2 Cooley-Tukey ceiling past $N = 2^{16}$; the 16.92$\times$ Metal NTT row in Table~\ref{tab:performance} reproduces from this kernel.
+\item \textbf{Pedersen tree-reduce} (LP-165 \cite{lp165}): width-256 Verkle vector commit; on Apple M2 Ultra the threadgroup-memory ceiling caps it at 0.73$\times$ vs the legacy two-stage path; on NVIDIA A100/H100 (192 KiB shared/SM) the tree-reduce wins.
+\item \textbf{Threshold pre-sign batch} (LP-166 \cite{lp166}): single-pass FROST + CGGMP21 round-1; projected 5.0--7.2$\times$ at $M=7$, $N=64$ vs MPCVM v0.62 sequential.
+\end{itemize}
+
+\subsection{What we do not benchmark}
+
+\paragraph{Throughput vs latency.} The numbers above are throughput. For a single signature verify (\texttt{N=1}), CPU is always faster than any GPU; the correct dispatch is to skip the GPU. We do not report ``$1\times$ verify on GPU is X microseconds'' because nobody dispatches that pattern.
+
+\paragraph{Multi-GPU.} The Lux substrate is designed to fan out across multiple GPUs, but the headline numbers are single-GPU (M2 Ultra has one Metal device). Multi-GPU numbers will be reported in a future LP-137 revision once the cluster topology stabilizes.
+
+\paragraph{TFHE end-to-end.} The TFHE numbers in this paper are for the underlying lattice arithmetic (NTT, poly\_mul). End-to-end TFHE program performance (encrypt$\rightarrow$evaluate$\rightarrow$decrypt with bootstrapping) is reported separately in LP-013.

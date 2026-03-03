@@ -1,0 +1,124 @@
+\section{Introduction}
+
+\label{sec:introduction}
+%% ============================================================================
+
+Block-STM~\cite{gelashvili2022blockstm} introduced ordered speculative
+execution to public blockchains: transactions in a block execute in
+parallel under their canonical position; conflicts are detected
+retroactively against MVCC version chains; offending transactions
+re-execute with bumped incarnation numbers until the read set stabilises.
+The contribution was conceptual. A known canonical order is not a
+serialization bottleneck; it is a validation primitive.
+
+The Lux execution stack has shipped three generations of this idea.
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Block-STM 1.0} --- a CPU port of the Aptos design
+  (\texttt{evmgpu}'s Go reference). Multi-threaded ordered speculation,
+  per-key version chains, retroactive validation. Adequate for a few
+  thousand transactions per block, throughput-bound by L3 traffic and
+  conflict re-execution.
+\item \textbf{Block-STM 2.0} --- the first GPU port. The GPU was treated
+  as a faster CPU: the same monolithic
+  execute--validate--repair loop, just with thousands of fibers in place
+  of OS threads. A single MVCC arena. The wave-drain executor.
+  Repair-rate telemetry. Production at \texttt{cevm}~v0.30.
+\item \textbf{Block-STM 3.0 / QuasarSTM} --- a re-architecture, not a
+  port. STM stops being a retroactive conflict detector and becomes
+  a \emph{scheduler-aware fabric}. Lanes are first-class. Validation
+  is three-tier (lane-clock, key-MVCC, semantic). Repair is
+  incremental against fiber checkpoints. Commit happens by
+  prefix/cut, not transaction-by-transaction. Contention is managed
+  deterministically, with explicit hard limits against SIMT livelock.
+\end{enumerate}
+
+\paragraph{Headline change.}
+Block-STM~1.0 and 2.0 \emph{discover} contention. They run a workload,
+record where conflicts happened, and try again. QuasarSTM~3.0
+\emph{predicts} contention through lane hints, \emph{prevents}
+the predictable cases through Prism refraction, and uses MVCC only
+where lane prediction is insufficient. When QuasarSTM is constantly
+repairing, the design has failed; the production target is
+$\mathit{repair\_amplification} = \mathit{repair\_count}\,/\,
+\mathit{committed\_count} < 1.01$ on normal regulated-DEX workloads.
+
+\paragraph{Why now.}
+Three forcing functions made the rewrite necessary.
+First, a regulated DEX workload (order-book appends, fee accumulation,
+balance deltas, audit appends) has dramatically more lane-local
+structure than naive ERC-20 traffic. Lane partitioning extracts that
+structure; key-only MVCC squanders it.
+Second, the Quasar consensus engine~\cite{quasar2025} requires
+\emph{ordered, deterministic, GPU-resident} execution to feed
+QuasarCert root construction without leaving the device. The Quasar
+round result is a commitment over \texttt{block\_hash},
+\texttt{state\_root}, \texttt{receipts\_root}, \texttt{execution\_root},
+\texttt{mode\_root}; a CPU-side STM cannot supply these on the wave-tick
+budget.
+Third, GPU-STM literature has long flagged SIMT livelock and unbounded
+retry as the dominant failure modes~\cite{cederman2010,holey2014}. A
+correctness-by-construction repair manager is mandatory, not optional.
+
+\paragraph{The lane abstraction.}
+The single most important change in 3.0 is that the unit of independence
+is no longer the storage key. It is the \emph{lane}:
+\[
+\mathit{lane\_id} = H(\mathit{domain}, \mathit{contract},
+\mathit{account}, \mathit{asset}, \mathit{market}, \mathit{nonce\_lane},
+\mathit{storage\_prefix})
+\]
+Lanes are the unit of frontier partitioning, fast validation,
+hot-state detection, semantic reduction, repair priority, and multi-GPU
+sharding. Without lanes, Block-STM discovers contention too late.
+With lanes, Block-STM is a safety net beneath a primary scheduler.
+
+\subsection{Contributions}
+
+\begin{enumerate}[leftmargin=2em]
+\item A formal model of ordered MVCC for both linear (Nova) and DAG
+      (Nebula) consensus modes, parameterised over a mode-specific
+      ordering oracle (\S\ref{sec:visibility}).
+\item The lane abstraction (\S\ref{sec:lanes}) and lane clocks,
+      together with a TL2-derived fast validation tier
+      (\S\ref{sec:validation}) that admits commits without touching
+      per-key version chains when lane state is undisturbed.
+\item Three-tier validation: lane-clock, key-MVCC, and semantic
+      commutativity (\S\ref{sec:validation}). Tier~3 is the difference
+      between a fast blockchain and a fast regulated DEX.
+\item TicToc-style per-key read/write timestamps adapted to a known
+      canonical order (\S\ref{sec:tictoc}). Hard rule: timestamps
+      reduce false aborts but cannot reorder consensus.
+\item Prism refraction (\S\ref{sec:prism}) as the primary contention
+      \emph{prevention} mechanism, partitioning ready frontiers by
+      lane conflict matrix before STM ever sees them.
+\item Incremental repair against fiber checkpoints
+      (\S\ref{sec:repair}), cutting repair cost by 5--30$\times$ on
+      router and DEX workloads relative to full re-execution.
+\item A deterministic contention manager (\S\ref{sec:contention})
+      with six fixed policies and explicit hard limits, eliminating
+      the nondeterministic-victim and unbounded-retry pathologies
+      catalogued in the GPU-STM literature.
+\item Commit horizons (\S\ref{sec:horizon}) that finalise contiguous
+      Nova prefixes or valid Nebula causal cuts in batches, slashing
+      per-transaction certificate overhead.
+\item Four formal invariants (\S\ref{sec:correctness}): determinism,
+      ordered serializability, repair monotonicity, and horizon
+      safety.
+\item Production measurements (\S\ref{sec:performance}): 1024-tx
+      end-to-end stress in ${\sim}150\,\text{ms}$ on M1 Max;
+      hot-key contention test of 16 same-key transactions producing
+      exactly 120 conflicts, 120 repairs, and 16 commits, matching
+      textbook Block-STM behaviour entirely on GPU.
+\end{enumerate}
+
+\paragraph{Scope.}
+This paper specifies QuasarSTM~3.0 frozen as of December~15, 2025
+and activated on the Quasar~3.0 mainnet on December~25, 2025. Work in
+progress on the adaptive evolution path (3.1 ConflictSpec / NEMO
+LaneClass / Aria, 3.2 RapidLane / ForeSight / Multiverse, 4.0 CSMV /
+Motor / vMVCC) is referenced in \S\ref{sec:related} but is explicitly
+out of scope for the 3.0 specification.
+
+
+%% ============================================================================

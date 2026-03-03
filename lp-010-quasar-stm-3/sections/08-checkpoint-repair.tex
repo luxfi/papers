@@ -1,0 +1,125 @@
+\section{Incremental Repair via Fiber Checkpoints}
+
+\label{sec:repair}
+%% ============================================================================
+
+Block-STM's classical repair is full transaction re-execution at the
+next incarnation. For complex EVM flows (multi-hop swap routers,
+compliance precompiles, batched settlement) this is wasteful: the
+invalidated read often occurs late, and re-running prefixes of pure
+arithmetic and warm storage accesses dominates wall time.
+
+QuasarSTM repairs against \emph{fiber checkpoints} taken at known
+boundaries during execution. A repair rolls back to the most recent
+checkpoint preceding the invalidated read, retains the warm bytecode,
+calldata, journal prefix, and earlier validated reads, and resumes the
+fiber from that point with the new visible version.
+
+\subsection{Checkpoint Boundaries}
+
+The Metal/CUDA EVM fiber takes checkpoints at six structural
+boundaries:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textsc{Call} boundaries (\texttt{CALL}, \texttt{STATICCALL},
+      \texttt{DELEGATECALL}, \texttt{CALLCODE}; deferred to v0.40+).
+\item \textsc{Sload} / \textsc{Sstore} boundaries.
+\item Precompile boundaries (entry and exit of any registered
+      precompile).
+\item Basic-block budget boundaries (every $B$ opcodes, where $B$ is
+      a per-fiber budget chosen to bound checkpoint memory).
+\item DEX semantic-operation boundaries (order append, cancel, match,
+      fee accumulate, balance settle---the Tier-3 reducer-eligible
+      operations).
+\item Cold-state resume boundaries (when a fiber resumes from a
+      \texttt{StateResp}, the resume point is implicitly a
+      checkpoint).
+\end{enumerate}
+
+\begin{definition}[Fiber checkpoint]
+\label{def:checkpoint}
+A fiber checkpoint is a tuple
+\[
+\mathit{EvmFiberCheckpoint} =
+(\mathit{tx\_id},\, \mathit{pc},\, \mathit{frame\_offset},\,
+ \mathit{stack\_offset},\, \mathit{memory\_offset},\,
+ \mathit{journal\_offset},\, \mathit{read\_set\_count},\,
+ \mathit{gas\_used})
+\]
+where the offsets index into the fiber's per-round arenas. A
+checkpoint is a constant-size record (typically 32\,B) that does not
+copy memory; it pins arena prefixes by index.
+\end{definition}
+
+\subsection{Repair Policy}
+
+\begin{algorithm}[H]
+\caption{Repair transaction $T$ after invalidated read at canonical
+position $p$}
+\label{alg:repair}
+\begin{algorithmic}[1]
+\State $K \gets$ the most recent checkpoint of $T$ with checkpoint
+       position $\leq p$.
+\State \textbf{if} $K$ exists \textbf{then}
+\State \quad Roll back fiber: restore
+       $\mathit{pc}, \mathit{stack\_offset},\,
+       \mathit{memory\_offset},\, \mathit{journal\_offset},\,
+       \mathit{read\_set\_count}$ to $K$'s recorded values.
+\State \quad Discard read records and write records appended after
+       $K.\mathit{read\_set\_count}$.
+\State \quad Increment $T.\mathit{incarnation}$.
+\State \quad Re-enter \textsc{Executing} state at $K.\mathit{pc}$,
+       observing the current visible version.
+\State \textbf{else}
+\State \quad Increment $T.\mathit{incarnation}$.
+\State \quad Re-enter \textsc{Executing} from start (full re-exec).
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Repair Telemetry}
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Counter} & \textbf{Definition} \\
+\midrule
+\texttt{checkpoint\_rollback\_count}  & repairs that restored to a checkpoint \\
+\texttt{full\_reexec\_count}          & repairs that ran from start \\
+\texttt{rollback\_saved\_gas}         & gas not re-executed under rollback \\
+\texttt{rollback\_saved\_wave\_ticks} & ticks not re-executed under rollback \\
+\bottomrule
+\end{tabular}
+\caption{Repair telemetry exported in \texttt{QuasarStmTelemetry}.}
+\label{tab:repair-telemetry}
+\end{table}
+
+\subsection{Cost Reduction}
+
+\begin{lemma}[Repair cost upper bound]
+\label{lem:repair-cost}
+Let $T$ be a transaction with fiber checkpoints at gas-cumulative
+positions $0 = g_0 < g_1 < \cdots < g_K \leq G(T)$, where $G(T)$ is
+$T$'s total gas. Let $g^*$ be the gas-cumulative position of the
+invalidated read. Then the gas re-executed under
+Algorithm~\ref{alg:repair} is bounded above by $G(T) - g_j$ where
+$g_j = \max\{g_i : g_i \leq g^*\}$.
+\end{lemma}
+
+\begin{proof}[Sketch]
+The rollback restores state at $g_j$; execution proceeds from $g_j$
+to the end. By construction $g_j \leq g^* \leq G(T)$, so the cost is
+at most $G(T) - g_j$.
+\end{proof}
+
+\begin{remark}[5--30$\times$ on routers]
+\label{rem:repair-router}
+On router and DEX-settlement workloads (bench~E,
+\S\ref{sec:performance}), measured repair cost falls 5--30$\times$
+relative to full re-execution. This is the fattest single optimisation
+in the repair path; without it, hot-frontier rounds suffer
+substantial repair amplification.
+\end{remark}
+
+
+%% ============================================================================

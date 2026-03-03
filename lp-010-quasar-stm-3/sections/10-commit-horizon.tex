@@ -1,0 +1,130 @@
+\section{Commit Horizon}
+
+\label{sec:horizon}
+%% ============================================================================
+
+Per-transaction commit imposes a fixed cost (root accumulation,
+receipt hashing, telemetry counters) on every transaction. For a
+workload of $N$ transactions and per-tx commit cost $c$, the total
+overhead is $\Theta(Nc)$. A commit horizon amortises this cost over
+contiguous valid prefixes (Nova) or valid causal cuts (Nebula),
+collapsing the overhead to $\Theta(\mathit{horizon\_count} \cdot c)$
+where $\mathit{horizon\_count} \ll N$.
+
+\subsection{Definition}
+
+\begin{definition}[Commit horizon]
+\label{def:commit-horizon}
+A commit horizon is a tuple
+\[
+\mathit{StmCommitHorizon} =
+(\mathit{start\_index},\, \mathit{end\_index},\,
+ \mathit{horizon\_root},\, \mathit{tx\_count}).
+\]
+A horizon is \emph{valid} iff:
+\begin{enumerate}[leftmargin=2em,nosep]
+\item every transaction $T$ with $\mathit{start\_index} \leq
+      \mathit{idx}(T) \leq \mathit{end\_index}$ has reached state
+      \textsc{Committable} or beyond;
+\item no unresolved earlier dependency exists (no transaction with
+      $\mathit{idx} < \mathit{end\_index}$ remains in
+      \textsc{Executing}, \textsc{Refracted}, or
+      \textsc{RepairPending});
+\item no \textsc{SuspendedState} request blocks visibility within
+      the horizon;
+\item all hot-lane reducers touching keys in the horizon's write set
+      have finalised.
+\end{enumerate}
+\end{definition}
+
+\subsection{Mode-Specific Horizon Shape}
+
+\begin{definition}[Nova horizon]
+\label{def:nova-horizon}
+Under Nova, a horizon
+$[\mathit{start\_index},\, \mathit{end\_index}]$ is a contiguous
+prefix of the canonical linear order. The next horizon begins at
+$\mathit{end\_index} + 1$.
+\end{definition}
+
+\begin{definition}[Nebula horizon]
+\label{def:nebula-horizon}
+Under Nebula, a horizon is a valid causal cut: a downward-closed
+subset $H$ of the round's DAG (i.e., $v \in H$ implies
+$\mathit{Pred}^*(v) \subseteq H$). The Photon /
+Wave finalisation indices supply the cut boundary; the Flare layer
+furnishes the deterministic linear extension that the
+$\mathit{horizon\_root}$ commits to.
+\end{definition}
+
+\begin{lemma}[Horizon completeness]
+\label{lem:horizon-complete}
+For any Quasar round, every committed transaction belongs to exactly
+one commit horizon.
+\end{lemma}
+
+\begin{proof}
+Horizons are produced by the \texttt{StmCommitHorizon} service in
+canonical order; each transaction enters exactly one horizon when
+the predicate of Definition~\ref{def:commit-horizon} fires. Within
+a round there is no overlap and no gap.
+\end{proof}
+
+\subsection{Root Construction over Horizons}
+
+The $\mathit{horizon\_root}$ is computed by the \texttt{StmCommit}
+service as a Keccak-f[1600] hash chain over the canonical-order
+sequence of per-transaction receipt hashes within the horizon. The
+chain seed is the previous horizon's root; the final horizon's
+output feeds directly into \texttt{execution\_root} on the round
+result.
+
+\begin{definition}[Round result fields fed by horizons]
+\label{def:round-result-from-horizon}
+The QuasarRoundResult derives the following fields from horizon
+material:
+\begin{itemize}[leftmargin=2em,nosep]
+\item \texttt{block\_hash}: finalisation digest over horizon roots.
+\item \texttt{state\_root}: accumulated commit chain across horizons.
+\item \texttt{receipts\_root}: per-tx receipt hash chain rooted at
+      horizon boundaries.
+\item \texttt{execution\_root}: Block-STM trace commitment over
+      horizons.
+\item \texttt{mode\_root}: Nova/Nebula-specific structural
+      commitment.
+\end{itemize}
+\end{definition}
+
+\subsection{Horizon Granularity}
+
+\begin{remark}[Empirical horizon count]
+\label{rem:horizon-count}
+On the 1024-tx end-to-end stress (\S\ref{sec:performance}), a
+typical round produces 8--16 horizons. Per-tx commit cost amortises
+to roughly $1024 / 12 \approx 85$ transactions per horizon, an
+$85\times$ reduction in per-tx commit overhead relative to the
+2.0 baseline.
+\end{remark}
+
+The horizon count is workload-dependent: high-conflict workloads
+produce more horizons (each cut waits for repair to settle) while
+disjoint-lane workloads produce few.
+
+\subsection{Horizon Safety}
+
+\begin{invariant}[Horizon safety]
+\label{inv:horizon-safety}
+No transaction $T$ with an unresolved dependency may enter any
+commit horizon. Formally, if there exists $T'$ with
+$T' \preceq_{\mathrm{can}} T$ and $T'$ is in a non-terminal state
+($\textsc{Executing}, \textsc{Refracted}, \textsc{RepairPending},
+\textsc{SuspendedState}, \textsc{Repairing}$), then $T$ is excluded
+from the current horizon.
+\end{invariant}
+
+This is the precondition that makes the horizon root meaningful:
+the root commits only to a state in which all canonical predecessors
+are stable.
+
+
+%% ============================================================================

@@ -1,0 +1,91 @@
+%% ====================================================================
+\section{Envelope Format}
+\label{sec:envelope-format}
+%% ====================================================================
+
+This section gives the canonical wire format for the Warp 2.0 envelope. The single source of truth for transcript binding is \texttt{proofs/definitions/transcript-binding.tex}; the canonical Go source is \texttt{github.com/luxfi/warp/envelope.go} \cite{warpgo}. Where this paper and the Go source disagree, the Go source is the tiebreaker.
+
+\subsection{Wire layout}
+
+A serialized Warp 2.0 envelope has the form:
+
+\begin{verbatim}
+0x02 || RLP([
+    Message,                       // v1 Beam (UnsignedMessage + BitSetSignature)
+    SourceNebulaRoot   [32]byte,   // canonical bundle root of source chain
+    SourceKeyEraID     uint64,     // source chain Pulsar lineage
+    SourceGeneration   uint64,     // source chain LSS resharing version
+    HashSuiteID        string,     // e.g. "Pulsar-SHA3"; "" defaults
+    PulsarPulse        []byte,     // Pulsar threshold sig; empty if absent
+    MLDSACertSet       []byte,     // ML-DSA cert set; empty if absent
+])
+\end{verbatim}
+
+\paragraph{Leading version byte.} \texttt{EnvelopeVersion2 = 0x02}. The byte is unconditionally present at offset 0 of every Warp 2.0 envelope. A Warp 1.x receiver attempting to parse a v2 envelope as a v1 message rejects on the first byte (RLP lists begin with \texttt{0xc0}--\texttt{0xff}; the bare \texttt{0x02} is not a valid RLP-list prefix). This is the correct refusal: a v1 verifier cannot validate v2 transcript binding (\cite{warpgo} \texttt{envelope.go} L43--L65 in the canonical commit).
+
+\paragraph{Field count is fixed.} All seven fields after the version byte are unconditionally present in the RLP list. Optional PQ lanes are signaled by zero-length byte slices when absent. This is deliberate: the field count is fixed, decoders only need to inspect lengths, and a future v2 extension cannot ambiguously truncate the list.
+
+\paragraph{Maximum size.} \texttt{MaxEnvelopeV2Size = 4 * MaxMessageSize}, conservatively bounded to leave room for the optional Pulse and ML-DSA cert-set bytes alongside the v1 message (\cite{warpgo} \texttt{envelope.go} L37).
+
+\subsection{Canonical transcript}
+
+The Pulse signs $H_T$ over the canonical \texttt{WARP-PULSAR-ENVELOPE-v1} transcript:
+
+\begin{verbatim}
+WarpEnvelopeV2Transcript := H_T(
+    "WARP-PULSAR-ENVELOPE-v1",
+    sourceChainID,            // 32-byte source chain id
+    payload,                  // the v1 Message's UnsignedMessage payload
+    sourceNebulaRoot,         // 32-byte canonical bundle root
+    sourceKeyEraID,           // uint64
+    sourceGeneration,         // uint64
+)
+\end{verbatim}
+
+This is Definition~\ref{def:warp-v2-envelope} of \texttt{proofs/definitions/transcript-binding.tex}. The personalization tag is canonical and \emph{not} re-used:
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \texttt{QUASAR-PULSAR-BUNDLE-v1} signs Nebula bundle roots in consensus.
+  \item \texttt{QUASAR-PULSAR-ACTIVATE-v1} signs Pulsar key-era activation messages.
+  \item \texttt{WARP-PULSAR-ENVELOPE-v1} signs cross-chain message envelopes.
+\end{itemize}
+A Pulse over a Nebula bundle root cannot be replayed as a Pulse over a Warp envelope, and vice versa. Re-using one prefix for both would let a consensus-side Pulse forge a cross-chain envelope (or vice versa); this is explicitly rejected by the domain-separation discipline.
+
+\subsection{Why \texttt{HashSuiteID} is bound}
+
+Every Pulsar deployment pins a hash suite identifier (\texttt{Pulsar-SHA3} as the production default, \texttt{Pulsar-BLAKE3} as an optional non-normative profile). The suite identifier is bound into every transcript via TupleHash personalization (\texttt{proofs/definitions/transcript-binding.tex} Definition~\ref{def:pulsar-sha3}). Cross-suite signatures do not collide; a forger cannot leverage a signature under one suite to forge under another (\texttt{proofs/pulsar/hash-suite-separation.tex} Theorem~\ref{thm:hash-suite-separation}).
+
+The Warp 2.0 envelope's $\mathsf{HashSuiteID}$ field commits the verifier to the source chain's suite at signing time. If the destination's resolver returns a $\mathsf{HashSuiteID}$ that does not match the envelope's, the verifier returns \texttt{ErrSuiteMismatch} (\cite{warpgo} \texttt{warp/pulsar/pulsar.go} L78--80). This catches the case where the source chain has Reanchored to a new suite but the destination has not yet seen the Reanchor: rather than verifying under a wrong suite, the destination correctly refuses.
+
+\subsection{Backward compatibility}
+
+A Warp 1.x receiver is presented with raw v2 wire bytes. The first byte \texttt{0x02} is not a valid RLP-list prefix (RLP lists begin \texttt{0xc0}--\texttt{0xff}); the v1 decoder rejects. This is a hard refusal, not a downgrade.
+
+A sender that needs to reach v1-only verifiers MUST emit Warp 1.x wire bytes (call \texttt{Message.Bytes()}) on the v1 channel. The same $\mathsf{UnsignedMessage}$ may be embedded in a v2 envelope on the v2 channel without re-signing the Beam; the BLS aggregate over $\mathsf{UnsignedMessage}.\mathsf{Hash()}$ is bit-equal in both channels.
+
+\subsection{Forward compatibility}
+
+A Warp 2.0 receiver decoding Warp 1.x bytes uses \texttt{ParseEnvelope}, which detects the leading byte. If the first byte is not \texttt{0x02}, the dispatcher falls back to \texttt{ParseMessage} and lifts the result into a v2 envelope with PQ lanes empty:
+
+\begin{verbatim}
+EnvelopeV2 {
+    Message:          v1 Message,        // populated
+    SourceNebulaRoot: [32]byte{0...},    // zero
+    SourceKeyEraID:   0,                 // zero
+    SourceGeneration: 0,                 // zero
+    HashSuiteID:      "",                // empty
+    PulsarPulse:      nil,               // absent
+    MLDSACertSet:     nil,               // absent
+}
+\end{verbatim}
+
+The v2 verifier sees the empty PQ lanes and falls back to the Beam-only verification path. This is the correct semantics: a v1 envelope is observable on the v2 channel as a $\mathsf{Beam\text{-}final}$-only confirmation, and the destination's downstream consumers can choose whether to act on Beam-only or to require Pulse-backed.
+
+\subsection{No v3 reserved}
+
+There is no v3 reserved byte. The version space is small by design (1 = legacy, 2 = current). Future extensions (Warp Private, Warp Private PQ) re-use the v2 envelope shape with additional optional fields, gated by the chain's governance --- not by a new wire version. This rejects the ``every protocol bump is a wire bump'' anti-pattern; the wire is stable, the policy on top of it evolves.
+
+\subsection{Forward-only migration discipline}
+
+There is no v1 $\leftrightarrow$ v2 negotiation. There is no protocol downgrade. There is no shared-protocol fallback that lets a v2 sender be ``polite'' to a v1-only receiver: senders that need to reach v1-only receivers emit v1 bytes on the v1 channel. The two channels coexist; the wire bytes do not negotiate.
+
+This is the LP-105 \cite{lp105} deprecation timeline made wire-explicit: ``no backwards compatibility only forwards perfection.'' The version space is for honest version identification, not for protocol-level fallback.

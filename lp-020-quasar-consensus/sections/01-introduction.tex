@@ -1,0 +1,137 @@
+\section{Introduction}
+
+\label{sec:introduction}
+%% ============================================================================
+
+Shor's algorithm~\cite{shor1994} breaks the elliptic-curve discrete logarithm
+problem in polynomial time on a cryptographically relevant quantum computer
+(CRQC). Every BLS, ECDSA, and Schnorr-based blockchain is therefore vulnerable
+to a harvest-now-decrypt-later attack: an adversary records signed blocks
+today and forges certificates once a CRQC becomes available. NIST estimates
+this threshold at 2030--2035~\cite{mosca2018}.
+
+The standard response---swap a classical signature for a post-quantum
+one---is insufficient for two reasons. First, no single post-quantum scheme
+has survived the cryptanalytic decade that broke each successive ``next big
+thing'' in classical cryptography; relying on a single post-quantum
+assumption swaps one single point of failure for another. Second, the natural
+post-quantum signatures are large: ML-DSA-65 (FIPS~204) signatures are
+$3{,}309$ bytes versus 48 bytes for an aggregated BLS signature, so a
+straightforward per-validator ML-DSA scheme increases header size by two
+orders of magnitude and degrades network throughput.
+
+Quasar 3.0, activated on the Lux primary network on 25 December 2025,
+resolves both problems in a single artifact. Each finalized block carries a
+\emph{QuasarCert} composed of three independent verification lanes:
+
+\begin{enumerate}[leftmargin=2em,label=\textbf{Lane \arabic*:}]
+\item \textbf{BLS} --- a 48-byte BLS12-381 aggregate signature on
+      $\mathbb{G}_1$, providing the classical fast path and rapid
+      catch-up verification.
+\item \textbf{Corona} --- a single Ring-LWE 2-round threshold signature
+      whose key material is rooted on Q-Chain via an epoch-bound DKG
+      ceremony~\cite{corona}.
+\item \textbf{MLDSAGroth16} --- a Z-Chain Groth16 rollup proof that attests
+      to $N$ validator ML-DSA-65 signatures, encoded as a 192-byte SNARK
+      plus a 32-byte public-inputs hash. \emph{This is not a raw
+      per-validator ML-DSA list.} The Z-Chain replaces the $N \times 3{,}309$
+      byte attestation with one pairing check.
+\end{enumerate}
+
+The three lanes rest on three algebraically independent hardness assumptions:
+discrete logarithm on BLS12-381 (broken by Shor), Module-LWE for both
+Corona and ML-DSA (with disjoint parameters), and Module-SIS underlying
+ML-DSA's commitment relation. No known reduction connects the hardness of
+one lane to another. An adversary must simultaneously break all three to
+forge a QuasarCert; any compromise that leaves at least one lane intact
+preserves safety. The third lane in particular forecloses the alternative of
+\emph{threshold} ML-DSA: as detailed in Appendix~A of the companion
+soundness proof~\cite{qcert-proof} and in Section~\ref{sec:why-not-threshold},
+threshold ML-DSA is non-standardized, requires unsafe relaxation of FIPS~204
+rejection sampling, and cannot be deployed in production. The Z-Chain
+Groth16 rollup gives the same on-chain footprint as a threshold scheme
+without altering the underlying primitive.
+
+\subsection{The P/Q/Z/A/B/M/F Chain Pipeline}
+
+QuasarCert generation is distributed across seven specialized chains, each
+contributing a chain-specific Merkle root that is bound into the
+certificate subject (Section~\ref{sec:chain-sep},
+Section~\ref{sec:replay}):
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{P-Chain} --- validator and stake authority; emits
+      $\mathsf{pchain\_validator\_root}$.
+\item \textbf{Q-Chain} --- Corona consensus DKG; emits
+      $\mathsf{qchain\_ceremony\_root}$.
+\item \textbf{Z-Chain} --- Groth16 verifying-key registry and rollup; emits
+      $\mathsf{zchain\_vk\_root}$.
+\item \textbf{A-Chain} --- unified attestation chain; emits
+      $\mathsf{achain\_attestation\_root}$.
+\item \textbf{B-Chain} --- bridge messaging chain; emits
+      $\mathsf{bchain\_bridge\_root}$.
+\item \textbf{M-Chain} --- MPC ceremonies (CGGMP21, FROST,
+      Corona-general); emits the $\mathsf{mchain\_mpc\_root}$.
+\item \textbf{F-Chain} --- FHE compute (TFHE, encrypted EVM); emits the
+      $\mathsf{fchain\_fhe\_root}$.
+\end{itemize}
+
+M-Chain and F-Chain share an internal substrate library
+(\texttt{lux/chains/thresholdvm}) but are operationally orthogonal. There
+is \emph{no} monolithic ``T-Chain''; MPC and FHE are independent chains
+with distinct validator sets, ceremonies, and failure domains.
+
+\subsection{Replay Protection}
+
+Every QuasarCert is bound to a \emph{certificate subject}:
+\[
+\mathsf{cert\_subject} \;=\; \mathsf{keccak}\!\bigl(
+\mathsf{chain\_id} \mathbin\| \mathsf{epoch} \mathbin\| \mathsf{round}
+\mathbin\| \mathsf{mode} \mathbin\|
+P_\text{val} \mathbin\| Q_\text{cer} \mathbin\| Z_\text{vk} \mathbin\|
+A_\text{att} \mathbin\| B_\text{br} \mathbin\| M_\text{mpc} \mathbin\|
+F_\text{fhe} \mathbin\| h_{\text{parent}} \mathbin\| \mathsf{state\_root}
+\mathbin\| \mathsf{exec\_root} \mathbin\| \mathsf{gas\_limit} \mathbin\|
+\mathsf{base\_fee} \bigr).
+\]
+All three lanes sign this exact 32-byte digest. Any change to validator
+set, epoch, round, mode, parent state, or execution context alters the
+subject, so a certificate cannot be replayed across chains, epochs,
+rounds, or forks. We prove this is structurally complete in
+Section~\ref{sec:replay}.
+
+\subsection{GPU-Native Verification}
+
+The three lanes are verified independently. BLS aggregate verification
+($n{=}100$) executes in ${\sim}875\,\mu$s of CPU; Corona batch verify is
+$O(1)$ amortized after DKG; the Groth16 pairing check runs in
+200--500\,$\mu$s when batched on a GPU. On the 21-validator mainnet board,
+the full three-lane verifier completes in 0.5--1.5\,ms, well inside the
+500\,ms target block time. The QuasarGPU adapter (LP-132)
+schedules these lanes onto the same kernel stream that drives EVM
+execution, so consensus verification consumes no incremental
+host-CPU budget.
+
+\subsection{Contributions}
+
+\begin{enumerate}[leftmargin=2em]
+\item A three-lane finality certificate (QuasarCert) whose unforgeability
+      reduces simultaneously to discrete logarithm on BLS12-381,
+      Module-LWE for Corona, and MLWE/MSIS for ML-DSA, with the
+      Z-Chain Groth16 lane bringing the third lane on-chain in
+      $192{+}32$ bytes regardless of $N$.
+\item A formal certificate-subject construction binding seven chain
+      roots, mode, and execution context, ruling out cross-chain and
+      cross-epoch replay structurally
+      (Theorem~\ref{thm:replay-impossible}).
+\item Theorems for safety, liveness, single-compromise insufficiency,
+      QuasarCert soundness, parallel liveness, and post-quantum safety,
+      with machine-checked proofs in Lean~4 and Tamarin and a companion
+      proof sketch~\cite{qcert-proof}.
+\item Production benchmarks for the 25 December 2025 release: 0.5--1.5\,ms
+      per-cert verify on GPU at $n{=}21$, 500\,ms block time, and
+      a sustained throughput target of $\geq$100K TPS per chain.
+\end{enumerate}
+
+
+%% ============================================================================
