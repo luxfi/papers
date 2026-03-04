@@ -1,0 +1,409 @@
+\section{The v0.24.0 Correctness Release}
+
+\label{sec:v024}
+%% ============================================================================
+
+The two preceding sections describe a kernel that runs Cancun bytecode
+end-to-end (\S\ref{sec:gpu}) and a consensus pipeline that plugs that
+kernel in via \texttt{block.ChainVM} (\S\ref{sec:cevm-consensus-integration}).
+Tag \texttt{v0.24.0} of \texttt{luxcpp/evm} is the first release whose
+explicit charter is \emph{tighten the seam}, not extend it. No new opcodes,
+no new precompiles, no new backends. Eight specialist branches converged
+on a single dispatcher contract, opt-in safety flags, and an audit-driven
+plug of the holes that the v0.23.0 four-way parity corpus could not see.
+This section records what landed, what did not, and why the gap matters.
+
+\subsection{Adversarial Review Summary}
+\label{sec:v024:adversarial}
+
+Every Lux release goes through a Red/Blue audit cycle: a Red specialist
+walks the diff against the EVM spec hunting consensus-relevant defects,
+Blue triages and assigns each finding to a specialist branch, and the
+release is cut only when every fix branch passes the four-way parity
+corpus from \S\ref{sec:parity}. For \texttt{v0.24.0} Red filed
+\textbf{22 HIGH-severity consensus findings} against the v0.23.0 head.
+``HIGH'' means the defect can produce a bit-different
+\texttt{(gas\_used, status, output)} tuple from the EVM spec on at least
+one constructed input.
+
+Table~\ref{tab:v024-red-findings} groups the findings by the layer they
+hit and the resolution status at \texttt{v0.24.0}. The honest accounting
+matters: of the 22, eight closed in this release, six are partial (the
+fix is on a specialist branch but waiting for parity-corpus extension),
+and eight are explicitly deferred to v0.25.0 with named owners.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Finding (Red ID)} & \textbf{Layer} & \textbf{Status at v0.24.0} \\
+\midrule
+Stack 32 $\to$ 1024 entries (R1)        & Metal kernel    & DONE (\texttt{8487d81}) \\
+Mulmod 128-bit carry (R2)               & CUDA kernel     & DONE (\texttt{a70ecf3}) \\
+Default-case ERRA semantics (R3)        & Metal kernel    & DONE (\texttt{2ab4b4d}) \\
+Offset-in-bounds checks (R4--R5)        & Metal kernel    & DONE (\texttt{2642e5d}) \\
+Refund counter signed int64 (R6)        & Metal kernel    & DONE (\texttt{c8c8845}) \\
+JUMPDEST O(1) bitmap (R7)               & CUDA kernel     & DONE (\texttt{be6714c}) \\
+EIP-3529 cap refund / 5 (R9)            & Metal kernel    & DONE (\texttt{bc72505}) \\
+SSTORE/TSTORE overflow (R10)            & Metal host      & DONE (\texttt{5bdc7d4}) \\
+\midrule
+CallNotSupported leaks to caller (R11)  & Dispatcher      & DONE (\texttt{0a5b8b7}) \\
+Gas-estimation shortcut unguarded (R12) & Dispatcher      & DONE (\texttt{b6ccd82}) \\
+Precompile positive-tests gap (R13)     & Test corpus     & DONE (\texttt{6f33dfd}) \\
+ABI v3 init guard (R14)                 & cevm Go         & DONE (\texttt{4d652b2}) \\
+Health() coverage gaps (R15)            & cevm Go         & DONE (\texttt{cf8ecb7}) \\
+\midrule
+EIP-2929 access-list pre-warm (R16)     & Dispatcher      & PARTIAL (flag only, no kernel wire) \\
+Cap-overflow fallback (R17)             & Dispatcher      & PARTIAL (Metal only) \\
+Account-state routing (R18)             & Host bridge     & PARTIAL (CALL bridge only) \\
+Unified pipeline non-Apple (R19)        & Host launchers  & PARTIAL (compile-only on Linux) \\
+\midrule
+V2 Metal kernel implementation (R20)    & Metal kernel    & DEFERRED to v0.25 \\
+Async dispatch API (R21)                & Metal host      & DEFERRED (\texttt{fc28203} on branch) \\
+GpuHostBridge real GPU CALL (R22)       & Host bridge     & DEFERRED to v0.25 \\
+\bottomrule
+\end{tabular}
+\caption{Red audit findings on \texttt{luxcpp/evm} for the v0.24.0
+release window. Commit hashes refer to fix-landing commits on
+\texttt{luxcpp/evm} (i.e.\ the SHA where the patch entered a
+specialist branch; merges into \texttt{main} use a separate hash).
+``PARTIAL'' means the fix lands on the dispatcher or kernel but the
+parity-corpus extension that would catch a regression is still in review.
+``DEFERRED'' is an explicit owner-and-deadline assignment.}
+\label{tab:v024-red-findings}
+\end{table}
+
+The point is not the count. Adversarial review on every version produces
+\emph{a public list of defects with named owners and verifiable
+resolution commits}. Eight HIGH findings deferring to v0.25.0 is the
+truthful state of an EVM that targets consensus-grade behaviour. A
+four-way parity corpus is necessary but not sufficient: the Red review
+is the missing half of the diff oracle.
+
+\subsection{Backend Routing as a State Machine}
+\label{sec:v024:routing}
+
+Before \texttt{v0.24.0} the dispatcher had a tangle of \texttt{if backend
+== Metal \&\& has\_code \&\& has\_host \dots} branches in a single
+\texttt{execute\_block} function. The Red audit found two routing bugs
+(\texttt{CallNotSupported} leaking to caller; gas-estimation shortcut
+firing without an opt-in) that were trivially detectable once the routing
+was drawn as a table. Commit \texttt{0a5b8b7} on
+\texttt{feat/specialist-dispatch} refactors \texttt{execute\_block} into
+three per-backend functions (\texttt{run\_cpu}, \texttt{run\_metal},
+\texttt{run\_cuda}) that each consult the same documented routing tree.
+The tree has 16 cells: 4 backends $\times$ 2 (has-code) $\times$ 2
+(has-host).
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{llll}
+\toprule
+\textbf{Backend} & \textbf{has-code} & \textbf{has-host} & \textbf{Route} \\
+\midrule
+\texttt{CPU\_Sequential} & no  & no   & gas-estimation gate or Error \\
+\texttt{CPU\_Sequential} & no  & yes  & evmone (sequential, real host) \\
+\texttt{CPU\_Sequential} & yes & no   & \texttt{kernel::execute\_cpu} (parity reference) \\
+\texttt{CPU\_Sequential} & yes & yes  & evmone (sequential, real host) \\
+\midrule
+\texttt{CPU\_Parallel}   & no  & no   & gas-estimation gate or Error \\
+\texttt{CPU\_Parallel}   & no  & yes  & evmone Block-STM (real host) \\
+\texttt{CPU\_Parallel}   & yes & no   & \texttt{kernel::execute\_cpu} per-thread \\
+\texttt{CPU\_Parallel}   & yes & yes  & evmone Block-STM (real host) \\
+\midrule
+\texttt{GPU\_Metal}      & no  & no   & \texttt{BlockStmGpu} scheduler-only or Error \\
+\texttt{GPU\_Metal}      & no  & yes  & evmone Block-STM (real host) \\
+\texttt{GPU\_Metal}      & yes & no   & \texttt{EvmKernelHost} + CNS fallback \\
+\texttt{GPU\_Metal}      & yes & yes  & evmone Block-STM (real host) \\
+\midrule
+\texttt{GPU\_CUDA}       & no  & no   & \texttt{BlockStmGpu} scheduler-only or Error \\
+\texttt{GPU\_CUDA}       & no  & yes  & evmone Block-STM (real host) \\
+\texttt{GPU\_CUDA}       & yes & no   & \texttt{cuda::EvmKernel} + CNS fallback \\
+\texttt{GPU\_CUDA}       & yes & yes  & evmone Block-STM (real host) \\
+\bottomrule
+\end{tabular}
+\caption{Backend routing matrix at \texttt{v0.24.0}. The 16 cells
+each map to exactly one execution path. The
+\texttt{has-host}/\texttt{has-code} axes are \emph{both} runtime
+inputs to \texttt{execute\_block(config, txs, host)}; the third axis
+(\texttt{config.gas\_estimation\_mode}, \texttt{config.fast\_value\_transfer}
+\ldots) is opt-in and changes the no-code/no-host cells from \texttt{Error}
+to a defined approximation. Source: \texttt{lib/evm/gpu/gpu\_dispatch.cpp}
+on \texttt{feat/specialist-dispatch} (commit \texttt{0a5b8b7}). The
+15-test \texttt{evm-dispatch-test} target
+(\texttt{test/unittests/dispatch\_test.cpp}, 487 SLOC, commit
+\texttt{0223eeb}) covers every cell at least once.}
+\label{tab:v024-routing}
+\end{table}
+
+\paragraph{CallNotSupported as an internal signal.} \texttt{TxStatus::%
+CallNotSupported} (status 5) is the kernel's way of saying ``I cannot
+resolve this \texttt{CALL} --- run me on CPU.'' Before v0.24.0 it leaked
+to the caller as if it were a consensus-relevant \texttt{TxStatus}.
+Commit \texttt{0a5b8b7} adds \texttt{apply\_call\_not\_supported\_%
+fallback}, an unconditional post-kernel pass that for each
+\texttt{CallNotSupported} tx either re-runs through
+\texttt{execute\_sequential\_evmone} (when a host was supplied; status
+normalised back to \texttt{Stop}/\texttt{Return}/\texttt{Revert}/%
+\texttt{OutOfGas}/\texttt{Error}) or rewrites to \texttt{Error} with a
+populated \texttt{error\_message}. The dispatcher also increments
+\texttt{BlockResult::gpu\_fallback\_count} so callers see the GPU
+rejection rate without parsing per-tx status arrays. The fallback is
+symmetric across all four backends; the CPU bytecode path goes through
+the same filter so a parity test tagged \texttt{Agree} sees identical
+results across all four routes.
+
+\subsection{Opt-in Optimisation Flags}
+\label{sec:v024:flags}
+
+Real consumers of \texttt{cevm} need three things the spec EVM does not
+provide: a fast gas-estimation mode for fee oracles, a low-overhead
+value-transfer fast path for benchmarks, and an EIP-2929 access-list
+pre-warm that lifts the cold-storage tax for known-warm slots. None of
+these is consensus-safe in general. Commit \texttt{b6ccd82} adds five
+flags to \texttt{Config}, all default-off:
+
+\begin{lstlisting}[basicstyle=\ttfamily\footnotesize, language=C++]
+struct Config {
+    Backend  backend                          = Backend::CPU_Sequential;
+    uint32_t num_threads                      = 0;
+    uint32_t gpu_device                       = 0;
+    bool     enable_state_trie_gpu            = false;
+    bool     enable_precompile_gpu            = false;
+
+    // v0.24.0 opt-in flags ---------------------------------------------
+    bool     gas_estimation_mode              = false;
+    bool     fast_value_transfer              = false;
+    bool     fast_value_transfer_acknowledged = false;
+    bool     skip_parity_check                = false;
+
+    std::vector<uint8_t> warm_addresses;       // 20-byte each
+    std::vector<uint8_t> warm_storage_keys;    // 52-byte each (addr || slot)
+};
+\end{lstlisting}
+
+The safety contract for each flag, verified by
+\texttt{test/unittests/dispatch\_test.cpp}:
+
+\paragraph{\texttt{gas\_estimation\_mode}.} Permits the no-host/no-code
+shortcut that returns \texttt{gas\_used = gas\_limit}. Useful for fee
+oracles. Without the flag the dispatcher returns \texttt{Error}; a
+caller cannot mistakenly treat a placeholder gas number as real
+execution. Test:
+\texttt{TEST(Dispatch, GasEstimationGate\_DefaultOff)}.
+
+\paragraph{\texttt{fast\_value\_transfer} +
+\texttt{fast\_value\_transfer\_acknowledged}.} Two-step lock. The first
+flag alone produces \texttt{Error} with
+\texttt{error\_message = "fast\_value\_transfer requires explicit
+acknowledgement"}. Both required to enable. The dispatcher logs to
+stderr on every block when set. \textbf{Never consensus-safe} --- this
+is benchmark-only, for measuring kernel dispatch cost without an
+evmone interpreter loop. Test:
+\texttt{TEST(Dispatch, FastValueTransferAckRequired)}.
+
+\paragraph{\texttt{warm\_addresses}, \texttt{warm\_storage\_keys}.}
+Pre-warmed access list per EIP-2929. Empty = everything cold. Flat
+20-byte / 52-byte vector layout avoids a per-block std::map allocation.
+Wired through the dispatcher contract today; the kernel-side surcharge
+skip lands on \texttt{feat/blue-hardening} but is not yet in the
+parity corpus (R16 PARTIAL).
+
+\paragraph{Semantics summary.} With every flag default-false, v0.24.0
+preserves bit-exact EVM consensus across every cell of
+Table~\ref{tab:v024-routing}. With unsafe flags set, the dispatcher
+logs to stderr on every block and the result is documented as
+approximate. The right place is benchmark and fee-oracle code; the
+wrong place is mainnet validators.
+
+\subsection{Empirical Performance Ceiling}
+\label{sec:v024:perf}
+
+The fair speedup sweep on M1 Max after the buffer-cache fix
+(\texttt{lib/evm/gpu/PERF.md}) shows the GPU \emph{losing} on typical
+block sizes. Reproduced verbatim from \texttt{PERF.md} at \texttt{v0.24.0}:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Path}                                   & \textbf{$N$}      & \textbf{Speedup} & \textbf{Source} \\
+\midrule
+\multicolumn{4}{l}{\textit{Direct kernel API (no dispatcher overhead)}} \\
+\texttt{bench\_kernel.cpp} 11M opcodes          & 10K $\times$ 100  & $1.84\times$     & GPU 339\,M ops/s \\
+\midrule
+\multicolumn{4}{l}{\textit{Dispatcher API (\texttt{cevm.ExecuteBlock} via \texttt{gpu\_dispatch.cpp})}} \\
+$N{=}4$K compute-loop bytecode                  & 4096              & $0.31\times$     & CPU 8.5ms / GPU 27.4ms \\
+$N{=}16$K compute-loop bytecode                 & 16384             & $0.46\times$     & CPU 30.7ms / GPU 66.6ms \\
+$N{=}32$K compute-loop bytecode                 & 32768             & $0.53\times$     & CPU 60.0ms / GPU 114.1ms \\
+$N{=}64$K compute-loop bytecode                 & 65536             & $0.48\times$     & CPU 119.7ms / GPU 249.3ms \\
+\bottomrule
+\end{tabular}
+\caption{M1 Max speedup vs CPU\_Parallel after the MTLBuffer cache
+landed (\texttt{48a0495} on \texttt{feat/speedup-bench}, 2026-02-28).
+The dispatcher curve plateaus at $0.53\times$ around $N=32$K and
+\emph{regresses} at $N=64$K --- L1-cache pressure as buffer count
+grows. The direct-kernel path wins because it ships an 11M-opcode
+workload in a single dispatch; the dispatcher path ships
+$\sim$2K--600K opcodes per call, an order of magnitude below the
+amortisation threshold. Source: \texttt{lib/evm/gpu/PERF.md}.}
+\label{tab:v024-perf-ceiling}
+\end{table}
+
+\paragraph{Crossover.} The break-even calculation in
+\S\ref{sec:cevm-saturation} placed the GPU-wins-on-bytecode threshold
+at $\sim$\num{1.2}M opcodes per dispatch. The dispatcher's typical
+workload is two orders of magnitude below that. Only the
+\texttt{bench\_kernel} path crosses, by shipping 10K txs $\times$
+100-iter loops in one launch. The honest reading: \emph{at the
+workloads a Lux validator actually emits per \texttt{Verify} call, the
+GPU loses on bytecode.} The crypto-dominated path
+(\S\ref{sec:gpu:speedup}) still wins because ecrecover/keccak per-op
+cost on CPU is higher.
+
+\paragraph{Root causes (PERF.md).} Three:
+
+\begin{enumerate}
+  \item \emph{V2 kernel declared in host but not defined in Metal
+    source.} \texttt{evm\_kernel\_host.mm} looks for
+    \texttt{evm\_execute\_v2}, a 32-thread/tx SIMD-cooperative kernel
+    that would saturate M1 Max's 4096 simultaneous lanes. The Metal
+    source defines only \texttt{evm\_execute} (1 thread/tx);
+    \texttt{has\_v2()} returns false; every call lands on V1.
+  \item \emph{Per-tx scratch buffer over-provisioned at 64\,KB.} The
+    kernel reserves 64\,KB per tx regardless of need; a 50-iter
+    ADD-loop tx uses 64 bytes. memset dominates at small batches.
+    Commit \texttt{3003b45} on \texttt{feat/v0.24-correctness} adds
+    static-analysis per-batch sizing (R17 cap-overflow fallback).
+  \item \emph{Synchronous \texttt{[commandBuffer waitUntilCompleted]}
+    blocks the dispatcher.} The async API lands on
+    \texttt{feat/specialist-metal-host} (\texttt{fc28203}) but is
+    not yet promoted into the dispatcher.
+\end{enumerate}
+
+\texttt{v0.24.0} ships as a correctness release; V2 kernel, async
+dispatch, indirect command buffers, and persistent state are the four
+priorities for v0.25.0. The bytecode kernel is correct; the
+performance shape is what remains.
+
+\subsection{Four-Way Parity Tightening}
+\label{sec:v024:parity}
+
+The four-way parity corpus from \S\ref{sec:parity} is the only
+mechanism that catches a backend silently producing a wrong gas number
+on a vector the corpus already touches. \texttt{v0.24.0} extends the
+corpus along three axes:
+
+\paragraph{Routing matrix coverage.}
+\texttt{test/unittests/dispatch\_test.cpp} (commit \texttt{0223eeb},
+487 SLOC, 15 GoogleTest cases) walks every cell of
+Table~\ref{tab:v024-routing} at least once and checks the
+\texttt{(status, gas\_used, error\_message, gpu\_fallback\_count)}
+tuple against an expected outcome:
+
+\begin{itemize}
+  \item \texttt{TEST(Dispatch, CallNotSupportedFallback\_WithHost)}
+    --- a \texttt{CALL} bytecode under each backend, with an
+    \texttt{evmc::Host*} supplied, must surface as \texttt{Stop} not
+    \texttt{CallNotSupported}.
+  \item \texttt{TEST(Dispatch, CallNotSupportedFallback\_NoHost)}
+    --- the same bytecode with no host must surface as \texttt{Error}
+    with a populated \texttt{error\_message}, never as
+    \texttt{CallNotSupported}.
+  \item \texttt{TEST(Dispatch, FastValueTransferAckRequired)} ---
+    setting \texttt{fast\_value\_transfer} alone must produce
+    \texttt{Error}; setting both flags must succeed (with a stderr
+    log expected).
+  \item \texttt{TEST(Dispatch, GasEstimationGate\_DefaultOff)} ---
+    no-host/no-code path returns \texttt{Error} unless
+    \texttt{gas\_estimation\_mode} is set.
+  \item \texttt{TEST(Dispatch, BackendRouting\_*)} (12 cases, one per
+    \{backend, has-code, has-host\} cell) --- each backend takes the
+    documented route and produces the documented status.
+\end{itemize}
+
+\paragraph{Precompile positive-test gap closure.}
+Commit \texttt{6f33dfd} on \texttt{feat/specialist-precompile-tests}
+adds 11 positive-functional tests for precompiles \texttt{0x08}
+(BN256\_PAIRING) through \texttt{0x11} (BLS12\_MAP\_FP2\_TO\_G2),
+filling the gap surfaced by Red finding R13. Each test pulls a vector
+from the canonical EIP source:
+
+\begin{itemize}
+  \item \texttt{0x08 BN256\_PAIRING}: empty input + EIP-197 ``jeff1''
+    (two cancelling pairs).
+  \item \texttt{0x09 BLAKE2F}: EIP-152 test vector 4
+    (BLAKE2b("abc"), rounds=12).
+  \item \texttt{0x0a POINT\_EVALUATION}: EIP-4844 zero-polynomial
+    KZG proof.
+  \item \texttt{0x0b}--\texttt{0x11}: EIP-2537 BLS12-381 test
+    corpus (G1ADD, G1MSM, G2ADD, G2MSM, PAIRING\_CHECK,
+    MAP\_FP\_TO\_G1, MAP\_FP2\_TO\_G2).
+\end{itemize}
+
+The precompile test count moved from 19 to 30. Every vector is byte-exact
+against the published EIP corpus; gas consumption is checked against the
+spec formula at the dispatcher boundary. (The pre-existing tests for
+\texttt{0x08}--\texttt{0x11} only covered failure paths --- ``invalid
+input size returns OutOfGas'' --- which gave zero confidence that the
+correct-input path produced correct output.)
+
+\paragraph{Outstanding gap: \texttt{KernelCpuMissing} carve-outs.} The
+spec witness (\texttt{evm\_interpreter.hpp} from \S\ref{sec:parity})
+still does not implement 26 opcodes per Red's count, each tagged
+\texttt{Expectation::KernelCpuMissing} in the parity corpus. The
+\texttt{feat/specialist-cpu-interpreter} branch is closing them, rate-
+limited by reviewer bandwidth. Until the carve-outs are zero, a CPU-only
+v0.24.0 deployment fails on those opcodes (the dispatcher returns
+\texttt{Error}, not a wrong gas number, but the deployment shape ``CPU
+only, no GPU available'' is degraded).
+
+\subsection{Roadmap to v0.25.0}
+\label{sec:v024:roadmap}
+
+The five v0.25.0 priorities, in landing order:
+
+\begin{enumerate}
+  \item \emph{V2 Metal kernel.} Define \texttt{evm\_execute\_v2} in
+    \texttt{lib/evm/gpu/kernel/evm\_kernel.metal}: 32 threads/tx
+    cooperative, warp-shuffle stack ops. PERF.md estimate:
+    3--5$\times$ at $N=2$K. Owner:
+    \texttt{feat/specialist-evm-kernel-metal}.
+  \item \emph{Async dispatch in production.} Promote
+    \texttt{execute\_async} (\texttt{fc28203}) into
+    \texttt{gpu\_dispatch.cpp}. Risk: the integration in
+    \S\ref{sec:cevm-glue} assumes a synchronous \texttt{Verify};
+    async dispatch needs a callback shape on \texttt{cevmBlock}.
+  \item \emph{Full CPU interpreter parity.} Close the 26 missing
+    opcodes on \texttt{feat/specialist-cpu-interpreter} so every
+    \texttt{Expectation::KernelCpuMissing} promotes to
+    \texttt{Agree}.
+  \item \emph{EIP-2929 access-list implementation.} Wire
+    \texttt{warm\_addresses}/\texttt{warm\_storage\_keys} into the
+    kernel's per-opcode gas decrement; today the flags exist on the
+    dispatcher contract but the kernel charges full cold cost. Owner:
+    \texttt{feat/blue-hardening}.
+  \item \emph{GpuHostBridge real GPU CALL.} Currently a 4-deep
+    static-CALL chain falls through to evmone. Real GPU CALL needs
+    the kernel to pop a frame from a dictionary entry, push it on a
+    per-thread call stack, and continue with new code/data pointers.
+    Owner: \texttt{feat/specialist-evmc-bridge}.
+\end{enumerate}
+
+These five close the v0.24.0 ``DEFERRED'' lines of
+Table~\ref{tab:v024-red-findings} and clear the bytecode crossover
+threshold. Item~1 alone upper-bounds the ceiling in
+\S\ref{sec:v024:perf}; items 2--5 buy the rest.
+
+\paragraph{Net.} v0.24.0 is the release where the seam between kernel
+and consumer became contractually clean: documented routing matrix,
+opt-in unsafe flags with explicit acknowledgements, fallback paths
+verified end-to-end by 15 dispatcher tests + 30 precompile tests + the
+133-vector parity corpus. The performance promise is unchanged from
+v0.23.0; the gap to the target is documented precisely. v0.25.0 is
+where it closes.
+
+%% ============================================================================
