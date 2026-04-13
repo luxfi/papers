@@ -1,0 +1,509 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{enumitem}
+\usepackage{xcolor}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{remark}{Remark}[section]
+
+\title{LP-308: QuantumSwap\\[4pt]
+\large A Post-Quantum AMM Protocol with Mixed\\
+Fungible/Non-Fungible Liquidity Pools}
+
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+
+\date{Original: March 2024\quad|\quad Revised: April 2026}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+QuantumSwap is an automated market maker protocol designed for the
+Lux Network with three distinguishing properties: post-quantum
+encryption of order flow via TFHE, mixed fungible/non-fungible token
+liquidity pools with configurable bonding curves, and a multi-chain
+teleport protocol using zero-knowledge bridges with Lamport and
+lattice-based signatures.
+
+This paper formalizes the bonding curve algorithms (linear,
+exponential, XYK), the interest rate mechanism for RWA-backed
+price-stable currencies, and the capital efficiency model. We provide
+the concrete interest rate schedule and analyze its stability
+properties.
+
+Section~\ref{sec:current} maps the QuantumSwap design to the current
+Lux exchange architecture: \texttt{luxfi/dex} (CLOB engine),
+\texttt{luxfi/standard/contracts/amm/} (AMM V1--V4 contracts), and
+the USDL stablecoin.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{Introduction}
+
+\subsection{Motivation}
+
+Automated market makers revolutionized decentralized exchange by
+replacing order books with deterministic pricing functions. However,
+existing AMMs suffer from three limitations:
+
+\begin{enumerate}[nosep]
+  \item \textbf{No privacy}: All orders are visible on-chain before
+        execution, enabling front-running and sandwich attacks.
+  \item \textbf{Fungible tokens only}: NFTs and real-world asset tokens
+        cannot participate in standard AMM pools.
+  \item \textbf{Single-chain}: Cross-chain liquidity requires third-party
+        bridges with variable security properties.
+\end{enumerate}
+
+QuantumSwap addresses all three: homomorphic encryption prevents order
+visibility, mixed FT/NFT pools extend liquidity to non-fungible assets,
+and a native teleport protocol provides cross-chain token movement with
+post-quantum security.
+
+\subsection{Historical Context}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Year} & \textbf{Protocol} & \textbf{Innovation} \\
+\midrule
+2013 & BitShares & Decentralized order books \\
+2016 & 0x Protocol & Gas-efficient meta-transactions \\
+2018 & Uniswap V1 & First AMM, LP tokens, ETH/ERC-20 pairs \\
+2020 & Uniswap V2 & ERC-20/ERC-20 pairs, flash swaps, oracle feeds \\
+2021 & Uniswap V3 & Concentrated liquidity, range orders~\cite{uniswapv3} \\
+2024 & QuantumSwap & Mixed FT/NFT pools, FHE-encrypted order flow \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%% ============================================================
+\section{Bonding Curve Algorithms}
+
+QuantumSwap pools are parameterized by a bonding curve that determines
+price dynamics. Each \texttt{LUXQSAPair} contract is associated with
+exactly one curve. The curves are pure functions: they do not modify
+pool state. State updates occur in the \texttt{LUXRWAPair} contract
+after the curve is consulted.
+
+\subsection{Notation}
+
+Let $\mathit{spot}$ denote the current spot price (instantaneous price
+to sell one item to the pool), $\delta$ the curve parameter, and $x$
+the trade size. The spot price to \emph{buy} one item from the pool is
+always $\mathit{spot} + \delta$ (additive) or $\mathit{spot} \cdot
+(1 + \delta)$ (multiplicative), depending on the curve.
+
+\subsection{Linear Bonding Curve}
+
+The linear curve adjusts price by a constant additive amount $\delta$
+per item traded:
+
+\begin{align}
+\mathit{spot}_{\text{after sell}} &= \mathit{spot} - \delta
+  \label{eq:linear-sell} \\
+\mathit{spot}_{\text{after buy}} &= \mathit{spot} + \delta
+  \label{eq:linear-buy}
+\end{align}
+
+For a multi-item sell of $x$ items, the total payout is:
+
+\begin{equation}\label{eq:linear-multi}
+\text{Payout}(x) = \sum_{i=0}^{x-1} (\mathit{spot} - i\delta)
+= x \cdot \mathit{spot} - \delta \cdot \frac{x(x-1)}{2}
+\end{equation}
+
+\begin{remark}
+The LP must set $\delta$ with the same decimal precision as the
+pair's underlying token. For an ETH-denominated pair with
+$\mathit{spot} = 1\,\text{ETH}$ and $\delta = 0.1\,\text{ETH}$,
+selling 5~NFTs yields
+$5 \cdot 1 - 0.1 \cdot 10 = 4\,\text{ETH}$, distributed as
+$\{1, 0.9, 0.8, 0.7, 0.6\}$.
+\end{remark}
+
+\subsection{Exponential Bonding Curve}
+
+The exponential curve adjusts price by a multiplicative factor:
+
+\begin{align}
+\mathit{spot}_{\text{after buy}} &= \mathit{spot} \cdot (1 + \delta)
+  \label{eq:exp-buy} \\
+\mathit{spot}_{\text{after sell}} &= \frac{\mathit{spot}}{1 + \delta}
+  \label{eq:exp-sell}
+\end{align}
+
+After $x$ consecutive buys from an initial spot price $p_0$:
+
+\begin{equation}\label{eq:exp-multi}
+\mathit{spot}(x) = p_0 \cdot (1+\delta)^x
+\end{equation}
+
+The total cost of buying $x$ items is:
+
+\begin{equation}
+\text{Cost}(x) = p_0 \cdot (1+\delta) \cdot
+\frac{(1+\delta)^x - 1}{\delta}
+\end{equation}
+
+\begin{remark}
+With $p_0 = 2\,\text{ETH}$ and $\delta = 0.5$ (50\%), the price
+sequence for 3~buys is $\{3, 4.5, 6.75\}$ ETH. Selling into the
+pool divides by $1.5$ at each step.
+\end{remark}
+
+\subsection{XYK Bonding Curve}
+
+The XYK curve maintains a constant-product invariant over virtual
+reserves, adapted for NFT pools. At pool creation:
+
+\begin{align}
+R_{\text{nft}} &= \text{(number of items to buy or sell)} + 1
+  \label{eq:xyk-nft} \\
+R_{\text{token}} &= R_{\text{nft}} \cdot \mathit{spot}
+  \label{eq:xyk-token}
+\end{align}
+
+The price to buy $x$ items from the pool (receiving NFTs, sending
+tokens) is:
+
+\begin{equation}\label{eq:xyk-buy}
+\text{Cost}(x) = \frac{x \cdot R_{\text{token}}}{R_{\text{nft}} - x}
+\end{equation}
+
+The price to sell $x$ items to the pool is:
+
+\begin{equation}\label{eq:xyk-sell}
+\text{Payout}(x) = \frac{x \cdot R_{\text{token}}}{R_{\text{nft}} + x}
+\end{equation}
+
+After each trade, the virtual reserves update:
+\begin{itemize}[nosep]
+  \item Pool sells NFTs:
+    $R_{\text{nft}} \leftarrow R_{\text{nft}} - x$, \;
+    $R_{\text{token}} \leftarrow R_{\text{token}} + \text{Cost}(x)$
+  \item Pool buys NFTs:
+    $R_{\text{nft}} \leftarrow R_{\text{nft}} + x$, \;
+    $R_{\text{token}} \leftarrow R_{\text{token}} - \text{Payout}(x)$
+\end{itemize}
+
+A concentration parameter allows LPs to tighten or loosen the curve
+around the current price, analogous to Uniswap V3's concentrated
+liquidity~\cite{uniswapv3} but applied to discrete (NFT) assets.
+
+%% ============================================================
+\section{Mixed FT/NFT Liquidity Pools}
+
+\subsection{Pool Types}
+
+QuantumSwap supports three pool configurations:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Type} & \textbf{Assets} & \textbf{Use Case} \\
+\midrule
+FT/FT & Two ERC-20 tokens & Standard AMM \\
+FT/NFT & ERC-20 + ERC-721 & RWA token trading \\
+NFT/NFT & Two ERC-721 collections & Cross-collection swaps \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{FT/NFT Mechanics}
+
+In an FT/NFT pool, the NFT side is treated as a discrete quantity
+while the FT side is continuous. The bonding curve operates on the
+NFT count, producing FT prices. This enables trade sequences like:
+
+\[
+\text{FT} \xrightarrow{\text{Pool A}} \text{NFT}_1
+\xrightarrow{\text{Pool B}} \text{NFT}_2
+\xrightarrow{\text{Pool C}} \text{FT}'
+\]
+
+Each hop uses the bonding curve of the respective pool. The router
+contract finds the optimal path across available pools.
+
+\subsection{Capital Efficiency}
+
+Concentrated liquidity in QuantumSwap achieves up to $4000\times$
+capital efficiency over Uniswap V2's uniform distribution, consistent
+with the analysis in Adams et al.~\cite{uniswapv3}. The improvement
+comes from restricting liquidity to a narrow price range rather than
+distributing it uniformly from zero to infinity.
+
+\begin{remark}
+The $4000\times$ figure is a theoretical maximum for a single tick
+range. Practical improvement depends on the LP's price range selection
+relative to realized volatility. Empirical data from Uniswap V3
+shows typical improvements of $4\times$ to $8\times$ for actively
+managed positions.
+\end{remark}
+
+%% ============================================================
+\section{RWA-Backed Price-Stable Currencies}
+
+\subsection{Design}
+
+A Real World Asset (RWA) token represents a claim on a physical
+asset (gold, silver, uranium, real estate). When users stake RWA tokens
+into a governance pool, they mint a price-stable currency pegged to
+the underlying asset's market value. The bonding curve automatically
+adjusts an interest rate to maintain the peg.
+
+\subsection{Interest Rate Algorithm}\label{sec:interest}
+
+Let:
+\begin{itemize}[nosep]
+  \item $b_{\text{LUX}}$ = value of one unit of the RWA token on
+        QuantumSwap (in USD)
+  \item $b_{\text{market}}$ = value of the same underlying asset on
+        major external exchanges (in USD)
+  \item $\text{premium} = (b_{\text{LUX}} - b_{\text{market}}) /
+        b_{\text{market}}$
+\end{itemize}
+
+The annualized interest rate $r$ is determined by:
+
+\begin{equation}\label{eq:interest-rate}
+r = \begin{cases}
+  0\%   & \text{if } \text{premium} = 0\% \\
+  2\%   & \text{if } 0\% < \text{premium} \leq 2\% \\
+  \text{premium} & \text{if } 2\% < \text{premium} \leq 15\% \\
+  15\%  & \text{if } \text{premium} > 15\%
+\end{cases}
+\end{equation}
+
+\subsection{Stability Analysis}
+
+The rate schedule in~\eqref{eq:interest-rate} has three regimes:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Dead zone} ($\text{premium} = 0$): No incentive to
+        issue or redeem. The peg is exact.
+  \item \textbf{Threshold} ($0 < \text{premium} \leq 2\%$): A fixed
+        2\% rate provides a clear signal to issuers. The step function
+        avoids oscillation around zero.
+  \item \textbf{Linear tracking} ($2\% < \text{premium} \leq 15\%$):
+        Rate tracks premium 1:1, providing proportional incentive.
+  \item \textbf{Cap} ($\text{premium} > 15\%$): Protects holders from
+        unbounded interest obligations.
+\end{enumerate}
+
+\begin{remark}
+The 2\% threshold was chosen empirically: users respond more
+reliably to a discrete step than to continuous micro-incentives. The
+15\% cap prevents death spirals where rising rates cause holder panic
+and further depegging.
+\end{remark}
+
+\subsection{Comparison to Prior Art}
+
+BitShares' pegged currencies (bitUSD, bitCNY) were collateralized
+solely by BTS, a volatile crypto-asset. This created reflexive
+collapse risk: BTS price drops $\rightarrow$ collateral falls
+$\rightarrow$ peg breaks $\rightarrow$ BTS price drops further.
+QuantumSwap's design requires 1:1 physical asset collateral (gold,
+uranium, etc.), breaking the reflexivity. The interest rate mechanism
+then handles \emph{demand}-side deviations from peg, while the
+physical collateral handles \emph{supply}-side solvency.
+
+%% ============================================================
+\section{Privacy: Homomorphic Encryption of Order Flow}
+
+\subsection{Threat Model}
+
+In a standard AMM, pending transactions are visible in the mempool.
+An adversary can:
+\begin{itemize}[nosep]
+  \item \textbf{Front-run}: Place a transaction before the victim's to
+        profit from the price impact.
+  \item \textbf{Sandwich}: Place transactions before and after the
+        victim's, extracting value from the spread.
+\end{itemize}
+
+\subsection{TFHE-Protected Pools}
+
+QuantumSwap encrypts order parameters (amount, direction, slippage
+tolerance) under TFHE before submission. The AMM contract evaluates
+the bonding curve on encrypted inputs:
+
+\begin{itemize}[nosep]
+  \item Comparison operations (is the price within slippage tolerance?)
+        execute as TFHE boolean circuits.
+  \item Reserve updates use TFHE integer arithmetic.
+  \item The result (trade executed or rejected) is encrypted; only
+        the trader can decrypt their outcome.
+\end{itemize}
+
+The performance cost is significant: a single TFHE-protected swap
+requires approximately 100 bootstrapping operations ($\sim$10 seconds
+at PN10QP27 parameters). This is acceptable for high-value RWA
+trades but not for high-frequency token swaps.
+
+%% ============================================================
+\section{Multi-Chain Teleport Protocol}
+
+\subsection{Architecture}
+
+The teleport protocol enables cross-chain token movement without
+relying on third-party bridges. It consists of:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Source chain lock}: Tokens are locked in a vault
+        contract on the source chain.
+  \item \textbf{ZK proof generation}: A zero-knowledge proof of the
+        lock event is generated, attesting to the token identity,
+        amount, and destination without revealing the sender.
+  \item \textbf{Relay}: A trustless relayer transmits the proof across
+        chains. The relayer cannot modify the proof or redirect the
+        tokens.
+  \item \textbf{Destination chain mint}: The proof is verified
+        on-chain using a ZK verifier (Groth16 or PLONK). On
+        verification, equivalent tokens are minted on the destination.
+\end{enumerate}
+
+\subsection{Post-Quantum Security}
+
+The ZK bridge uses Lamport signatures for proof authentication (quantum
+resistance from hash-only construction) and lattice-based encryption
+for the relay channel. The combination provides post-quantum security
+for the bridge even if the underlying chains use ECDSA.
+
+%% ============================================================
+\section{Gas-Free Meta-Transactions}
+
+QuantumSwap implements ERC-2771~\cite{erc2771} compliant
+meta-transactions. Users sign transactions off-chain; a trusted
+forwarder contract verifies the signature and forwards the call to the
+AMM, paying gas on the user's behalf. This eliminates the gas barrier
+for new users.
+
+Formally, a meta-transaction $M = (\mathit{to}, \mathit{value},
+\mathit{data}, \mathit{sig})$ is a standard transaction with the sender
+address derived from $\mathit{sig}$ rather than from \texttt{msg.sender}.
+The forwarder verifies $\mathit{sig}$ against a nonce to prevent replay.
+
+%% ============================================================
+\section{Current Status}\label{sec:current}
+
+\subsection{Architecture Evolution}
+
+The Lux exchange architecture has evolved from AMM-first
+(QuantumSwap, 2024) to a hybrid CLOB + AMM design:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Component} & \textbf{2024 (QuantumSwap)} & \textbf{2026 (Production)} \\
+\midrule
+Matching engine & AMM bonding curves & CLOB (\texttt{luxfi/dex}) \\
+AMM contracts & Proposed & Deployed (V1--V4) \\
+Order privacy & TFHE on all orders & TFHE on Z-Chain only \\
+Stablecoin & Gold/uranium-backed & USD-backed (USDL) \\
+Cross-chain & ZK teleport & Warp messaging + MPC bridge \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{What Shipped}
+
+\begin{itemize}[nosep]
+  \item \textbf{AMM contracts} in \texttt{luxfi/standard/contracts/amm/}
+        implement V1 (constant-product), V2 (multi-asset), V3
+        (concentrated liquidity), and V4 (hook-extensible) designs.
+        The bonding curve algorithms from Sections~2--3 are implemented
+        in the V1/V2 pair contracts.
+  \item \textbf{CLOB engine} (\texttt{luxfi/dex}) provides 434M ops/sec
+        GPU-accelerated matching, used as the primary exchange engine.
+        AMM pools serve as passive liquidity that the CLOB can route
+        through.
+  \item \textbf{USDL}: The stablecoin shipped as a straightforward
+        USD-backed ERC-20, not the RWA-collateralized multi-asset
+        design. Physical commodity backing (gold, uranium) was deferred
+        due to regulatory complexity around commodity-backed tokens.
+  \item \textbf{Mixed FT/NFT pools}: The \texttt{LUXRWAPair} contract
+        is deployed for RWA token trading, including SecurityToken
+        (ERC-20) swaps.
+\end{itemize}
+
+\subsection{What Changed}
+
+\begin{itemize}[nosep]
+  \item \textbf{CLOB over AMM}: For securities trading, a CLOB provides
+        price discovery, order types (limit, stop, market), and
+        regulatory compliance (best execution obligations) that AMMs
+        cannot. AMM pools remain available for DeFi use cases.
+  \item \textbf{Warp + MPC over ZK teleport}: The production bridge
+        uses Warp messaging with BLS aggregation and 2-of-3 MPC
+        threshold signing, which is simpler to audit and maintain than
+        a full ZK bridge circuit.
+  \item \textbf{USD-backed over commodity-backed}: USDL is 1:1
+        USD-backed via ACH deposits. The interest rate mechanism
+        from Section~\ref{sec:interest} was not needed for a
+        fiat-backed stablecoin.
+\end{itemize}
+
+%% ============================================================
+\section{Conclusion}
+
+QuantumSwap introduced three ideas that influenced the production Lux
+exchange: mixed FT/NFT liquidity pools with formal bonding curves,
+FHE-encrypted order flow for front-running prevention, and an interest
+rate mechanism for maintaining asset-backed pegs. The CLOB engine
+superseded AMM as the primary matching mechanism for securities, while
+AMM contracts remain deployed for DeFi liquidity provision. The
+interest rate algorithm remains available for future commodity-backed
+stablecoin deployments.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{99}
+
+\bibitem{uniswapv3}
+H.~Adams, N.~Zinsmeister, M.~Salem, R.~Keefer, and D.~Robinson,
+``Uniswap v3 Core,'' Uniswap Labs, 2021.
+
+\bibitem{erc2771}
+G.~S.~Vogelsteller et al., ``ERC-2771: Secure Protocol for Native
+Meta Transactions,'' Ethereum Improvement Proposals, 2020.
+
+\bibitem{sudoswap}
+0xmons, ``sudoswap: An on-chain NFT AMM,''
+\url{https://docs.sudoswap.xyz/}, 2022.
+
+\bibitem{gentry2009}
+C.~Gentry, ``A fully homomorphic encryption scheme,'' Ph.D.
+dissertation, Stanford University, 2009.
+
+\bibitem{lamport1979}
+L.~Lamport, ``Constructing digital signatures from a one-way
+function,'' Technical Report SRI-CSL-98, 1979.
+
+\bibitem{lp105}
+Z.~Kelling, ``LP-105: Quasar---Hybrid BLS + Lattice Consensus for
+Post-Quantum Finality,'' Lux Industries, 2026.
+
+\end{thebibliography}
+
+\end{document}
