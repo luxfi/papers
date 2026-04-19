@@ -1,0 +1,115 @@
+\section{EPERVIER: Public Key Recovery}
+
+
+\subsection{Motivation: Ethereum's Account Model}
+
+Ethereum uses address-based accounts where:
+\begin{equation}
+\text{address} = \text{rightmost 20 bytes of } \text{Keccak256}(\text{pubkey})
+\end{equation}
+
+ECDSA's ecrecover precompile recovers public keys from signatures, enabling:
+\begin{itemize}
+    \item Transaction validation without storing public keys
+    \item EIP-4337 Account Abstraction (AA) with signature aggregation
+    \item EIP-7702 delegation (EOA $\rightarrow$ smart contract logic)
+\end{itemize}
+
+Standard FALCON requires explicit public key storage ($2 \times 512 = 1024$ bytes), incompatible with Ethereum's 20-byte address model.
+
+\subsection{FALCON Recovery Mode (FalconRec)}
+
+FALCON specification (Section 3.12) \cite{falcon2020} describes a recovery mode:
+
+\textbf{Key Modification:}
+\begin{equation}
+\text{address} = H(h)
+\end{equation}
+where $H$ is collision-resistant hash (e.g., Keccak256).
+
+\textbf{Signature:} $\sigma = (r, s_1, s_2)$ (includes both signature components)
+
+\textbf{Recovery:}
+\begin{algorithmic}[1]
+\STATE Compute $c = \text{HashToPoint}(r \| m)$
+\STATE Recover $h = s_2^{-1} \cdot (c - s_1) \mod q$
+\STATE Verify $H(h) = \text{address}$
+\STATE Check $\|s_1\|^2 + \|s_2\|^2 \leq B$
+\end{algorithmic}
+
+\textbf{Cost Problem:} Computing $s_2^{-1}$ in coefficient domain requires:
+\begin{itemize}
+    \item Extended Euclidean algorithm (expensive)
+    \item Forward NTT to compute $h$
+    \item Inverse NTT to convert back
+    \item \textbf{Total:} 3 NTT operations (vs. 2 in standard verification)
+\end{itemize}
+
+\subsection{EPERVIER Optimization}
+
+EPERVIER (French for ``sparrowhawk'') eliminates inverse NTT through two innovations:
+
+\subsubsection{Hint-Based Inversion}
+
+We provide $\text{NTT}(s_2^{-1})$ as a hint in the signature:
+
+\textbf{Signature:} $\sigma = (r, s_1, s_2, \text{hint})$ where $\text{hint} = \text{NTT}(s_2^{-1})$
+
+\textbf{Verification:}
+\begin{algorithmic}[1]
+\STATE Verify hint correctness: $\text{NTT}(s_2) \odot \text{hint} = [1, 1, \ldots, 1]$
+\STATE Check norm: $\|s_1\|^2 + \|s_2\|^2 \leq B$
+\STATE Compute: $h_{\text{NTT}} = \text{hint} \odot \text{NTT}(c - s_1)$
+\STATE Verify: $H(h_{\text{NTT}}) = \text{address}$
+\end{algorithmic}
+
+\textbf{Cost Reduction:}
+\begin{itemize}
+    \item Step 1: Pointwise multiplication in NTT domain (80k gas)
+    \item Step 3: One forward NTT eliminated
+    \item \textbf{Result:} 2 NTT operations (same as standard FALCON)
+\end{itemize}
+
+\subsubsection{NTT-Domain Public Key}
+
+Further optimization moves the public key itself to NTT domain:
+
+\textbf{Address:}
+\begin{equation}
+\text{address} = H(\text{NTT}(h))
+\end{equation}
+
+\textbf{Recovery:}
+\begin{algorithmic}[1]
+\STATE $h_{\text{NTT}} \gets \text{hint} \odot \text{NTT}(c - s_1)$
+\STATE Verify $H(h_{\text{NTT}}) = \text{address}$
+\end{algorithmic}
+
+\textbf{Key Insight:} By keeping computation in NTT domain, we avoid the inverse NTT entirely. The recovered value is already in the correct form for hashing.
+
+\textbf{Final Cost:}
+\begin{center}
+\begin{tabular}{lrr}
+\hline
+\textbf{Variant} & \textbf{NTT Ops} & \textbf{Gas} \\
+\hline
+Standard FALCON & 2 forward, 1 inverse & 2.7M \\
+FalconRec (naive) & 3 forward & 2.7M \\
+EPERVIER & 2 forward & 1.9M \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{Security Analysis}
+
+\textbf{Hint Integrity:} The condition $\text{NTT}(s_2) \odot \text{hint} = [1, \ldots, 1]$ is checked in NTT domain where:
+\begin{equation}
+\hat{s}_2[i] \cdot \hat{h}[i] = 1 \mod q \quad \forall i \in [0, n)
+\end{equation}
+
+This is equivalent to verifying polynomial inversion in coefficient domain, since NTT is an isomorphism.
+
+\textbf{Malleability:} FALCON signatures are naturally malleable (negation). We enforce canonical encoding by requiring all coefficients $s_{2,i} \in [0, q/2)$ (CVETH-2025-080202).
+
+\textbf{Public Key Uniqueness:} The NTT transformation is bijective, so $H(\text{NTT}(h))$ and $H(h)$ have equivalent collision resistance. Moving to NTT domain does not weaken security.
+

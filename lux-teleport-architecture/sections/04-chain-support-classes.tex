@@ -1,0 +1,95 @@
+\section{Chain Support Classes}
+
+\label{sec:adapters}
+%% =========================================================================
+
+Teleport classifies connected chains into four support classes. Each class defines an adapter interface that translates the wire protocol into chain-native operations.
+
+\subsection{Class A: Lux-Native (No MPC Hop)}
+\label{sec:class-a}
+
+Transfers between Lux appchains use Warp Messaging~\cite{luxwarp2023} with BLS12-381 aggregate signatures. No MPC threshold ceremony is required---the source appchain's validator set signs the Warp message directly.
+
+\begin{property}[Warp Bypass]
+For transfers where both $C_s$ and $C_d$ are Lux appchains, the Teleporter verifies BLS aggregate signatures via the \texttt{0x0200000005} precompile rather than MPC ECDSA signatures via \texttt{ecrecover}.
+\end{property}
+
+Latency: sub-second (limited by appchain block time). Cost: no external gas, precompile verification only.
+
+\subsection{Class B: External EVM (TeleportVault Template)}
+\label{sec:class-b}
+
+External EVM chains (Ethereum, Arbitrum, Optimism, Base, BSC, Polygon, etc.) deploy a \texttt{TeleportVault} contract from a shared template. The template provides:
+
+\begin{itemize}[nosep]
+  \item ERC-4626 compatible vault for lock/release accounting
+  \item \texttt{ecrecover}-based MPC signature verification (CGGMP21 / secp256k1)
+  \item Per-token daily mint limits and global pause
+  \item Yield strategy integration hooks (see \S\ref{sec:yield})
+\end{itemize}
+
+\begin{lstlisting}[language=Solidity,caption={TeleportVault lock function (simplified)}]
+function lock(
+    address token,
+    uint256 amount,
+    uint64  dstChainId,
+    bytes32 recipient
+) external nonReentrant whenNotPaused {
+    IERC20(token).safeTransferFrom(
+        msg.sender, address(this), amount
+    );
+    uint256 nonce = ++lockNonces[dstChainId];
+    emit Lock(
+        block.chainid, dstChainId,
+        nonce, token, recipient, amount
+    );
+}
+\end{lstlisting}
+
+Confirmation depth before the MPC signs: configurable per chain, defaults listed in Table~\ref{tab:depths}.
+
+\subsection{Class C: Bitcoin-Family / Script Chains (Watcher-First)}
+\label{sec:class-c}
+
+Bitcoin, OP\_NET, Litecoin, and Dogecoin lack smart contract runtimes capable of verifying threshold signatures on-chain. The adapter uses a \emph{watcher-first} architecture:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Deposit path}: A watcher service monitors the chain for deposits to a FROST-derived Taproot address. Upon reaching confirmation depth (6 blocks for Bitcoin, 12 for Litecoin, 40 for Dogecoin), the watcher submits a deposit attestation to the MPC cluster.
+  \item \textbf{Release path}: The MPC cluster constructs and signs a Bitcoin transaction using FROST (Schnorr/BIP-340) threshold signing, producing a valid Taproot spend.
+\end{enumerate}
+
+% [FIGURE: Watcher-first flow diagram showing deposit detection, confirmation
+%  depth waiting, MPC attestation, and FROST-signed release transaction]
+
+\begin{property}[Script Chain Asymmetry]
+On Class~C chains, deposits are permissionless (any user sends to the Taproot address) but releases require MPC coordination. There is no on-chain contract to enforce nonces; the MPC cluster maintains canonical nonce state.
+\end{property}
+
+For OP\_NET specifically, the watcher interfaces with the OP\_NET runtime's AssemblyScript contracts, which can emit structured events but cannot verify external signatures. The adapter treats OP\_NET as a script chain with event-emitting capability.
+
+\subsection{Class D: Non-EVM Account-Model Chains}
+\label{sec:class-d}
+
+Solana, TON, and XRP use account-model architectures with non-EVM signature schemes.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{llll}
+\toprule
+\textbf{Chain} & \textbf{Curve} & \textbf{Threshold Protocol} & \textbf{Verify Method} \\
+\midrule
+Solana   & Ed25519     & FROST    & \texttt{Ed25519SigVerify} precompile \\
+TON      & Ed25519     & FROST    & \texttt{check\_signature} TVM opcode \\
+XRP      & secp256k1   & CGGMP21  & Native transaction signing \\
+Sui      & Ed25519     & FROST    & \texttt{ed25519::verify} Move \\
+Aptos    & Ed25519     & FROST    & \texttt{ed25519::verify} Move \\
+Cosmos   & secp256k1   & CGGMP21  & \texttt{VerifySignature} SDK \\
+\bottomrule
+\end{tabular}
+\caption{Non-EVM chain adapter configurations}
+\label{tab:non-evm}
+\end{table}
+
+Each Class~D adapter implements the same four-tag wire protocol. The hash function $H$ and signature encoding vary per chain but the proof semantics remain identical.
+
+%% =========================================================================

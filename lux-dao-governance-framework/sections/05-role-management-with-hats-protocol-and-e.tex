@@ -1,0 +1,230 @@
+\section{Role Management with Hats Protocol and ERC-6551}
+
+
+\subsection{Organizational Structures}
+
+Modern DAOs require sophisticated organizational structures beyond simple token-weighted voting. Lux DAO integrates Hats Protocol to provide:
+
+\begin{itemize}
+    \item Hierarchical role definitions
+    \item Permission-based access control
+    \item Automated role assignment and revocation
+    \item Integration with governance mechanisms
+\end{itemize}
+
+\subsection{Hats Tree Architecture}
+
+\subsubsection{Hat Hierarchy}
+
+Each DAO creates a ``Hats tree'' with the following structure:
+
+\begin{verbatim}
+Top Hat (DAO Safe)
+|---- Admin Hat (Autonomous Admin)
+|   |---- Engineering Lead
+|   |   |---- Senior Engineer
+|   |   \---- Junior Engineer
+|   |---- Operations Lead
+|   |   |---- Community Manager
+|   |   \---- Support Specialist
+|   \---- Finance Lead
+|       |---- Treasurer
+|       \---- Accountant
+\end{verbatim}
+
+\subsubsection{Hat Properties}
+
+\begin{lstlisting}[caption=Hat Structure]
+struct Hat {
+    uint256 id;              // Unique identifier
+    string details;          // IPFS metadata
+    uint32 maxSupply;        // Max wearers
+    address eligibility;     // Eligibility module
+    address toggle;          // Active/inactive module
+    bool mutable;            // Can details change?
+    string imageURI;         // Visual representation
+}
+\end{lstlisting}
+
+\subsection{UtilityRolesManagementV1}
+
+This utility contract provides a unified interface for creating and managing Hats trees:
+
+\begin{lstlisting}[caption=Creating a Hats Tree]
+struct CreateTreeParams {
+    IHats hatsProtocol;
+    IERC6551Registry erc6551Registry;
+    address hatsAccountImplementation;
+    ISablierV2LockupLinear sablierLockup;
+
+    TopHatParams topHat;
+    AdminHatParams adminHat;
+    RoleHatParams[] roleHats;
+}
+
+function createAndDeclareTree(
+    CreateTreeParams calldata params
+) external onlyDelegatecall {
+    // 1. Mint top hat to DAO Safe
+    uint256 topHatId = _processTopHat(...);
+
+    // 2. Create and mint admin hat
+    uint256 adminHatId = _processAdminHat(...);
+
+    // 3. Deploy autonomous admin for automation
+    address autonomousAdmin = _deployAutonomousAdmin(...);
+
+    // 4. Create role hats with payment streams
+    _processRoleHats(...);
+
+    // 5. Associate tree with Safe in KeyValuePairs
+    keyValuePairs.updateValues(
+        keys,
+        [topHatId.toString(), ...]
+    );
+}
+\end{lstlisting}
+
+\subsection{Token-Bound Accounts (ERC-6551)}
+
+\subsubsection{Motivation}
+
+Traditional role-based payment requires:
+\begin{enumerate}
+    \item Tracking who holds each role
+    \item Manually updating payment recipients when roles change
+    \item Complex escrow mechanisms for role transitions
+\end{enumerate}
+
+ERC-6551 elegantly solves this by making the role (NFT) itself own an account.
+
+\subsubsection{Account Creation}
+
+\begin{lstlisting}[caption=Token-Bound Account Creation]
+function createAccount(
+    address implementation,
+    uint256 chainId,
+    address tokenContract,
+    uint256 tokenId,
+    uint256 salt,
+    bytes calldata initData
+) external returns (address account) {
+    // Deterministic address calculation
+    account = _computeAddress(
+        implementation,
+        chainId,
+        tokenContract,
+        tokenId,
+        salt
+    );
+
+    // Deploy via CREATE2
+    if (account.code.length == 0) {
+        bytes memory code = abi.encodePacked(
+            type(ERC1167).creationCode,
+            abi.encode(implementation)
+        );
+
+        assembly {
+            account := create2(0, add(code, 32),
+                              mload(code), salt)
+        }
+
+        // Initialize
+        IERC6551Executable(account).execute(
+            account, 0, initData, 0
+        );
+    }
+
+    return account;
+}
+\end{lstlisting}
+
+\subsubsection{Payment Streaming Integration}
+
+Each role hat has an associated ERC-6551 account that receives Sablier payment streams:
+
+\begin{lstlisting}[caption=Role with Payment Stream]
+struct RoleHatParams {
+    HatParams hat;
+    SablierStreamParams[] streams;
+}
+
+function _createPaymentStream(
+    address recipient,      // Token-bound account
+    uint128 totalAmount,
+    uint40 startTime,
+    uint40 endTime
+) internal returns (uint256 streamId) {
+    LockupLinear.CreateWithRange memory params =
+        LockupLinear.CreateWithRange({
+            sender: address(this),          // DAO Safe
+            recipient: recipient,           // TBA
+            totalAmount: totalAmount,
+            asset: paymentToken,
+            cancelable: true,
+            range: LockupLinear.Range({
+                start: startTime,
+                cliff: 0,
+                end: endTime
+            }),
+            broker: Broker(address(0), 0)
+        });
+
+    streamId = sablier.createWithRange(params);
+}
+\end{lstlisting}
+
+\paragraph{Benefits}
+
+\begin{itemize}
+    \item \textbf{Atomic Role Transfer}: When hat ownership changes, payment automatically redirects
+    \item \textbf{Simplified Management}: No need to update payment recipients manually
+    \item \textbf{Account Functionality}: Role holders can use their TBA for on-chain actions
+    \item \textbf{Programmable Compensation}: Stream parameters can be adjusted via governance
+\end{itemize}
+
+\subsection{Autonomous Admin}
+
+The Autonomous Admin contract automates role management operations:
+
+\begin{lstlisting}[caption=Autonomous Admin Structure]
+contract AutonomousAdminV1 {
+    IHats public hatsProtocol;
+    uint256 public adminHatId;
+
+    // Called by DAO proposals
+    function createHat(
+        uint256 parentHatId,
+        string calldata details,
+        uint32 maxSupply
+    ) external onlyOwner returns (uint256 hatId) {
+        hatId = hatsProtocol.createHat(
+            parentHatId,
+            details,
+            maxSupply,
+            address(0),  // No eligibility
+            address(0),  // No toggle
+            true,        // Mutable
+            ""           // No image
+        );
+    }
+
+    function mintHat(uint256 hatId, address wearer)
+        external onlyOwner
+    {
+        hatsProtocol.mintHat(hatId, wearer);
+    }
+
+    function transferHat(
+        uint256 hatId,
+        address from,
+        address to
+    ) external onlyOwner {
+        hatsProtocol.transferHat(hatId, from, to);
+    }
+}
+\end{lstlisting}
+
+This enables DAO proposals to directly manage organizational structure without requiring the DAO Safe to wear the admin hat.
+

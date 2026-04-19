@@ -1,0 +1,141 @@
+\section{Core Protocols}
+
+
+Our framework integrates four complementary threshold protocols, each optimized for specific use cases.
+
+\subsection{CMP Protocol}
+
+The CMP protocol \cite{canetti2021} provides $(t,n)$-threshold ECDSA signatures with identifiable abort. We implement the enhanced version with:
+
+\paragraph{Key Generation} 4-round protocol using Shamir secret sharing and Paillier homomorphic encryption:
+\begin{algorithmic}[1]
+\State Sample $x^{(i)} \in \mathbb{F}_q$, compute $X^{(i)} = x^{(i)} \cdot G$
+\State Sample safe primes $p^{(i)}, q^{(i)}$, compute $N^{(i)} = p^{(i)} q^{(i)}$
+\State Define VSS polynomial $f^{(i)}(Z) = x^{(i)} + \sum_{l=1}^t f^{(i)}_l Z^l$
+\State Broadcast commitments, exchange encrypted shares
+\State Verify ZK proofs: $\Pi_{\textsf{mod}}, \Pi_{\textsf{prm}}, \Pi_{\textsf{sch}}$
+\State Compute share $\textsf{sk}^{(i)} = \sum_{j=1}^n f^{(j)}(i) \bmod q$
+\end{algorithmic}
+
+\paragraph{Pre-signing} 7-round protocol generating presignature triples $(k_i, \gamma_i, \rho_i)$ using multiplicative-to-additive (MtA) conversion:
+\begin{align*}
+k &= \sum_{i \in S} k_i \cdot \lambda_i \bmod q \\
+\gamma &= k \cdot x = \sum_{i \in S} \gamma_i \cdot \lambda_i \bmod q
+\end{align*}
+
+\paragraph{Online Signing} 4-round signing given message $m$ and presignature:
+\begin{align*}
+R &= \gamma^{-1} \cdot G, \quad r = R_x \bmod q \\
+s_i &= k_i (H(m) + r \cdot x_i \cdot \lambda_i) \\
+s &= \sum_{i \in S} s_i \bmod q
+\end{align*}
+
+\paragraph{Identifiable Abort} ZK proofs at each round enable identification of malicious parties failing to follow protocol.
+
+\subsection{FROST Protocol}
+
+FROST \cite{komlo2020} provides efficient threshold Schnorr/EdDSA signatures with 2-round signing.
+
+\paragraph{Key Generation} Similar to CMP but simplified for Schnorr:
+\begin{algorithmic}[1]
+\State Each party $i$ samples polynomial $f_i(z)$ with $f_i(0) = s_i$
+\State Broadcast commitments $F_{il} = f_{il} \cdot G$ for $l = 0, \ldots, t$
+\State Send shares $f_i(j)$ to party $j$ via secure channel
+\State Each party computes $s_j = \sum_i f_i(j)$ and verifies commitments
+\State Public key: $Y = \sum_i F_{i0}$
+\end{algorithmic}
+
+\paragraph{Signing} 2-round protocol with nonce commitments:
+\begin{algorithmic}[1]
+\State \textbf{Round 1:} Each signer $i$ samples $(d_i, e_i)$, computes $(D_i, E_i)$, broadcasts commitment
+\State \textbf{Round 2:} Reveal $(D_i, E_i)$, compute binding factor $\rho_i = H(\text{context})$
+\State Compute group commitment $R = \sum_i (D_i + \rho_i E_i)$
+\State Challenge: $c = H(R, Y, m)$
+\State Each party computes $z_i = d_i + \rho_i e_i + \lambda_i s_i c$
+\State Aggregate: $z = \sum_i z_i$
+\State Output signature $(R, z)$
+\end{algorithmic}
+
+\paragraph{Taproot Compatibility} We implement BIP-340 \cite{bip340} compatibility by:
+\begin{itemize}
+\item Normalizing public key $Y$ to even y-coordinate during keygen
+\item Negating nonces if $R$ has odd y-coordinate
+\item Using BIP-340 challenge hash $c = H(\text{tag} || R_x || Y_x || m)$
+\end{itemize}
+
+\paragraph{Hedged Nonces} We enhance security using deterministic nonces with optional randomness:
+\begin{align*}
+k &\leftarrow \text{KDF}(s_i) \\
+a &\xleftarrow{R} \{0,1\}^{256} \\
+(d_i, e_i) &\leftarrow H_k(\text{SSID} || m || a)
+\end{align*}
+
+\subsection{LSS Dynamic Resharing}
+
+The LSS protocol \cite{seesahai2025} solves critical operational challenges: live membership changes without downtime or master key reconstruction.
+
+\paragraph{Motivation} Traditional threshold schemes require complete key regeneration to change $n$ or $t$. For systems with 24/7 uptime requirements, coordinating simultaneous key migration is operationally infeasible. LSS enables seamless transition from $(t,n)$ to $(t', n \pm k)$ while maintaining liveness.
+
+\paragraph{Architecture}
+\begin{itemize}
+\item \textbf{Bootstrap Dealer}: Orchestrates resharing protocol, never handles unencrypted secrets
+\item \textbf{Signature Coordinator}: Public API for signing requests, triggers automatic rollback on failures
+\item \textbf{Participant Nodes}: Hold private key shares, maintain generation history
+\end{itemize}
+
+\paragraph{Resharing Protocol} Transition from shares $\{a_i^{\text{old}}\}$ to $\{a_j^{\text{new}}\}$:
+\begin{algorithmic}[1]
+\State \textbf{Auxiliary Secret Generation:} Parties generate shares of temporary secrets $w, q$ via JVSS
+\State \textbf{Blinded Secret:} Original parties compute $a \cdot w$ using interpolation
+\State \textbf{Inverse Blinding:} Compute $z = (q \cdot w)^{-1}$ and distribute shares
+\State \textbf{Final Shares:} Each party $j$ computes $a_j^{\text{new}} = (a \cdot w) \cdot q_j \cdot z_j$
+\end{algorithmic}
+
+Key property: $\sum_{j \in S'} \lambda_j^{S'} a_j^{\text{new}} = a$ for any authorized subset $S'$ of size $\geq t'+1$.
+
+\paragraph{Shard Generations} Each resharing increments generation counter. Historical generations maintained for rollback:
+\begin{itemize}
+\item \textbf{Generation 0}: Initial key generation
+\item \textbf{Generation $g$}: After $g$ resharing operations
+\item \textbf{Rollback}: Revert to generation $g-1$ on signing failures
+\end{itemize}
+
+\paragraph{Automated Fault Tolerance}
+\begin{itemize}
+\item Signature coordinator detects signing failures
+\item Automatically triggers rollback to previous generation
+\item Evicts Byzantine parties from current generation
+\item Maintains liveness even with $t-1$ malicious parties
+\end{itemize}
+
+\paragraph{FROST Integration} LSS seamlessly extends FROST signing:
+\begin{algorithmic}[1]
+\State \textbf{function} \textsc{DynamicReshareFROST}($\{\text{config}_i^{\text{old}}\}, \text{newParties}, t'$)
+\State Run LSS resharing protocol on FROST shares
+\State Update verification shares $Y_j$ via Lagrange interpolation
+\State Maintain public key $Y$ unchanged
+\State \Return $\{\text{config}_j^{\text{new}}\}$
+
+\end{algorithmic}
+
+\subsection{Doerner 2-Party Protocol}
+
+The Doerner protocol \cite{doerner2018} optimizes 2-of-2 ECDSA for minimal latency using oblivious transfer and garbled circuits.
+
+\paragraph{Key Generation}
+\begin{algorithmic}[1]
+\State Party 1 samples $x_1$, Party 2 samples $x_2$
+\State Public key: $Y = x_1 \cdot G + x_2 \cdot G$
+\State Exchange Paillier public keys for MtA
+\end{algorithmic}
+
+\paragraph{Signing} Constant-time 2-party computation:
+\begin{algorithmic}[1]
+\State Generate additive shares of $k$ via OT
+\State Compute $k^{-1}$ using garbled circuit
+\State MtA to compute shares of $k^{-1} \cdot x$
+\State Each party computes $s_i$, aggregate to $s$
+\end{algorithmic}
+
+Performance: $\sim 5$ms for 2-party signing vs. $\sim 15$ms for CMP.
+

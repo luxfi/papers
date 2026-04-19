@@ -1,0 +1,125 @@
+\section{Security Considerations}
+\label{sec:security}
+%% ============================================================
+
+\subsection{Encryption Layers}
+
+The system provides defense in depth through three independent
+encryption layers:
+
+\begin{table}[H]
+\centering
+\caption{Encryption layers.}
+\label{tab:encryption}
+\begin{tabular}{@{}lllp{5cm}@{}}
+\toprule
+\textbf{Layer} & \textbf{Scope} & \textbf{Algorithm} & \textbf{Purpose} \\
+\midrule
+Application & On-disk DB & SQLCipher AES-256-CBC & Protects data at rest
+  on pod local disk. Key derived from KMS. \\
+Replication & S3 objects & age X25519 + ChaCha20-Poly1305 & Protects
+  data at rest in object storage. Per-org keys. \\
+Transport & Network & TLS 1.3 & Protects data in transit to S3. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+An attacker who compromises S3 sees only age-encrypted blobs. An
+attacker who compromises the pod filesystem sees only
+SQLCipher-encrypted databases. An attacker who compromises the network
+sees only TLS-encrypted traffic. All three layers must be breached
+simultaneously to access plaintext.
+
+\subsection{Key Hierarchy}\label{sec:key-hierarchy}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  key/.style={draw, rounded corners=2pt, minimum width=3cm,
+    minimum height=0.7cm, font=\small},
+  arr/.style={-{Stealth[length=4pt]}, thick},
+]
+  \node[key, fill=red!10] (master) at (0, 3)
+    {Master Key (KMS)};
+  \node[key, fill=blue!10] (orgA) at (-3, 1.5)
+    {Org A Key (HKDF)};
+  \node[key, fill=blue!10] (orgB) at (0, 1.5)
+    {Org B Key (HKDF)};
+  \node[key, fill=blue!10] (orgN) at (3, 1.5)
+    {Org N Key (HKDF)};
+  \node[key, fill=green!10] (ageA) at (-3, 0)
+    {age Identity A};
+  \node[key, fill=green!10] (ageB) at (0, 0)
+    {age Identity B};
+  \node[key, fill=green!10] (ageN) at (3, 0)
+    {age Identity N};
+  \node[key, fill=yellow!10] (recovery) at (5.5, 3)
+    {Recovery Key (KMS)};
+
+  \draw[arr] (master) -- (orgA);
+  \draw[arr] (master) -- (orgB);
+  \draw[arr] (master) -- (orgN);
+  \draw[arr] (orgA) -- (ageA);
+  \draw[arr] (orgB) -- (ageB);
+  \draw[arr] (orgN) -- (ageN);
+\end{tikzpicture}
+\caption{Key derivation hierarchy. The master key in KMS derives
+  per-org keys via HKDF. Each org key generates an age identity.
+  The recovery key is independent and added as a second recipient.}
+\label{fig:keyhier}
+\end{figure}
+
+\begin{invariant}[No Plaintext Egress]\label{inv:no-plaintext}
+No plaintext database content ever exists outside the pod boundary.
+WAL frames are encrypted before upload. Snapshots are encrypted before
+upload. The age identity (private key) exists only in the pod's
+memory, loaded from a K8s Secret mounted as a tmpfs volume.
+\end{invariant}
+
+\subsection{Threat Model}
+
+\begin{table}[H]
+\centering
+\caption{Threat model and mitigations.}
+\label{tab:threats}
+\begin{tabular}{@{}lp{4cm}p{5cm}@{}}
+\toprule
+\textbf{Threat} & \textbf{Attack Vector} & \textbf{Mitigation} \\
+\midrule
+S3 compromise & Attacker gains read access to S3 bucket &
+  All objects age-encrypted; no plaintext. \\
+Pod compromise & Attacker gains shell in pod &
+  SQLCipher encrypts on-disk DB; age identity in tmpfs. \\
+KMS compromise & Attacker reads master key &
+  All org keys derivable; requires KMS + S3 compromise
+  simultaneously for data access. \\
+Rogue operator & Operator uses recovery key &
+  Recovery key access is audited in KMS; dual-control
+  required for recovery key retrieval. \\
+WAL truncation & Attacker deletes S3 objects &
+  S3 versioning enabled; object lock (WORM) for
+  compliance-critical buckets. \\
+Replay attack & Attacker replays old WAL segments &
+  Generation index enforces monotonic WAL positions;
+  stale segments rejected. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{SQLCipher Interaction}
+
+When the application database uses SQLCipher (AES-256-CBC at rest),
+the replication layer encrypts already-encrypted data with age. This
+is deliberate double encryption:
+
+\begin{itemize}[nosep]
+  \item SQLCipher protects data at rest on local disk against pod
+    filesystem access.
+  \item age protects data at rest in S3 against object storage access.
+  \item The two keys are independent: SQLCipher key is derived from
+    KMS via a different path than the age key.
+  \item The replicator does not need the SQLCipher key. It treats the
+    database as an opaque byte stream.
+\end{itemize}
+
+%% ============================================================

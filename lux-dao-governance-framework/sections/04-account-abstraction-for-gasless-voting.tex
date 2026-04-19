@@ -1,0 +1,203 @@
+\section{Account Abstraction for Gasless Voting}
+
+
+\subsection{Motivation}
+
+Traditional on-chain voting requires users to pay gas fees for every vote transaction. This creates significant barriers:
+
+\begin{itemize}
+    \item \textbf{Economic Exclusion}: Small token holders may find gas costs exceed their stake's influence
+    \item \textbf{Reduced Participation}: High gas fees during network congestion discourage voting
+    \item \textbf{Timing Issues}: Users without ETH for gas cannot vote, even if they hold governance tokens
+    \item \textbf{Multi-Chain Complexity}: Each chain requires native tokens for gas, complicating cross-chain governance
+\end{itemize}
+
+ERC-4337 account abstraction enables DAOs to sponsor gas fees for their members, removing these barriers while maintaining security and decentralization.
+
+\subsection{Architecture Overview}
+
+Lux DAO's gasless voting system consists of several integrated components:
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=1.5cm,
+    box/.style={rectangle, draw, minimum width=3cm, minimum height=1cm, align=center},
+]
+    \node[box] (user) {Voter\\(Light Account)};
+    \node[box, right=of user] (bundler) {Bundler\\Service};
+    \node[box, below=of bundler] (entry) {EntryPoint\\Contract};
+    \node[box, left=of entry] (paymaster) {Paymaster\\Contract};
+    \node[box, below=of entry] (strategy) {Strategy\\Contract};
+    \node[box, below=of paymaster] (safe) {DAO Safe\\(Treasury)};
+
+    \draw[->] (user) -- node[above] {1. Sign UserOp} (bundler);
+    \draw[->] (bundler) -- node[right] {2. Submit} (entry);
+    \draw[->] (entry) -- node[above] {3. Validate} (paymaster);
+    \draw[->] (paymaster) -- node[right] {4. Check funds} (safe);
+    \draw[->] (entry) -- node[right] {5. Execute vote} (strategy);
+\end{tikzpicture}
+\caption{Gasless Voting Transaction Flow}
+\end{figure}
+
+\subsection{PaymasterV1 Implementation}
+
+\subsubsection{Core Functionality}
+
+\begin{lstlisting}[caption=Paymaster Core Structure]
+contract PaymasterV1 is BasePaymaster, Ownable2Step {
+    // Function-specific validators
+    mapping(address => mapping(bytes4 => address))
+        public validators;
+
+    // Deposit info from EntryPoint
+    struct DepositInfo {
+        uint256 balance;        // Available for gas
+        uint256 stake;          // Locked for security
+        bool staked;            // Is stake locked?
+        uint256 withdrawTime;   // When stake is unlockable
+    }
+
+    function setFunctionValidator(
+        address target,
+        bytes4 selector,
+        address validator
+    ) external onlyOwner {
+        validators[target][selector] = validator;
+    }
+}
+\end{lstlisting}
+
+\subsubsection{Validation Flow}
+
+\begin{algorithm}
+\caption{Paymaster Validation}
+\begin{algorithmic}[1]
+\Function{ValidatePaymasterUserOp}{$userOp, maxCost$}
+    \State $callData \gets userOp.callData$
+    \State $(target, selector) \gets \Call{ParseCallData}{callData}$
+
+    \State $validator \gets validators[target][selector]$
+    \Require $validator \neq$ \texttt{address(0)}
+
+    \State $validationData \gets \Call{validator.ValidateSignature}{userOp}$
+
+    \If{validation fails}
+        \State \Return \texttt{SIG\_VALIDATION\_FAILED}
+    \EndIf
+
+    \State \Return $(validUntil, validAfter)$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Strategy Validators}
+
+Each voting strategy has a corresponding validator that verifies votes:
+
+\begin{lstlisting}[caption=StrategyV1 Validator]
+contract StrategyV1ValidatorV1 {
+    function validateSignature(
+        UserOperation calldata userOp
+    ) external view returns (uint256 validationData) {
+        // Decode vote parameters from callData
+        (uint32 proposalId, uint8 voteType) =
+            abi.decode(userOp.callData[4:], (uint32, uint8));
+
+        // Verify proposal is active
+        require(strategy.isProposalActive(proposalId),
+                "Proposal not active");
+
+        // Verify user hasn't voted
+        require(!strategy.hasVoted(proposalId, userOp.sender),
+                "Already voted");
+
+        // Verify vote type is valid
+        require(voteType <= 2, "Invalid vote type");
+
+        return 0; // Success
+    }
+}
+\end{lstlisting}
+
+\subsection{Light Account Integration}
+
+Light Accounts \cite{lightaccount} provide a minimal ERC-4337 account implementation optimized for gas efficiency:
+
+\begin{lstlisting}[caption=Light Account Structure]
+contract LightAccount {
+    address public owner;
+
+    function validateUserOp(
+        UserOperation calldata userOp,
+        bytes32 userOpHash,
+        uint256 missingAccountFunds
+    ) external returns (uint256 validationData) {
+        // Verify signature from owner
+        bytes32 hash = userOpHash.toEthSignedMessageHash();
+        address signer = hash.recover(userOp.signature);
+
+        if (signer != owner) {
+            return SIG_VALIDATION_FAILED;
+        }
+
+        // Pay prefund if needed
+        if (missingAccountFunds > 0) {
+            (bool success,) = payable(msg.sender).call{
+                value: missingAccountFunds
+            }("");
+            require(success);
+        }
+
+        return 0;
+    }
+}
+\end{lstlisting}
+
+\subsection{Deposit Management}
+
+The Paymaster maintains funds in the EntryPoint for gas sponsorship:
+
+\begin{lstlisting}[caption=Deposit Management]
+// Fund the paymaster
+function depositTo(address paymaster, uint256 amount)
+    external payable
+{
+    entryPoint.depositTo{value: amount}(paymaster);
+}
+
+// Stake for security (required by bundlers)
+function addStake(uint32 unstakeDelaySec)
+    external payable onlyOwner
+{
+    entryPoint.addStake{value: msg.value}(unstakeDelaySec);
+}
+
+// Withdraw available balance
+function withdrawTo(address recipient, uint256 amount)
+    external onlyOwner
+{
+    entryPoint.withdrawTo(payable(recipient), amount);
+}
+
+// Begin stake withdrawal
+function unlockStake() external onlyOwner {
+    entryPoint.unlockStake();
+}
+
+// Complete stake withdrawal after cooldown
+function withdrawStake(address recipient)
+    external onlyOwner
+{
+    entryPoint.withdrawStake(payable(recipient));
+}
+\end{lstlisting}
+
+\subsection{Security Considerations}
+
+\paragraph{Stake Requirements} Bundlers require paymasters to stake funds as a security deposit. This prevents DoS attacks where malicious paymasters approve invalid operations. Typical minimum stake: 0.01 ETH with 1-day unlock period.
+
+\paragraph{Validator Whitelisting} By requiring explicit validator registration per function, the paymaster ensures only authorized operations are sponsored. This prevents abuse where users attempt to sponsor arbitrary transactions.
+
+\paragraph{Deposit Monitoring} DAOs must monitor paymaster deposits to ensure sufficient funds for voting. The system gracefully degrades to standard voting if deposits are exhausted, preventing governance failure.
+

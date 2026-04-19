@@ -1,0 +1,69 @@
+\section{The Wave Specification}
+
+
+Wave is Lux Network's sub-second finality protocol. It achieves fast finality through
+optimistic pipelining: blocks are tentatively finalized after a single round of
+communication, with a fallback to a slower path if conflicts are detected.
+
+\subsection{Key Insight: Pipelining Creates Subtlety}
+
+The naive approach---finalize immediately after one round of votes---is unsafe if a
+Byzantine proposer sends conflicting blocks to different validators. Wave detects this
+through a conflict resolution phase. The TLA+ specification was critical for getting
+this right: the first three versions of the protocol had liveness bugs that only
+manifested with specific message orderings.
+
+\begin{lstlisting}[language=TLA,caption={Wave specification excerpt}]
+---- MODULE Wave ----
+EXTENDS Integers, FiniteSets
+
+CONSTANTS Validators, MaxFaulty, MaxRound, Values
+
+VARIABLES
+    round, phase, estimate, locked, decision, messages
+
+\* Phase: PROPOSE -> VOTE -> CONFIRM -> FINALIZE
+Phases == {"PROPOSE", "VOTE", "CONFIRM", "FINALIZE"}
+
+\* Fast path: single round-trip finality
+FastFinalize(v) ==
+    /\ phase[v] = "CONFIRM"
+    /\ LET confirms == {m \in messages :
+            m.type = "CONFIRM" /\ m.round = round[v]
+            /\ m.value = estimate[v]}
+       IN Cardinality({m.sender : m \in confirms}) >= Q
+    /\ decision' = [decision EXCEPT ![v] = estimate[v]]
+    /\ phase' = [phase EXCEPT ![v] = "FINALIZE"]
+    /\ UNCHANGED <<round, estimate, locked, messages>>
+
+\* Slow path: fallback when conflicts detected
+SlowResolve(v) ==
+    /\ phase[v] = "CONFIRM"
+    /\ \E conflict \in messages :
+        /\ conflict.type = "CONFIRM"
+        /\ conflict.round = round[v]
+        /\ conflict.value # estimate[v]
+    /\ round' = [round EXCEPT ![v] = round[v] + 1]
+    /\ phase' = [phase EXCEPT ![v] = "PROPOSE"]
+    /\ locked' = [locked EXCEPT ![v] = estimate[v]]
+    /\ UNCHANGED <<estimate, decision, messages>>
+\end{lstlisting}
+
+\subsection{Bugs Found During Specification}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lp{7cm}l@{}}
+\toprule
+\textbf{Bug} & \textbf{Description} & \textbf{Found by} \\
+\midrule
+Liveness \#1 & Validators could deadlock if two conflicting proposals arrived simultaneously and all honest validators locked on different values. & TLC trace \\
+Liveness \#2 & Round advancement required $n - f$ messages but network partition could prevent accumulation indefinitely. & TLC liveness check \\
+Safety \#1 & A validator that crashed and recovered could vote for a conflicting value in the same round if its locked state was lost. & TLC invariant \\
+\bottomrule
+\end{tabular}
+\caption{Bugs found during TLA+ specification of Wave. All fixed before implementation.}
+\end{table}
+
+%% ============================================================

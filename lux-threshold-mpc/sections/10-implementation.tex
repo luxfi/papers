@@ -1,0 +1,116 @@
+\section{Implementation}
+
+\label{sec:impl}
+% ============================================================
+
+The framework is implemented in Go across two packages:
+
+\begin{itemize}[nosep]
+  \item \texttt{github.com/luxfi/threshold} --- Core threshold cryptography: FROST
+    (Ed25519, BIP-340), CGGMP21 (secp256k1), DKG, key refresh, resharing.
+  \item \texttt{github.com/luxfi/mpc} --- MPC coordination daemon: signer
+    orchestration, nonce management, chain adapters, key storage, rotation ceremonies.
+\end{itemize}
+
+\subsection{Architecture}
+
+The MPC daemon (\texttt{mpckeyd}) runs on each signer node and exposes a gRPC
+interface for signing requests. The coordination flow:
+
+\begin{enumerate}[nosep]
+  \item A bridge relayer detects a cross-chain transfer request.
+  \item The relayer broadcasts a signing request to the MPC network.
+  \item The coordinator (rotating leader) selects the signer set $S$ and initiates
+    the protocol.
+  \item Signers execute FROST or CGGMP21 depending on the target chain's signature
+    scheme.
+  \item The resulting signature is submitted to the destination chain.
+\end{enumerate}
+
+\subsection{Protocol Selection}
+
+Chain adapters implement a common \texttt{Signer} interface:
+
+\begin{verbatim}
+type Signer interface {
+    KeyGen(t, n int) (*KeyShare, error)
+    Sign(msg []byte, signers []int)
+        (*Signature, error)
+    Refresh() (*KeyShare, error)
+    PublicKey() []byte
+    Protocol() string // "frost" or "cggmp21"
+}
+\end{verbatim}
+
+Each chain adapter maps from the chain's transaction format to the appropriate
+protocol:
+
+\begin{verbatim}
+func AdapterFor(chain Chain) Signer {
+    switch chain.SigType() {
+    case Ed25519, BIP340:
+        return frost.NewSigner(chain)
+    case ECDSA:
+        return cggmp.NewSigner(chain)
+    }
+}
+\end{verbatim}
+
+\subsection{Nonce Management}
+
+Nonce reuse in threshold Schnorr signatures is catastrophic: reusing a nonce pair
+$(d_i, e_i)$ in two signing sessions with different binding factors leaks the
+secret share $s_i$. The implementation enforces:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Single-use nonces}: Each $(d_i, e_i)$ pair is stored with a unique
+    session ID and deleted after use. The nonce store is append-only with
+    cryptographic deletion.
+  \item \textbf{Hedged nonces}: Following RFC 6979~\cite{rfc6979} principles, nonces
+    are derived from $\mathsf{HKDF}(\mathsf{sk}_i, \text{session\_id}, \text{aux\_rand})$
+    where $\text{aux\_rand}$ provides fresh entropy as a hedge against
+    RNG failure.
+  \item \textbf{Nonce pre-generation}: For latency-sensitive paths, nonce pairs are
+    pre-generated in batches and stored encrypted at rest. Each nonce is marked as
+    consumed atomically with protocol execution.
+  \item \textbf{Broadcast serialization}: A \texttt{sync.Mutex} on
+    \texttt{StoreBroadcastMessage} prevents a race condition where concurrent FROST
+    signing sessions could overwrite each other's commitment messages in the broadcast
+    store. Without this lock, two sessions arriving simultaneously could corrupt the
+    commitment list $B$, leading to inconsistent binding factors and signing failure.
+\end{enumerate}
+
+\subsection{Performance}
+
+Benchmarks on production hardware (AMD EPYC 7763, 2.45 GHz, 64 cores, Ubuntu 22.04,
+Go 1.22):
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}llrr@{}}
+\toprule
+\textbf{Operation} & \textbf{Protocol} & \textbf{$(3,5)$} & \textbf{$(67,100)$} \\
+\midrule
+DKG & FROST & 14 ms & 820 ms \\
+DKG & CGGMP21 & 1,100 ms & 48,000 ms \\
+Sign & FROST & 8 ms & 180 ms \\
+Presign & CGGMP21 & 120 ms & 4,200 ms \\
+Sign (online) & CGGMP21 & 2 ms & 12 ms \\
+Refresh & Both & 12 ms & 680 ms \\
+LSS Reshare ($3 \to 5$) & Both & 0.14 ms & --- \\
+LSS Reshare ($50 \to 100$) & Both & --- & 3.5 ms \\
+\bottomrule
+\end{tabular}
+\caption{Latency benchmarks (median over 1,000 runs, single-machine simulation with
+network latency of 0ms between parties). LSS (Lux Secret Sharing) dynamic resharing
+enables threshold changes (e.g., $3$-of-$5 \to 3$-of-$7$) without DKG restart.}
+\label{tab:perf}
+\end{table}
+
+In production with geographically distributed signers (median inter-signer RTT 45ms),
+end-to-end signing latency is dominated by network round-trips: FROST signing
+completes in 2 $\times$ 45ms + 8ms $\approx$ 98ms; CGGMP21 online signing completes
+in 1 $\times$ 45ms + 2ms $\approx$ 47ms (with pre-computed presignatures).
+
+% ============================================================

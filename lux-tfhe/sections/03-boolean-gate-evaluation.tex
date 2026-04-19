@@ -1,0 +1,125 @@
+\section{Boolean Gate Evaluation}
+
+\label{sec:tfhe}
+
+\subsection{Bootstrapping via Blind Rotation}
+
+The core TFHE operation is \emph{programmable bootstrapping}: given an LWE ciphertext
+$\text{ct} = (\mathbf{a}, b)$ encrypting $m$, produce a fresh LWE ciphertext encrypting
+$f(m)$ for an arbitrary function $f: \{0,1\} \to \{0,1\}$.
+
+\begin{algorithm}[H]
+\caption{TFHE Blind Rotation (Bootstrapping)}
+\label{alg:bootstrap}
+\begin{algorithmic}[1]
+\Require LWE ciphertext $(\mathbf{a}, b) \in \mathbb{Z}_q^n \times \mathbb{Z}_q$
+\Require Bootstrap key $\text{BSK} = \{\text{RGSW}(s_i)\}_{i=1}^n$
+\Require Lookup table (test vector) $\mathbf{v} \in R_Q$ encoding gate function
+\State \Comment{Step 1: Initialize accumulator with rotated test vector}
+\State $\text{ACC} \gets X^{-\tilde{b}} \cdot \mathbf{v}$ \Comment{RLWE encryption of rotated LUT}
+\State \Comment{where $\tilde{b} = \lfloor b \cdot 2N/q \rceil$ is the scaled phase}
+\State \Comment{Step 2: Blind rotation --- multiply by $X^{a_i}$ conditioned on $s_i$}
+\For{$i = 1$ to $n$}
+    \State $\tilde{a}_i \gets \lfloor a_i \cdot 2N/q \rceil$ \Comment{scaled coefficient}
+    \State $\text{ACC} \gets \text{CMUX}(\text{BSK}[i], X^{\tilde{a}_i} \cdot \text{ACC}, \text{ACC})$
+    \State \Comment{CMUX: if $s_i = 1$, rotate by $X^{\tilde{a}_i}$; else keep ACC}
+\EndFor
+\State \Comment{Step 3: Sample extraction --- extract coefficient 0 as LWE ciphertext}
+\State $\text{ct}_{\text{out}} \gets \text{SampleExtract}(\text{ACC}, 0)$
+\State \Return $\text{ct}_{\text{out}}$ \Comment{fresh LWE encryption of $f(m)$}
+\end{algorithmic}
+\end{algorithm}
+
+The CMUX gate is implemented as an RGSW external product:
+\[
+\text{CMUX}(\text{RGSW}(s_i), \text{ct}_1, \text{ct}_0) = \text{RGSW}(s_i) \boxdot (\text{ct}_1 - \text{ct}_0) + \text{ct}_0
+\]
+This selects $\text{ct}_1$ if $s_i = 1$ and $\text{ct}_0$ if $s_i = 0$, all homomorphically.
+
+\subsection{Gate Evaluation via Test Vectors}
+
+Each boolean gate is implemented by choosing the appropriate test vector $\mathbf{v}$:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Gate} & \textbf{Input} & \textbf{Test Vector Encoding} \\
+\midrule
+AND & $\text{ct}_1, \text{ct}_2$ & $\text{Bootstrap}(\text{ct}_1 + \text{ct}_2 - q/4, \mathbf{v}_{\text{AND}})$ \\
+OR & $\text{ct}_1, \text{ct}_2$ & $\text{Bootstrap}(\text{ct}_1 + \text{ct}_2 + q/4, \mathbf{v}_{\text{OR}})$ \\
+XOR & $\text{ct}_1, \text{ct}_2$ & $\text{Bootstrap}(2(\text{ct}_1 + \text{ct}_2), \mathbf{v}_{\text{XOR}})$ \\
+NAND & $\text{ct}_1, \text{ct}_2$ & $\text{Bootstrap}(-\text{ct}_1 - \text{ct}_2 + q/4, \mathbf{v}_{\text{NAND}})$ \\
+NOT & $\text{ct}_1$ & $(-\mathbf{a}, q/2 - b)$ (no bootstrap needed) \\
+MUX & $\text{ct}_s, \text{ct}_1, \text{ct}_0$ & Two bootstraps + addition \\
+MAJORITY & $\text{ct}_1, \text{ct}_2, \text{ct}_3$ & $\text{Bootstrap}(\text{ct}_1 + \text{ct}_2 + \text{ct}_3, \mathbf{v}_{\text{MAJ}})$ \\
+\bottomrule
+\end{tabular}
+\caption{Boolean gate implementations via TFHE bootstrapping}
+\label{tab:gates}
+\end{table}
+
+\subsection{CMPCOMBINE Optimization}
+
+\begin{definition}[CMPCOMBINE]
+The CMPCOMBINE gate fuses comparison and combination operations for multi-bit integers.
+For encrypted bits $a_0, \ldots, a_{k-1}$ and $b_0, \ldots, b_{k-1}$ representing
+$k$-bit integers $A$ and $B$:
+\[
+\text{CMPCOMBINE}(A, B) = \begin{cases}
+1 & \text{if } A > B \\
+0 & \text{if } A \leq B
+\end{cases}
+\]
+evaluated in a single bootstrapping chain rather than $k$ independent comparisons.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{CMPCOMBINE --- Multi-Bit Comparison in One Pass}
+\label{alg:cmpcombine}
+\begin{algorithmic}[1]
+\Require Encrypted bits $\text{ct}_{a_0}, \ldots, \text{ct}_{a_{k-1}}$, $\text{ct}_{b_0}, \ldots, \text{ct}_{b_{k-1}}$
+\State $\text{carry} \gets \text{Encrypt}(0)$ \Comment{initial carry = 0}
+\For{$i = 0$ to $k-1$} \Comment{LSB to MSB}
+    \State $\text{diff}_i \gets \text{ct}_{a_i} - \text{ct}_{b_i}$ \Comment{homomorphic subtraction}
+    \State $\text{sum}_i \gets \text{diff}_i + \text{carry}$
+    \State \Comment{Bootstrap with carry-propagation test vector}
+    \State $\text{carry} \gets \text{Bootstrap}(\text{sum}_i, \mathbf{v}_{\text{carry}})$
+\EndFor
+\State \Return $\text{carry}$ \Comment{encrypted comparison result}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[CMPCOMBINE Correctness]
+\label{thm:cmpcombine}
+The CMPCOMBINE gate correctly computes $A > B$ using $k$ bootstrappings (one per bit),
+compared to the naive approach requiring $2k - 1$ bootstrappings (one XOR + one AND
+per bit plus carry propagation).
+\end{theorem}
+
+\begin{proof}
+The carry $c_i$ after processing bit $i$ satisfies:
+\[
+c_i = \begin{cases}
+1 & \text{if } A[0:i] > B[0:i] \\
+0 & \text{if } A[0:i] \leq B[0:i]
+\end{cases}
+\]
+where $A[0:i]$ denotes the $(i+1)$-bit prefix. The test vector $\mathbf{v}_{\text{carry}}$
+encodes the function $f(x) = 1$ iff $x > 0$ (where $x$ is the phase of $\text{sum}_i$).
+
+Since $\text{sum}_i = (a_i - b_i) + c_{i-1}$, the phase encodes:
+\begin{itemize}[nosep]
+\item $a_i > b_i$: phase $> 0$ regardless of $c_{i-1}$ $\Rightarrow$ $c_i = 1$.
+\item $a_i = b_i$: phase $= c_{i-1}$ $\Rightarrow$ $c_i = c_{i-1}$ (carry propagated).
+\item $a_i < b_i$: phase $< 0$ regardless of $c_{i-1}$ $\Rightarrow$ $c_i = 0$.
+\end{itemize}
+
+Each bit requires one homomorphic subtraction ($O(1)$, no bootstrap) and one bootstrap
+for the carry, totaling $k$ bootstraps. The naive approach requires separate XOR, AND,
+and carry gates per bit, totaling $\geq 2k - 1$ bootstraps.
+\end{proof}
+
+%% -----------------------------------------------------------------------
+%%  4. THRESHOLD DECRYPTION
+%% -----------------------------------------------------------------------

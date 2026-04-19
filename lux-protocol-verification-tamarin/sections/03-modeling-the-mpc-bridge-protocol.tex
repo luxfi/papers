@@ -1,0 +1,107 @@
+\section{Modeling the MPC Bridge Protocol}
+
+
+Lux Network's Teleport bridge uses FROST-BLS threshold signatures: $t$-of-$n$ validators
+collaboratively sign cross-chain messages without any single validator holding the full
+private key. The Tamarin model verifies that this protocol is secure against a network
+adversary who controls up to $t - 1$ validators.
+
+\subsection{Protocol Description}
+
+The FROST-BLS protocol has three phases:
+\begin{enumerate}
+  \item \textbf{Key Generation}: Each validator $i$ generates a secret share $s_i$ via
+    Feldman's Verifiable Secret Sharing (VSS). The group public key $PK$ is derived from
+    the commitments.
+  \item \textbf{Signing Round 1}: Each signer $i$ generates a nonce pair $(d_i, e_i)$
+    and broadcasts the corresponding commitments $(D_i, E_i)$.
+  \item \textbf{Signing Round 2}: Each signer $i$ computes a partial signature
+    $z_i = d_i + e_i \cdot \rho_i + \lambda_i \cdot s_i \cdot c$ where $c$ is the
+    challenge and $\lambda_i$ is the Lagrange coefficient. Partial signatures are
+    aggregated into the group signature $\sigma$.
+\end{enumerate}
+
+\subsection{Tamarin Model}
+
+\begin{lstlisting}[language=Tamarin,caption={FROST-BLS key generation in Tamarin}]
+theory FROST_BLS
+begin
+
+builtins: signing, hashing, multiset
+
+functions: pk/1, lagrange/2, commit/1, verify_share/3,
+           aggregate/1 [private]
+
+// Key generation: each validator gets a secret share
+rule KeyGen:
+    [ Fr(~share_i) ]
+    --[ ShareGenerated($V, ~share_i) ]->
+    [ !Share($V, ~share_i),
+      Out(commit(~share_i)) ]  // VSS commitment is public
+
+// Signing round 1: generate nonces
+rule Sign_Round1:
+    [ !Share($V, share_i), Fr(~d_i), Fr(~e_i) ]
+    --[ Nonce($V, ~d_i, ~e_i) ]->
+    [ SignerState1($V, share_i, ~d_i, ~e_i),
+      Out(<commit(~d_i), commit(~e_i)>) ]
+
+// Signing round 2: compute partial signature
+rule Sign_Round2:
+    let z_i = ~d_i + ~e_i * rho + lagrange($V, signers) * share_i * c
+    in
+    [ SignerState1($V, share_i, ~d_i, ~e_i),
+      In(<msg, c, rho, signers>) ]
+    --[ PartialSig($V, msg, z_i),
+        Running($V, 'Bridge', <msg, z_i>) ]->
+    [ Out(z_i) ]
+
+// Aggregation: combine partial signatures
+rule Aggregate:
+    [ In(<z_1, z_2, z_3>),  // t partial sigs
+      In(msg) ]
+    --[ Commit('Bridge', 'Validators', <msg, aggregate(<z_1, z_2, z_3>)>),
+        Signed(msg, aggregate(<z_1, z_2, z_3>)) ]->
+    [ Out(<msg, aggregate(<z_1, z_2, z_3>)>) ]
+\end{lstlisting}
+
+\subsection{Security Properties}
+
+\begin{lstlisting}[language=Tamarin,caption={FROST-BLS security properties}]
+// Unforgeability: adversary cannot produce a valid signature
+// without controlling t shares
+lemma unforgeability:
+  "All msg sig #i.
+    Signed(msg, sig) @i
+    ==> (Ex V1 V2 V3 #j1 #j2 #j3.
+          PartialSig(V1, msg, _) @j1
+        & PartialSig(V2, msg, _) @j2
+        & PartialSig(V3, msg, _) @j3
+        & not (V1 = V2) & not (V2 = V3) & not (V1 = V3))"
+
+// Nonce secrecy: adversary never learns honest nonces
+lemma nonce_secrecy:
+  "All V d e #i.
+    Nonce(V, d, e) @i & not (Ex #c. Corrupt(V) @c)
+    ==> not (Ex #j. K(d) @j) & not (Ex #k. K(e) @k)"
+
+// No nonce reuse: each nonce pair is used exactly once
+lemma no_nonce_reuse:
+  "All V d e #i #j.
+    Nonce(V, d, e) @i & Nonce(V, d, e) @j
+    ==> #i = #j"
+\end{lstlisting}
+
+\subsection{The Reflection Attack}
+
+During verification of an early protocol version, Tamarin found a reflection attack: if
+the protocol did not bind the signer's identity into the nonce commitment, an adversary
+could replay validator~A's round-1 message as if it came from validator~B. The adversary
+does not learn any secret, but it causes the aggregated signature to be computed with
+incorrect Lagrange coefficients, producing an invalid group signature. This is a liveness
+attack, not a safety attack, but it causes the bridge to stall.
+
+The fix: bind the signer identity $V$ into the nonce commitment: $D_i = g^{d_i} \cdot H(V \| \text{msg})$.
+After this fix, Tamarin proves all properties hold.
+
+%% ============================================================

@@ -1,0 +1,68 @@
+\section{Input/Output ABI}
+
+
+\subsection{Design Principles}
+
+\begin{enumerate}[nosep]
+  \item \textbf{Fixed-size fields}: All inputs use fixed-width encoding (32 bytes for
+    scalars, 48 bytes for G1 points, etc.). No length-prefixed variable fields.
+  \item \textbf{Left-padded}: Scalars are left-padded with zeros to 32 bytes, matching
+    Solidity ABI conventions.
+  \item \textbf{Concatenated}: Multiple inputs are concatenated without separators. The
+    precompile deduces structure from the total input length.
+  \item \textbf{Error = revert}: Invalid inputs cause the precompile to return an error,
+    which the EVM interprets as a revert consuming all provided gas.
+\end{enumerate}
+
+\subsection{Example: BLS12-381 Pairing Check}
+
+\begin{lstlisting}[language=Go,caption={BLS12-381 pairing input/output format}]
+// Input: k pairs of (G1, G2) points, concatenated
+// Each pair: 128 bytes (48 for G1 compressed + 96 for G2 compressed,
+//            padded to 128 for alignment)
+// Total input: k * 128 bytes
+//
+// Output: 32 bytes
+// 0x00...01 if pairing check passes (product of pairings == 1)
+// 0x00...00 if pairing check fails
+
+func (c *bls12381Pairing) Run(input []byte) ([]byte, error) {
+    if len(input) == 0 || len(input)%128 != 0 {
+        return nil, errInvalidInput
+    }
+
+    k := len(input) / 128
+    pairs := make([]PairingPair, k)
+
+    for i := 0; i < k; i++ {
+        chunk := input[i*128 : (i+1)*128]
+
+        g1, err := decodeG1(chunk[:48])
+        if err != nil {
+            return nil, err
+        }
+        if !g1.IsOnCurve() || !g1.IsInSubgroup() {
+            return nil, errNotOnCurve
+        }
+
+        g2, err := decodeG2(chunk[48:128])
+        if err != nil {
+            return nil, err
+        }
+        if !g2.IsOnCurve() || !g2.IsInSubgroup() {
+            return nil, errNotOnCurve
+        }
+
+        pairs[i] = PairingPair{G1: g1, G2: g2}
+    }
+
+    result := multiPairing(pairs)
+    output := make([]byte, 32)
+    if result.IsOne() {
+        output[31] = 1
+    }
+    return output, nil
+}
+\end{lstlisting}
+
+%% ============================================================

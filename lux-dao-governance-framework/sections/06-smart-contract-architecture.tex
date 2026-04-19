@@ -1,0 +1,225 @@
+\section{Smart Contract Architecture}
+
+
+\subsection{Contract Categories}
+
+Lux DAO organizes contracts into four categories based on deployment patterns:
+
+\subsubsection{Deployables}
+
+Deployed once per DAO, hold state, owned by DAOs:
+\begin{itemize}
+    \item ModuleAzoriusV1
+    \item StrategyV1
+    \item VotingAdapters (ERC20, ERC721)
+    \item ProposerAdapters (Token, Hats)
+    \item PaymasterV1
+    \item FreezeGuardAzoriusV1
+    \item FreezeVotingV1
+\end{itemize}
+
+\subsubsection{Singletons}
+
+Deployed once per chain, called by client applications:
+\begin{itemize}
+    \item SystemDeployerV1
+    \item KeyValuePairsV1
+\end{itemize}
+
+\subsubsection{Utilities}
+
+Deployed once per chain, called via delegatecall from Safe:
+\begin{itemize}
+    \item UtilityRolesManagementV1
+\end{itemize}
+
+\subsubsection{Services}
+
+Deployed once per chain, referenced by multiple DAO contracts:
+\begin{itemize}
+    \item StrategyV1ValidatorV1
+    \item KYCVerifierV1
+\end{itemize}
+
+\subsection{Storage Patterns}
+
+\subsubsection{EIP-7201 Namespaced Storage}
+
+All upgradeable contracts use EIP-7201 \cite{eip7201} for storage isolation:
+
+\begin{lstlisting}[caption=Namespaced Storage Pattern]
+contract ModuleAzoriusV1 {
+    struct ModuleAzoriusStorage {
+        uint32 totalProposalCount;
+        uint32 timelockPeriod;
+        uint32 executionPeriod;
+        mapping(uint32 => Proposal) proposals;
+        IStrategyV1 strategy;
+    }
+
+    // keccak256(abi.encode(uint256(keccak256(
+    //   "DAO.ModuleAzorius.main")) - 1))
+    //   & ~bytes32(uint256(0xff))
+    bytes32 constant STORAGE_LOCATION =
+        0xedd394c11bb1dac1602ad0766d0e03cc697fdaf9a9996bf169d40a2c3b6fa100;
+
+    function _getStorage()
+        internal pure
+        returns (ModuleAzoriusStorage storage $)
+    {
+        assembly {
+            $.slot := STORAGE_LOCATION
+        }
+    }
+}
+\end{lstlisting}
+
+This prevents storage collisions in upgradeable contracts and enables safe evolution of contract logic.
+
+\subsubsection{Delegatecall Safety}
+
+Utilities that must be called via delegatecall use a safety pattern:
+
+\begin{lstlisting}[caption=Delegatecall Detection]
+contract UtilityRolesManagementV1 {
+    address private immutable UTILITY_ADDRESS;
+
+    constructor() {
+        UTILITY_ADDRESS = address(this);
+    }
+
+    modifier onlyDelegatecall() {
+        require(address(this) != UTILITY_ADDRESS,
+                "Must be called via delegatecall");
+        _;
+    }
+
+    function createAndDeclareTree(...)
+        external onlyDelegatecall
+    {
+        // When called via delegatecall from Safe,
+        // address(this) == Safe address
+        // All operations execute with Safe's permissions
+    }
+}
+\end{lstlisting}
+
+\subsection{Upgradeability Strategy}
+
+\subsubsection{UUPS Pattern}
+
+Core governance contracts use UUPS (Universal Upgradeable Proxy Standard):
+
+\begin{lstlisting}[caption=UUPS Upgrade Authorization]
+contract ModuleAzoriusV1 is UUPSUpgradeable, Ownable {
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyOwner
+    {}
+}
+\end{lstlisting}
+
+\paragraph{Advantages over Transparent Proxies}
+\begin{itemize}
+    \item Lower deployment cost (no proxy admin contract)
+    \item Lower gas costs (no admin delegation logic)
+    \item Upgrade logic stored in implementation (more flexible)
+    \item Owner (DAO Safe) controls upgrades directly
+\end{itemize}
+
+\subsubsection{Immutable Components}
+
+Strategy and adapter contracts are intentionally immutable:
+\begin{itemize}
+    \item Simpler security model
+    \item Lower gas costs
+    \item Easier to reason about behavior
+    \item Can be replaced by deploying new versions
+\end{itemize}
+
+DAOs can switch to new strategies/adapters by updating Azorius configuration via governance proposal.
+
+\subsection{Deployment System}
+
+\subsubsection{SystemDeployerV1}
+
+Orchestrates DAO creation in a single transaction:
+
+\begin{lstlisting}[caption=System Deployment]
+function deployDAO(
+    DAOParams calldata params
+) external returns (address safe) {
+    // 1. Deploy Safe (via Safe factory)
+    safe = _deploySafe(params.owners, params.threshold);
+
+    // 2. Deploy Azorius module
+    address azorius = _deployAzorius(safe);
+
+    // 3. Deploy Strategy
+    address strategy = _deployStrategy(
+        azorius,
+        params.votingPeriod,
+        params.quorum
+    );
+
+    // 4. Deploy voting adapters
+    _deployVotingAdapters(strategy, params.tokens);
+
+    // 5. Deploy proposer adapters
+    _deployProposerAdapters(strategy, params.proposers);
+
+    // 6. Enable Azorius module on Safe
+    _enableModule(safe, azorius);
+
+    // 7. Record deployment in KeyValuePairs
+    _recordDeployment(safe, azorius, strategy);
+
+    emit DAODeployed(safe, azorius, strategy);
+}
+\end{lstlisting}
+
+\subsubsection{CREATE2 Deterministic Deployment}
+
+All contracts use CREATE2 for deterministic addresses:
+
+\begin{lstlisting}[caption=Deterministic Deployment]
+function deployDeterministic(
+    bytes memory bytecode,
+    bytes32 salt
+) internal returns (address addr) {
+    assembly {
+        addr := create2(
+            0,
+            add(bytecode, 0x20),
+            mload(bytecode),
+            salt
+        )
+    }
+    require(addr != address(0), "Deployment failed");
+}
+
+function computeAddress(
+    bytes memory bytecode,
+    bytes32 salt
+) internal view returns (address) {
+    bytes32 hash = keccak256(
+        abi.encodePacked(
+            bytes1(0xff),
+            address(this),
+            salt,
+            keccak256(bytecode)
+        )
+    );
+    return address(uint160(uint256(hash)));
+}
+\end{lstlisting}
+
+This enables:
+\begin{itemize}
+    \item Cross-chain address consistency
+    \item Address prediction before deployment
+    \item Reproducible deployments
+    \item Simpler multi-chain coordination
+\end{itemize}
+

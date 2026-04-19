@@ -1,0 +1,121 @@
+\section{Key Architecture}
+
+\label{sec:keys}
+
+\subsection{Root Key Derivation}
+
+The user's root key is derived from a passphrase using Argon2id
+\cite{argon2}:
+
+\begin{equation}
+  \text{rootKey} = \text{Argon2id}(\text{passphrase}, \text{salt}, t=3, m=65536, p=4)
+\end{equation}
+
+Parameters: 3 iterations, 64 MiB memory, 4 parallel lanes.  The salt is
+generated once and stored alongside the encrypted vault header (the salt
+is not secret).  The output is 32 bytes, used as the master symmetric key.
+
+The root key never leaves the device.  It is held in memory only during
+an active session and zeroed on lock/logout.
+
+\subsection{Per-Vault Data Encryption Key}
+
+Each vault (a logical container for related data---e.g., a company's
+cap table, a personal document set) has its own DEK.  The DEK is a random
+256-bit key, encrypted to the vault owner's ML-KEM-1024 public key:
+
+\begin{equation}
+  \text{encDEK} = \text{ML-KEM-1024.Encapsulate}(\text{ownerPubKey}) \to (\text{encapsulated}, \text{sharedSecret})
+\end{equation}
+
+The shared secret serves as the DEK.  The encapsulated key blob is stored
+alongside the vault metadata.
+
+To share a vault with another user, the DEK is re-encapsulated to the
+recipient's ML-KEM-1024 public key.  Each recipient gets their own
+encapsulated key blob; the DEK itself is never transmitted in plaintext.
+
+\subsection{Per-Document Encryption}
+
+Individual documents are encrypted with AES-256-GCM using the vault DEK
+and a random 12-byte nonce per document.  This is implemented in
+\texttt{lux/transfer/pkg/crypto/envelope.go}:
+
+\begin{lstlisting}[language=Go,caption={envelope.go: ML-KEM + AES-256-GCM envelope}]
+func Seal(plaintext []byte,
+          recipientPubKey []byte) (*Envelope, error) {
+    pk, err := mlkem.PublicKeyFromBytes(
+        recipientPubKey, mlkem.MLKEM1024)
+    // ML-KEM encapsulate: shared secret + encapsulated key
+    encapsulated, sharedSecret, err := pk.Encapsulate()
+    // AES-256-GCM with shared secret as key
+    block, err := aes.NewCipher(sharedSecret[:32])
+    gcm, err := cipher.NewGCM(block)
+    nonce := make([]byte, gcm.NonceSize())
+    rand.Read(nonce)
+    ciphertext := gcm.Seal(nil, nonce, plaintext, nil)
+    return &Envelope{
+        Ciphertext:      ciphertext,
+        EncapsulatedKey: encapsulated,
+        Nonce:           nonce,
+        Algorithm:       AlgoMLKEM1024_AES256GCM,
+    }, nil
+}
+\end{lstlisting}
+
+Decryption requires the recipient's ML-KEM-1024 private key to
+decapsulate the shared secret, then AES-256-GCM decryption:
+
+\begin{lstlisting}[language=Go,caption={envelope.go: decryption path}]
+func Open(env *Envelope,
+          recipientPrivKey []byte) ([]byte, error) {
+    sk, err := mlkem.PrivateKeyFromBytes(
+        recipientPrivKey, mlkem.MLKEM1024)
+    sharedSecret, err := sk.Decapsulate(env.EncapsulatedKey)
+    block, err := aes.NewCipher(sharedSecret[:32])
+    gcm, err := cipher.NewGCM(block)
+    plaintext, err := gcm.Open(
+        nil, env.Nonce, env.Ciphertext, nil)
+    return plaintext, nil
+}
+\end{lstlisting}
+
+\subsection{Post-Quantum Signatures}
+
+All envelopes can be signed using ML-DSA-87 (FIPS 204 \cite{fips204}).
+The signer's public key is included in the envelope for verification:
+
+\begin{lstlisting}[language=Go,caption={envelope.go: ML-DSA-87 signing}]
+func Sign(data []byte,
+          signerPrivKey []byte) ([]byte, error) {
+    sk, err := mldsa.PrivateKeyFromBytes(
+        mldsa.MLDSA87, signerPrivKey)
+    return sk.Sign(data)
+}
+\end{lstlisting}
+
+ML-DSA-87 provides NIST Security Level 5---equivalent security to
+AES-256 against quantum adversaries.
+
+\subsection{Algorithm Summary}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Function} & \textbf{Algorithm} & \textbf{Standard} & \textbf{Security Level} \\
+\midrule
+Key derivation    & Argon2id       & RFC 9106       & Memory-hard \\
+Key encapsulation & ML-KEM-1024    & FIPS 203       & NIST Level 5 \\
+Symmetric encrypt & AES-256-GCM    & FIPS 197       & 256-bit \\
+Digital signature  & ML-DSA-87      & FIPS 204       & NIST Level 5 \\
+Threshold ECDSA   & CGGMP21        & ---            & secp256k1 \\
+Threshold EdDSA   & FROST          & RFC 9591       & Ed25519 \\
+\bottomrule
+\end{tabular}
+\caption{Cryptographic algorithms and their security levels.}
+\label{tab:algorithms}
+\end{table}
+
+% ======================================================================

@@ -1,0 +1,115 @@
+\section{Phase 3: Fuzz Testing with Foundry}
+
+
+\subsection{What Fuzzing Catches}
+
+Fuzzing generates random inputs and checks that invariants hold. It catches:
+\begin{itemize}[nosep]
+  \item Arithmetic overflow/underflow (despite Solidity 0.8 checks).
+  \item Edge cases: zero amounts, maximum uint256, empty arrays.
+  \item State-dependent bugs: invariant violations after specific transaction sequences.
+\end{itemize}
+
+\subsection{Writing Fuzz Tests}
+
+\begin{lstlisting}[language=Solidity,caption={Foundry fuzz test example}]
+function testFuzz_depositWithdraw(
+    uint256 amount,
+    address user
+) public {
+    // Bound inputs to valid ranges
+    amount = bound(amount, 1, 1e24);
+    vm.assume(user != address(0));
+    vm.assume(user != address(vault));
+
+    // Setup
+    deal(address(token), user, amount);
+    vm.startPrank(user);
+    token.approve(address(vault), amount);
+
+    // Record state
+    uint256 totalBefore = vault.totalAssets();
+
+    // Deposit
+    uint256 shares = vault.deposit(amount, user);
+    assertGt(shares, 0, "shares must be nonzero");
+
+    // Withdraw
+    uint256 withdrawn = vault.redeem(shares, user, user);
+    vm.stopPrank();
+
+    // Invariant: withdrawn <= deposited (rounding loss ok)
+    assertLe(withdrawn, amount, "cannot withdraw more than deposited");
+    // Invariant: vault total assets are consistent
+    assertEq(vault.totalAssets(), totalBefore, "total assets unchanged");
+}
+\end{lstlisting}
+
+\subsection{Stateful Fuzzing (Invariant Testing)}
+
+Foundry's invariant testing mode generates random sequences of function calls and
+checks invariants after each call:
+
+\begin{lstlisting}[language=Solidity,caption={Stateful invariant test}]
+// Handler contract: defines valid actions
+contract PoolHandler is Test {
+    Pool public pool;
+
+    function swap(uint256 amount, bool direction) external {
+        amount = bound(amount, 1, pool.reserve0() / 2);
+        if (direction) {
+            pool.swap(amount, 0, address(this));
+        } else {
+            pool.swap(0, amount, address(this));
+        }
+    }
+
+    function addLiquidity(uint256 amount0, uint256 amount1) external {
+        amount0 = bound(amount0, 1, 1e24);
+        amount1 = bound(amount1, 1, 1e24);
+        pool.addLiquidity(amount0, amount1, address(this));
+    }
+}
+
+// Invariant contract
+contract PoolInvariantTest is Test {
+    PoolHandler handler;
+    Pool pool;
+
+    function setUp() public { /* ... */ }
+
+    // This runs after every random action sequence
+    function invariant_constantProduct() public {
+        assertGe(
+            pool.reserve0() * pool.reserve1(),
+            initialK,
+            "k must never decrease"
+        );
+    }
+
+    function invariant_noFreeTokens() public {
+        assertEq(
+            token0.balanceOf(address(pool)),
+            pool.reserve0(),
+            "reserve0 matches actual balance"
+        );
+    }
+}
+\end{lstlisting}
+
+\subsection{Fuzzing Configuration}
+
+\begin{lstlisting}[language=TOML,caption={foundry.toml fuzz configuration}]
+[fuzz]
+runs = 10000           # Number of fuzz runs per test
+max_test_rejects = 500 # Max invalid inputs before failing
+seed = 0               # 0 = random seed each run
+dictionary_weight = 40 # Weight for dictionary-based inputs
+
+[invariant]
+runs = 256             # Number of invariant test runs
+depth = 128            # Max actions per run
+fail_on_revert = false # Don't fail on expected reverts
+\end{lstlisting}
+
+%% ============================================================

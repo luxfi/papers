@@ -1,0 +1,62 @@
+\section{E2E Post-Quantum Encrypted Streaming Backups}
+
+
+\subsection{Threat Model}
+
+Traditional database backups (pg\_dump, WAL-G) produce plaintext or GPG-encrypted archives.
+GPG relies on RSA or classical ECDH, both vulnerable to quantum computers running Shor's
+algorithm. A harvest-now-decrypt-later adversary could capture today's encrypted backups
+and decrypt them when quantum computers become available.
+
+\subsection{Cryptographic Construction}
+
+We employ a hybrid post-quantum encryption scheme using the \texttt{age} file encryption
+format~\cite{age} with the ML-KEM-768 extension:
+
+\begin{definition}[Hybrid PQ Encryption]
+For each WAL segment, the encryption proceeds as follows:
+\begin{enumerate}
+  \item Generate ephemeral keypair $(ek_{ml}, dk_{ml}) \leftarrow \text{ML-KEM-768.KeyGen}()$
+  \item Generate ephemeral keypair $(ek_{x}, dk_{x}) \leftarrow \text{X25519.KeyGen}()$
+  \item Encapsulate: $(c_{ml}, ss_{ml}) \leftarrow \text{ML-KEM-768.Encaps}(pk_{recipient})$
+  \item Key agree: $ss_{x} \leftarrow \text{X25519}(dk_{x}, pk_{recipient})$
+  \item Derive file key: $k \leftarrow \text{HKDF-SHA256}(ss_{ml} \| ss_{x}, \text{info})$
+  \item Encrypt payload: STREAM construction with ChaCha20-Poly1305, 64\,KB chunks
+  \item Zero ephemeral keys: $dk_{ml} \leftarrow 0, dk_{x} \leftarrow 0$
+\end{enumerate}
+\end{definition}
+
+\begin{proposition}[Security]
+The hybrid scheme is IND-CCA2 secure if either ML-KEM-768 or X25519 is secure. Formally,
+an adversary must break \emph{both} algorithms to recover plaintext. This provides
+defense-in-depth: classical security from X25519 and quantum resistance from ML-KEM-768.
+\end{proposition}
+
+\subsection{Streaming Protocol}
+
+\begin{enumerate}
+  \item SQLite writes produce WAL frames on disk
+  \item Replicate monitors the WAL file via \texttt{fsnotify}
+  \item New frames are packaged into immutable LTX (Log Transaction) segments
+  \item Each LTX segment is encrypted with a fresh ephemeral keypair
+  \item Encrypted segments are uploaded to S3 with per-chain path isolation
+  \item Replicate manages checkpointing to ensure all data is streamed before flush
+\end{enumerate}
+
+\begin{invariant}[Completeness]
+No WAL frame is checkpointed (flushed to main SQLite file) before it has been successfully
+streamed to S3. This is enforced by disabling SQLite auto-checkpoint
+(\texttt{\_auto\_checkpoint=0}) when Replicate is active.
+\end{invariant}
+
+\subsection{Point-in-Time Restore}
+
+Each LTX segment is identified by a monotonic transaction ID (TXID). Restore proceeds by:
+
+\begin{enumerate}
+  \item Downloading LTX segments from S3 up to the target TXID
+  \item Decrypting each segment with the recipient's private key
+  \item Replaying LTX frames onto a fresh SQLite database
+  \item Resulting database is byte-identical to the original at that TXID
+\end{enumerate}
+

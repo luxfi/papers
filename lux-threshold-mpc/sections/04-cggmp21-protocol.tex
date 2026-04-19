@@ -1,0 +1,140 @@
+\section{CGGMP21 Protocol}
+
+\label{sec:cggmp}
+% ============================================================
+
+CGGMP21~\cite{canetti2021cggmp} provides $(t,n)$-threshold ECDSA with identifiable
+abort. The protocol separates into an offline presigning phase and a fast online
+signing phase.
+
+\subsection{Key Generation}
+
+CGGMP21 DKG extends Feldman VSS with Paillier encryption and zero-knowledge proofs to
+enable multiplicative-to-additive (MtA) share conversion during signing.
+
+\begin{algorithm}[H]
+\caption{CGGMP21 Distributed Key Generation}
+\label{alg:cggmp-dkg}
+\begin{algorithmic}[1]
+\Require Threshold $t$, participants $n$, generator $G$ on secp256k1
+\Ensure Public key $Q$, shares $\{x_i\}_{i=1}^n$, Paillier keys $\{(N_i, p_i, q_i)\}$
+\For{each party $i \in [n]$}
+  \State $x_i^{(0)} \xleftarrow{\$} \mathbb{F}_q$, define VSS polynomial $f_i$ of degree $t-1$
+  \State Generate safe primes $p_i, q_i$; set $N_i = p_i q_i$
+  \State Broadcast $X_i = x_i^{(0)} \cdot G$ with commitment
+  \State Prove $\Pi_{\mathsf{sch}}$: knowledge of $x_i^{(0)}$ w.r.t.\ $X_i$
+  \State Prove $\Pi_{\mathsf{mod}}$: $N_i$ is a Blum integer
+  \State Prove $\Pi_{\mathsf{prm}}$: ring-Pedersen parameters are well-formed
+  \State Send $f_i(j)$ encrypted under party $j$'s Paillier key
+\EndFor
+\For{each party $j \in [n]$}
+  \State Verify all proofs $\Pi_{\mathsf{sch}}, \Pi_{\mathsf{mod}}, \Pi_{\mathsf{prm}}$
+  \State Decrypt and verify Feldman commitments
+  \State $x_j \gets \sum_{i=1}^n f_i(j) \bmod q$
+\EndFor
+\State $Q \gets \sum_{i=1}^n X_i$
+\State \Return $(Q, \{x_i\}, \{N_i, p_i, q_i\})$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Presigning (Offline Phase)}
+
+The presigning protocol generates nonce shares and MtA conversion values that enable
+fast online signing. Each presignature is single-use.
+
+\begin{algorithm}[H]
+\caption{CGGMP21 Presigning}
+\label{alg:cggmp-presign}
+\begin{algorithmic}[1]
+\Require Signer set $S$ with $|S| \geq t$, shares $\{x_i\}_{i \in S}$
+\Ensure Presignature record $(R, k_i, \chi_i)$ for each $i \in S$
+\For{each signer $i \in S$}
+  \State $k_i, \gamma_i \xleftarrow{\$} \mathbb{F}_q$
+  \State $K_i \gets k_i \cdot G$, $\Gamma_i \gets \gamma_i \cdot G$
+  \State Broadcast $K_i$ with $\Pi_{\mathsf{enc}}$ proof
+\EndFor
+\Statex \textbf{MtA Conversion:}
+\For{each pair $(i, j) \in S \times S$, $i \neq j$}
+  \State Run $\mathsf{MtA}(k_i, \gamma_j) \to (\alpha_{ij}, \beta_{ij})$
+  \State \quad such that $\alpha_{ij} + \beta_{ji} = k_i \cdot \gamma_j$
+  \State Run $\mathsf{MtA}(k_i, x_j) \to (\hat{\alpha}_{ij}, \hat{\beta}_{ij})$
+\EndFor
+\For{each signer $i \in S$}
+  \State $\delta_i \gets k_i \gamma_i + \sum_{j \neq i} (\alpha_{ij} + \beta_{ji})$
+  \State $\chi_i \gets k_i x_i + \sum_{j \neq i} (\hat{\alpha}_{ij} + \hat{\beta}_{ji})$
+\EndFor
+\State $\delta \gets \sum_{i \in S} \delta_i$ \Comment{reconstruct $k \cdot \gamma$}
+\State $\Gamma \gets \sum_{i \in S} \Gamma_i$ \Comment{reconstruct $\gamma \cdot G$}
+\State $R \gets \delta^{-1} \cdot \Gamma$, \; $r \gets R_x \bmod q$
+\State \Return $(R, r, \{k_i, \chi_i\}_{i \in S})$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Online Signing}
+
+Given a presignature and message $m$, online signing requires a single round:
+
+\begin{algorithm}[H]
+\caption{CGGMP21 Online Signing}
+\label{alg:cggmp-sign}
+\begin{algorithmic}[1]
+\Require Message $m$, presignature $(R, r, \{k_i, \chi_i\}_{i \in S})$
+\Ensure ECDSA signature $(r, s)$
+\For{each signer $i \in S$}
+  \State $\sigma_i \gets k_i \cdot H(m) + r \cdot \chi_i$
+  \State Broadcast $\sigma_i$
+\EndFor
+\State $s \gets \sum_{i \in S} \sigma_i \bmod q$
+\State Normalize: if $s > q/2$ then $s \gets q - s$ \Comment{low-$s$ form}
+\State \textbf{Verify:} ECDSA.Verify$(m, (r, s), Q) \stackrel{?}{=} 1$
+\If{verification fails}
+  \State Identify aborter via $\Pi_{\mathsf{log*}}$ proofs \Comment{identifiable abort}
+\EndIf
+\State \Return $(r, s)$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[CGGMP21 Correctness]
+\label{thm:cggmp-correct}
+If all signers follow the protocol, then $s = k^{-1}(H(m) + r \cdot x) \bmod q$
+where $k = \sum_{i \in S} k_i \cdot \lambda_{i,S}$ and $x$ is the secret key.
+\end{theorem}
+
+\begin{proof}
+The MtA conversion ensures $\sum_{i \in S} \chi_i = k \cdot x$ and
+$\sum_{i \in S} \delta_i = k \cdot \gamma$ where $\gamma = \sum_{i \in S} \gamma_i
+\cdot \lambda_{i,S}$. Then:
+\begin{align*}
+s &= \sum_{i \in S} \sigma_i = \sum_{i \in S} (k_i \cdot H(m) + r \cdot \chi_i) \\
+  &= k \cdot H(m) + r \cdot k \cdot x = k(H(m) + r \cdot x)
+\end{align*}
+Since $R = (k \cdot \gamma)^{-1} \cdot (\gamma \cdot G) = k^{-1} \cdot G$, the
+value $r = R_x$ corresponds to $k^{-1} \cdot G$, and $s = k(H(m) + rx)$. After
+division by $k$ in the verification equation, this yields a valid ECDSA signature.
+\end{proof}
+
+\subsection{Chain Coverage}
+
+CGGMP21 produces standard ECDSA signatures for the following chain families:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Chain Family} & \textbf{Curve} & \textbf{Sig. Format} & \textbf{Size} \\
+\midrule
+Ethereum / EVM & secp256k1 & $(v, r, s)$ & 65 B \\
+TRON & secp256k1 & $(v, r, s)$ & 65 B \\
+XRPL & secp256k1 & DER-encoded & 70--72 B \\
+StarkNet${}^*$ & secp256k1 & $(r, s)$ & 64 B \\
+Bitcoin (legacy) & secp256k1 & DER-encoded & 70--72 B \\
+\bottomrule
+\end{tabular}
+\caption{CGGMP21 chain coverage. ${}^*$StarkNet account abstraction allows arbitrary
+signature schemes; the Lux Teleport StarkNet adapter uses secp256k1 ECDSA via a
+signature verifier account.}
+\label{tab:cggmp-chains}
+\end{table}
+
+% ============================================================

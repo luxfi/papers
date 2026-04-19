@@ -1,0 +1,119 @@
+\section{Implementation}
+
+\label{sec:implementation}
+%% ============================================================================
+
+\subsection{Architecture Overview}
+
+Lux-DAS is implemented as a module within the Lux node software (luxd), integrated
+with the Platform VM for Primary Network blocks and available as a library for appchain VMs.
+
+\begin{lstlisting}[language=Go, caption={Core DAS interfaces}]
+// BlobEncoder encodes raw data into 2D RS extended matrix.
+type BlobEncoder interface {
+    Encode(data []byte) (*ExtendedMatrix, error)
+    Decode(matrix *ExtendedMatrix) ([]byte, error)
+}
+
+// CommitmentScheme produces and verifies KZG commitments.
+type CommitmentScheme interface {
+    Commit(matrix *ExtendedMatrix) (*DACommitment, error)
+    OpenCell(row, col int) (*CellProof, error)
+    VerifyCell(commit *DACommitment, row, col int,
+               value FieldElement, proof *CellProof) bool
+}
+
+// Sampler implements the DAS sampling protocol.
+type Sampler interface {
+    Sample(ctx context.Context, header *BlockHeader,
+           securityParam int) (bool, error)
+    GetCell(ctx context.Context, appchainID ids.ID,
+            blobIdx uint32, row, col int) (*CellWithProof, error)
+}
+\end{lstlisting}
+
+\subsection{Finite Field Arithmetic}
+
+All field operations use the BLS12-381 scalar field
+$\mathbb{F}_r$ with $r = 0x73eda753\ldots$ (a 255-bit prime). We employ the Montgomery
+multiplication form for efficient modular arithmetic, with a specialized implementation for
+the Number Theoretic Transform (NTT) used in polynomial evaluation and interpolation.
+
+\begin{table}[H]
+\centering
+\caption{Field operation benchmarks (Apple M2, single core)}
+\label{tab:field-ops}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Operation} & \textbf{Time (ns)} & \textbf{Throughput (Mops/s)} \\
+\midrule
+Field addition & 2.1 & 476 \\
+Field multiplication (Montgomery) & 8.3 & 120 \\
+Field inversion (Fermat) & 2{,}400 & 0.42 \\
+NTT forward ($k=64$) & 48{,}000 & --- \\
+NTT forward ($k=256$) & 310{,}000 & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{KZG Trusted Setup}
+
+Lux-DAS reuses the Ethereum KZG ceremony~\cite{ethereumceremony} structured reference string
+(SRS), which supports polynomials of degree up to $4{,}096$. This is sufficient for blob
+matrices up to $k = 2{,}048$ (supporting blobs up to $2048^2 \times 31 \approx 130$\,MiB).
+Reusing an existing ceremony avoids the coordination overhead of a new trusted setup while
+benefiting from the 141{,}416-participant contribution chain.
+
+\subsection{Networking Layer}
+
+Cell distribution and sampling queries use a dedicated gossip topic per appchain. The message
+format is:
+
+\begin{lstlisting}[language=Go, caption={Cell gossip message}]
+type CellMessage struct {
+    AppchainID  ids.ID          `json:"appchainId"`
+    SlotNum   uint64          `json:"slot"`
+    BlobIndex uint32          `json:"blobIndex"`
+    Row       uint16          `json:"row"`
+    Col       uint16          `json:"col"`
+    Value     [32]byte        `json:"value"`
+    RowProof  bls.G1Affine    `json:"rowProof"`
+    ColProof  bls.G1Affine    `json:"colProof"`
+}
+\end{lstlisting}
+
+Each cell message is 228 bytes (32-byte appchain ID + 8-byte slot + 4-byte index + 2+2 byte
+coordinates + 32-byte value + 2 $\times$ 48-byte proofs + overhead). For a full blob with
+$k=64$, disseminating all $4 \times 64^2 = 16{,}384$ cells requires approximately 3.7\,MiB
+of gossip traffic, spread across all validators.
+
+\subsection{Storage and Pruning}
+
+Full nodes store the extended matrix $\hat{M}$ and all KZG proofs for a configurable retention
+period (default: 30 days). After this period, only the DACommitment and the first $k$ rows of
+the original data matrix are retained, enabling reconstruction but not sampling verification
+for historical blocks. Light clients do not store any blob data; they rely on full nodes for
+on-demand cell retrieval.
+
+\subsection{Parallelism and Pipelining}
+
+Encoding a blob is embarrassingly parallel across rows and columns. Our implementation uses
+a worker pool of $\min(2k, \text{GOMAXPROCS})$ goroutines for the NTT evaluations, achieving
+near-linear speedup up to 8 cores.
+
+\begin{table}[H]
+\centering
+\caption{Encoding latency vs.\ core count ($k = 64$, blob $\approx 127$\,KiB)}
+\label{tab:encoding-parallel}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Cores} & 1 & 2 & 4 & 8 \\
+\midrule
+Encoding (ms) & 48.2 & 25.1 & 13.4 & 7.8 \\
+Speedup & 1.0$\times$ & 1.92$\times$ & 3.60$\times$ & 6.18$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+%% ============================================================================
