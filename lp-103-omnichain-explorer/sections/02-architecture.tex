@@ -1,0 +1,52 @@
+\section{Architecture}
+
+
+\subsection{Single Binary Design}
+
+The explorer binary contains three major subsystems running concurrently:
+
+\begin{enumerate}
+  \item \textbf{Indexer goroutines}: One per chain, each writing to its own SQLite database
+  \item \textbf{API server}: HTTP server (Base) reading from all chain databases, serving
+        \texttt{/v1/explorer/\{chain\}/*} endpoints
+  \item \textbf{Replication}: Per-chain WAL streaming to S3 with PQ encryption
+\end{enumerate}
+
+The frontend (Next.js static export) is embedded in the binary via Go's \texttt{embed}
+directive and served at the root path.
+
+\subsection{Per-Chain Storage Isolation}
+
+Each chain receives an independent directory containing a SQLite database (WAL mode) and
+a BadgerDB key-value store:
+
+\begin{lstlisting}[language=bash]
+{data_dir}/{chain_slug}/
+  query/indexer.db    # SQLite: blocks, txs, tokens, contracts
+  kv/                 # BadgerDB: hash->data, height->block
+\end{lstlisting}
+
+\textbf{Properties}:
+\begin{itemize}
+  \item Zero write contention between chains (each is sole writer to its SQLite)
+  \item 8 concurrent readers per chain (API layer, WAL mode)
+  \item Independent backup and restore per chain
+  \item Drop a chain by deleting its directory
+\end{itemize}
+
+\subsection{Dual-Layer Storage}
+
+\begin{definition}[Unified Store]
+The storage layer combines two complementary backends:
+\begin{itemize}
+  \item \textbf{KV Layer} (BadgerDB): $O(1)$ lookups by hash, height, or composite key.
+        Prefix-isolated namespaces: \texttt{blk:}, \texttt{vtx:}, \texttt{edg:}, \texttt{tx:},
+        \texttt{st:}, \texttt{meta:}, \texttt{idx:}.
+  \item \textbf{Query Layer} (SQLite): Complex queries with SQL, joins, aggregations,
+        full-text search. WAL mode for concurrent reads.
+\end{itemize}
+\end{definition}
+
+The indexer performs dual-writes to both layers. Reads prefer the KV layer for direct
+lookups and fall back to the Query layer for filtered/sorted/aggregated queries.
+

@@ -1,0 +1,90 @@
+\section{DAG-EVM}
+
+\label{sec:dagevm}
+%% ============================================================================
+
+\subsection{Lineage: Block-STM Lifted}
+
+Block-STM~\cite{blockstm} (Aptos Labs, 2022) is an optimistic concurrency
+control (OCC) algorithm that speculatively executes a linear block's
+transactions in parallel on separate copies of state, tracks per-transaction
+read and write sets, and re-executes any transaction whose reads were
+invalidated by an earlier-committed transaction's writes.
+
+Block-STM's correctness reduces to two properties:
+\begin{enumerate}
+  \item Every execution is \emph{conflict-equivalent} to the sequential
+    execution of the same block in the block's canonical order.
+  \item Every committed write is visible to every strictly-later transaction
+    that reads the same storage location.
+\end{enumerate}
+
+These properties are purely local to the block's set of transactions; they
+make no reference to the fact that blocks are arranged in a linear chain.
+This is the opening we exploit.
+
+\subsection{Construction}
+
+Let $T$ be a sequence of pending EVM transactions. The DAG-EVM builder
+performs:
+
+\begin{algorithm}[h]
+\caption{BuildVertex (DAG-EVM)}
+\begin{algorithmic}[1]
+\State Drain up to $N$ txs from the mempool into $T$
+\State Run Block-STM speculative exec on $T$ over the current state snapshot
+\State Emit $(R, W) \gets$ union of per-tx read/write sets
+\State $P \gets$ minimal antichain of frontier vertices whose $W$ covers $R$
+\State Let $v.\mathsf{parents} \gets P$
+\State $v.\mathsf{id} \gets \mathsf{keccak256}(\mathsf{txHashes} \parallel R \parallel W)$
+\State Emit $v$ to the DAG engine
+\end{algorithmic}
+\end{algorithm}
+
+The DAG engine (nebula) votes on acceptance. Once an antichain at rank $r$
+is fully populated with accepted vertices, Quasar stamps it with a
+post-quantum triple-signature certificate and $r$ becomes final. The EVM
+state is updated by applying the vertices of each finalised antichain in
+any valid topological order.
+
+\subsection{Correctness Sketch}
+
+\begin{theorem}[Non-Conflict Commutativity, Lean: \texttt{nonConflict\_commute}]
+\label{thm:commute}
+For any two EVM vertices $v_1, v_2$ with $\mathsf{conflicts}(v_1, v_2)
+= \mathsf{false}$ and any state $\sigma$:
+\[
+v_2.\mathsf{apply}(v_1.\mathsf{apply}(\sigma)) = v_1.\mathsf{apply}(v_2.\mathsf{apply}(\sigma)).
+\]
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+By case analysis on membership of each storage key $k$ in the write sets
+of $v_1$ and $v_2$. The non-conflict hypothesis excludes write-write
+overlap; the footprint lemmas (\texttt{writesOnly}, \texttt{readsOnly}) in
+the Lean development handle the remaining four cases. Full proof in
+\texttt{Consensus/DAGEVM.lean:60--135}.
+\end{proof}
+
+\begin{theorem}[Topological Order Invariance, Lean: \texttt{topo\_equivalence}]
+\label{thm:topo}
+Given the Siblings-Commute invariant, any two topological orderings $L_1,
+L_2$ of the same accepted DAG $D$ satisfy
+$\mathsf{applyList}(L_1, \sigma) = \mathsf{applyList}(L_2, \sigma)$
+for every initial state $\sigma$.
+\end{theorem}
+
+\begin{theorem}[No Double Spend, Lean: \texttt{no\_double\_spend}]
+If $v, w$ are both accepted, $v \neq w$, and both write the same storage
+key $k$, then $v$ and $w$ must be in distinct ranks (one is an ancestor of
+the other in the DAG).
+\end{theorem}
+
+\begin{corollary}[Serialisability]
+Every DAG-EVM execution is conflict-equivalent to a sequential EVM
+execution over the same set of transactions. An external observer sees a
+linear history of state transitions; the underlying parallel vertex
+topology is invisible at the state projection.
+\end{corollary}
+
+%% ============================================================================

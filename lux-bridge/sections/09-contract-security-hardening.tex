@@ -1,0 +1,83 @@
+\section{Contract Security Hardening}
+\label{sec:contract-security}
+%% ═══════════════════════════════════════════════════════════════════════════
+
+Four critical vulnerabilities were identified and fixed in the bridge smart contracts during the 2025 security audit. Each fix is verified by Halmos symbolic proofs.
+
+\subsection{C-01: Daily Mint Limits}
+
+\textbf{Vulnerability}: The \texttt{bridgeMint()} function in \texttt{LRC20B.sol} had no rate limiting. A compromised MPC key could mint unlimited tokens in a single transaction.
+
+\textbf{Fix}: Enforced configurable daily mint limits with automatic period reset.
+
+\begin{algorithm}[H]
+\caption{C-01: Rate-Limited Bridge Mint}
+\begin{algorithmic}[1]
+\Function{bridgeMint}{$\text{account}, \text{amount}$}
+    \State \textbf{require} $\text{hasRole}(\texttt{MINTER\_ROLE}, \text{msg.sender})$ \Comment{C-02}
+    \If{$\text{block.timestamp} \geq \text{mintPeriodStart} + \texttt{1 day}$}
+        \State $\text{dailyMinted} \gets 0$
+        \State $\text{mintPeriodStart} \gets \text{block.timestamp}$
+    \EndIf
+    \If{$\text{dailyMintLimit} > 0$}
+        \State \textbf{require} $\text{dailyMinted} + \text{amount} \leq \text{dailyMintLimit}$ \Comment{Revert: \texttt{MintLimitExceeded}}
+        \State $\text{dailyMinted} \mathrel{+}= \text{amount}$
+    \EndIf
+    \State $\text{\_mint}(\text{account}, \text{amount})$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Halmos verification}: \texttt{check\_bridgeMint\_daily\_limit} proves that $\forall a, b$: if $\text{dailyMinted} + a \leq L$ and $\text{dailyMinted} + b \leq L$, then $\text{dailyMinted} + a + b \leq 2L$ (no overflow bypass).
+
+\subsection{C-02: MINTER\_ROLE Separation}
+
+\textbf{Vulnerability}: Bridge minting was gated by \texttt{DEFAULT\_ADMIN\_ROLE}. A compromised admin could both mint tokens and grant new admins, creating a single point of failure.
+
+\textbf{Fix}: Introduced a separate \texttt{MINTER\_ROLE} ($\texttt{keccak256("MINTER\_ROLE")}$) with explicit \texttt{grantMinter()} / \texttt{revokeMinter()} management. Admin and minter are orthogonal capabilities.
+
+\textbf{Invariant}: $\texttt{MINTER\_ROLE} \neq \texttt{DEFAULT\_ADMIN\_ROLE}$ and no function grants both roles atomically.
+
+\subsection{C-03: Monotonic MPC Nonce}
+
+\textbf{Vulnerability}: MPC-signed messages used \texttt{block.timestamp} as the nonce, which is manipulable by validators within the 15-second tolerance window and is not guaranteed unique across chains.
+
+\textbf{Fix}: Replaced with a strictly monotonic counter nonce per bridge contract:
+
+\begin{equation}
+\text{nonce}_{i+1} = \text{nonce}_i + 1, \quad \text{nonce}_0 = 0
+\end{equation}
+
+\textbf{Property}: Nonce monotonicity guarantees replay protection without relying on block timestamps. The MPC committee signs $H(\text{chainId} \| \text{nonce} \| \text{payload})$.
+
+\subsection{C-04: Sequential Withdraw Nonce}
+
+\textbf{Vulnerability}: Withdraw operations used $H(\text{sender} \| \text{amount} \| \text{block.timestamp})$ as the nonce, which is predictable and allows front-running: an attacker observing a pending withdrawal can compute its nonce and submit a conflicting transaction.
+
+\textbf{Fix}: Replaced with a per-user sequential counter:
+
+\begin{equation}
+\text{withdrawNonce}[\text{user}]_{i+1} = \text{withdrawNonce}[\text{user}]_i + 1
+\end{equation}
+
+\textbf{Property}: Sequential nonces are unpredictable to third parties (the next valid nonce for user $u$ is $\text{withdrawNonce}[u]$, which requires knowing the current state).
+
+\subsection{Security Fix Summary}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\textbf{ID} & \textbf{Severity} & \textbf{Vulnerability} & \textbf{Fix} \\
+\midrule
+C-01 & Critical & Unlimited \texttt{bridgeMint()} & Daily mint limits \\
+C-02 & Critical & Admin = Minter role conflation & Separate \texttt{MINTER\_ROLE} \\
+C-03 & Critical & Timestamp-based MPC nonce & Monotonic counter nonce \\
+C-04 & High & Predictable withdraw nonce & Sequential per-user nonce \\
+\bottomrule
+\end{tabular}
+\caption{Bridge contract security fixes (2025 audit)}
+\label{tab:security-fixes}
+\end{table}
+
+%% ═══════════════════════════════════════════════════════════════════════════

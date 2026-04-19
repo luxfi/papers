@@ -1,0 +1,112 @@
+\section{Wire Protocol}
+
+\label{sec:wire}
+%% =========================================================================
+
+The wire protocol defines the canonical format for all cross-chain proofs. It is frozen: no new tags, no field reordering, no encoding changes. Upgrades occur exclusively at the adapter layer.
+
+\subsection{Proof Tags}
+
+Every proof is a \texttt{bytes32}-tagged ABI-encoded payload signed by the MPC threshold committee. Four tags exist:
+
+\begin{definition}[Canonical Proof Tags]
+\label{def:tags}
+\begin{align}
+  \mathsf{DEPOSIT}  &= \texttt{keccak256("DEPOSIT")}  \label{eq:tag-deposit} \\
+  \mathsf{YIELD}    &= \texttt{keccak256("YIELD")}    \label{eq:tag-yield} \\
+  \mathsf{BACKING}  &= \texttt{keccak256("BACKING")}  \label{eq:tag-backing} \\
+  \mathsf{RELEASE}  &= \texttt{keccak256("RELEASE")}  \label{eq:tag-release}
+\end{align}
+These four values are compile-time constants in the Teleporter contract. No mechanism exists to add, remove, or modify tags post-deployment.
+\end{definition}
+
+\subsection{Proof Encoding}
+
+Each proof $\pi$ consists of a tag, a payload, and a threshold signature:
+
+\begin{definition}[Wire Proof Format]
+\label{def:proof}
+\begin{equation}
+  \pi = \bigl(\mathsf{tag},\; \mathsf{payload},\; \sigma\bigr)
+\end{equation}
+where:
+\begin{align}
+  \mathsf{payload} &= \texttt{abi.encode}(\mathsf{tag}, C_s, \nu, T, r, a, \mathsf{extra}) \\
+  \sigma &= \mathrm{ThresholdSign}_{t,n}\bigl(H(\mathsf{payload})\bigr)
+\end{align}
+$C_s$ is the source chain identifier, $\nu$ is the operation nonce, $T$ is the token address, $r$ is the recipient, $a$ is the amount, and $\mathsf{extra}$ is a tag-specific extension field (empty for \texttt{DEPOSIT} and \texttt{RELEASE}).
+\end{definition}
+
+The hash function $H$ is chain-determined: \texttt{keccak256} for EVM targets, SHA-256 for Bitcoin-family, and the native hash for other environments. The adapter layer handles this mapping (see \S\ref{sec:adapters}).
+
+\subsection{Tag Semantics}
+
+\paragraph{DEPOSIT.} Attests that a user locked $a$ units of asset $T$ on source chain $C_s$, destined for recipient $r$ on the destination chain. The destination Teleporter verifies $\sigma$ and mints wrapped tokens.
+
+\begin{equation}
+  m_{\mathsf{dep}} = H\bigl(\mathsf{DEPOSIT} \,\|\, C_s \,\|\, \nu \,\|\, T \,\|\, r \,\|\, a\bigr)
+  \label{eq:deposit}
+\end{equation}
+
+\paragraph{YIELD.} Attests that accrued yield $\delta$ has increased the share price of bridge token $T$. The $\mathsf{extra}$ field carries the new share price numerator $p'$ and the epoch index $e$.
+
+\begin{equation}
+  m_{\mathsf{yld}} = H\bigl(\mathsf{YIELD} \,\|\, C_s \,\|\, \nu \,\|\, T \,\|\, p' \,\|\, e\bigr)
+  \label{eq:yield}
+\end{equation}
+
+\paragraph{BACKING.} Attests that total backing $B$ exists for token $T$ on source chain $C_s$ at timestamp $\tau$. The Teleporter enforces that $\tau$ is strictly greater than any previously accepted $\tau$ (monotonicity) and that $\tau \geq \mathrm{block.timestamp} - \Delta_{\mathsf{stale}}$ (staleness bound, default $\Delta_{\mathsf{stale}} = 7200\,\text{s}$).
+
+\begin{equation}
+  m_{\mathsf{back}} = H\bigl(\mathsf{BACKING} \,\|\, T \,\|\, B \,\|\, \tau \,\|\, C_s\bigr)
+  \label{eq:backing}
+\end{equation}
+
+\begin{invariant}[Backing Monotonicity]
+For successive backing proofs $\pi_k, \pi_{k+1}$ on a given token:
+\begin{equation}
+  \tau_{k+1} > \tau_k \quad \text{and} \quad \tau_{k+1} \geq \mathrm{block.timestamp} - \Delta_{\mathsf{stale}}
+\end{equation}
+\end{invariant}
+
+\paragraph{RELEASE.} Attests that the MPC authorizes releasing $a$ units of underlying asset $T$ to recipient $r'$ on source chain $C_s$. Issued after a user burns wrapped tokens on a destination chain.
+
+\begin{equation}
+  m_{\mathsf{rel}} = H\bigl(\mathsf{RELEASE} \,\|\, C_d \,\|\, \nu' \,\|\, T \,\|\, r' \,\|\, a\bigr)
+  \label{eq:release}
+\end{equation}
+
+The distinct tag prefixes in Equations~\eqref{eq:deposit}--\eqref{eq:release} guarantee domain separation: a signature valid for \texttt{DEPOSIT} cannot verify as \texttt{RELEASE}.
+
+\subsection{Replay Protection}
+\label{sec:replay}
+
+Each Teleporter contract maintains a per-source-chain nonce bitmap:
+
+\begin{equation}
+  \mathcal{N}: \mathbb{Z}_{\mathsf{chainId}} \times \mathbb{Z}_{\mathsf{nonce}} \to \{0, 1\}
+\end{equation}
+
+The verify-and-mark operation executes atomically within a single transaction:
+
+\begin{algorithm}[H]
+\caption{Atomic Nonce Check-and-Set}
+\begin{algorithmic}[1]
+\Require Source chain $C_s$, nonce $\nu$
+\State \textbf{assert} $\mathcal{N}(C_s, \nu) = 0$ \Comment{Not yet processed}
+\State $\mathcal{N}(C_s, \nu) \leftarrow 1$
+\end{algorithmic}
+\end{algorithm}
+
+Nonces are \emph{not} required to be sequential for \texttt{DEPOSIT} operations (out-of-order relay is permitted). Withdraw nonces for \texttt{RELEASE} operations \emph{are} sequential per destination chain, preventing front-running reordering of withdrawals.
+
+\begin{property}[Sequential Withdraw Nonces]
+\label{prop:seq-nonce}
+For \texttt{RELEASE} operations on chain $C$, the Teleporter enforces:
+\begin{equation}
+  \nu'_{k+1} = \nu'_k + 1
+\end{equation}
+where $\nu'_k$ is the last processed release nonce for chain $C$.
+\end{property}
+
+%% =========================================================================

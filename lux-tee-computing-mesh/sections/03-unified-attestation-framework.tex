@@ -1,0 +1,85 @@
+\section{Unified Attestation Framework}
+
+\label{sec:attestation}
+
+\subsection{Heterogeneous TEE Support}
+
+Lux supports four TEE types with a unified interface:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{TEE} & \textbf{Isolation Guarantee} & \textbf{Attestation Primitive} \\
+\midrule
+Intel SGX v2/FLC & EPC pages encrypted (AES-128) & SGX Quote v5 \\
+Intel TDX Mkt 2 & VM memory encrypted, I/O MMU & TDREPORT \\
+AMD SEV-SNP & NPT integrity + encryption & REPORT\_REQUEST \\
+NVIDIA H100 GPU & SM isolation, memory encryption & AttestationToken (ECDSA-P521) \\
+\bottomrule
+\end{tabular}
+\caption{Supported TEE hardware specifications}
+\label{tab:tees}
+\end{table}
+
+\subsection{Attestation Quote Protocol}
+
+All TEE attestations are normalized into a unified protobuf message:
+
+\begin{lstlisting}[language=C,caption={Unified TeeQuote Protocol Buffer}]
+message TeeQuote {
+  enum Type { SGX=0; TDX=1; SNP=2; GPU=3; }
+  Type    tee_type      = 1;
+  bytes   raw_quote     = 2;  // vendor binary blob
+  bytes   job_payload   = 3;  // SHA-256(encrypted_code + inputs)
+  bytes   merkle_root   = 4;  // root of execution trace
+  bytes   signature     = 5;  // re-signed with Lux domain key
+}
+\end{lstlisting}
+
+\subsection{On-Chain Verification}
+
+The \texttt{TeeQuoteVerifier} smart contract implements vendor-specific parsers:
+
+\begin{lstlisting}[caption={Solidity Verification Interface},label={lst:verifier}]
+function verifyQuote(
+    TeeType teeType,
+    bytes calldata quote,
+    bytes32 expectedPayloadHash,
+    bytes32 merkleRoot
+) external view returns (bool valid);
+\end{lstlisting}
+
+\textbf{SGX Verification} (Quote v3/v4):
+\begin{enumerate}
+  \item Extract \texttt{reportBody} and \texttt{reportData} fields (offsets 42:106)
+  \item Verify \texttt{reportData[0:32] == SHA256(job\_payload)}
+  \item Verify \texttt{reportData[32:64] == merkleRoot}
+  \item Check signature chain: Quoting Enclave $\rightarrow$ PCK Certificate $\rightarrow$ Intel Root CA
+  \item Validate enclave measurement (MRENCLAVE) against trusted whitelist
+\end{enumerate}
+
+\textbf{TDX Verification} (TDREPORT):
+\begin{enumerate}
+  \item Parse TD measurements (offset 32:64)
+  \item Verify \texttt{reportData == keccak256(job\_payload || merkleRoot)}
+  \item Check TD measurement against known good values
+  \item Validate signature chain to Intel TDX root CA
+\end{enumerate}
+
+\textbf{SEV-SNP Verification} (Attestation Report):
+\begin{enumerate}
+  \item Extract measurement from offset 96:128
+  \item Verify \texttt{hostData == keccak256(job\_payload || merkleRoot)}
+  \item Check VCEK certificate chain to AMD root CA
+  \item Validate TCB version and policy bits
+\end{enumerate}
+
+\textbf{GPU TEE Verification} (NVIDIA Hopper):
+\begin{enumerate}
+  \item Extract AttestationToken nonce (offset 64:96)
+  \item Verify \texttt{nonce == keccak256(job\_payload || merkleRoot)}
+  \item Check GPU measurement (offset 128:160)
+  \item Validate ECDSA-P521 signature against NVIDIA GPU root CA
+\end{enumerate}
+

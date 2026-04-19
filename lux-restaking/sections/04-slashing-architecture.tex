@@ -1,0 +1,99 @@
+\section{Slashing Architecture}
+
+\label{sec:slashing}
+%%==========================================================================
+
+\subsection{Slashing Conditions}
+
+Each AVS $s$ registers a \emph{slashing module} $\Phi_s$, a smart contract on the C-Chain
+exposing the interface:
+
+\begin{algorithmic}
+\Function{SubmitSlashProof}{operator $v$, evidence $\pi$}
+  \State Verify $\pi$ proves $v$ violated $\Sigma_s$
+  \State Emit \texttt{SlashRequest}$(v, s, \text{fraction})$
+\EndFunction
+\end{algorithmic}
+
+The LRP coordinator contract on the P-Chain monitors all registered slashing modules.
+Upon receiving a valid \texttt{SlashRequest}, it initiates the following multi-step process.
+
+\subsection{Slashing Execution Flow}
+
+\begin{algorithm}[H]
+\caption{LRP Slashing Protocol}
+\label{alg:slash}
+\begin{algorithmic}[1]
+\Require Operator $v$, Service $s$, Slash fraction $\delta$, Evidence $\pi$
+\Ensure Operator's allocated stake reduced; slashed amount distributed
+\State \textbf{Freeze} operator $v$'s stake for all services (prevent withdrawal)
+\State \textbf{Verify} $\Phi_s.\texttt{SubmitSlashProof}(v, \pi)$ returns \texttt{true}
+\State Compute slash amount: $\Delta = \delta \cdot \alpha_{v,s} \cdot w(v)$
+\State Initiate \textbf{veto window} of duration $T_{\text{veto}} = 24\,\text{hours}$
+\If{Veto Committee approves slash within $T_{\text{veto}}$}
+  \State Transfer $\Delta$ from $v$'s staking contract to slash distributor
+  \State Update $w(v) \leftarrow w(v) - \Delta$
+  \State Redistribute $\Delta$: 50\% burn, 30\% AVS insurance fund, 20\% reporter reward
+\Else
+  \State \textbf{Unfreeze} $v$'s stake; no slash executed
+\EndIf
+\State Update $v$'s reputation score $\rho_v \leftarrow \rho_v - \text{SlashPenalty}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Veto Committee}
+
+The veto committee prevents spurious or malicious slashing. It consists of:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item 9 members elected by LUX governance with 6-month terms;
+  \item Quorum requirement: 5-of-9 must approve a slash within the veto window;
+  \item Committee members have no financial stake in the slashed operator or AVS;
+  \item Decisions are final and not subject to further governance challenge.
+\end{itemize}
+
+\begin{remark}[Decentralization Trajectory]
+The veto committee is a pragmatic interim mechanism. Our roadmap targets replacing it with
+an on-chain ZK proof of valid slashing conditions by Q4 2025, eliminating the trusted
+committee entirely.
+\end{remark}
+
+\subsection{Double-Slash Prevention}
+
+A critical invariant is that the total slashed amount never exceeds $w(v)$, even when
+multiple services slash the same operator simultaneously. The LRP coordinator enforces:
+
+\[
+  \sum_{s: \text{active slash}(v,s)} \delta_{v,s} \cdot \alpha_{v,s} \leq 1.
+\]
+
+This is implemented through a \emph{slash queue}: incoming slash requests for operator $v$
+are serialized and executed in order, with each subsequent slash computed on the
+\emph{post-slash} stake. If the remaining stake falls below the minimum required for any
+service, the operator is automatically ejected from that service.
+
+\subsection{Slashing Conditions Taxonomy}
+
+Table~\ref{tab:slash_conditions} summarizes the standard slashing conditions defined by
+the LRP specification. Individual AVSs may define additional conditions.
+
+\begin{table}[H]
+\centering
+\caption{Standard Slashing Conditions in LRP}
+\label{tab:slash_conditions}
+\begin{tabular}{lll}
+\toprule
+\textbf{Condition} & \textbf{Evidence Type} & \textbf{Slash Rate} \\
+\midrule
+Double signing (Beacon) & Two conflicting block headers & 100\% \\
+Equivocation (X-Chain UTXO) & Two conflicting UTXO spends & 100\% \\
+Liveness fault (extended) & $> 1\%$ downtime in epoch & 0.5\% per epoch \\
+Invalid state transition & ZK proof of invalid transition & 10--100\% \\
+Oracle manipulation & Statistical divergence proof & 5--50\% \\
+Data withholding (DA service) & Coding proof of unavailability & 10\% \\
+Censorship (MEV service) & Transaction inclusion proof & 2\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%%==========================================================================

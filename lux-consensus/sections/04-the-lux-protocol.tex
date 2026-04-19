@@ -1,0 +1,221 @@
+\section{The Lux Protocol}
+
+\label{sec:protocol}
+
+\subsection{Protocol Overview}
+
+Lux Consensus operates in continuous asynchronous rounds. Each node $v$:
+\begin{enumerate}
+\item Selects a set of $k$ validators uniformly at random (with replacement) from $V$,
+weighted by stake
+\item Queries each selected validator for its current preference on an unresolved conflict set
+\item If more than $\alpha k$ responses favor a single preference, updates its own preference
+and increments the confidence counter
+\item If the confidence counter reaches $\beta$ consecutive rounds of supermajority agreement,
+the node finalizes its preference
+\end{enumerate}
+
+The key parameters are:
+\begin{itemize}
+\item $k$: sample size (default: 20)
+\item $\alpha$: supermajority threshold, $\alpha > 1/2$ (default: $\lceil 0.8k \rceil$)
+\item $\beta$: finalization threshold (default: 20 consecutive rounds)
+\end{itemize}
+
+\subsection{Slush Layer}
+
+The base layer implements Slush semantics for binary preference:
+
+\begin{algorithm}
+\caption{Slush: Binary Preference Gossip}
+\label{alg:slush}
+\begin{algorithmic}[1]
+\State \textbf{Init:} $\text{col}_v \leftarrow \bot$ (no preference)
+\Procedure{OnQuery}{$c$ from validator $u$}
+    \If{$\text{col}_v = \bot$}
+        \State $\text{col}_v \leftarrow c$
+    \EndIf
+    \State \textbf{return} $\text{col}_v$
+\EndProcedure
+\Procedure{MainLoop}{}
+    \While{not decided}
+        \State $S \leftarrow$ sample $k$ validators from $V$ uniformly at random
+        \State $\text{cnt}[0], \text{cnt}[1] \leftarrow 0, 0$
+        \ForAll{$u \in S$}
+            \State $c_u \leftarrow$ \textsc{Query}($u$, $\text{col}_v$)
+            \State $\text{cnt}[c_u] \mathrel{+}= 1$
+        \EndFor
+        \If{$\exists c : \text{cnt}[c] \geq \alpha k$ \textbf{and} $c \neq \text{col}_v$}
+            \State $\text{col}_v \leftarrow c$
+        \EndIf
+    \EndWhile
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Flare Layer: Conviction Counter}
+
+Flare extends Slush with a consecutive-round conviction counter:
+
+\begin{algorithm}
+\caption{Flare: Conviction-Based Finalization}
+\label{alg:flare}
+\begin{algorithmic}[1]
+\State \textbf{Init:} $\text{col}_v \leftarrow \bot$, $\text{cnt}_v \leftarrow 0$
+\Procedure{MainLoop}{}
+    \While{$\text{cnt}_v < \beta$}
+        \State $S \leftarrow$ sample $k$ validators from $V$ uniformly at random
+        \State $c^* \leftarrow$ majority color in responses from $S$
+        \If{$|\{u \in S : \text{resp}(u) = c^*\}| \geq \alpha k$}
+            \If{$c^* \neq \text{col}_v$}
+                \State $\text{col}_v \leftarrow c^*$
+                \State $\text{cnt}_v \leftarrow 0$ \Comment{Reset on switch}
+            \EndIf
+            \State $\text{cnt}_v \mathrel{+}= 1$
+        \EndIf
+    \EndWhile
+    \State \textbf{decide}($\text{col}_v$)
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Wave Layer: Historical Confidence}
+
+Wave adds per-color confidence counters that persist across preference switches:
+
+\begin{algorithm}
+\caption{Wave: Persistent Confidence Counters}
+\label{alg:wave}
+\begin{algorithmic}[1]
+\State \textbf{Init:} $d[c] \leftarrow 0$ for all $c$, $\text{pref}_v \leftarrow \bot$, $\text{last}_v \leftarrow \bot$, $\text{cnt}_v \leftarrow 0$
+\Procedure{MainLoop}{}
+    \While{$\text{cnt}_v < \beta$}
+        \State $S \leftarrow$ sample $k$ validators from $V$ uniformly at random
+        \State $c^* \leftarrow \arg\max_c |\{u \in S : \text{resp}(u) = c\}|$
+        \If{$|\{u \in S : \text{resp}(u) = c^*\}| \geq \alpha k$}
+            \State $d[c^*] \mathrel{+}= 1$
+            \If{$d[c^*] > d[\text{pref}_v]$}
+                \State $\text{pref}_v \leftarrow c^*$ \Comment{Switch preference}
+            \EndIf
+            \If{$c^* = \text{last}_v$}
+                \State $\text{cnt}_v \mathrel{+}= 1$
+            \Else
+                \State $\text{last}_v \leftarrow c^*$
+                \State $\text{cnt}_v \leftarrow 1$
+            \EndIf
+        \EndIf
+    \EndWhile
+    \State \textbf{decide}($\text{pref}_v$)
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Lux DAG Layer}
+
+Lux extends Wave to operate over a DAG of transactions rather than binary choices.
+Each transaction $t$ carries a set of parent transactions, creating a partial order. Lux
+runs independent Wave instances per conflict set and derives a consistent total
+preference through the DAG structure.
+
+\begin{definition}[Ancestry Set]
+For transaction $t$, its ancestry set is $\mathcal{A}(t) = \{t' : t' \text{ is an ancestor of } t\}$.
+\end{definition}
+
+\begin{definition}[Acceptance Condition]
+Transaction $t$ is accepted (finalized) when:
+\begin{enumerate}
+\item All $t' \in \mathcal{A}(t)$ have been accepted, and
+\item The Wave instance for $t$'s conflict set has decided in favor of $t$,
+i.e., $\text{cnt}(t) \geq \beta$ consecutive rounds of supermajority
+\end{enumerate}
+\end{definition}
+
+\begin{algorithm}
+\caption{Lux: DAG-Based Consensus}
+\label{alg:lux}
+\begin{algorithmic}[1]
+\State \textbf{Init:} $\mathcal{T} \leftarrow \emptyset$ (known transactions), $d[\cdot] \leftarrow 0$, $\text{pref}[\cdot] \leftarrow \bot$
+\Procedure{OnReceive}{transaction $t$}
+    \State Verify $t$'s parents $\subseteq \mathcal{T}$ and $t$'s cryptographic validity
+    \State $\mathcal{T} \leftarrow \mathcal{T} \cup \{t\}$
+    \State $\text{pref}[t] \leftarrow t$ \Comment{Initially prefer first-seen}
+\EndProcedure
+\Procedure{QueryLoop}{}
+    \While{$\exists t \in \mathcal{T}$ not accepted}
+        \State Select unaccepted transaction $t^*$ with highest chit count
+        \State $S \leftarrow$ sample $k$ validators from $V \setminus \{v\}$, stake-weighted
+        \ForAll{$u \in S$ \textbf{in parallel}}
+            \State $r_u \leftarrow$ \textsc{PrefQuery}($u$, $t^*$)
+        \EndFor
+        \State $c^* \leftarrow \arg\max_{c \in \mathcal{C}(t^*)} |\{u \in S : r_u = c\}|$
+        \If{$|\{u \in S : r_u = c^*\}| \geq \alpha k$}
+            \State $d[c^*] \mathrel{+}= 1$
+            \If{$d[c^*] > d[\text{pref}[t^*]]$}
+                \State $\text{pref}[t^*] \leftarrow c^*$
+            \EndIf
+            \If{$c^* = \text{last}[t^*]$}
+                \State $\text{cnt}[t^*] \mathrel{+}= 1$
+            \Else
+                \State $\text{last}[t^*] \leftarrow c^*$
+                \State $\text{cnt}[t^*] \leftarrow 1$
+            \EndIf
+            \If{$\text{cnt}[t^*] \geq \beta$ \textbf{and} all ancestors accepted}
+                \State \textsc{Accept}($\text{pref}[t^*]$)
+            \EndIf
+        \EndIf
+    \EndWhile
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Query Response Protocol}
+
+When validator $v$ receives a query about transaction $t$ from validator $u$:
+\begin{enumerate}
+\item If $v$ has never seen $t$: return $\bot$ (neutral)
+\item If $t$ is in a conflict set with an already-accepted transaction $t'$: return $t'$
+\item Otherwise: return $\text{pref}[v, t]$ (current preference within $t$'s conflict set)
+\end{enumerate}
+
+The response is signed with $v$'s private key, enabling $u$ to verify authenticity.
+Responses include a Merkle proof of $v$'s current DAG state, enabling detection of
+equivocating validators that send conflicting preferences to different queriers in the
+same round.
+
+\subsection{Metastability Breaking with VRFs}
+
+In the pathological case where exactly $\lfloor n/2 \rfloor$ nodes prefer each option,
+pure random sampling may not resolve the tie. Lux introduces a deterministic tie-breaking
+mechanism using Verifiable Random Functions (VRFs)~\cite{micali1999verifiable}.
+
+Each validator $v$ has a VRF key pair $(sk_v, pk_v)$. For each query round $r$, $v$
+computes $\pi_v = \text{VRF}_{sk_v}(r \| t)$ and the output $h_v = H(\pi_v)$.
+The validator with the lexicographically smallest $h_v$ among the sample $S$ becomes the
+\emph{leader} for this query. If the query is tied ($|\text{cnt}[0] - \text{cnt}[1]| \leq 1$),
+the tie is broken in favor of the leader's preference.
+
+\begin{proposition}[VRF Tie-Breaking Fairness]
+Under the VRF security assumption, the probability that any specific validator is
+selected as leader in a given round is $1/|S|$, independent of the adversary's strategy.
+\end{proposition}
+
+Since VRF outputs are pseudorandom and verifiable, this mechanism is both unpredictable
+before commitment and verifiable after the fact, preventing adversaries from gaming the
+tie-breaking without controlling the VRF key.
+
+\subsection{Adaptive Threshold Adjustment}
+
+Lux implements an adaptive threshold mechanism that adjusts $\alpha$ based on observed
+network conditions. When the network is healthy (low latency, few timeouts), the threshold
+can be lowered to accelerate convergence. Under adversarial conditions (high timeout rate,
+inconsistent responses), the threshold is raised to strengthen safety:
+\begin{equation}
+\alpha_r = \alpha_0 + \gamma \cdot \frac{\text{timeout}_r}{k}
+\end{equation}
+where $\alpha_0 = 0.75$ is the base threshold, $\gamma = 0.15$ is the adjustment factor,
+and $\text{timeout}_r$ is the number of timed-out queries in round $r$. The maximum
+effective threshold is $\alpha_{\max} = 0.95$.
+
+%% -----------------------------------------------------------------------
+%%  5. FORMAL ANALYSIS
+%% -----------------------------------------------------------------------

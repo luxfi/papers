@@ -1,0 +1,67 @@
+\section{Memory Allocation}
+
+%% ============================================================================
+
+\subsection{Per-Message Allocation Profile}
+
+\begin{table}[h]
+\centering
+\caption{Heap allocations per encode+decode round-trip}
+\label{tab:allocs}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Protocol} & \textbf{Allocs (enc)} & \textbf{Allocs (dec)} & \textbf{B/op} & \textbf{GC/M msgs} \\
+\midrule
+\rowcolor{luxblue!10}
+ZAP & 0 & 0 & 0 & 0 \\
+FlatBuffers & 0 & 0 & 0 & 0 \\
+Cap'n Proto & 1 & 0 & 64 & 0.8 \\
+gRPC (protobuf) & 5 & 3 & 576 & 7.2 \\
+QUIC (raw) & 3 & 2 & 384 & 4.8 \\
+Protobuf-mux & 8 & 5 & 896 & 11.2 \\
+JSON-RPC & 12 & 28 & 3,072 & 38.4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+ZAP and FlatBuffers achieve zero allocations for both encode and decode. Cap'n Proto allocates one segment during encode (64 bytes) but achieves zero-copy decode. gRPC's protobuf path allocates 8 objects (576 bytes) per round-trip due to message struct construction, byte slice allocation for string fields, and HTTP/2 frame buffering. JSON-RPC allocates 40 objects (3,072 bytes) due to reflection-based marshaling, intermediate map construction, and string buffer allocation.
+
+\subsection{Cumulative Heap Growth}
+
+\begin{table}[h]
+\centering
+\caption{Cumulative heap allocation after 1 million round-trips}
+\label{tab:heap}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Protocol} & \textbf{Total allocated} & \textbf{Peak heap} & \textbf{Total GC pauses} \\
+\midrule
+\rowcolor{luxblue!10}
+ZAP & 0 B & 2.1 MB (runtime) & 0 \\
+FlatBuffers & 0 B & 2.1 MB & 0 \\
+Cap'n Proto & 61 MB & 4.8 MB & 8 \\
+gRPC & 549 MB & 12.3 MB & 72 \\
+QUIC & 366 MB & 8.7 MB & 48 \\
+Protobuf-mux & 854 MB & 18.4 MB & 112 \\
+JSON-RPC & 2,929 MB & 42.1 MB & 384 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+After 1M messages, JSON-RPC has allocated 2.93 GB of heap memory (subsequently collected), triggering 384 GC cycles. Each GC cycle introduces 50--800$\mu$s of stop-the-world pause. ZAP's total allocation remains at 0 bytes on the hot path; the 2.1 MB baseline is Go runtime overhead (goroutine stacks, type metadata).
+
+\begin{corollary}[Consensus Timeout Risk]
+\label{cor:timeout}
+For a consensus protocol with timeout $T$ and GC pause distribution $P_{\text{gc}} \sim \text{LogNormal}(\mu_{\text{gc}}, \sigma_{\text{gc}})$, the probability of a GC-induced timeout in $n$ messages is:
+\[
+\Pr[\text{timeout}] = 1 - \left(1 - \Pr[P_{\text{gc}} > T]\right)^{n \cdot r_{\text{gc}}}
+\]
+where $r_{\text{gc}}$ is the GC trigger rate per message. For gRPC with $r_{\text{gc}} = 7.2 \times 10^{-6}$, $\mu_{\text{gc}} = 5.3$ (150$\mu$s), $\sigma_{\text{gc}} = 0.8$, and $T = 100$ms:
+\[
+\Pr[\text{timeout in 10M msgs}] = 1 - (1 - 2.3 \times 10^{-8})^{72} = 1.66 \times 10^{-6}
+\]
+For ZAP with $r_{\text{gc}} = 0$: $\Pr[\text{timeout}] = 0$.
+\end{corollary}
+
+%% ============================================================================

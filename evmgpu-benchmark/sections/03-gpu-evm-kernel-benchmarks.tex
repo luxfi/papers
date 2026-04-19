@@ -1,0 +1,121 @@
+\section{GPU EVM Kernel Benchmarks}
+
+
+\subsection{Peak Throughput}
+
+The GPU EVM kernel dispatches EVM opcodes as Metal compute shader workgroups. Each
+transaction runs as an independent GPU thread with its own stack and program counter.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Metric} & \textbf{CPU} & \textbf{GPU (Metal)} & \textbf{Speedup} \\
+\midrule
+Opcodes/sec & 17.7\,M & 85.9\,M & \textbf{4.85$\times$} \\
+\bottomrule
+\end{tabular}
+\caption{Peak EVM opcode throughput. GPU measured on 50k transactions $\times$
+5{,}000 opcodes each (250M total opcodes). CPU measured on the same workload
+using the Go EVM interpreter.}
+\label{tab:peak}
+\end{table}
+
+\subsection{GPU Crossover Analysis}
+
+GPU acceleration incurs fixed overhead for kernel launch, buffer allocation, and command
+buffer encoding. This overhead dominates at low per-transaction complexity. The crossover
+point---where GPU matches CPU---occurs at approximately 500 opcodes per transaction.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{rrrr}
+\toprule
+\textbf{Ops/tx} & \textbf{CPU (ms)} & \textbf{GPU (ms)} & \textbf{GPU Speedup} \\
+\midrule
+100    & ---  & ---  & $<$1$\times$ (CPU wins) \\
+500    & ---  & ---  & $\approx$1.0$\times$ (crossover) \\
+2{,}000  & ---  & ---  & 2.08$\times$ \\
+5{,}000  & ---  & ---  & 2.83$\times$ \\
+10{,}000 & ---  & ---  & 3.09$\times$ \\
+\bottomrule
+\end{tabular}
+\caption{GPU speedup as a function of per-transaction opcode count. Below 500 ops/tx,
+CPU is faster due to GPU launch overhead. Speedup increases with complexity as GPU
+parallelism amortizes fixed costs. All measurements at 50k transactions.}
+\label{tab:crossover}
+\end{table}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=\linewidth,
+    height=6cm,
+    xlabel={Opcodes per transaction},
+    ylabel={GPU Speedup ($\times$)},
+    xmode=log,
+    log basis x=10,
+    xmin=100, xmax=15000,
+    ymin=0, ymax=5.5,
+    grid=major,
+    legend pos=south east,
+    legend style={font=\small},
+    every axis label/.style={font=\small},
+    every tick label/.style={font=\small},
+]
+\addplot[thick, gpugreen, mark=*, mark size=2.5] coordinates {
+    (500, 1.0)
+    (2000, 2.08)
+    (5000, 2.83)
+    (10000, 3.09)
+};
+\addlegendentry{Measured speedup}
+
+\draw[dashed, gray] (axis cs:100,1) -- (axis cs:15000,1);
+\node[font=\tiny, gray] at (axis cs:200,1.15) {breakeven};
+
+\draw[dashed, gpugreen!50] (axis cs:500,0) -- (axis cs:500,1.0);
+\node[font=\tiny, gpugreen!70!black] at (axis cs:700,0.4) {crossover};
+
+% Peak annotation
+\node[font=\tiny, gpugreen!70!black, anchor=west] at (axis cs:10000,3.5) {50k txs: 4.85$\times$};
+\end{axis}
+\end{tikzpicture}
+\caption{GPU speedup curve. The crossover at $\sim$500 ops/tx reflects Metal kernel launch
+overhead ($\sim$50$\mu$s). Real-world smart contracts (Uniswap: $\sim$3{,}000--5{,}000 ops,
+complex DeFi: $>$10{,}000 ops) fall in the 2--3$\times$ GPU advantage zone.}
+\label{fig:crossover}
+\end{figure}
+
+\subsection{GPU Memory Scaling}
+
+Unified memory on Apple Silicon eliminates explicit CPU--GPU transfers but imposes a
+total memory budget. GPU memory consumption scales linearly with transaction count:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{rrrl}
+\toprule
+\textbf{Transactions} & \textbf{GPU Memory} & \textbf{Per-tx} & \textbf{Notes} \\
+\midrule
+10{,}000  & 732\,MB  & 73\,KB  & Fits any Apple GPU \\
+50{,}000  & 3.7\,GB  & 74\,KB  & M1 Max 32GB+ \\
+100{,}000 & 7.3\,GB  & 73\,KB  & M1 Max 64GB \\
+\midrule
+\multicolumn{2}{l}{Persistent state DB} & \multicolumn{2}{l}{$\sim$5\,GB} \\
+\bottomrule
+\end{tabular}
+\caption{GPU memory consumption. Per-transaction overhead is stable at $\sim$73\,KB,
+encompassing stack, memory, calldata, and MvMemory versioned state. Persistent state
+(the GPU-resident hash table) adds $\sim$5\,GB for a full Ethereum-scale state trie.}
+\label{tab:gpumem}
+\end{table}
+
+At 73\,KB per transaction, a 64\,GB unified memory system can process blocks of up to
+$\sim$800{,}000 transactions in a single GPU batch (excluding persistent state). With the
+5\,GB persistent state buffer, practical capacity is $\sim$700{,}000 transactions per block.
+

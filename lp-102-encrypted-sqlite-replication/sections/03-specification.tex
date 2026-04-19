@@ -1,0 +1,166 @@
+\section{Specification}
+\label{sec:spec}
+%% ============================================================
+
+\subsection{Encryption: age (X25519)}\label{sec:age}
+
+All replicated data is encrypted using age~\cite{age}, a modern
+file encryption format designed by Filippo Valsorda. The Lux
+ecosystem vendors age as \texttt{luxfi/age} and \texttt{hanzoai/age}.
+
+\begin{definition}[age Encryption]\label{def:age}
+An age-encrypted file consists of:
+\begin{enumerate}[nosep]
+  \item A header containing one or more recipient stanzas, each
+    wrapping a symmetric file key for a specific recipient.
+  \item A payload encrypted with ChaCha20-Poly1305 using the file
+    key, with a random 16-byte nonce.
+\end{enumerate}
+The X25519 recipient type derives a shared secret via Diffie-Hellman
+on Curve25519, then wraps the file key using HKDF-SHA-256 +
+ChaCha20-Poly1305.
+\end{definition}
+
+\noindent\textbf{Why age over GPG or NaCl box:}
+
+\begin{itemize}[nosep]
+  \item No configuration. No key servers. No web of trust. One format.
+  \item Streaming encryption: large files encrypt without buffering
+    the entire plaintext.
+  \item Composable: multiple recipients per file (operator + org key).
+  \item Audited: formal security analysis by Valsorda et al.
+  \item Small: the Go implementation (\texttt{filippo.io/age}) is
+    \textasciitilde2000 lines.
+\end{itemize}
+
+\subsection{Replication: WAL Streaming}\label{sec:replication}
+
+Replication is performed by \texttt{hanzoai/replicate}, a fork of
+Litestream~\cite{litestream} extended with age end-to-end encryption.
+
+\begin{definition}[WAL Replication]\label{def:wal}
+The replicator operates as a sidecar process that:
+\begin{enumerate}[nosep]
+  \item Opens the SQLite database in WAL mode
+    (\texttt{PRAGMA journal\_mode=WAL}).
+  \item Monitors the WAL file for new frames via \texttt{inotify}
+    (Linux) or \texttt{kqueue} (macOS/BSD).
+  \item On each sync interval (default 1\,s), reads uncommitted WAL
+    frames, encrypts them with the principal's age public key, and
+    uploads the encrypted segment to S3.
+  \item On each snapshot interval (default 1\,h), creates a full
+    database snapshot, encrypts it, and uploads it to S3.
+  \item Maintains a generation index in S3 that maps WAL positions
+    to segment keys.
+\end{enumerate}
+\end{definition}
+
+\noindent\textbf{Sync interval.} The default is 1\,s. For
+high-throughput services (e.g., ATS during market hours), this can be
+reduced to 100\,ms. For low-write services (e.g., KMS audit logs),
+10\,s is acceptable. The interval is configurable per database.
+
+\noindent\textbf{Snapshot interval.} Full snapshots bound recovery
+time. With hourly snapshots and 1\,s WAL segments, worst-case recovery
+replays at most 1 hour of WAL segments on top of the snapshot. For
+services requiring faster recovery, the snapshot interval can be
+reduced to 15\,min.
+
+\subsection{Storage Backend}\label{sec:storage}
+
+Replicated data is stored on S3-compatible object storage:
+
+\begin{itemize}[nosep]
+  \item \textbf{Production}: MinIO via \texttt{hanzoai/s3}, deployed
+    per cluster.
+  \item \textbf{Cloud fallback}: AWS S3, GCS, Cloudflare R2.
+  \item \textbf{Development}: MinIO single-node or local filesystem.
+\end{itemize}
+
+\noindent\textbf{S3 path convention:}
+
+\begin{lstlisting}[language=YAML,caption={S3 path structure.}]
+# Pattern
+s3://{bucket}/{service}/{org-id}/{db-name}/generations/{gen}/
+
+# Example
+s3://lux-replicate/ats/org-abc123/data.db/generations/0001/
+  snapshots/000000000000.db.age
+  wal/000000000001.wal.age
+  wal/000000000002.wal.age
+\end{lstlisting}
+
+Files in S3 carry the \texttt{.age} suffix to indicate age encryption.
+No plaintext database content is ever written to S3.
+
+\subsection{Per-Principal Key Derivation}\label{sec:keys}
+
+Each organization derives a unique age keypair from the service's
+master key using HKDF~\cite{rfc5869}.
+
+\begin{definition}[Key Hierarchy]\label{def:keyhier}
+\begin{enumerate}[nosep]
+  \item \textbf{Master key}: A 256-bit secret stored in KMS
+    (\texttt{hanzoai/kms}), scoped to the service (e.g.,
+    \texttt{ats-replicate-master}).
+  \item \textbf{Org key material}: Derived via
+    $\mathrm{HKDF\text{-}SHA256}(\mathit{master}, \mathit{org\_id}, \texttt{"age-replicate-v1"})$
+    producing 32 bytes.
+  \item \textbf{age identity}: The 32-byte org key material is used
+    as the X25519 scalar to derive an age identity (private key) and
+    its corresponding recipient (public key).
+  \item \textbf{Operator recovery key}: A separate age identity held
+    by the operator (stored in KMS under
+    \texttt{replicate-recovery-key}), added as a second recipient to
+    every encrypted file.
+\end{enumerate}
+\end{definition}
+
+\begin{proposition}[Principal Isolation]\label{prop:isolation}
+Compromise of org $A$'s derived key material reveals no information
+about org $B$'s key material, provided the master key remains secret.
+This follows from the PRF security of HKDF: if the master key is
+uniformly random and the org IDs are distinct, the derived keys are
+computationally independent.
+\end{proposition}
+
+\noindent\textbf{Key rotation.} When a master key is rotated in KMS:
+
+\begin{enumerate}[nosep]
+  \item The service re-derives all org keypairs from the new master.
+  \item Existing S3 data remains readable via the old keypair (stored
+    as a ``retired key'' in KMS with an expiry).
+  \item New WAL segments and snapshots use the new keypair.
+  \item A background job re-encrypts old snapshots to the new key
+    within 24 hours, after which the old key is deleted.
+\end{enumerate}
+
+\subsection{Configuration}\label{sec:config}
+
+Each service declares replication targets in a \texttt{litestream.yml}
+file:
+
+\begin{lstlisting}[language=YAML,caption={Minimal litestream.yml for a Base service.}]
+dbs:
+  - path: /data/pb_data/data.db
+    replicas:
+      - type: s3
+        bucket: lux-replicate
+        path: ${SERVICE_NAME}/${ORG_ID}
+        endpoint: ${S3_ENDPOINT}
+        access-key-id: ${S3_ACCESS_KEY}
+        secret-access-key: ${S3_SECRET_KEY}
+        sync-interval: 1s
+        snapshot-interval: 1h
+        age:
+          recipients:
+            - ${ORG_AGE_RECIPIENT}
+            - ${RECOVERY_AGE_RECIPIENT}
+          identities:
+            - ${ORG_AGE_IDENTITY_PATH}
+\end{lstlisting}
+
+The \texttt{age} block is the extension added by
+\texttt{hanzoai/replicate}. Upstream Litestream does not support it.
+
+%% ============================================================
