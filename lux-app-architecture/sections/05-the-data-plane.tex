@@ -1,0 +1,82 @@
+\section{The Data Plane}
+\label{sec:data}
+% ============================================================================
+
+The data plane is Base: an encrypted SQLite runtime with CRDT sync, realtime
+subscriptions, and a plugin architecture.
+
+\subsection{Encrypted SQLite}
+
+Each vault is a single SQLite database file encrypted by SQLCipher. The
+encryption parameters:
+
+\begin{itemize}[nosep]
+  \item Algorithm: AES-256-CBC with per-page HMAC-SHA512.
+  \item Key derivation: PBKDF2-HMAC-SHA512, 256,000 iterations for
+        passphrase-derived keys. Direct key mode for HKDF-derived keys.
+  \item Page size: 4096 bytes (matching OS page size for mmap efficiency).
+  \item Reserve bytes: 80 (IV + HMAC per page).
+\end{itemize}
+
+The vault key $k_{\mathsf{enc}}$ is derived from the capsule's root key material:
+\[
+  k_{\mathsf{enc}} = \mathsf{HKDF\text{-}SHA256}(k_{\mathsf{root}},
+    \texttt{"vault"} \| \mathsf{capsule\_id}, 32)
+\]
+
+For post-quantum key wrapping, $k_{\mathsf{enc}}$ is additionally encapsulated
+under ML-KEM-768:
+\[
+  (c, k_{\mathsf{shared}}) \leftarrow \mathsf{ML\text{-}KEM.Encaps}(pk_{\mathsf{pq}})
+\]
+\[
+  k_{\mathsf{wrapped}} = \mathsf{AES\text{-}256\text{-}GCM.Enc}(k_{\mathsf{shared}},
+    k_{\mathsf{enc}})
+\]
+
+\subsection{CRDT Sync Protocol}
+
+The sync protocol operates on the write-ahead log, not the database file.
+Each write produces a CRDT operation:
+
+\begin{definition}[Sync Operation]\label{def:syncop}
+A sync operation is a tuple $(\mathsf{hlc}, \mathsf{table}, \mathsf{row\_id},
+\mathsf{col}, \mathsf{value}, \mathsf{tombstone}, \sigma)$ where $\mathsf{hlc}$
+is a hybrid logical clock timestamp, and $\sigma$ is an Ed25519 signature over
+the preceding fields by the writing principal.
+\end{definition}
+
+Conflict resolution uses last-writer-wins (LWW) semantics ordered by HLC.
+For columns requiring richer merge semantics (e.g., collaborative text), the
+application may register custom CRDT types (RGA for sequences, OR-Set for
+collections).
+
+The sync protocol:
+
+\begin{enumerate}[nosep]
+  \item The local vault writes an operation to the WAL and increments the HLC.
+  \item The operation is encrypted with $k_{\mathsf{sync}}$ (derived from
+        $k_{\mathsf{root}}$ via a separate HKDF context) and sent to peers
+        in $\Sigma$.
+  \item Receiving peers decrypt, verify $\sigma$, check capability authorization
+        in $\Gamma$, and merge into their local WAL.
+  \item Periodically, the vault compacts the WAL into the SQLite database and
+        publishes a checkpoint hash to $\mathcal{A}$.
+\end{enumerate}
+
+\subsection{Realtime API}
+
+Base exposes a realtime subscription API over the vault. Clients subscribe to
+table/row/column changes. The subscription is local---it observes the CRDT merge
+stream. When a remote peer's operation merges into the local WAL, subscribed
+clients receive the change event. No server is in the loop.
+
+\subsection{Plugin Runtime}
+
+Base supports server-side plugins for operations that cannot run purely
+client-side: scheduled tasks, webhook handlers, schema migrations, and
+background sync jobs. Plugins execute in a sandboxed runtime (V8 isolate or
+WASM) with read/write access scoped by $\Gamma$. A plugin cannot access vault
+data outside its granted capabilities.
+
+% ============================================================================

@@ -1,0 +1,127 @@
+\section{Key Management}
+
+\label{sec:keymgmt}
+% ============================================================
+
+Both FROST and CGGMP21 share a common key management layer providing distributed key
+generation, proactive refresh, and signer rotation.
+
+\subsection{Distributed Key Generation}
+
+Both protocols use Feldman VSS~\cite{feldman1987} for DKG with no trusted dealer.
+The shared structure is:
+
+\begin{enumerate}[nosep]
+  \item Each party $i$ samples a random polynomial $f_i$ of degree $t-1$ and broadcasts
+    Feldman commitments $C_{i,k} = a_{i,k} \cdot G$.
+  \item Parties exchange encrypted shares and verify against commitments.
+  \item The public key is $\mathsf{pk} = \sum_{i=1}^n C_{i,0}$.
+\end{enumerate}
+
+The difference is that CGGMP21 additionally requires Paillier key generation and
+zero-knowledge proofs ($\Pi_{\mathsf{mod}}, \Pi_{\mathsf{prm}}, \Pi_{\mathsf{sch}}$)
+for the MtA sub-protocol.
+
+\begin{remark}
+DKG is the most computationally expensive phase. For FROST, DKG completes in 12--18ms
+for a 3-of-5 configuration. For CGGMP21, Paillier safe prime generation dominates at
+800--1200ms for 2048-bit moduli. DKG runs once per key; its cost is amortized over all
+subsequent signing operations.
+\end{remark}
+
+\subsection{Proactive Key Refresh}
+\label{sec:refresh}
+
+Key refresh replaces all shares without changing the public key, limiting the window
+during which a compromised share is useful.
+
+\begin{algorithm}[H]
+\caption{Proactive Key Refresh}
+\label{alg:refresh}
+\begin{algorithmic}[1]
+\Require Current shares $\{s_i\}_{i=1}^n$, threshold $t$
+\Ensure New shares $\{s'_i\}_{i=1}^n$ with same public key
+\For{each party $i \in [n]$}
+  \State Sample $g_i(x)$ of degree $t-1$ with $g_i(0) = 0$
+  \State Broadcast commitments $G_{i,k} = g_{i,k} \cdot G$ for $k = 0, \ldots, t-1$
+  \State Verify $G_{i,0} = \mathcal{O}$ (identity point) \Comment{ensures zero constant}
+  \State Send $g_i(j)$ to party $j$
+\EndFor
+\For{each party $j \in [n]$}
+  \State Verify commitments: $g_i(j) \cdot G = \sum_k j^k \cdot G_{i,k}$
+  \State $s'_j \gets s_j + \sum_{i=1}^n g_i(j) \bmod q$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{lemma}[Refresh Preserves Public Key]
+\label{lem:refresh-pk}
+After refresh, the public key is unchanged: $\mathsf{pk}' = \mathsf{pk}$.
+\end{lemma}
+
+\begin{proof}
+The new secret is $s' = s + \sum_{i=1}^n g_i(0) = s + 0 = s$. Therefore
+$\mathsf{pk}' = s' \cdot G = s \cdot G = \mathsf{pk}$.
+\end{proof}
+
+\begin{lemma}[Forward Security]
+\label{lem:forward-sec}
+An adversary who compromises $t-1$ shares from epoch $e$ and $t-1$ shares from
+epoch $e+1$ cannot reconstruct the secret key, provided at least one honest party
+participated in the refresh.
+\end{lemma}
+
+\begin{proof}
+Shares from different epochs lie on different polynomials. The adversary holds
+$t-1$ points on each of two degree-$(t-1)$ polynomials sharing the same constant
+term. Reconstructing $s$ from $t-1$ points on a single polynomial is infeasible
+by Shamir's information-theoretic security. Combining shares across epochs does not
+help because the refresh polynomials $g_i$ are independently random---the adversary
+cannot correlate shares across epochs without knowing at least one honest party's
+refresh polynomial.
+\end{proof}
+
+\subsection{Signer Rotation}
+\label{sec:rotation}
+
+Signer rotation changes the set of authorized signers (e.g., replacing a
+decommissioned node). Unlike key refresh, rotation changes the set $[n]$ itself.
+
+\begin{definition}[Signer Rotation]
+A signer rotation from set $\mathcal{P} = \{P_1, \ldots, P_n\}$ to set
+$\mathcal{P}' = \{P'_1, \ldots, P'_{n'}\}$ with overlap
+$\mathcal{P} \cap \mathcal{P}' \geq t$ proceeds as:
+\begin{enumerate}[nosep]
+  \item \textbf{Announce} (on-chain): New MPC group address is posted with a
+    configurable rotation delay (default 24h, governor-settable $\in [0, 7\text{d}]$).
+  \item \textbf{Reshare}: After delay expiry, $t$ members of $\mathcal{P}$ run an LSS
+    dynamic resharing protocol to generate shares for $\mathcal{P}'$ under the same
+    public key (0.14ms for $3 \to 5$, 3.5ms for $50 \to 100$).
+  \item \textbf{Activate}: $\mathcal{P}'$ proves liveness by producing a threshold
+    signature, and the on-chain registry transitions to the new group address.
+  \item \textbf{Revoke}: Old shares from $\mathcal{P} \setminus \mathcal{P}'$ are
+    zeroed.
+\end{enumerate}
+\end{definition}
+
+The rotation delay is an operational parameter, not a security invariant---the MPC
+threshold \emph{is} the trust model. Setting the delay to 0 enables instant rotation
+when operationally required (e.g., emergency signer replacement). The delay provides
+on-chain visibility: any observer can verify the upcoming rotation and challenge it
+(e.g., via governance) before activation.
+
+\begin{theorem}[Rotation Security]
+\label{thm:rotation-sec}
+If the adversary controls fewer than $t$ parties in both $\mathcal{P}$ and
+$\mathcal{P}'$, then rotation preserves unforgeability.
+\end{theorem}
+
+\begin{proof}
+The resharing protocol is a DKG where the secret $s$ is determined by the old shares
+rather than fresh randomness. From the perspective of $\mathcal{P}'$, the shares are
+identically distributed to fresh DKG shares (a random polynomial of degree $t'-1$ with
+$f(0) = s$). Security follows from the DKG security theorem applied to $\mathcal{P}'$
+with the fixed secret $s$.
+\end{proof}
+
+% ============================================================

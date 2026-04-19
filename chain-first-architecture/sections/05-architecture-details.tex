@@ -1,0 +1,91 @@
+\section{Architecture Details}
+
+\label{sec:architecture}
+%% =====================================================================
+
+\subsection{Cache Layer: SQLite in Development, PostgreSQL in Production}
+
+The cache is intentionally disposable.  In development, each ATS
+instance uses an embedded SQLite database (via Hanzo Base) for
+zero-configuration operation.  In production, multiple ATS instances
+share a PostgreSQL database for concurrent access.
+
+In both cases, the cache can be rebuilt from the chain:
+
+\begin{verbatim}
+$ atsd cache rebuild --from-genesis
+  Processing block 0...
+  Processing block 1...
+  ...
+  Processing block 847291...
+  Cache rebuilt: 12,784 tokens, 847,291 blocks, 2.3M events
+  Duration: 4m 12s
+\end{verbatim}
+
+\subsection{Indexer: Deterministic Event Replay}
+
+The indexer subscribes to chain events via WebSocket and processes
+them in strict block order.  For each event type, a deterministic
+handler updates the cache:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Chain Event} & \textbf{Cache Update} \\
+\midrule
+\texttt{Transfer(from, to, amount)} & Debit \texttt{from}, credit
+  \texttt{to} \\
+\texttt{Mint(to, amount)} & Credit \texttt{to} \\
+\texttt{Burn(from, amount)} & Debit \texttt{from} \\
+\texttt{SecurityTokenCreated(addr, symbol)} & Insert token record \\
+\texttt{ComplianceCheck(addr, result)} & Update compliance status \\
+\bottomrule
+\end{tabular}
+\caption{Event-to-cache mapping for the deterministic indexer.}
+\label{tab:events}
+\end{table}
+
+The indexer maintains a \texttt{last\_processed\_block} cursor.  On
+restart, it resumes from the cursor, ensuring exactly-once processing.
+
+\subsection{Read Path (Fast)}
+
+The API layer reads from the cache for all queries:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrr}
+\toprule
+\textbf{Query} & \textbf{Cache (ms)} & \textbf{Chain RPC (ms)} \\
+\midrule
+Get balance & 0.8 & 45 \\
+List positions & 1.2 & 150 \\
+Transaction history & 2.0 & 320 \\
+Token metadata & 0.5 & 25 \\
+\bottomrule
+\end{tabular}
+\caption{Read latency: cache vs.\ chain RPC.}
+\label{tab:read-latency}
+\end{table}
+
+The cache provides 50--200$\times$ faster reads than chain RPC calls.
+For a securities exchange serving 1,000 concurrent users, this is the
+difference between a responsive UI and an unusable one.
+
+\subsection{Write Path (Durable)}
+
+Writes flow through the settlement pipeline:
+
+\begin{verbatim}
+API -> validation -> pending_orders (DB)
+    -> matching    -> trades (DB) + pending_settlements (DB)
+    -> cron (30s)  -> MPC sign -> broadcast -> chain
+    -> indexer     -> cache update -> pending_settlements.confirmed
+\end{verbatim}
+
+If any step fails, the pending settlement remains in the queue and is
+retried.  The settlement is considered final only when the chain
+transaction is confirmed and the indexer has processed the block.
+
+%% =====================================================================

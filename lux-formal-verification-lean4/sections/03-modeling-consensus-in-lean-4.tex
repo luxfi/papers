@@ -1,0 +1,149 @@
+\section{Modeling Consensus in Lean~4}
+
+
+We now apply these foundations to model and verify BFT consensus.
+
+\subsection{System Model}
+
+\begin{definition}[BFT System]
+A BFT system consists of:
+\begin{itemize}[nosep]
+  \item A set of $n$ validators, at most $f$ of which are Byzantine ($f < n/3$).
+  \item An asynchronous network: messages may be delayed arbitrarily but are eventually delivered.
+  \item A state machine replicated across all honest validators.
+\end{itemize}
+\end{definition}
+
+\begin{lstlisting}[language=Lean,caption={BFT system model in Lean~4}]
+-- Network model
+inductive Message where
+  | propose : Round -> Block -> Message
+  | vote : Round -> BlockHash -> ValidatorId -> Message
+  | commit : Round -> Certificate -> Message
+
+-- Validator state
+structure ValidatorState where
+  round : Nat
+  lockedRound : Option Nat
+  lockedBlock : Option Block
+  decisions : List (Round × Block)
+
+-- System state
+structure SystemState (n : Nat) where
+  validators : Fin n -> ValidatorState
+  network : List Message  -- in-flight messages
+  faulty : Finset (Fin n)
+  faulty_bound : faulty.card < n / 3
+\end{lstlisting}
+
+The \texttt{faulty\_bound} field is a proof obligation: any function that constructs a
+\texttt{SystemState} must prove that the number of faulty validators is below the
+threshold.
+
+\subsection{Safety: No Two Honest Validators Decide Differently}
+
+\begin{theorem}[Consensus Safety]
+If honest validators $i$ and $j$ both decide in round $r$, they decide on the same block.
+\end{theorem}
+
+The proof proceeds by contradiction. Suppose $i$ decides block $B$ and $j$ decides block
+$B' \neq B$ in round $r$. Both decisions require a quorum certificate---a set of
+$\lceil 2n/3 \rceil$ votes. Since there are $n$ validators and at most $f < n/3$ are
+Byzantine, any two quorums of size $\lceil 2n/3 \rceil$ must overlap in at least one
+honest validator. This honest validator voted for both $B$ and $B'$ in round $r$, which
+contradicts the voting rule (an honest validator votes for at most one block per round).
+
+\begin{lstlisting}[language=Lean,caption={Safety proof sketch in Lean~4}]
+theorem consensus_safety
+    (sys : SystemState n)
+    (i j : Fin n)
+    (hi : i \notin sys.faulty)
+    (hj : j \notin sys.faulty)
+    (r : Nat)
+    (di : decides sys i r B)
+    (dj : decides sys j r B')
+    : B = B' := by
+  -- Both decisions require quorum certificates
+  obtain ⟨qi, hqi⟩ := quorum_of_decision di
+  obtain ⟨qj, hqj⟩ := quorum_of_decision dj
+  -- Two quorums of size >= 2n/3 overlap
+  have overlap := quorum_intersection qi qj sys.faulty_bound
+  -- The overlap contains an honest validator
+  obtain ⟨v, hv_in_qi, hv_in_qj, hv_honest⟩ := overlap
+  -- Honest validators vote for one block per round
+  have := honest_single_vote hv_honest r hv_in_qi hv_in_qj
+  exact this
+\end{lstlisting}
+
+\subsection{The Quorum Intersection Lemma}
+
+This is the heart of BFT safety. We prove it from first principles using Lean~4's
+arithmetic.
+
+\begin{lemma}[Quorum Intersection]
+If $|Q_1| \geq \lceil 2n/3 \rceil$ and $|Q_2| \geq \lceil 2n/3 \rceil$ and $|F| < n/3$,
+then $Q_1 \cap Q_2 \setminus F \neq \emptyset$.
+\end{lemma}
+
+\begin{lstlisting}[language=Lean,caption={Quorum intersection proof}]
+theorem quorum_intersection
+    {n : Nat}
+    (Q1 Q2 : Finset (Fin n))
+    (F : Finset (Fin n))
+    (hQ1 : Q1.card >= 2 * n / 3 + 1)
+    (hQ2 : Q2.card >= 2 * n / 3 + 1)
+    (hF : F.card < n / 3)
+    : (Q1 ∩ Q2 \ F).Nonempty := by
+  -- By inclusion-exclusion:
+  -- |Q1 cap Q2| >= |Q1| + |Q2| - n
+  --             >= 2*(2n/3 + 1) - n
+  --             = n/3 + 2
+  -- |Q1 cap Q2 \ F| >= n/3 + 2 - |F| > 0
+  have h1 := Finset.card_union_le Q1 Q2
+  have h2 : (Q1 ∩ Q2).card >= n / 3 + 2 := by omega
+  have h3 : (Q1 ∩ Q2 \ F).card >= 2 := by
+    calc (Q1 ∩ Q2 \ F).card
+        >= (Q1 ∩ Q2).card - F.card := Finset.card_sdiff_le_card ..
+      _ >= n / 3 + 2 - F.card := by omega
+      _ > 0 := by omega
+  exact Finset.card_pos.mp (by omega)
+\end{lstlisting}
+
+\subsection{Liveness: Eventual Progress}
+
+Safety is easy relative to liveness. Liveness requires showing that the protocol
+eventually makes progress despite Byzantine faults and asynchronous delivery.
+
+\begin{theorem}[Consensus Liveness]
+If the network is eventually synchronous (there exists a Global Stabilization Time after
+which all messages between honest validators are delivered within a known bound $\Delta$),
+then all honest validators eventually decide.
+\end{theorem}
+
+The proof uses well-founded induction on the round number. After GST, an honest proposer's
+proposal reaches all honest validators within $\Delta$. Since honest validators form a
+quorum ($n - f \geq 2n/3 + 1$ when $f < n/3$), they produce a quorum certificate within
+$2\Delta$ (one round trip). The key lemma: if a round has an honest proposer and the
+network is synchronous, the round succeeds.
+
+\begin{lstlisting}[language=Lean,caption={Liveness argument structure}]
+theorem consensus_liveness
+    (sys : SystemState n)
+    (gst : Nat)  -- Global Stabilization Time
+    (sync_after_gst : SynchronousAfter sys gst)
+    (fair_proposer : EventuallyHonestProposer sys gst)
+    : ∀ v, v ∉ sys.faulty → EventuallyDecides sys v := by
+  intro v hv
+  -- After GST, find round r with honest proposer
+  obtain ⟨r, hr_after_gst, hr_honest_proposer⟩ := fair_proposer
+  -- In synchronous round with honest proposer, all honest
+  -- validators receive proposal and vote
+  have votes := synchronous_round_votes sync_after_gst hr_after_gst
+                  hr_honest_proposer
+  -- Honest votes form a quorum
+  have quorum := honest_quorum_sufficient sys.faulty_bound votes
+  -- Quorum certificate leads to decision
+  exact decision_from_quorum quorum hv
+\end{lstlisting}
+
+%% ============================================================

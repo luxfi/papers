@@ -1,0 +1,89 @@
+\section{Architecture: The cevm Pipeline}
+
+\label{sec:arch}
+%% ============================================================================
+
+\subsection{Pipeline Overview}
+
+cevm processes blocks through five sequential stages, each executing entirely on GPU
+(with the exception of the current ecrecover stage, which uses CPU multicore):
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=0.4cm,
+    stage/.style={draw, rounded corners=3pt, minimum width=3.2cm, minimum height=0.9cm,
+                  font=\small\bfseries, thick},
+    arrow/.style={-{Stealth[length=2.5mm]}, thick, luxblue},
+    label/.style={font=\tiny, text=gray}
+]
+% Stages
+\node[stage, fill=luxblue!15] (validate) {1. tx\_validate};
+\node[stage, fill=cpured!15, right=0.6cm of validate] (ecrecover) {2. ecrecover};
+\node[stage, fill=luxgold!20, below=0.8cm of validate] (blockstm) {3. Block-STM};
+\node[stage, fill=gpugreen!15, right=0.6cm of blockstm] (execute) {4. evm\_kernel};
+\node[stage, fill=fhepurple!12, below=0.8cm of blockstm, xshift=1.9cm] (stateroot) {5. state\_root};
+
+% Arrows
+\draw[arrow] (validate) -- (ecrecover);
+\draw[arrow] (ecrecover) -- ++(0,-0.4) -| (blockstm);
+\draw[arrow] (blockstm) -- (execute);
+\draw[arrow] (execute) -- ++(0,-0.4) -| (stateroot);
+
+% Labels
+\node[label, above=0.05cm of validate] {GPU: nonce, gas, balance};
+\node[label, above=0.05cm of ecrecover] {CPU 10-core: 7.1$\times$};
+\node[label, below=0.05cm of blockstm] {GPU atomics: MvMemory};
+\node[label, below=0.05cm of execute] {GPU: 85.9M ops/s};
+\node[label, below=0.05cm of stateroot] {GPU: Keccak-256 13.2$\times$};
+
+% GPU boundary
+\node[draw, dashed, thick, luxblue!40, rounded corners=5pt,
+      fit=(validate)(ecrecover)(blockstm)(execute)(stateroot),
+      inner sep=0.4cm, label={[font=\small\bfseries, luxblue]above:cevm GPU Pipeline}] {};
+\end{tikzpicture}
+\caption{The cevm five-stage pipeline. Stages 1, 3, 4, 5 run on GPU. Stage 2 (ecrecover)
+currently runs on 10 CPU cores (7.1$\times$) with GPU ecrecover as the next target.}
+\label{fig:pipeline}
+\end{figure}
+
+\subsection{Stage Details}
+
+\subsubsection{Stage 1: Transaction Validation (\texttt{tx\_validate} shader)}
+Validates transaction fields in parallel: nonce sequence, gas limit $\leq$ block gas limit,
+sender balance $\geq$ value + gas $\times$ gasPrice, calldata length bounds. Each transaction
+is one GPU thread. Invalid transactions are flagged in a results buffer; the block execution
+skips them without aborting.
+
+\subsubsection{Stage 2: Signature Recovery (ecrecover)}
+Recovers sender addresses from ECDSA signatures. Currently runs on 10 CPU cores achieving
+7.1$\times$ speedup (334\,ms $\to$ 47\,ms for 10k transactions). This is the \textbf{highest
+priority GPU target}: ecrecover consumes 87\% of sequential block processing time. The
+\texttt{secp256k1} Metal shader is compiled and tested; integration with the pipeline is
+in progress.
+
+\subsubsection{Stage 3: Block-STM Scheduling (\texttt{block\_stm} shader)}
+Implements the Block-STM~\cite{blockstm} optimistic concurrency protocol on GPU.
+MvMemory---the multi-version data structure holding per-transaction state versions---is
+backed by GPU shared memory with atomic compare-and-swap for conflict detection. The
+scheduler assigns transactions to GPU threads; conflicts trigger re-execution of the
+conflicting transaction only.
+
+\subsubsection{Stage 4: EVM Execution (\texttt{evm\_kernel} shader)}
+The core EVM interpreter running as a Metal compute shader. Each transaction is one GPU
+thread with its own 1{,}024-element stack, 32\,KB memory region, and program counter. The
+shader implements the full EVM instruction set including:
+\begin{itemize}
+\item 256-bit arithmetic via the \texttt{evm256} helper shader
+\item State access through the GPU-resident \texttt{state\_table}
+\item Dynamic gas metering with out-of-gas abort
+\end{itemize}
+
+Measured throughput: \textbf{85.9\,M opcodes/sec} (50k txs $\times$ 5k ops, Apple M1 Max).
+
+\subsubsection{Stage 5: State Root (\texttt{keccak256} shader)}
+Computes the post-block state root by hashing the modified Merkle-Patricia trie nodes
+on GPU. The Keccak-256 Metal shader achieves 17.1\,Mhash/s versus 1.3\,Mhash/s on CPU
+(13.2$\times$ speedup).
+
+%% ============================================================================

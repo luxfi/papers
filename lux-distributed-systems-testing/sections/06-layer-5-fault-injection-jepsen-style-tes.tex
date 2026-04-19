@@ -1,0 +1,162 @@
+\section{Layer 5: Fault Injection (Jepsen-Style Testing)}
+
+
+\subsection{What Is Jepsen}
+
+Jepsen is a framework for testing distributed systems under adverse conditions. It:
+\begin{enumerate}[nosep]
+  \item Deploys the system on multiple VMs or containers.
+  \item Runs a workload (clients submitting operations).
+  \item Injects faults (partitions, crashes, clock skew).
+  \item Records a history of operations and results.
+  \item Checks the history against a consistency model (linearizability, serializability,
+    sequential consistency).
+\end{enumerate}
+
+\subsection{Consistency Models}
+
+\begin{definition}[Linearizability]
+A history $H$ is linearizable if every operation appears to take effect at a single
+point between its invocation and response, and the resulting sequential history satisfies
+the specification.
+\end{definition}
+
+Linearizability is the gold standard. If a blockchain's RPC endpoint is linearizable,
+then for every pair of transactions, if $T_1$ was confirmed before $T_2$ was submitted,
+then $T_1$ appears before $T_2$ in the chain.
+
+\subsection{The Nemesis: Fault Injection}
+
+A Jepsen ``nemesis'' is a process that injects faults:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lp{8cm}@{}}
+\toprule
+\textbf{Fault} & \textbf{What It Tests} \\
+\midrule
+Network partition & Can the system make progress with a minority partition? Does it maintain safety? \\
+Process kill (SIGKILL) & Does the system recover correctly after an unclean shutdown? \\
+Process pause (SIGSTOP) & Does the system handle slow/unresponsive nodes? \\
+Clock skew & Does time-dependent logic (timeouts, timestamps) break under clock drift? \\
+Disk corruption & Does the system detect and recover from corrupted state? \\
+Packet loss & Does the system handle unreliable networks? \\
+Packet reordering & Does the system handle out-of-order message delivery? \\
+\bottomrule
+\end{tabular}
+\caption{Nemesis fault types for blockchain testing.}
+\end{table}
+
+\subsection{Implementing Fault Injection}
+
+\begin{lstlisting}[language=Go,caption={Fault injection test framework}]
+type Nemesis interface {
+    // Inject starts the fault
+    Inject(cluster *Cluster) error
+    // Recover restores normal operation
+    Recover(cluster *Cluster) error
+}
+
+// Partition nemesis: splits the cluster into two groups
+type PartitionNemesis struct {
+    GroupA []int // Node indices in partition A
+    GroupB []int // Node indices in partition B
+}
+
+func (p *PartitionNemesis) Inject(cluster *Cluster) error {
+    for _, a := range p.GroupA {
+        for _, b := range p.GroupB {
+            if err := cluster.BlockTraffic(a, b); err != nil {
+                return err
+            }
+        }
+    }
+    return nil
+}
+
+func (p *PartitionNemesis) Recover(cluster *Cluster) error {
+    return cluster.UnblockAllTraffic()
+}
+
+// CrashNemesis: kills a random node
+type CrashNemesis struct {
+    NodeIndex int
+}
+
+func (c *CrashNemesis) Inject(cluster *Cluster) error {
+    return cluster.Kill(c.NodeIndex) // SIGKILL, not SIGTERM
+}
+
+func (c *CrashNemesis) Recover(cluster *Cluster) error {
+    return cluster.Restart(c.NodeIndex)
+}
+\end{lstlisting}
+
+\subsection{Linearizability Checking}
+
+After running a workload with fault injection, we collect the history of all operations
+(invocations and responses) and check linearizability using the Knossos algorithm:
+
+\begin{lstlisting}[language=Go,caption={Linearizability check}]
+func TestLinearizabilityUnderPartition(t *testing.T) {
+    cluster := StartCluster(5) // 5 nodes
+    defer cluster.Stop()
+
+    // Start workload: concurrent read/write operations
+    history := NewHistory()
+    var wg sync.WaitGroup
+    for i := 0; i < 10; i++ {
+        wg.Add(1)
+        go func(clientID int) {
+            defer wg.Done()
+            for j := 0; j < 100; j++ {
+                op := randomOperation()
+                invocation := history.RecordInvoke(clientID, op)
+                result, err := cluster.Execute(op)
+                history.RecordReturn(invocation, result, err)
+            }
+        }(i)
+    }
+
+    // Inject faults concurrently
+    go func() {
+        nemesis := &PartitionNemesis{
+            GroupA: []int{0, 1},
+            GroupB: []int{2, 3, 4},
+        }
+        time.Sleep(2 * time.Second)
+        nemesis.Inject(cluster)
+        time.Sleep(5 * time.Second)
+        nemesis.Recover(cluster)
+    }()
+
+    wg.Wait()
+
+    // Check linearizability
+    ok, info := CheckLinearizable(history, RegisterModel{})
+    if !ok {
+        t.Fatalf("linearizability violation:\n%s", info)
+    }
+}
+\end{lstlisting}
+
+\subsection{Bugs Only Jepsen Finds}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lp{7cm}l@{}}
+\toprule
+\textbf{Bug} & \textbf{Description} & \textbf{Fault Required} \\
+\midrule
+Stale read after partition heal & After a network partition heals, a node serves stale state for up to 2 seconds before catching up. & Network partition \\
+Double-commit on leader change & If the leader crashes mid-commit, the new leader may re-propose the same block, causing duplicate execution. & Process crash \\
+Timeout miscalculation & Clock skew causes a node to time out and vote for a conflicting proposal even though the original proposer is alive. & Clock skew \\
+State corruption on crash recovery & An unclean shutdown during state database write leaves a partially written batch, causing the node to start with corrupt state. & SIGKILL during write \\
+\bottomrule
+\end{tabular}
+\caption{Bugs found exclusively through fault injection testing.}
+\end{table}
+
+%% ============================================================

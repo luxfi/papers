@@ -1,0 +1,93 @@
+\section{Rate Limiting and Governance}
+\label{sec:governance}
+
+\subsection{Rate Limiting}
+
+To contain potential exploits, the bridge enforces rate limits:
+
+\begin{table}[H]
+\centering
+\caption{Bridge rate limits.}
+\label{tab:ratelimits}
+\begin{tabular}{lrl}
+\toprule
+\textbf{Limit} & \textbf{Value} & \textbf{Scope} \\
+\midrule
+Per-transfer max & 1M LUX & Single transfer \\
+Hourly outflow & 10M LUX & Aggregate per chain pair \\
+Daily outflow & 50M LUX & Aggregate per chain pair \\
+Emergency pause & Governance multi-sig & 6/10 signers \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Guardian Network}
+
+A secondary validation layer (guardians) monitors bridge operations for anomalies:
+
+\begin{algorithm}[H]
+\caption{Guardian Monitoring}
+\label{alg:guardian}
+\begin{algorithmic}[1]
+\For{each pending transfer $\mathsf{tx}$}
+    \State Verify $\mathsf{tx}$ matches on-chain lock event
+    \State Check transfer amount against rate limits
+    \State Verify source chain finality depth $\geq \Delta_{\text{safe}}$
+    \If{anomaly detected}
+        \State Submit pause transaction (requires 6/10 guardians)
+    \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+Guardians are a defense-in-depth measure; they cannot forge transfers (only the light client proof can authorize minting) but can pause the bridge to prevent exploitation of bugs.
+
+\subsection{MPC Threshold Security (2025 Revision)}
+
+For external chain transfers that rely on threshold signatures (Bitcoin, XRPL), the bridge security depends on the MPC committee. The concrete security analysis for production parameters:
+
+\begin{table}[H]
+\centering
+\caption{MPC threshold security for LITP external chain bridges.}
+\label{tab:mpc_security}
+\begin{tabular}{llrl}
+\toprule
+\textbf{Target Chain} & \textbf{Protocol} & \textbf{Threshold} & \textbf{Forgery Bound} \\
+\midrule
+Bitcoin & FROST (Schnorr) & 11-of-15 & $< 2^{-128}$ (OMDL) \\
+Ethereum & CGGMP21 (ECDSA) & 11-of-15 & $< 2^{-127}$ (ECDLP + Paillier) \\
+XRPL & FROST (EdDSA) & 7-of-10 & $< 2^{-128}$ (OMDL) \\
+All (PQ) & Ringtail & 15-of-21 & $< 2^{-128}$ (LWE) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At $n = 100$ validators with $t = 67$ threshold and $p = 0.999$ individual uptime, the probability that the bridge cannot produce a valid signature is $\Pr[\text{unavailable}] < 2^{-139.6}$ (see \cite{lux-bridge-2025} Appendix~C for derivation).
+
+\subsection{Contract Security Hardening (C-01 through C-04)}
+
+Four critical fixes were applied to the LITP bridge contracts:
+
+\begin{description}
+    \item[C-01] \textbf{Daily mint limits}: \texttt{bridgeMint()} in \texttt{LRC20B.sol} now enforces a configurable \texttt{dailyMintLimit} with automatic period reset, preventing unlimited minting from a compromised MPC key.
+    \item[C-02] \textbf{Role separation}: \texttt{MINTER\_ROLE} separated from \texttt{DEFAULT\_ADMIN\_ROLE}, ensuring that admin key compromise does not grant minting capability.
+    \item[C-03] \textbf{Monotonic nonce}: MPC-signed messages use a strictly monotonic counter nonce (replacing \texttt{block.timestamp}), providing replay protection without relying on block timestamps.
+    \item[C-04] \textbf{Sequential withdraw nonce}: Per-user sequential counter replaces predictable hash-based nonce, preventing front-running of withdrawal operations.
+\end{description}
+
+All fixes are verified by 68 Halmos symbolic proofs across the ecosystem, including bridge conservation, daily limit enforcement, and nonce monotonicity invariants.
+
+% Added 2025-04: ZAP bridge consensus
+\subsection{Watcher Transport and Identity}
+
+Inter-watcher communication uses the ZAP wire protocol \cite{lux-zap-2023} for deposit event broadcast and CGGMP21 signing round coordination. ZAP provides 8.7$\mu$s per-message latency with zero heap allocations, eliminating GC-induced signing timeouts. Each watcher node holds a W3C Decentralized Identifier bound to an ML-DSA-65 (Dilithium) post-quantum key pair for authentication independent of the Ed25519 transport layer. Threshold signature results are finalized via Quasar consensus before relay. ZAP's 20.26M TPS batch mode absorbs Bitcoin block deposit spikes without backpressure on the signing pipeline.
+
+\subsection{Formal Verification}
+
+The LITP security model is backed by formal proofs at two levels:
+
+\begin{itemize}
+    \item \textbf{Lean~4} (18 files at \texttt{github.com/luxfi/formal}): BLS aggregation soundness, FROST threshold correctness, Ringtail LWE security, Warp message delivery and ordering guarantees.
+    \item \textbf{Halmos} (68 check functions): Bridge token conservation, daily mint limit invariant, teleport supply conservation (2-chain and 3-chain), vault exchange rate monotonicity.
+\end{itemize}
+

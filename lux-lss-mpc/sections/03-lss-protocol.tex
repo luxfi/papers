@@ -1,0 +1,88 @@
+\section{LSS Protocol}
+
+%% ═══════════════════════════════════════════════════════════════════════════
+
+\subsection{Architecture}
+
+LSS operates as a wrapper around CGGMP21 and FROST:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Component} & \textbf{Purpose} \\
+\midrule
+\texttt{Suite} & Unified entry point, protocol selection \\
+\texttt{WithCMP(pool)} & CMP/CGGMP21 backend for ECDSA \\
+\texttt{WithFROST(pool)} & FROST backend for Schnorr/EdDSA \\
+\texttt{Coordinator} & Manages resharing ceremonies \\
+\texttt{Dealer} & Distributes JVSS shares during reshare \\
+\texttt{Rollback} & Maintains generation history \\
+\texttt{SignerAdapter} & Chain-specific signature formatting \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Dynamic Resharing Protocol}
+
+\begin{algorithm}
+\caption{LSS Dynamic Reshare: $(t, n) \to (t', n')$}
+\begin{algorithmic}[1]
+\Require Current config $C_{old}$ with shares $\{s_i\}_{i \in P_{old}}$, new set $P_{new}$, new threshold $t'$
+\Ensure New config $C_{new}$ with shares $\{s'_j\}_{j \in P_{new}}$, same public key $Y$
+\State \textbf{Phase 1: Coordinator Preparation}
+\State Coordinator broadcasts $(P_{new}, t', \text{generation}_{k+1})$ to all parties in $P_{old} \cup P_{new}$
+\State Each old party $p_i \in P_{old}$ generates resharing polynomial $g_i(x)$ of degree $t' - 1$
+\State $g_i(0) = \lambda_i \cdot s_i$ where $\lambda_i$ is Lagrange coefficient for $P_{old}$ subset
+\State \textbf{Phase 2: Verifiable Distribution (JVSS)}
+\ForAll{$p_i \in P_{old}$}
+  \State Compute commitments $\{C_{i,k} = g^{a_{i,k}}\}_{k=0}^{t'-1}$ and broadcast
+  \ForAll{$p_j \in P_{new}$}
+    \State Send share $g_i(j)$ privately to $p_j$
+  \EndFor
+\EndFor
+\State \textbf{Phase 3: Verification and Aggregation}
+\ForAll{$p_j \in P_{new}$}
+  \State Verify each received share against commitments
+  \State File complaint if verification fails
+  \State Aggregate: $s'_j = \sum_{i \in P_{old}} g_i(j)$
+\EndFor
+\State \textbf{Phase 4: Certification}
+\State All parties verify $Y' = Y$ (public key unchanged)
+\State Coordinator certifies generation $k+1$, stores $C_{new}$ in persistence layer
+\State Previous generation $k$ retained for rollback
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[Reshare Correctness]
+After protocol execution, the new shares $\{s'_j\}_{j \in P_{new}}$ form a valid $(t', n')$-Shamir sharing of the same secret $s = f(0)$, and the group public key $Y = g^s$ is unchanged.
+\end{theorem}
+
+\begin{proof}
+By linearity of Lagrange interpolation:
+\[
+  s'_j = \sum_{i \in P_{old}} g_i(j) = \sum_{i \in P_{old}} \lambda_i \cdot s_i \cdot L_{i,j}(t')
+\]
+At $j = 0$:
+\[
+  \sum_{i \in P_{old}} g_i(0) = \sum_{i \in P_{old}} \lambda_i \cdot s_i = s
+\]
+since $\sum \lambda_i s_i$ is Lagrange interpolation of $f$ at $x = 0$. The new polynomial has degree $t' - 1$, so any $t'$ shares suffice to recover $s$. The public key $Y = g^s$ is unchanged since $s$ is unchanged. \qed
+\end{proof}
+
+\subsection{Fault Tolerance and Rollback}
+
+\begin{definition}[Generation History]
+LSS maintains a chain of certified shard generations: $C_0 \to C_1 \to \cdots \to C_k$. If signing under generation $k$ fails (node eviction, timeout, abort), the coordinator rolls back to $C_{k-1}$ and retries.
+\end{definition}
+
+\begin{theorem}[Rollback Safety]
+If generation $C_{k-1}$ was certified (all parties confirmed valid shares), then rollback to $C_{k-1}$ preserves the ability to sign with the original secret key $s$.
+\end{theorem}
+
+\subsection{Protocol Variants}
+
+\paragraph{Protocol I: Localized Nonce Blinding.} Each party generates their own blinding factor for nonce computation. Lower latency ($\sim$8ms) but requires an honest majority assumption for nonce generation.
+
+\paragraph{Protocol II: Collaborative Nonce Blinding.} Nonce blinding is jointly computed via another round of JVSS. Higher latency ($\sim$25ms) but secure against dishonest majority up to $t - 1$ corruptions.
+
+%% ═══════════════════════════════════════════════════════════════════════════

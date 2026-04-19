@@ -1,0 +1,110 @@
+\section{Sovereign Governance}
+
+\label{sec:governance}
+% ============================================================
+
+\subsection{Governance Instantiation}
+
+Each chain $\Chain_i$ that connects to Teleport deploys an OmnichainRouter instance $R_i$ with a designated governor $\Gov_i$. The governor is typically:
+
+\begin{itemize}[nosep]
+  \item \textbf{Lux C-Chain}: LUX token DAO with 48-hour timelock. Fees flow to xLUX holders.
+  \item \textbf{Zoo EVM}: ZOO token governance. Fees flow to ZOO stakers.
+  \item \textbf{External L1/L2}: The chain's own governance mechanism, chosen at deployment.
+\end{itemize}
+
+\noindent
+The key insight is that $\Gov_i$ controls \emph{only} the economic parameters of $R_i$. It has no authority over $R_j$ for $j \neq i$, and no authority over the MPC signer set or immutable protocol logic.
+
+\subsection{Governor Capability Matrix}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{3.8cm}cc@{}}
+\toprule
+\textbf{Action} & \textbf{CAN} & \textbf{CANNOT} \\
+\midrule
+Set bridge fee (0--100 bps) & $\checkmark$ & \\
+Set daily mint limits & $\checkmark$ & \\
+Register new bridge tokens & $\checkmark$ & \\
+Enable Shariah mode & $\checkmark$ & \\
+Set yield strategy routing & $\checkmark$ & \\
+Change fee recipient (48h lock) & $\checkmark$ & \\
+Transfer governance (2-step) & $\checkmark$ & \\
+\midrule
+Mint bridge tokens & & $\times$ \\
+Modify nonce bitmaps & & $\times$ \\
+Set fee $> 100$ bps & & $\times$ \\
+Bypass signature verification & & $\times$ \\
+Upgrade contract bytecode & & $\times$ \\
+Override signer rotation & & $\times$ \\
+Access other chains' $R_j$ & & $\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Governor capability matrix. The ``CANNOT'' column represents hard-coded invariants enforced at the bytecode level, not merely policy.}
+\label{tab:capability}
+\end{table}
+
+\subsection{Fee Configuration}
+
+The governor sets the bridge fee rate $f_b$ and stakeholder share $f_s$:
+
+\begin{equation}
+  0 \leq f_b \leq 100 \text{ bps}, \quad 0 \leq f_s \leq 10{,}000 \text{ bps}
+\end{equation}
+
+The hard cap $f_b \leq 100$ bps (1\%) is enforced at the bytecode level:
+
+\begin{lstlisting}[language=Solidity,caption=Fee cap enforcement]
+function setBridgeFee(uint256 newFeeBps)
+    external onlyGovernor
+{
+    require(
+        newFeeBps <= MAX_FEE_BPS,
+        "fee exceeds hard cap"
+    );
+    // MAX_FEE_BPS = 100, immutable
+    bridgeFeeBps = newFeeBps;
+    emit BridgeFeeUpdated(newFeeBps);
+}
+\end{lstlisting}
+
+\noindent
+The constant \texttt{MAX\_FEE\_BPS = 100} is defined at compile time and cannot be modified post-deployment, even by the governor.
+
+\subsection{Fee Distribution}
+
+For a bridge operation of amount $a$ on chain $\Chain_i$ with fee rate $f_b^{(i)}$ and stakeholder share $f_s^{(i)}$:
+
+\begin{align}
+  \text{fee} &= a \cdot \frac{f_b^{(i)}}{10{,}000} \\
+  \text{toStakeholders} &= \text{fee} \cdot \frac{f_s^{(i)}}{10{,}000} \\
+  \text{toTreasury} &= \text{fee} - \text{toStakeholders}
+\end{align}
+
+Each chain instance independently determines where fees flow:
+\begin{itemize}[nosep]
+  \item On Lux C-Chain: stakeholder vault $=$ xLUX (LiquidLUX).
+  \item On Zoo EVM: stakeholder vault $=$ ZOO staking contract.
+  \item On white-label deployments: stakeholder vault $=$ deployer-designated address.
+\end{itemize}
+
+\subsection{Signer Rotation Protection}
+
+MPC signer rotation is the highest-severity operation. The rotation delay is a configurable operational parameter (default 24h, governor-settable $\in [0, 7\text{d}]$), not a security invariant---the MPC threshold \emph{is} the trust model. A compromised governor cannot initiate rotation; only the current $t$-of-$n$ MPC set can.
+
+\begin{enumerate}[nosep]
+  \item Current $t$-of-$n$ MPC set signs the rotation proposal with the new MPC group address.
+  \item Configurable delay begins (default 24h). Pending signers are published on-chain.
+  \item During the delay, users may exit by burning bridge tokens for underlying assets.
+  \item After the delay expires, any address may execute the rotation.
+  \item Current signers may cancel during the delay period.
+\end{enumerate}
+
+\begin{property}[Exit Window]
+\label{prop:exit}
+For any signer rotation event at time $t_0$ with rotation delay $\delta$ (default 24h, max 7 days), every bridge token holder has the interval $[t_0, t_0 + \delta)$ to exit the system by burning bridge tokens and receiving the underlying asset at the current share price.
+\end{property}
+
+% ============================================================

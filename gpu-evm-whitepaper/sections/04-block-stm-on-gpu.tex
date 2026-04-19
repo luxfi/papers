@@ -1,0 +1,64 @@
+\section{Block-STM on GPU}
+
+\label{sec:blockstm}
+%% ============================================================================
+
+\subsection{Algorithm}
+
+Block-STM~\cite{blockstm} is an optimistic parallel execution protocol: transactions
+execute speculatively in parallel, and conflicts (read-write overlaps between transactions)
+are detected and resolved by re-executing only the conflicting transactions.
+
+The key insight enabling GPU Block-STM is that MvMemory operations (version lookup,
+conflict detection, write recording) are all atomic compare-and-swap operations---which
+GPU hardware implements natively.
+
+\subsection{GPU Implementation}
+
+\begin{algorithm}[h]
+\caption{GPU Block-STM (simplified)}
+\begin{algorithmic}[1]
+\State \textbf{Input}: Block $B$ with transactions $T_0, T_1, \ldots, T_{n-1}$
+\State \textbf{Shared}: MvMemory $M$ (GPU shared memory), status array $S$
+\For{each GPU thread $i$ (parallel)}
+    \State $S[i] \gets \text{EXECUTING}$
+    \State Execute $T_i$ against $M$, recording read-set $R_i$ and write-set $W_i$
+    \State \textbf{atomic}: Write $W_i$ to $M$ with version $i$
+    \State Validate: for each $(k,v) \in R_i$, check $M[k].\text{version} < i$
+    \If{validation fails}
+        \State $S[i] \gets \text{NEEDS\_REEXEC}$
+    \Else
+        \State $S[i] \gets \text{COMMITTED}$
+    \EndIf
+\EndFor
+\State Re-execute transactions with $S[i] = \text{NEEDS\_REEXEC}$ (repeat until stable)
+\end{algorithmic}
+\end{algorithm}
+
+The scheduler runs entirely on GPU. No CPU round-trip is required for conflict detection
+or re-execution scheduling. This eliminates the kernel launch overhead that would otherwise
+dominate for small re-execution batches.
+
+\subsection{Measured Scaling}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Workload} & \textbf{1 thread} & \textbf{10 threads} & \textbf{Speedup} \\
+                   & (Mgas/s)          & (Mgas/s)            & \\
+\midrule
+ETH Transfer (zero conflict)  & 546  & 4{,}680 & 8.6$\times$ \\
+ERC-20 (low conflict)         & 524  & 3{,}920 & 7.5$\times$ \\
+Uniswap V2 (medium conflict)  & 519  & 2{,}850 & 5.5$\times$ \\
+Storage Write (high conflict)  & 514  & 2{,}100 & 4.1$\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Block-STM scaling by conflict level. Zero-conflict workloads achieve
+near-linear scaling. High-conflict workloads (shared storage slots) degrade
+to 4.1$\times$ on 10 threads due to re-execution overhead.}
+\label{tab:blockstm}
+\end{table}
+
+%% ============================================================================

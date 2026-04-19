@@ -1,0 +1,64 @@
+\section{Market Data Aggregation}
+\label{sec:marketdata}
+
+\subsection{Consolidated Quote}
+
+The SOR maintains a consolidated quote across all venues for each security:
+
+\begin{lstlisting}[language=Go,caption={Consolidated quote aggregation.}]
+type ConsolidatedQuote struct {
+    SecurityID SecurityID
+    NBBO       NBBO
+    Venues     []VenueQuote
+    Timestamp  time.Time
+}
+
+type NBBO struct {
+    BidPrice    decimal.Decimal
+    BidSize     uint64
+    BidVenue    ProviderID
+    AskPrice    decimal.Decimal
+    AskSize     uint64
+    AskVenue    ProviderID
+}
+
+func (r *Router) consolidateQuotes(
+    secID SecurityID,
+) (*ConsolidatedQuote, error) {
+    var quotes []VenueQuote
+    var mu sync.Mutex
+    var wg sync.WaitGroup
+
+    for _, p := range r.providers {
+        if !p.Supports(secID) {
+            continue
+        }
+        wg.Add(1)
+        go func(prov Provider) {
+            defer wg.Done()
+            q, err := prov.Quote(context.Background(),
+                QuoteRequest{Security: secID})
+            if err != nil {
+                return // skip unavailable venues
+            }
+            mu.Lock()
+            quotes = append(quotes, VenueQuote{
+                Provider: prov.ID(), Quote: *q,
+            })
+            mu.Unlock()
+        }(p)
+    }
+    wg.Wait()
+
+    nbbo := computeNBBO(quotes)
+    return &ConsolidatedQuote{
+        SecurityID: secID,
+        NBBO:       nbbo,
+        Venues:     quotes,
+        Timestamp:  time.Now().UTC(),
+    }, nil
+}
+\end{lstlisting}
+
+The market data infrastructure descends from Arca's \texttt{miners/binance-recorder}, which recorded and replayed exchange data feeds for market analysis. The Lux SOR extends this to aggregate real-time quotes from all 16 providers.
+

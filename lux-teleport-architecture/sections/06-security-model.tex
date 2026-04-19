@@ -1,0 +1,93 @@
+\section{Security Model}
+
+\label{sec:security}
+%% =========================================================================
+
+\subsection{Confirmation Depths}
+\label{sec:depths}
+
+The MPC cluster waits for chain-specific confirmation depths before signing a \texttt{DEPOSIT} proof. These depths are chosen to make chain reorganization economically infeasible.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrl}
+\toprule
+\textbf{Chain} & \textbf{Depth} & \textbf{Rationale} \\
+\midrule
+Bitcoin        & 6    & $\sim$60 min; 51\% attack cost $>\$10$B/hr \\
+Litecoin       & 12   & $\sim$30 min; proportional to hashrate \\
+Dogecoin       & 40   & $\sim$40 min; lower hashrate margin \\
+Ethereum       & 64   & $\sim$13 min; 2 finalized epochs \\
+Arbitrum       & 1    & Sequencer + L1 finality inherited \\
+Optimism       & 1    & Sequencer + L1 finality inherited \\
+Base           & 1    & Sequencer + L1 finality inherited \\
+BSC            & 15   & $\sim$45 sec; fast finality mode \\
+Polygon PoS    & 128  & $\sim$4 min; probabilistic finality \\
+Solana         & 32   & $\sim$13 sec; confirmed commitment \\
+TON            & 1    & Instant finality (masterchain) \\
+Lux (Warp)     & 0    & Sub-second finality; Warp proof suffices \\
+\bottomrule
+\end{tabular}
+\caption{Confirmation depth configuration per chain}
+\label{tab:depths}
+\end{table}
+
+\subsection{Backing Attestation}
+
+The MPC cluster periodically attests to total backing. The Teleporter enforces three invariants on backing proofs:
+
+\begin{invariant}[Monotonic Timestamp]
+$\tau_{k+1} > \tau_k$ for successive backing proofs on a given token.
+\end{invariant}
+
+\begin{invariant}[Staleness Bound]
+$\tau \geq \mathrm{block.timestamp} - \Delta_{\mathsf{stale}}$ where $\Delta_{\mathsf{stale}} = 7200\,\text{s}$ (2 hours) by default.
+\end{invariant}
+
+\begin{invariant}[Auto-Pause Threshold]
+If the backing ratio $B / \mathrm{totalMinted}(T) < 0.985$, the Teleporter sets $\mathsf{paused} \leftarrow \mathsf{true}$. No \texttt{DEPOSIT} or \texttt{YIELD} operations are processed while paused. Unpausing requires a separate MPC-signed proof with a fresh backing attestation showing ratio $\geq 1.0$.
+\end{invariant}
+
+\subsection{Sequential Withdraw Nonces}
+
+Deposit nonces use a bitmap and may arrive out of order. Withdraw nonces are strictly sequential (Property~\ref{prop:seq-nonce}). This prevents an attacker who observes multiple pending \texttt{RELEASE} proofs from selectively replaying a subset in a different order to manipulate vault accounting.
+
+\subsection{Peg Oracle}
+
+An independent peg oracle monitors the price ratio of each wrapped token against its underlying on external markets. If the peg deviates beyond a configurable threshold (default: 2\% for stablecoins, 5\% for volatile assets), the oracle submits a pause transaction.
+
+The peg oracle is defense-in-depth: it triggers only if the on-chain backing attestation fails to catch an undercollateralization event. The oracle runs as a separate process with its own signing key, distinct from the MPC committee.
+
+\subsection{Key Separation}
+
+\begin{definition}[Key Hierarchy]
+The system maintains three distinct key classes:
+\begin{enumerate}[nosep]
+  \item \textbf{MPC threshold key}: distributed across $n$ signer nodes; used exclusively for wire protocol proofs. Never held by a single entity.
+  \item \textbf{Hot wallet keys}: per-chain operational keys for gas payment, relay submission, and watcher operations. Individually compromisable without bridge fund risk.
+  \item \textbf{Admin timelock key}: controls MPC public key rotation with a 7-day delay. Held by a separate multisig.
+\end{enumerate}
+Compromise of hot wallet keys cannot produce valid wire protocol proofs. Compromise of the admin key introduces a 7-day window for detection and response.
+\end{definition}
+
+\subsection{Security Properties}
+
+\begin{theorem}[Wire Protocol Soundness]
+\label{thm:soundness}
+Under the ECDLP assumption on secp256k1, the DLP assumption on Ed25519, and the co-CDH assumption on BLS12-381, an adversary controlling fewer than $t$ MPC signer nodes cannot produce a valid proof $\pi$ for any tag.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Each tag's proof requires a valid threshold signature. By the unforgeability of CGGMP21~\cite{cggmp21} and FROST~\cite{frost} under their respective hardness assumptions, an adversary with $< t$ shares cannot produce a valid signature. Domain separation via distinct \texttt{bytes32} tags ensures that a signature valid for one tag cannot verify under another. The per-\texttt{srcChainId} nonce bitmap prevents replay. See formal proofs in~\cite{luxproof-teleport}.
+\end{proof}
+
+\begin{theorem}[Conservation]
+\label{thm:conservation}
+For any token $T$ and any execution trace, the total supply of wrapped tokens across all destination chains does not exceed the total backing on source chains.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Minting requires a valid \texttt{DEPOSIT} proof with unused nonce. Backing attestation with auto-pause ensures that if backing drops below 98.5\% of minted supply, minting halts. Sequential release nonces prevent double-withdraw. See formal proof in~\cite{luxproof-teleport}.
+\end{proof}
+
+%% =========================================================================

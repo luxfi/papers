@@ -1,0 +1,91 @@
+\section{The Ringtail Scheme}
+
+\label{sec:scheme}
+
+\subsection{Key Generation (Trusted Dealer)}
+
+\begin{algorithm}[H]
+\caption{Ringtail Key Generation}
+\label{alg:keygen}
+\begin{algorithmic}[1]
+\Require Threshold $t$, parties $n$, parameters $(N, q, M, N', \sigma_e)$
+\State $\mathbf{A} \stackrel{\$}{\leftarrow} R_q^{M \times N'}$ \Comment{public matrix}
+\State $\mathbf{s} \stackrel{\$}{\leftarrow} D_{\sigma_e}^{N'}$ \Comment{secret key}
+\State $\mathbf{e} \stackrel{\$}{\leftarrow} D_{\sigma_e}^{M}$ \Comment{error}
+\State $\mathbf{b} \gets \mathbf{A}\mathbf{s} + \mathbf{e}$ \Comment{public key component}
+\State $\tilde{\mathbf{b}} \gets \text{Round}(\mathbf{b}, \xi)$ \Comment{rounded for verification}
+\State $\{\mathbf{s}_1, \ldots, \mathbf{s}_n\} \gets \text{ShamirShare}(\mathbf{s}, t, n)$ \Comment{secret shares}
+\State \Comment{Generate correlated randomness for signing}
+\For{each pair $(i, j)$ with $i < j$}
+    \State $\text{seed}_{i,j} \stackrel{\$}{\leftarrow} \{0,1\}^{256}$ \Comment{shared PRF seed}
+    \State Send $\text{seed}_{i,j}$ to parties $i$ and $j$
+\EndFor
+\State \Comment{Generate MAC keys for authentication}
+\For{each pair $(i, j)$}
+    \State $\text{MACkey}_{i \to j} \stackrel{\$}{\leftarrow} \{0,1\}^{256}$
+\EndFor
+\State \Return pk $= (\mathbf{A}, \tilde{\mathbf{b}})$, shares $\{\mathbf{s}_i, \text{seeds}_i, \text{MACkeys}_i\}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Signing Protocol (2 Rounds)}
+
+\begin{algorithm}[H]
+\caption{Ringtail Signing --- Round 1 (Message-Independent)}
+\label{alg:sign-r1}
+\begin{algorithmic}[1]
+\Require Party $i$, PRF key, signers set $\mathcal{S}$ with $|\mathcal{S}| \geq t$
+\State \Comment{Generate party $i$'s randomness share}
+\State $\mathbf{r}_i \gets \text{PRF}(\text{key}, \text{session} \| i)$ \Comment{deterministic from seed}
+\For{each party $j \in \mathcal{S} \setminus \{i\}$}
+    \State $\mathbf{r}_{i,j} \gets \text{PRF}(\text{seed}_{i,j}, \text{session})$ \Comment{correlated randomness}
+\EndFor
+\State $\mathbf{y}_i \gets \mathbf{r}_i + \sum_{j : j > i} \mathbf{r}_{i,j} - \sum_{j : j < i} \mathbf{r}_{j,i}$
+\Comment{combined randomness with cancellation}
+\State $\mathbf{w}_i \gets \mathbf{A} \mathbf{y}_i$ \Comment{commitment}
+\State \Comment{Compute MAC for authentication}
+\For{each $j \in \mathcal{S} \setminus \{i\}$}
+    \State $\text{mac}_{i \to j} \gets \text{HMAC}(\text{MACkey}_{i \to j}, \mathbf{w}_i)$
+\EndFor
+\State \textbf{broadcast} $(\mathbf{w}_i, \{\text{mac}_{i \to j}\}_{j \in \mathcal{S}})$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{Ringtail Signing --- Round 2 (Message-Dependent)}
+\label{alg:sign-r2}
+\begin{algorithmic}[1]
+\Require Party $i$, message $\mu$, Round 1 data $\{(\mathbf{w}_j, \text{mac}_j)\}_{j \in \mathcal{S}}$
+\State \Comment{Verify MACs from all parties}
+\For{each $j \in \mathcal{S} \setminus \{i\}$}
+    \State Verify $\text{mac}_{j \to i}$ using $\text{MACkey}_{j \to i}$
+    \State \textbf{abort} if verification fails
+\EndFor
+\State $\mathbf{w} \gets \sum_{j \in \mathcal{S}} \lambda_j \cdot \mathbf{w}_j$ \Comment{combined commitment}
+\State $c \gets H(\mathbf{w}, \mu)$ \Comment{challenge: ternary polynomial, weight $\kappa$}
+\State $\mathbf{z}_i \gets \mathbf{y}_i + c \cdot \lambda_i \cdot \mathbf{s}_i$ \Comment{partial response}
+\State \Comment{Rejection sampling: abort if $\|\mathbf{z}_i\|$ too large}
+\If{$\|\mathbf{z}_i\|_\infty > B$}
+    \State \textbf{abort} and restart with new session
+\EndIf
+\State \textbf{broadcast} $\mathbf{z}_i$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Finalization and Verification}
+
+The combiner (any party or external verifier) assembles the signature:
+\[
+\mathbf{z} = \sum_{i \in \mathcal{S}} \lambda_i \cdot \mathbf{z}_i
+\]
+
+Verification checks:
+\begin{enumerate}[nosep]
+\item $\|\mathbf{z}\|_\infty \leq t \cdot B$ (response is small).
+\item Recompute $\mathbf{w}' = \mathbf{A}\mathbf{z} - c \cdot \tilde{\mathbf{b}}$ and check
+$c = H(\text{Round}(\mathbf{w}', \xi), \mu)$.
+\end{enumerate}
+
+%% -----------------------------------------------------------------------
+%%  4. SECURITY ANALYSIS
+%% -----------------------------------------------------------------------
