@@ -1,0 +1,127 @@
+\section{The Capsule Model}
+\label{sec:model}
+% ============================================================================
+
+\begin{definition}[Capsule]\label{def:capsule}
+A \textbf{Capsule} is a seven-tuple
+\[
+  \mathcal{C} = (V, \mathcal{I}, \Gamma, \Sigma, \Pi, \mathcal{A}, \mathcal{P})
+\]
+where:
+\begin{itemize}[nosep]
+  \item $V$ is the \textbf{vault}: an encrypted SQLite database with a CRDT-based
+        write-ahead log.
+  \item $\mathcal{I}$ is the \textbf{identity}: a DID document anchored on I-Chain,
+        binding the capsule to one or more public keys.
+  \item $\Gamma$ is the \textbf{capability set}: a lattice of UCAN-style
+        capability tokens governing read, write, sync, delegate, and revoke
+        operations.
+  \item $\Sigma$ is the \textbf{sync topology}: the set of peers, relays,
+        and chain anchors through which the vault replicates.
+  \item $\Pi$ is the \textbf{compute policy}: a specification of where computation
+        may execute---local, provider-hosted, or confidential (FHE/TEE).
+  \item $\mathcal{A}$ is the \textbf{audit chain}: an append-only sequence of
+        anchored receipts on Lux recording policy changes, capability grants,
+        and sync checkpoints.
+  \item $\mathcal{P}$ is the \textbf{key policy}: the set of threshold, rotation,
+        and recovery rules governing the capsule's cryptographic material,
+        enforced on K-Chain.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Principal]\label{def:principal}
+A \textbf{principal} is any entity that owns a capsule: a human user, an
+organization, an AI agent, a device, or a shared workspace. Each principal
+has exactly one root capsule. Derived capsules (e.g., per-app or per-workspace
+vaults) inherit capabilities from the root through delegation chains in $\Gamma$.
+\end{definition}
+
+\begin{definition}[Vault]\label{def:vault}
+The vault $V = (\mathsf{DB}, \mathsf{WAL}, k_{\mathsf{enc}})$ consists of:
+\begin{itemize}[nosep]
+  \item $\mathsf{DB}$: a SQLite database encrypted with SQLCipher using AES-256-CBC
+        with HMAC-SHA512 page authentication.
+  \item $\mathsf{WAL}$: a CRDT-based write-ahead log where each entry is a
+        $(\mathsf{hlc}, \mathsf{op}, \mathsf{sig})$ triple---hybrid logical clock
+        timestamp, operation, and signature from the writing principal.
+  \item $k_{\mathsf{enc}}$: the vault encryption key, derived from the principal's
+        root key material via HKDF-SHA256, optionally wrapped under ML-KEM for
+        post-quantum protection.
+\end{itemize}
+\end{definition}
+
+\subsection{Ownership Invariants}
+
+The Capsule model enforces four invariants that distinguish it from both
+traditional cloud architectures and fully on-chain systems.
+
+\begin{invariant}[Key Sovereignty]\label{inv:keys}
+The vault encryption key $k_{\mathsf{enc}}$ is never transmitted in plaintext
+to any party other than the owning principal. Providers receive only ciphertext.
+Recovery requires threshold reconstruction on T-Chain, not provider cooperation.
+\end{invariant}
+
+\begin{invariant}[Data Locality]\label{inv:locality}
+The authoritative copy of the vault state is the local replica. Remote replicas
+(provider-hosted, peer-hosted) hold only encrypted snapshots and CRDT operation
+logs. A principal can reconstruct the full vault from any replica plus the
+encryption key.
+\end{invariant}
+
+\begin{invariant}[Provider Replaceability]\label{inv:provider}
+No provider holds state that the principal cannot obtain elsewhere. Sync
+topology $\Sigma$ can be reconfigured to exclude any provider at any time
+without data loss. The protocol guarantees that switching providers requires
+only re-pointing the sync target---no data migration, no key re-wrapping
+(unless the principal chooses to rotate).
+\end{invariant}
+
+\begin{invariant}[Audit Completeness]\label{inv:audit}
+Every policy change, capability grant, capability revocation, and key rotation
+produces a receipt anchored in $\mathcal{A}$. The audit chain is append-only
+and anchored to Lux. A third party can verify the complete history of a
+capsule's trust configuration without access to the vault contents.
+\end{invariant}
+
+\begin{theorem}[Capsule Sovereignty]\label{thm:sovereignty}
+Under Invariants~\ref{inv:keys}--\ref{inv:audit}, a capsule $\mathcal{C}$ is
+\textbf{sovereign}: the owning principal can, at any time, (a) decrypt and read
+all vault contents, (b) revoke all delegated capabilities, (c) migrate to a
+new provider set, and (d) verify the complete trust history---without cooperation
+from any provider or peer.
+\end{theorem}
+
+\begin{proof}
+By Invariant~\ref{inv:keys}, the principal holds $k_{\mathsf{enc}}$ (or can
+reconstruct it via T-Chain threshold recovery without provider participation),
+so (a) holds. By Invariant~\ref{inv:locality}, at least one encrypted replica
+is locally held, so the principal has data availability independent of providers.
+Capability revocation (b) is a K-Chain transaction signed by the principal's root
+key---no provider co-signature is required because $\Gamma$ is a unilateral
+delegation lattice. Migration (c) follows from Invariant~\ref{inv:provider}:
+the principal re-points $\Sigma$ and the new provider receives the encrypted
+snapshot. Trust history verification (d) follows from Invariant~\ref{inv:audit}:
+$\mathcal{A}$ is on Lux, readable by any party.
+\end{proof}
+
+\subsection{Capsule Lifecycle}
+
+A capsule transitions through four phases:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Genesis}: The principal generates root key material, derives
+        $k_{\mathsf{enc}}$, creates the initial encrypted vault, registers the
+        DID on I-Chain, and publishes the initial key policy to K-Chain.
+  \item \textbf{Active}: The vault accepts local writes, syncs via $\Sigma$,
+        and anchors checkpoints to $\mathcal{A}$. Capabilities in $\Gamma$
+        may be delegated and revoked.
+  \item \textbf{Recovery}: If the principal loses access to $k_{\mathsf{enc}}$,
+        threshold reconstruction on T-Chain produces a new key share set.
+        The vault is re-encrypted under the new key. The recovery event is
+        recorded in $\mathcal{A}$.
+  \item \textbf{Termination}: The principal publishes a revocation of all
+        capabilities and a tombstone DID document. Provider replicas are
+        garbage-collected. The audit chain remains on Lux permanently.
+\end{enumerate}
+
+% ============================================================================

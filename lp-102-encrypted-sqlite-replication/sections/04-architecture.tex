@@ -1,0 +1,195 @@
+\section{Architecture}
+\label{sec:arch}
+%% ============================================================
+
+\subsection{Sidecar Pattern}\label{sec:sidecar}
+
+Replication runs as a two-phase Kubernetes sidecar:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Init container} (\texttt{replicate-restore}): On pod
+    startup, downloads the latest snapshot + WAL segments from S3,
+    decrypts with the principal's age identity, and writes the
+    restored database to the shared volume.
+  \item \textbf{Sidecar container} (\texttt{replicate}): Runs
+    continuously alongside the application, replicating WAL changes
+    to S3 in real time.
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw, rounded corners=2pt, minimum width=2.8cm,
+    minimum height=1cm, font=\small},
+  storage/.style={draw, rounded corners=2pt, minimum width=2.2cm,
+    minimum height=0.8cm, font=\small, fill=black!5},
+  arr/.style={-{Stealth[length=5pt]}, thick},
+]
+  % Pod boundary
+  \node[draw, dashed, rounded corners=4pt, minimum width=10cm,
+    minimum height=4.5cm, label={[font=\footnotesize]above:Pod}] (pod) {};
+
+  % Init container
+  \node[box, fill=blue!8] (init) at (-2.5, 1.2)
+    {\texttt{init:restore}};
+
+  % App
+  \node[box, fill=green!8] (app) at (0, -0.5)
+    {Base (app)};
+
+  % Sidecar
+  \node[box, fill=orange!8] (sidecar) at (2.5, 1.2)
+    {\texttt{replicate}};
+
+  % Shared volume
+  \node[storage] (vol) at (0, -1.8)
+    {\texttt{/data} (emptyDir)};
+
+  % S3
+  \node[storage, fill=yellow!10] (s3) at (6, 0.3)
+    {S3 (age-encrypted)};
+
+  % KMS
+  \node[storage, fill=red!5] (kms) at (-5.5, 0.3)
+    {KMS};
+
+  % Arrows
+  \draw[arr] (init) -- (vol) node[midway, left, font=\scriptsize] {restore};
+  \draw[arr] (app) -- (vol) node[midway, right, font=\scriptsize] {read/write};
+  \draw[arr] (sidecar) -- (vol) node[midway, right, font=\scriptsize] {watch WAL};
+  \draw[arr, blue] (s3) -- (init) node[midway, above, font=\scriptsize] {download};
+  \draw[arr, orange] (sidecar) -- (s3) node[midway, above, font=\scriptsize] {upload};
+  \draw[arr, red] (kms) -- (init) node[midway, above, font=\scriptsize] {age key};
+  \draw[arr, red] (kms) -- (sidecar) node[midway, below, font=\scriptsize, sloped] {age key};
+
+\end{tikzpicture}
+\caption{Sidecar replication architecture. The init container restores
+  from S3 on startup. The sidecar ships WAL segments continuously.
+  Both fetch age keys from KMS. The shared volume uses emptyDir---no
+  PVC required.}
+\label{fig:sidecar}
+\end{figure}
+
+\noindent\textbf{No PVC required.} Because the init container restores
+the database from S3, the shared volume can be \texttt{emptyDir}
+(backed by node memory or local disk). The pod is fully reconstructable
+from S3 state. PVCs become optional performance optimizations, not
+durability requirements.
+
+\subsection{Kubernetes Patch}\label{sec:k8s-patch}
+
+Replication is applied to existing deployments via Kustomize strategic
+merge patches. A single patch adds both the init container and sidecar:
+
+\begin{lstlisting}[language=YAML,caption={Kustomize patch: replicate-sidecar.yaml}]
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ats
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: replicate-restore
+          image: ghcr.io/hanzoai/replicate:latest
+          args: ["restore", "-config", "/etc/litestream.yml"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: litestream-config
+              mountPath: /etc/litestream.yml
+              subPath: litestream.yml
+            - name: age-keys
+              mountPath: /etc/age
+              readOnly: true
+          env:
+            - name: LITESTREAM_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: s3-credentials
+                  key: access-key
+            - name: LITESTREAM_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: s3-credentials
+                  key: secret-key
+      containers:
+        - name: replicate
+          image: ghcr.io/hanzoai/replicate:latest
+          args: ["replicate", "-config", "/etc/litestream.yml"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: litestream-config
+              mountPath: /etc/litestream.yml
+              subPath: litestream.yml
+            - name: age-keys
+              mountPath: /etc/age
+              readOnly: true
+          env:
+            - name: LITESTREAM_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: s3-credentials
+                  key: access-key
+            - name: LITESTREAM_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: s3-credentials
+                  key: secret-key
+      volumes:
+        - name: litestream-config
+          configMap:
+            name: litestream-config
+        - name: age-keys
+          secret:
+            secretName: replicate-age-keys
+\end{lstlisting}
+
+Patch files live at \texttt{universe/k8s/patches/replicate-sidecar.yaml}
+and are referenced in each environment's \texttt{kustomization.yaml}.
+
+\subsection{Recovery Procedure}\label{sec:recovery}
+
+On pod startup, the init container executes:
+
+\begin{enumerate}[nosep]
+  \item Fetch the age identity from the mounted secret.
+  \item List generations in S3 for the target database path.
+  \item Download the latest snapshot (\texttt{.db.age}).
+  \item Decrypt the snapshot using the age identity.
+  \item Download all WAL segments after the snapshot.
+  \item Decrypt each WAL segment.
+  \item Apply WAL segments to the snapshot in order using SQLite's
+    WAL replay mechanism.
+  \item Write the restored database to \texttt{/data}.
+  \item Exit 0, allowing the application container to start.
+\end{enumerate}
+
+If no S3 data exists (first deployment), the init container exits 0
+with no database, and the application creates a fresh one.
+
+\subsection{Multi-Database Services}\label{sec:multidb}
+
+Services with per-org databases (e.g., ATS with 500 tenants) replicate
+each database independently. The \texttt{litestream.yml} supports
+glob patterns:
+
+\begin{lstlisting}[language=YAML,caption={Multi-database replication.}]
+dbs:
+  - path: /data/pb_data/orgs/*/data.db
+    replicas:
+      - type: s3
+        bucket: lux-replicate
+        path: ats/${DB_ORG_ID}
+        sync-interval: 1s
+        age:
+          recipients:
+            - ${ORG_AGE_RECIPIENT}
+            - ${RECOVERY_AGE_RECIPIENT}
+\end{lstlisting}
+
+The replicator resolves \texttt{\$\{DB\_ORG\_ID\}} from the directory
+name containing each matched database file.
+
+%% ============================================================

@@ -1,0 +1,116 @@
+\section{Protocol Specification}
+\label{sec:protocol}
+
+\subsection{Message Format}
+
+\begin{definition}[Warp Message]
+A warp message is a tuple:
+\begin{equation}
+    \mathcal{M} = (\mathsf{src}, \mathsf{dst}, \mathsf{nonce}, \mathsf{payload}, \mathsf{expiry}, \mathsf{gasLimit})
+\end{equation}
+where $\mathsf{src}, \mathsf{dst} \in \{0,1\}^{32}$ are chain IDs, $\mathsf{nonce} \in \mathbb{N}$ is a per-pair sequence number, $\mathsf{payload} \in \{0,1\}^*$ is the application data, $\mathsf{expiry} \in \mathbb{N}$ is a block height deadline, and $\mathsf{gasLimit} \in \mathbb{N}$ bounds destination execution cost.
+\end{definition}
+
+The signing digest is domain-separated:
+\begin{equation}
+    d(\mathcal{M}) = H_{\text{warp}}\bigl(\texttt{"LUX-WARP-V1"} \| \mathsf{src} \| \mathsf{dst} \| \mathsf{nonce} \| \mathsf{SHA256}(\mathsf{payload}) \| \mathsf{expiry} \| \mathsf{gasLimit}\bigr)
+\end{equation}
+where $H_{\text{warp}} : \{0,1\}^* \to \mathbb{G}_1$ uses the hash-to-curve construction from RFC~9380.
+
+\subsection{Signing Phase}
+
+\begin{algorithm}[H]
+\caption{Warp Message Signing (Validator $v_i$)}
+\label{alg:signing}
+\begin{algorithmic}[1]
+\Require Finalized block $B$ at height $h$ containing log event $\mathsf{WarpEmit}(\mathcal{M})$
+\State Verify $B$ is accepted by appchain consensus (finalized)
+\State Verify $\mathcal{M}.\mathsf{src} = \text{local chain ID}$
+\State Verify $\mathcal{M}.\mathsf{expiry} > h$
+\State Compute $d \gets d(\mathcal{M})$
+\State $\sigma_i \gets \mathsf{sk}_i \cdot d$ \Comment{BLS sign in $\mathbb{G}_1$}
+\State Broadcast $(\mathcal{M}.\mathsf{nonce}, i, \sigma_i)$ to relayer gossip network
+\end{algorithmic}
+\end{algorithm}
+
+Key invariant: honest validators only sign messages that appear in finalized blocks. This is the foundation of message authenticity.
+
+\subsection{Aggregation Phase}
+
+\begin{algorithm}[H]
+\caption{Signature Aggregation (Relayer)}
+\label{alg:aggregation}
+\begin{algorithmic}[1]
+\Require Partial signatures $\{(i, \sigma_i)\}$ for message $\mathcal{M}$
+\Require Source validator set $\mathcal{V}_{\text{src}}$
+\Ensure Aggregate proof $\Pi$ or $\bot$
+\State $\mathcal{Q} \gets \emptyset$; $W_q \gets 0$
+\For{each $(i, \sigma_i)$ received}
+    \If{$e(\sigma_i, g_2) = e(d(\mathcal{M}), \mathsf{pk}_i)$} \Comment{Verify individual sig}
+        \State $\mathcal{Q} \gets \mathcal{Q} \cup \{i\}$; $W_q \gets W_q + w_i$
+    \EndIf
+\EndFor
+\If{$W_q < 2W/3$}
+    \State \Return $\bot$ \Comment{Insufficient quorum}
+\EndIf
+\State $\sigma_{\text{agg}} \gets \sum_{i \in \mathcal{Q}} \sigma_i$ \Comment{Point addition in $\mathbb{G}_1$}
+\State $\mathsf{bm} \gets \texttt{BitVector}(n)$ with bit $i$ set $\forall\, i \in \mathcal{Q}$
+\State \Return $\Pi = (\sigma_{\text{agg}}, \mathsf{bm})$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Verification Phase}
+
+\begin{algorithm}[H]
+\caption{On-Chain Warp Verification (Destination Appchain)}
+\label{alg:verification}
+\begin{algorithmic}[1]
+\Require Message $\mathcal{M}$, proof $\Pi = (\sigma_{\text{agg}}, \mathsf{bm})$
+\Require Source validator set $\mathcal{V}_{\text{src}}$ for current epoch
+\State $\mathcal{Q} \gets \{i : \mathsf{bm}[i] = 1\}$
+\State $W_q \gets \sum_{i \in \mathcal{Q}} w_i$
+\If{$W_q < 2W_{\text{src}} / 3$}
+    \State \textbf{revert} \texttt{"InsufficientQuorum"}
+\EndIf
+\If{$\mathsf{block.height} > \mathcal{M}.\mathsf{expiry}$}
+    \State \textbf{revert} \texttt{"MessageExpired"}
+\EndIf
+\If{$\mathsf{nonces}[\mathcal{M}.\mathsf{src}] \neq \mathcal{M}.\mathsf{nonce}$}
+    \State \textbf{revert} \texttt{"InvalidNonce"}
+\EndIf
+\State $\mathsf{apk} \gets \sum_{i \in \mathcal{Q}} \mathsf{pk}_i$
+\State $d \gets d(\mathcal{M})$
+\If{$e(\sigma_{\text{agg}}, g_2) \neq e(d, \mathsf{apk})$}
+    \State \textbf{revert} \texttt{"InvalidSignature"}
+\EndIf
+\State $\mathsf{nonces}[\mathcal{M}.\mathsf{src}] \gets \mathcal{M}.\mathsf{nonce} + 1$
+\State Execute $\mathcal{M}.\mathsf{payload}$ with gas limit $\mathcal{M}.\mathsf{gasLimit}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Proof Size Analysis}
+
+\begin{proposition}[Constant-Size Core Proof]\label{prop:proofsize}
+The proof $\Pi$ has size $48 + \lceil n/8 \rceil$ bytes, where $n = |\mathcal{V}_{\text{src}}|$.
+\end{proposition}
+
+\begin{proof}
+$\sigma_{\text{agg}} \in \mathbb{G}_1$ compresses to 48 bytes. The bitmap $\mathsf{bm}$ uses one bit per validator, totaling $\lceil n/8 \rceil$ bytes. These are the only components; the message $\mathcal{M}$ itself is required by the application and not part of the proof overhead.
+\end{proof}
+
+\begin{table}[H]
+\centering
+\caption{Total warp message sizes (header + proof) for varying validator counts.}
+\label{tab:proofsize}
+\begin{tabular}{rrrr}
+\toprule
+\textbf{$|\mathcal{V}|$} & \textbf{Signature (B)} & \textbf{Bitmap (B)} & \textbf{Total w/ Header (B)} \\
+\midrule
+100 & 48 & 13 & 181 \\
+500 & 48 & 63 & 231 \\
+1{,}000 & 48 & 125 & 293 \\
+5{,}000 & 48 & 625 & 793 \\
+\bottomrule
+\end{tabular}
+\end{table}
+

@@ -1,0 +1,144 @@
+\section{Migration Mapping}
+\label{sec:mapping}
+
+We define a component-by-component mapping from Firebase primitives to
+capsule equivalents on Lux Network.
+
+\begin{table}[H]
+\centering
+\caption{Component mapping from Firebase/Supabase to Lux capsule architecture.}
+\label{tab:mapping}
+\begin{tabular}{p{3.5cm}p{4.5cm}p{5cm}}
+\toprule
+\textbf{Firebase} & \textbf{Supabase} & \textbf{Lux Capsule} \\
+\midrule
+Firestore & PostgreSQL + Realtime & Encrypted SQLite + CRDT sync \\
+Firebase Auth & GoTrue (JWT) & I-Chain DIDs + Capsule keys \\
+Cloud Functions & Edge Functions (Deno) & Base Functions (capsule-local) \\
+Firebase Hosting & -- & Provider market (relay + gateway) \\
+Cloud Storage & S3-compatible storage & Encrypted blob storage \\
+Security Rules & Row Level Security & Capsule access policy (TFHE) \\
+FCM (Push) & -- & Relay notifications (encrypted) \\
+Remote Config & -- & Capsule config (CRDT) \\
+Analytics & -- & Local analytics (private) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Firestore to Encrypted SQLite + CRDT}
+
+Firestore is a document database with real-time listeners and
+offline persistence. The capsule equivalent is SQLite (for local
+storage and queries) combined with CRDTs (for real-time
+synchronization across devices and collaborators).
+
+\begin{definition}[Capsule Data Layer]
+The capsule data layer consists of:
+\begin{enumerate}
+    \item An encrypted SQLite database $\mathcal{D}$ stored in the capsule
+    vault, encrypted under the capsule key $k_C$ using SQLCipher
+    \cite{zetetic2024sqlcipher} (AES-256-CBC with HMAC-SHA512 page-level
+    authentication).
+    \item A CRDT synchronization layer that propagates changes across
+    devices and authorized collaborators via relay providers.
+    \item A query engine that operates over the decrypted database locally,
+    supporting full SQL (joins, aggregations, indexes) without network
+    round-trips.
+\end{enumerate}
+\end{definition}
+
+The critical advantage: queries execute against a local database. There
+is no network round-trip for reads. The data is already on the device,
+encrypted at rest, decryptable only by the capsule key holder.
+
+Real-time synchronization is achieved via CRDTs \cite{shapiro2011crdt}.
+When a client writes to the local SQLite database, the write is captured
+as a CRDT operation (using Automerge \cite{kleppmann2017automerge} or
+Yjs \cite{nicolaescu2015yjs} as the CRDT engine), encrypted under the
+capsule key, and broadcast to other authorized devices via relay providers.
+Each device applies incoming operations to its local database, with CRDT
+merge semantics guaranteeing eventual consistency.
+
+\begin{equation}
+    \mathsf{Sync}(C_i, C_j) : \mathsf{ops}_i \xrightarrow{\text{encrypt}} \mathsf{relay} \xrightarrow{\text{decrypt}} \mathsf{ops}_j \xrightarrow{\text{merge}} \mathcal{D}_j
+\end{equation}
+
+\subsection{Firebase Auth to I-Chain DIDs}
+
+Firebase Auth manages user identity as a provider-owned resource. The
+capsule equivalent uses decentralized identifiers (DIDs) anchored on
+the Lux I-Chain:
+
+\begin{definition}[Capsule Identity]
+Each capsule has a DID of the form \texttt{did:lux:<method-specific-id>}
+registered on the I-Chain. The DID document contains:
+\begin{itemize}
+    \item Public keys for authentication and encryption
+    \item Service endpoints (relay addresses, gateway URLs)
+    \item Recovery metadata (guardian set commitment hash)
+\end{itemize}
+The DID is self-sovereign: the capsule owner controls the private keys
+and can update the DID document without permission from any provider.
+\end{definition}
+
+Authentication in the capsule model is key-based rather than
+credential-based. The user proves identity by signing a challenge
+with their capsule key, not by submitting a password to a server.
+Social login (Google, Apple, GitHub) is supported as an initial
+bootstrap mechanism: the social identity is linked to a DID during
+onboarding and can be unlinked after the user establishes direct
+key-based authentication.
+
+\subsection{Cloud Functions to Base Functions}
+
+Cloud Functions execute server-side logic in a provider-controlled
+runtime. Base Functions execute logic within the capsule's trust
+boundary:
+
+\begin{definition}[Base Function]
+A Base Function $f$ is a deterministic computation that:
+\begin{enumerate}
+    \item Executes locally on the capsule owner's device (for personal capsules)
+    or on a compute provider within a TEE (for shared capsules).
+    \item Has read/write access to the capsule's encrypted SQLite database.
+    \item Can be triggered by database changes, HTTP requests (via gateway
+    providers), scheduled timers, or explicit invocation.
+    \item Produces a deterministic execution receipt anchored on-chain.
+\end{enumerate}
+\end{definition}
+
+The key difference: Cloud Functions run on Google's servers with Google's
+access to the function's inputs and outputs. Base Functions run in the
+capsule's trust boundary---either on the user's device or in a TEE where
+the compute provider cannot inspect the function's data.
+
+For functions that must run when the user's device is offline (e.g.,
+scheduled tasks, webhook handlers), the function executes on a compute
+provider in TEE mode. The provider runs the function inside an enclave,
+with remote attestation proving that the code executed correctly and that
+no data was exfiltrated.
+
+\subsection{Firebase Hosting to Provider Market}
+
+Firebase Hosting is a single-provider CDN. The capsule equivalent is
+the decentralized provider market described in \cite{kelling2026cloud}:
+
+\begin{itemize}
+    \item Static assets are stored as encrypted blobs with storage providers.
+    \item Gateway providers serve assets to browsers, terminating TLS and
+    translating HTTP requests.
+    \item Multiple providers can serve the same application simultaneously,
+    with automatic failover.
+    \item The developer selects providers through the market based on
+    price, latency, and reputation---not through a single vendor contract.
+\end{itemize}
+
+Deployment is a single command:
+
+\begin{lstlisting}
+lux deploy --providers auto --budget 0.5LUX/month
+\end{lstlisting}
+
+The \texttt{--providers auto} flag selects the optimal provider set based
+on the application's latency requirements and the current market prices.
+

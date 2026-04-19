@@ -1,0 +1,79 @@
+\section{Architecture}
+
+\label{sec:architecture}
+
+\subsection{Anchor Lifecycle}
+
+\begin{enumerate}[nosep]
+  \item \textbf{Compute}: Application computes SHA-256 Merkle root of
+        serialized CRDT \texttt{DocumentSnapshot} every $N$ operations or
+        $T$ seconds (configurable; default $N=1000$, $T=300$s).
+  \item \textbf{Submit}: Application calls
+        \texttt{anchor.Submit(appID, height, root)} which encodes a
+        72-byte payload and sends an EVM transaction to the anchor
+        precompile.
+  \item \textbf{Finalize}: Transaction is included in a block and
+        finalized by Quasar certificate (Q-Chain) or Snow consensus
+        (C-Chain). The anchor is now immutable.
+  \item \textbf{Verify}: Any party calls \texttt{anchor.Get(appID, height)}
+        via \texttt{eth\_call}, recomputes the local Merkle root from their
+        CRDT state, and compares.
+\end{enumerate}
+
+\subsection{Precompile Design}
+
+The anchor precompile is a stateful EVM precompile registered at address
+\texttt{0x0700\ldots10} (Privacy/Encryption page, C-Chain slot, item 0x10
+in the LP addressing scheme). It exposes four functions via ABI selector:
+
+\begin{center}
+\begin{tabular}{llr}
+\toprule
+\textbf{Function} & \textbf{Selector} & \textbf{Gas} \\
+\midrule
+\texttt{submit(bytes32,uint64,bytes32)} & \texttt{0x3c21e8a1} & 25,400 \\
+\texttt{get(bytes32,uint64)} & \texttt{0x8eaa6ac0} & 2,600 \\
+\texttt{getLatest(bytes32)} & \texttt{0xba41d847} & 2,600 \\
+\texttt{list(bytes32,uint64,uint64)} & \texttt{0x70fa9a4d} & 2,600 + 200/entry \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection{Storage Layout}
+
+Each anchor occupies two EVM storage slots:
+
+\begin{itemize}[nosep]
+  \item Slot $\texttt{keccak256}(\mathit{appID} \| h)$: the 32-byte root.
+  \item Slot $\texttt{keccak256}(\mathit{appID} \| \texttt{``latest''})$:
+        the highest submitted height for this appID (8 bytes, right-padded).
+\end{itemize}
+
+\noindent
+This gives $O(1)$ lookup per anchor and $O(1)$ latest-height query. The
+\texttt{list} function iterates heights $[h_{\text{from}}, h_{\text{to}})$,
+issuing one \texttt{SLOAD} per height.
+
+\subsubsection{Gas Cost Derivation}
+
+\begin{align*}
+\text{submit gas} &= G_{\text{base}} + 2 \times G_{\text{sstore\_new}} + G_{\text{keccak}} \\
+                  &= 400 + 2 \times 12{,}000 + 600 + 400 \\
+                  &= 25{,}400
+\end{align*}
+
+\noindent
+where $G_{\text{sstore\_new}} = 12{,}000$ for writing a new storage slot
+(after EIP-2929 warm access), $G_{\text{keccak}} = 600$ for the two hash
+computations, and $G_{\text{base}} = 400$ for ABI decoding and validation.
+A \texttt{get} call costs 2,600 (one warm \texttt{SLOAD}).
+
+\subsection{Height Monotonicity Invariant}
+
+The precompile enforces $h > h_{\text{latest}}$ for a given appID. Attempts
+to submit a height $\leq$ the current latest revert with
+\texttt{AnchorHeightNotMonotonic}. This prevents retroactive anchor
+forgery: once height 100 is anchored, no one can insert a different root
+at height 100 or below.
+
+% ============================================================================

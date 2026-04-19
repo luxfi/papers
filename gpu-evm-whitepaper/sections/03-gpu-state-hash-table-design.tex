@@ -1,0 +1,58 @@
+\section{GPU State: Hash Table Design}
+
+\label{sec:state}
+%% ============================================================================
+
+\subsection{Design Principles}
+
+Traditional EVM state is a Merkle-Patricia trie stored in LevelDB/PebbleDB on disk,
+accessed through multiple layers of caching. This design is incompatible with GPU
+execution because:
+
+\begin{enumerate}
+\item \textbf{Pointer-chasing}: Trie traversal involves dependent memory accesses that
+      serialize GPU threads.
+\item \textbf{CPU--GPU transfer}: Moving state to GPU memory on every block is prohibitive.
+\item \textbf{Allocation}: GPU compute shaders cannot dynamically allocate memory.
+\end{enumerate}
+
+cevm replaces the trie with a GPU-resident open-addressing hash table:
+
+\subsection{Hash Table Structure}
+
+\begin{itemize}
+\item \textbf{Keys}: 20-byte account addresses, hashed to 32-bit slots via Keccak-256
+      truncation.
+\item \textbf{Values}: Fixed-size account records (nonce: 8B, balance: 32B, code hash: 32B,
+      storage root: 32B = 104 bytes per account).
+\item \textbf{Storage}: Separate hash table mapping (address, slot) $\to$ 32-byte value.
+\item \textbf{Collision resolution}: Robin Hood linear probing with backshift deletion.
+\item \textbf{Load factor}: Maintained below 0.7 for O(1) amortized access.
+\end{itemize}
+
+\subsection{Persistent Buffers}
+
+The hash table lives in a persistent Metal buffer that survives across blocks.
+On Apple Silicon unified memory, this buffer is accessible to both CPU and GPU without
+copying. The persistent state consumes approximately \textbf{5\,GB} for an Ethereum-scale
+state ($\sim$250M accounts).
+
+\subsection{MvMemory for Block-STM}
+
+During block execution, the Block-STM MvMemory layer overlays the persistent state.
+Each transaction has a version-stamped write set stored in GPU shared memory. Reads
+check MvMemory first (O(1) lookup by tx index), falling through to the persistent hash
+table on miss. After block execution, committed writes are flushed to the persistent table.
+
+\subsection{GPU State DB Validation}
+
+The GPU state hash table is validated by 8 dedicated tests verifying:
+\begin{itemize}
+\item Insertion and lookup correctness
+\item Collision handling under high load factor
+\item Concurrent read/write from multiple GPU threads
+\item Consistency between GPU hash table and CPU trie (cross-validation)
+\item Persistence across simulated block boundaries
+\end{itemize}
+
+%% ============================================================================

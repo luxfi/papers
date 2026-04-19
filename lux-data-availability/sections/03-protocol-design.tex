@@ -1,0 +1,194 @@
+\section{Protocol Design}
+
+\label{sec:protocol}
+%% ============================================================================
+
+\subsection{System Model}
+
+We consider a network of $N$ validators partitioned across $m$ appchains
+$\mathcal{S}_1, \ldots, \mathcal{S}_m$, with the Primary Network $\mathcal{P}$ serving as
+the coordination layer. Each validator $v_i$ participates in the Primary Network and optionally
+in one or more appchains. Light clients $\ell_1, \ldots, \ell_L$ connect to the network via
+RPC endpoints and do not maintain full state.
+
+\begin{definition}[Threat Model]
+We assume an adversary controlling at most $f < N/3$ validators on the Primary Network and at
+most $f_j < N_j/3$ validators on each appchain $\mathcal{S}_j$. The adversary is computationally
+bounded and cannot break the discrete logarithm or $d$-SDH assumption. The adversary may
+selectively withhold data from specific light clients.
+\end{definition}
+
+\subsection{Blob Encoding}
+\label{sec:protocol:encoding}
+
+A blob $B$ is a byte sequence of length at most $k^2 \cdot 31$ bytes, where $k$ is the matrix
+dimension and 31 bytes is the field-element capacity of a BLS12-381 scalar. The encoding
+proceeds as follows:
+
+\begin{algorithm}[H]
+\caption{Blob Encoding}
+\label{alg:blob-encoding}
+\begin{algorithmic}[1]
+\Require Blob $B$ of length $\leq k^2 \cdot 31$ bytes
+\Ensure Extended matrix $\hat{M} \in \mathbb{F}_p^{2k \times 2k}$, commitments $\mathbf{C}$
+\State Pad $B$ to exactly $k^2 \cdot 31$ bytes with zeros.
+\State Parse $B$ into $k^2$ field elements $b_0, \ldots, b_{k^2-1} \in \mathbb{F}_p$.
+\State Arrange into $k \times k$ matrix $M$ with $M[i][j] = b_{ik + j}$.
+\For{each row $i \in [k]$}
+    \State Interpolate polynomial $R_i(x)$ of degree $< k$ through $(M[i][0], \ldots, M[i][k-1])$.
+    \State Extend: $M'[i][j] = R_i(\omega_j)$ for $j \in [2k]$, where $\omega$ is a $2k$-th root of unity.
+\EndFor
+\For{each column $j \in [2k]$}
+    \State Interpolate polynomial $C_j(x)$ of degree $< k$ through $(M'[0][j], \ldots, M'[k-1][j])$.
+    \State Extend: $\hat{M}[i][j] = C_j(\omega_i)$ for $i \in [2k]$.
+\EndFor
+\For{each row $i \in [2k]$}
+    \State Compute KZG commitment $\mathbf{C}_{\text{row}}[i] = \text{KZG.Commit}(\hat{R}_i)$ where
+           $\hat{R}_i$ interpolates row $i$ of $\hat{M}$.
+\EndFor
+\For{each column $j \in [2k]$}
+    \State Compute KZG commitment $\mathbf{C}_{\text{col}}[j] = \text{KZG.Commit}(\hat{C}_j)$ where
+           $\hat{C}_j$ interpolates column $j$ of $\hat{M}$.
+\EndFor
+\State \Return $\hat{M}$, $\mathbf{C} = (\mathbf{C}_{\text{row}}, \mathbf{C}_{\text{col}})$
+\end{algorithmic}
+\end{algorithm}
+
+The total commitment size is $4k$ group elements (two per row, two per column---though we
+store only $2k$ row commitments and $2k$ column commitments). For $k = 64$ (blob size
+$64^2 \times 31 \approx 127$\,KiB), the commitment vector is $4 \times 64 \times 48 = 12{,}288$
+bytes.
+
+\subsection{Block Header Extension}
+
+Each Lux block header is extended with a \texttt{DACommitment} field:
+
+\begin{lstlisting}[language=Go, caption={DACommitment structure}]
+type DACommitment struct {
+    AppchainID      ids.ID                // Appchain originating the blob
+    BlobIndex     uint32                // Index within the slot
+    RowCommits    [2*K]bls.G1Affine     // KZG row commitments
+    ColCommits    [2*K]bls.G1Affine     // KZG column commitments
+    DataRoot      [32]byte              // Merkle root of extended matrix
+}
+\end{lstlisting}
+
+The \texttt{DataRoot} is a Merkle tree over all $4k^2$ cells of $\hat{M}$, providing a
+fallback commitment for nodes that do not support BLS12-381 pairing operations.
+
+\subsection{Data Availability Sampling Protocol}
+\label{sec:protocol:sampling}
+
+Light clients execute the following sampling procedure upon receiving a new block header:
+
+\begin{algorithm}[H]
+\caption{Light Client DAS}
+\label{alg:das-sampling}
+\begin{algorithmic}[1]
+\Require Block header $H$ with DACommitment $\mathbf{C}$, security parameter $\lambda$
+\Ensure Accept or reject data availability
+\State Set sample count $s = \lceil \lambda / 2 \rceil$.
+\For{$t = 1$ to $s$}
+    \State Sample uniformly random $(i_t, j_t) \in [2k] \times [2k]$.
+    \State Request cell $\hat{M}[i_t][j_t]$ and KZG opening proofs $\pi_{\text{row}}^{(t)}$,
+           $\pi_{\text{col}}^{(t)}$ from any full node.
+    \State Verify $\text{KZG.Verify}(\mathbf{C}_{\text{row}}[i_t], \omega_{j_t}, \hat{M}[i_t][j_t],
+           \pi_{\text{row}}^{(t)}) = 1$.
+    \State Verify $\text{KZG.Verify}(\mathbf{C}_{\text{col}}[j_t], \omega_{i_t}, \hat{M}[i_t][j_t],
+           \pi_{\text{col}}^{(t)}) = 1$.
+    \If{either verification fails}
+        \State \Return \textbf{Reject}
+    \EndIf
+\EndFor
+\State \Return \textbf{Accept}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[Sampling Security]
+\label{thm:sampling-security}
+If the block producer has made less than $50\%$ of the cells in any row or column available,
+then a light client sampling $s$ uniformly random cells rejects with probability at least
+$1 - (3/4)^s$.
+\end{theorem}
+
+\begin{proof}
+Suppose the adversary withholds more than $50\%$ of cells in row $i^*$. For each sample,
+the probability of hitting a cell in row $i^*$ is $2k / (4k^2) = 1/(2k)$, and conditioned
+on hitting row $i^*$, the probability of hitting a withheld cell is at least $1/2$. However,
+we obtain a stronger bound by observing that if the adversary withholds more than $50\%$ of
+\emph{any} row or column, the extended matrix is not a valid codeword. The number of cells
+inconsistent with the KZG commitments is at least $k$ (one full row minus the $k$ available
+cells). The probability that a single random sample avoids all inconsistent cells is at most
+$1 - k/(4k^2) = 1 - 1/(4k)$. Over $s$ independent samples, the acceptance probability is
+at most $(1 - 1/(4k))^s$. For the 2D structure with correlated row-column constraints, Al-Bassam
+et al.~\cite{albassam2018fraud} show the tighter bound $(3/4)^s$, which we adopt.
+\end{proof}
+
+For $\lambda = 80$ bits of security, we need $s = 75$ samples (since $(3/4)^{75} < 2^{-80}$).
+
+\subsection{Appchain-Scoped Commitment Aggregation}
+\label{sec:protocol:aggregation}
+
+In a network with $m$ appchains each producing blobs, the naive approach includes $m$ separate
+DACommitments in every Primary Network block. This wastes bandwidth for validators who validate
+only a subset of appchains.
+
+Lux-DAS introduces \emph{aggregated DA roots}:
+
+\begin{definition}[Aggregated DA Root]
+Let $\mathbf{C}_1, \ldots, \mathbf{C}_m$ be the DACommitments for appchains
+$\mathcal{S}_1, \ldots, \mathcal{S}_m$ in a given slot. The aggregated DA root is
+\[
+    R_{\text{agg}} = \text{Merkle}(\mathbf{C}_1.\text{DataRoot}, \ldots, \mathbf{C}_m.\text{DataRoot})
+\]
+with the individual appchain DA roots available via Merkle inclusion proofs of depth
+$O(\log m)$.
+\end{definition}
+
+Validators only download the full DACommitment for appchains they validate. For cross-appchain
+DA verification (e.g., for Teleporter messages), a validator requests a Merkle proof linking
+the target appchain's DA root to $R_{\text{agg}}$, then performs DAS sampling against that
+appchain's commitments.
+
+\subsection{Adaptive Sampling Under Network Churn}
+
+Validator sets on Lux appchains are dynamic: validators join and leave over epochs. High
+churn reduces the effective number of independent sampling nodes, weakening the aggregate
+DA guarantee. Lux-DAS adapts by increasing the per-client sample count when churn is high.
+
+\begin{definition}[Churn-Adjusted Sampling]
+Let $\rho \in [0,1]$ denote the fraction of the validator set that has changed in the last
+epoch. The adjusted sample count is
+\[
+    s' = \left\lceil \frac{s}{1 - \rho/2} \right\rceil
+\]
+where $s$ is the baseline sample count. When $\rho = 0$ (no churn), $s' = s$. When
+$\rho = 1$ (complete turnover), $s' = 2s$.
+\end{definition}
+
+This adjustment compensates for the reduced independence among samplers due to correlated
+join/leave patterns. The factor $1/(1 - \rho/2)$ is derived from a birthday-paradox analysis
+of overlapping sample sets among validators with correlated uptime.
+
+\subsection{KZG Commitment Aggregation via Inner Product Arguments}
+
+When a light client verifies multiple blobs in the same slot, it can amortize verification
+cost using the inner product argument (IPA) structure of KZG~\cite{bowe2019recursive}.
+
+\begin{proposition}[Batched Verification]
+\label{prop:batched-verification}
+Given $m$ KZG opening claims $(C_i, z_i, y_i, \pi_i)$ for $i \in [m]$, the verifier can
+check all $m$ claims with a single pairing computation plus $O(m)$ scalar multiplications
+by computing random linear combinations:
+\[
+    e\left(\sum_{i=1}^{m} r_i(C_i - y_i g_1) - \sum_{i=1}^{m} r_i z_i \pi_i,\; g_2\right)
+    = e\left(\sum_{i=1}^{m} r_i \pi_i,\; \tau g_2\right)
+\]
+where $r_1, \ldots, r_m$ are random challenges from the Fiat-Shamir transcript.
+\end{proposition}
+
+This reduces the per-blob verification cost from 2 pairings to $2/m$ amortized pairings
+for $m$ blobs, which is critical for validators handling dozens of appchain blobs per slot.
+
+
+%% ============================================================================

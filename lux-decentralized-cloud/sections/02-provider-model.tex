@@ -1,0 +1,145 @@
+\section{Provider Model}
+\label{sec:model}
+
+The Lux decentralized cloud defines five distinct provider roles. Each role
+represents a separable service that can be operated independently, composed
+with other roles, or bundled by a single operator. The critical property is
+that no single role requires custodial access to user data.
+
+\subsection{Relay Providers}
+
+A relay provider routes encrypted messages between capsules and between capsules
+and external services. Relays operate on ciphertext exclusively---they forward
+bytes without the ability to inspect, modify, or selectively drop content
+(detectable via receipt verification).
+
+\begin{definition}[Relay Provider]
+A relay provider $\mathcal{R}$ is a network node that accepts encrypted payloads
+$\mathsf{Enc}(k, m)$ from source capsule $C_s$ and delivers them to destination
+capsule $C_d$ (or external endpoint $E$) within a committed latency bound
+$\tau_{\mathcal{R}}$. The relay produces a delivery receipt
+$\sigma_{\mathcal{R}} = \mathsf{Sign}(sk_{\mathcal{R}}, (h(m), t_{\text{recv}}, t_{\text{deliver}}))$
+anchored on the P-Chain.
+\end{definition}
+
+Relay providers are analogous to CDN edge nodes and load balancers in the
+centralized cloud, with two differences: (i)~they cannot read the traffic
+they route, and (ii)~their performance is independently verifiable via
+chain receipts.
+
+The relay selection algorithm uses a stake-weighted latency score:
+
+\begin{equation}\label{eq:relay-score}
+    \mathsf{Score}(\mathcal{R}) = \frac{w_{\text{stake}} \cdot S_{\mathcal{R}} / S_{\text{total}} + w_{\text{perf}} \cdot (1 - \bar{\tau}_{\mathcal{R}} / \tau_{\max})}{w_{\text{stake}} + w_{\text{perf}}}
+\end{equation}
+
+where $S_{\mathcal{R}}$ is the relay's staked amount, $\bar{\tau}_{\mathcal{R}}$
+is its rolling average latency, and $\tau_{\max}$ is the network-wide maximum
+tolerated latency.
+
+\subsection{Storage Providers}
+
+Storage providers persist encrypted blobs on behalf of capsules. They guarantee
+durability (data survives hardware failure) and availability (data is retrievable
+within committed latency bounds) but never hold decryption keys.
+
+\begin{definition}[Storage Provider]
+A storage provider $\mathcal{S}$ accepts encrypted blobs $b = \mathsf{Enc}(k, d)$
+with a committed durability class $\delta \in \{1, 2, 3\}$ (single-replica,
+geo-redundant, erasure-coded) and availability SLA $\alpha_{\mathcal{S}}$
+(fraction of time the blob must be retrievable). The provider produces
+periodic proof-of-storage attestations:
+\begin{equation}
+    \pi_t = \mathsf{PoSt}(\mathcal{S}, b, t)
+\end{equation}
+verified on-chain without revealing blob contents.
+\end{definition}
+
+The proof-of-storage mechanism adapts the Filecoin proof-of-spacetime
+construction \cite{benet2017filecoin} to operate over encrypted blobs where
+the prover cannot inspect the underlying data. The key modification is that
+challenge responses are computed over the ciphertext directly:
+
+\begin{equation}
+    \mathsf{PoSt}(\mathcal{S}, b, t) = \mathsf{MerkleProof}(b[c_1], b[c_2], \ldots, b[c_k])
+\end{equation}
+
+where $c_1, \ldots, c_k$ are pseudorandom challenge indices derived from the
+block hash at epoch $t$.
+
+\subsection{Gateway Providers}
+
+Gateway providers expose capsule services to the external internet. They
+terminate TLS connections, translate HTTP requests into capsule protocol
+messages, and route responses back to clients. Gateways are the public
+interface of the decentralized cloud.
+
+\begin{definition}[Gateway Provider]
+A gateway provider $\mathcal{G}$ maps external requests to capsule endpoints:
+\begin{equation}
+    \mathcal{G}: (\mathsf{domain}, \mathsf{path}, \mathsf{headers}) \mapsto (\mathsf{capsule\_id}, \mathsf{action}, \mathsf{params})
+\end{equation}
+The gateway authenticates external callers via standard mechanisms (API keys,
+OAuth, JWTs) but delegates authorization to the capsule's access control
+policy. Gateway providers never decrypt capsule data.
+\end{definition}
+
+The gateway role is analogous to API Gateway services (AWS API Gateway,
+Cloudflare Workers, Vercel Edge Functions) but with a critical difference:
+the gateway does not execute application logic. It routes requests to
+capsules that execute logic locally with their own keys.
+
+\subsection{Recovery Providers}
+
+Recovery providers hold encrypted key shares for capsule disaster recovery.
+Under normal operation, recovery providers are inert. When a user loses
+access to their primary device, recovery providers participate in a
+threshold reconstruction protocol to restore capsule access.
+
+\begin{definition}[Recovery Provider]
+A recovery provider $\mathcal{P}$ holds a Shamir share $s_i$ of a capsule's
+recovery key, where the shares are distributed under a $(t, n)$ threshold
+scheme. Recovery requires $t$ of $n$ providers to participate in a
+reconstruction protocol:
+\begin{equation}
+    k_{\text{recovery}} = \mathsf{Reconstruct}(s_{i_1}, s_{i_2}, \ldots, s_{i_t})
+\end{equation}
+The reconstruction is mediated by the T-Chain threshold protocol, ensuring
+no single provider (and no subset smaller than $t$) can recover the key
+unilaterally.
+\end{definition}
+
+Recovery providers are compensated via a retainer fee (paid per epoch for
+availability) plus a recovery fee (paid per successful reconstruction).
+The retainer creates economic incentive to maintain share availability
+even during long periods of inactivity.
+
+\subsection{Compute Providers}
+
+Compute providers execute workloads on behalf of capsules. Workloads include
+inference (running ML models on user data), transformation (processing
+encrypted data), and general-purpose computation. Compute providers operate
+in one of two modes:
+
+\begin{enumerate}
+    \item \textbf{Plaintext compute in TEE.} The capsule sends encrypted data
+    to a compute provider running inside a Trusted Execution Environment (Intel
+    SGX, AMD SEV, ARM CCA). Data is decrypted inside the enclave, processed,
+    and re-encrypted before leaving.
+    \item \textbf{Encrypted compute via FHE.} The capsule sends CKKS- or
+    TFHE-encrypted data to the provider, which performs computation over
+    ciphertext. Results are returned encrypted and decrypted by the capsule.
+\end{enumerate}
+
+\begin{definition}[Compute Provider]
+A compute provider $\mathcal{C}$ accepts a workload specification $W = (f, x, \mathsf{mode})$
+where $f$ is the function to compute, $x$ is the (encrypted) input, and
+$\mathsf{mode} \in \{\mathsf{TEE}, \mathsf{FHE}\}$. The provider returns
+$y = f(x)$ (encrypted under the capsule's key) along with an execution receipt:
+\begin{equation}
+    \sigma_{\mathcal{C}} = \mathsf{Sign}(sk_{\mathcal{C}}, (h(W), h(y), t_{\text{start}}, t_{\text{end}}, \mathsf{attestation}))
+\end{equation}
+where $\mathsf{attestation}$ is a TEE remote attestation (in TEE mode) or an
+FHE correctness proof (in FHE mode).
+\end{definition}
+

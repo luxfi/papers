@@ -1,0 +1,93 @@
+\section{MPC Yield Attestation}
+\label{sec:attestation}
+% ============================================================
+
+\subsection{Backing Oracle}
+
+Because the yield vault (source chain) and the share token (destination chain) exist on different blockchains, destination chains cannot query source-chain vault balances directly. Instead, the MPC signer set periodically attests to the total backing:
+
+\begin{algorithm}[H]
+\caption{MPC Backing Attestation}
+\label{alg:attestation}
+\begin{algorithmic}[1]
+\Require Attestation interval $\Delta$, signer set $\mathcal{S}$, threshold $t$
+\State At each interval $t_k = t_0 + k\Delta$:
+\State Each signer $s_i$ independently queries all active strategies:
+\State \quad $B_i \leftarrow \sum_{j=1}^{m} \texttt{strategy}_j.\texttt{totalAssets}()$
+\State Signers exchange $B_i$ values and verify $|B_i - B_j| \leq \epsilon$ for all $i, j$
+\If{consensus on $B^* = \text{median}(B_1, \ldots, B_n)$}
+  \State Produce threshold signature: $\sigma \leftarrow \text{Sign}_{t,n}(H(\texttt{``BACKING''} \| B^* \| t_k))$
+  \State Broadcast $(B^*, t_k, \sigma)$ to all destination chains
+\Else
+  \State Flag disagreement; trigger emergency review
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\begin{definition}[Attestation Message]
+The signed backing report has the form:
+\begin{equation}\label{eq:attestation}
+  m_k = H\bigl(\texttt{``BACKING''} \,\|\, B^*_k \,\|\, t_k \,\|\, \text{chainId}_{\text{source}}\bigr)
+\end{equation}
+where $B^*_k$ is the attested backing, $t_k$ is the attestation timestamp, and $\text{chainId}_{\text{source}}$ identifies the source chain. The signature $\sigma_k$ is produced via CGGMP21 (for EVM destinations) or FROST (for Ed25519/Schnorr destinations).
+\end{definition}
+
+\subsection{Undercollateralization Detection}
+
+\begin{invariant}[Collateralization Bound]\label{inv:collateral}
+The protocol enforces:
+\begin{equation}\label{eq:collateral}
+  \frac{B^*_k}{S(t_k) \cdot p(t_{k-1})} \geq \theta_{\min} = 0.985
+\end{equation}
+where $\theta_{\min} = 98.5\%$ is the minimum collateralization ratio. If this invariant is violated, the OmnichainRouter on all destination chains enters \texttt{PAUSED} state.
+\end{invariant}
+
+\begin{algorithm}[H]
+\caption{Auto-Pause on Undercollateralization}
+\label{alg:autopause}
+\begin{algorithmic}[1]
+\Require Backing report $(B^*_k, t_k, \sigma_k)$, current state
+\State Verify $\sigma_k$ against MPC public key
+\State Verify $t_k > t_{k-1}$ (monotonic timestamps)
+\State Compute collateralization ratio: $\theta_k \leftarrow B^*_k / (S(t_k) \cdot p(t_{k-1}))$
+\If{$\theta_k < \theta_{\min}$}
+  \State Set \texttt{bridgePaused} $\leftarrow$ \texttt{true}
+  \State Emit \texttt{UndercollateralizationDetected}($\theta_k$, $B^*_k$, $t_k$)
+  \State Disable \texttt{mintDeposit} and \texttt{updateBacking}
+  \State \textbf{Allow} \texttt{burnForWithdrawal} (users can always exit)
+\Else
+  \State Update $p(t_k) \leftarrow B^*_k / S(t_k)$
+  \State Emit \texttt{BackingUpdated}($B^*_k$, $p(t_k)$, $t_k$)
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[Pause Liveness]\label{thm:pause}
+If the actual backing drops below $\theta_{\min} \cdot S(t) \cdot p(t)$, the bridge pauses within at most $\Delta + \delta_{\text{confirm}}$ time, where $\Delta$ is the attestation interval and $\delta_{\text{confirm}}$ is the destination chain confirmation time.
+\end{theorem}
+
+\begin{proof}
+The MPC signer set produces a backing report at each interval $\Delta$. By construction, the attested value $B^*_k$ reflects the actual backing at time $t_k$ (median of independent queries). The attestation transaction is submitted to the destination chain and confirmed within $\delta_{\text{confirm}}$. Total worst-case latency: the undercollateralization occurs immediately after attestation $k$, is detected at attestation $k+1$ (delay $\Delta$), and the pause transaction confirms after $\delta_{\text{confirm}}$.
+\end{proof}
+
+\subsection{Attestation Parameters}
+
+\begin{table}[h]
+\centering
+\small
+\caption{Default attestation parameters.}
+\label{tab:attestation_params}
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Attestation interval ($\Delta$) & 1 hour \\
+Minimum collateralization ($\theta_{\min}$) & 98.5\% \\
+Signer disagreement tolerance ($\epsilon$) & 0.1\% \\
+Pause recovery requires & Governor + MPC joint action \\
+Emergency pause & Any single MPC signer \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================

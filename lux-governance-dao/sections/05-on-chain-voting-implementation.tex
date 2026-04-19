@@ -1,0 +1,146 @@
+\section{On-Chain Voting Implementation}
+
+
+\subsection{Governance Smart Contract}
+
+\begin{lstlisting}[language=Solidity,caption=Core governance contract interface]
+// SPDX-License-Identifier: Apache-2.0
+pragma solidity ^0.8.20;
+
+interface ILuxGovernance {
+    struct Proposal {
+        uint256 id;
+        address proposer;
+        string ipfsHash;           // LP document on IPFS
+        ProposalType proposalType;
+        uint256 startBlock;
+        uint256 endBlock;
+        uint256 forVotes;
+        uint256 againstVotes;
+        uint256 abstainVotes;
+        bool executed;
+        mapping(address => Vote) votes;
+    }
+
+    enum ProposalType {
+        Standard,    // Simple majority
+        Protocol,    // Supermajority + validators
+        Economic,    // Weighted voting
+        Emergency    // Fast-track
+    }
+
+    enum Vote { None, For, Against, Abstain }
+
+    // Create new proposal
+    function propose(
+        string calldata ipfsHash,
+        ProposalType pType,
+        bytes calldata data
+    ) external returns (uint256 proposalId);
+
+    // Cast vote with token weight
+    function castVote(
+        uint256 proposalId,
+        Vote vote
+    ) external;
+
+    // Validators cast enhanced vote
+    function castValidatorVote(
+        uint256 proposalId,
+        Vote vote,
+        bytes calldata validatorProof
+    ) external;
+
+    // Execute approved proposal
+    function execute(uint256 proposalId) external;
+
+    // Query proposal status
+    function getProposal(uint256 proposalId)
+        external view returns (Proposal memory);
+}
+\end{lstlisting}
+
+\subsection{Voting Power Calculation}
+
+\begin{lstlisting}[language=Solidity,caption=Voting power calculation with reputation]
+contract VotingPower {
+    // Base voting power from staked tokens
+    function calculateBaseVotingPower(address voter)
+        public view returns (uint256)
+    {
+        return stakingContract.balanceOf(voter);
+    }
+
+    // Reputation multiplier (0-50% boost)
+    function calculateReputation(address voter)
+        public view returns (uint256)
+    {
+        uint256 participationCount =
+            governanceHistory.getParticipationCount(voter);
+        uint256 proposalQuality =
+            governanceHistory.getProposalQuality(voter);
+
+        // Reputation = 0.3 * participation + 0.2 * quality
+        // Max reputation: 0.5 (50% boost)
+        uint256 reputation =
+            (participationCount * 300 / 1000) +
+            (proposalQuality * 200 / 1000);
+
+        return min(reputation, 500); // Cap at 50%
+    }
+
+    // Final voting power
+    function getVotingPower(address voter)
+        public view returns (uint256)
+    {
+        uint256 base = calculateBaseVotingPower(voter);
+        uint256 reputation = calculateReputation(voter);
+
+        // VP = base * (1 + reputation)
+        return base * (1000 + reputation) / 1000;
+    }
+}
+\end{lstlisting}
+
+\subsection{Quantum-Secure Vote Aggregation}
+
+Votes are secured using dual-certificate signatures (BLS + Corona):
+
+\begin{lstlisting}[language=Solidity,caption=Quantum-secure vote verification]
+contract QuantumSecureVoting {
+    struct DualSignature {
+        bytes blsSignature;      // 48 bytes
+        bytes coronaSignature; // ~2.5KB
+    }
+
+    function verifyVote(
+        address voter,
+        uint256 proposalId,
+        Vote vote,
+        DualSignature calldata sig
+    ) public view returns (bool) {
+        bytes32 message = keccak256(abi.encodePacked(
+            voter, proposalId, vote
+        ));
+
+        // Verify both signatures (classical + quantum-safe)
+        bool blsValid = verifyBLS(
+            voter, message, sig.blsSignature
+        );
+        bool coronaValid = verifyCorona(
+            voter, message, sig.coronaSignature
+        );
+
+        return blsValid && coronaValid;
+    }
+
+    // BLS signature aggregation for efficiency
+    function aggregateVotes(
+        DualSignature[] calldata signatures
+    ) public pure returns (bytes memory aggregatedBLS) {
+        // BLS signatures can be aggregated O(1)
+        return bls.aggregate(extractBLS(signatures));
+    }
+}
+\end{lstlisting}
+

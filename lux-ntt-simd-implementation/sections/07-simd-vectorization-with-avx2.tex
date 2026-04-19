@@ -1,0 +1,52 @@
+\section{SIMD Vectorization with AVX2}
+
+
+\subsection{Why SIMD}
+
+The NTT inner loop performs the same operation (butterfly) on independent data elements.
+This is a textbook case for Single Instruction, Multiple Data (SIMD) parallelism.
+
+AVX2 provides 256-bit registers holding 16 elements of 16 bits each. One AVX2 instruction
+performs 16 butterflies simultaneously.
+
+\subsection{AVX2 Butterfly}
+
+\begin{lstlisting}[language=asm,caption={AVX2 NTT butterfly (Go Plan 9 assembly)}]
+// func nttButterfly16AVX2(a *[16]int16, b *[16]int16,
+//                         zeta int16, q int16, qinv int16)
+TEXT ·nttButterfly16AVX2(SB), NOSPLIT, $0-40
+    // Load 16 coefficients from a and b
+    VMOVDQU  (R8), Y0        // Y0 = a[0..15]
+    VMOVDQU  (R9), Y1        // Y1 = b[0..15]
+
+    // Broadcast twiddle factor
+    VPBROADCASTW R10, Y2     // Y2 = [zeta, zeta, ..., zeta]
+
+    // Montgomery multiply: t = zeta * b
+    VPMULLW  Y2, Y1, Y3      // Y3 = low(zeta * b)
+    VPMULHW  Y2, Y1, Y4      // Y4 = high(zeta * b)
+
+    // Montgomery reduction
+    VPBROADCASTW R12, Y5     // Y5 = [qinv, ...]
+    VPMULLW  Y3, Y5, Y6      // Y6 = low * qinv (mod 2^16)
+    VPBROADCASTW R11, Y7     // Y7 = [q, ...]
+    VPMULHW  Y6, Y7, Y6      // Y6 = high(low*qinv * q)
+    VPSUBW   Y4, Y6, Y6      // Y6 = t = high - high(low*qinv*q)
+
+    // Butterfly
+    VPADDW   Y0, Y6, Y8      // Y8 = a + t
+    VPSUBW   Y0, Y6, Y9      // Y9 = a - t (note: Y0 - Y6)
+
+    // Store results
+    VMOVDQU  Y8, (R8)        // a[0..15] = a + t
+    VMOVDQU  Y9, (R9)        // b[0..15] = a - t
+    RET
+\end{lstlisting}
+
+Each AVX2 butterfly processes 16 coefficient pairs in approximately 8 cycles. For NTT-256
+with 8 layers of 128 butterflies each: $128 \times 8 / 16 = 64$ AVX2 butterfly invocations,
+at roughly 8 cycles each = 512 cycles. At 5~GHz, that is approximately 0.1\,$\mu$s for
+the butterfly core (the full NTT includes twiddle loads and other overhead, totaling
+approximately 0.9\,$\mu$s).
+
+%% ============================================================

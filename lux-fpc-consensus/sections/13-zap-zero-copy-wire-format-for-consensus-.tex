@@ -1,0 +1,63 @@
+\section{ZAP: Zero-Copy Wire Format for Consensus Messages}
+
+\label{sec:zap}
+
+FPC's message complexity of $O(k \log n)$ makes per-message overhead a first-order concern. The default networking stack (gRPC + Protobuf) imposes substantial deserialization costs that dominate round-trip latency at high throughput. We replace Protobuf with the Zero-copy Application Protocol (ZAP), a binary wire format that enables direct memory access without deserialization.
+
+\subsection{Design}
+
+ZAP encodes consensus messages as fixed-layout binary structures with explicit field offsets. The receiver reads fields directly from the network buffer via offset arithmetic, eliminating the allocate-deserialize-copy pipeline of Protobuf.
+
+\begin{lstlisting}[language=Go, caption=ZAP message layout for FPC vote]
+// ZAP FPC Vote Message (72 bytes fixed)
+// Offset 0:  [32]byte TxID
+// Offset 32: [4]byte  Round (uint32, big-endian)
+// Offset 36: [1]byte  Opinion (0x00 = false, 0x01 = true)
+// Offset 37: [1]byte  Confidence (uint8)
+// Offset 38: [2]byte  Reserved
+// Offset 40: [32]byte Signature (Ed25519 or BLS)
+
+func (m *ZAPVote) TxID() ids.ID {
+    return ids.ID(m.buf[0:32])  // zero-copy: no allocation
+}
+
+func (m *ZAPVote) Round() uint32 {
+    return binary.BigEndian.Uint32(m.buf[32:36])
+}
+
+func (m *ZAPVote) Opinion() bool {
+    return m.buf[36] == 0x01
+}
+\end{lstlisting}
+
+\subsection{Benchmark Results}
+
+Benchmarks conducted on Apple M2 Ultra (24-core, 192GB) comparing ZAP against Protobuf for FPC consensus messages:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Metric} & \textbf{Protobuf} & \textbf{ZAP} & \textbf{Improvement} \\
+\midrule
+Deserialization (ns/op) & 487 & 34 & $14.3\times$ \\
+Serialization (ns/op) & 312 & 28 & $11.1\times$ \\
+Allocations (allocs/op) & 7 & 0 & $\infty$ \\
+Throughput (msg/s, single core) & 690K & 9.69M & $14.0\times$ \\
+Message size (bytes, FPC vote) & 94 & 72 & $1.3\times$ smaller \\
+\bottomrule
+\end{tabular}
+\caption{ZAP vs.\ Protobuf for FPC consensus messages}
+\label{tab:zap}
+\end{table}
+
+\subsection{Throughput Impact}
+
+At $k = 20$ samples per round and 5 rounds to finality, each consensus decision requires $k \times 5 \times 2 = 200$ messages (query + response). With ZAP's 9.69M messages/second throughput on a single core:
+
+\begin{equation}
+\text{TPS}_{\text{theoretical}} = \frac{9.69 \times 10^6}{200} = 48{,}450 \text{ tx/s (single core)}
+\end{equation}
+
+This matches the empirical benchmarks in Table~\ref{tab:benchmarks} (45,000--52,000 TPS), confirming that ZAP removes serialization as the bottleneck and consensus message processing becomes network-bound rather than CPU-bound.
+

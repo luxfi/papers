@@ -1,0 +1,50 @@
+\section{GPU-Native Conflict Detection}
+
+\label{sec:gpu}
+%% ============================================================================
+
+The critical path of DAG-EVM is:
+
+\begin{enumerate}
+  \item \textbf{Speculative Block-STM execution} of candidate vertex's txs.
+  \item \textbf{ecrecover} for every transaction in the batch.
+  \item \textbf{Conflict scan} against the frontier's bitmap union.
+  \item \textbf{keccak} for vertex ID and inclusion in the next level's
+    Merkle-Patricia state root.
+\end{enumerate}
+
+The GPU bridge (\texttt{lux/evm/core/parallel/gpu\_bridge.go}) already
+accelerates (2) with a measured $32\times$ speedup ($\SI{1613}{\milli\second}
+\to \SI{50}{\milli\second}$ for 47{,}000 signatures on Apple M1 Max). The
+conflict scan in (3) is a set-intersection operation over bitmaps encoded
+as packed \texttt{uint64} arrays; a Metal threadgroup reduce plus
+\texttt{popcount} retires it in $O(|\mathsf{keys}| / 4096)$ per
+frontier vertex at GPU clock. Table~\ref{tab:gpu} summarises the impact.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Stage} & \textbf{CPU} & \textbf{GPU} & \textbf{Speedup} \\
+\midrule
+ecrecover (47K sigs)        & \SI{1613}{\milli\second} & \SI{50}{\milli\second}  & 32.3$\times$ \\
+keccak256 (47K hashes)      & \SI{127}{\milli\second}  & \SI{18}{\milli\second}  & 7.1$\times$ \\
+Block-STM speculative exec  & \SI{420}{\milli\second}  & \SI{95}{\milli\second}  & 4.4$\times$ \\
+Bitmap conflict reduce      & \SI{38}{\milli\second}   & \SI{4}{\milli\second}   & 9.5$\times$ \\
+\midrule
+\textbf{Total per vertex}   & \SI{2198}{\milli\second} & \SI{167}{\milli\second} & \textbf{13.2$\times$} \\
+\bottomrule
+\end{tabular}
+\caption{GPU versus CPU on the DAG-EVM critical path (Apple M1 Max, 32-core
+Metal GPU). The ecrecover number is measured and reproduced in
+\texttt{evm-bench/bench/}; other numbers are projected from the GPU
+bridge microbenchmarks in the same suite.}
+\label{tab:gpu}
+\end{table}
+
+GPU is auto-detected at runtime: if \texttt{luxgpu.DefaultContext} returns
+a non-CPU backend, all four stages dispatch to GPU; otherwise the Block-STM
+CPU parallel path handles the work on all cores. There is no user flag.
+
+%% ============================================================================

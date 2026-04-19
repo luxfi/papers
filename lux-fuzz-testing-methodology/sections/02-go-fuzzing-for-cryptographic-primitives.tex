@@ -1,0 +1,155 @@
+\section{Go Fuzzing for Cryptographic Primitives}
+
+
+\subsection{The Go Fuzzing Framework}
+
+Go 1.18 introduced native fuzzing in the \texttt{testing} package. A fuzz test is a
+function that accepts \texttt{*testing.F} and calls \texttt{f.Fuzz}:
+
+\begin{lstlisting}[language=Go,caption={Basic Go fuzz test for NTT round-trip}]
+func FuzzNTTRoundTrip(f *testing.F) {
+    // Seed corpus: known interesting inputs
+    f.Add([]byte{0, 0, 0, 0})
+    f.Add([]byte{255, 255, 255, 255})
+
+    f.Fuzz(func(t *testing.T, data []byte) {
+        if len(data) < PolyDegree*4 {
+            t.Skip()
+        }
+
+        // Decode input as polynomial coefficients
+        poly := decodePoly(data[:PolyDegree*4])
+
+        // Apply NTT then INTT
+        nttPoly := NTT(poly)
+        recovered := INTT(nttPoly)
+
+        // Property: round-trip is identity
+        for i := range poly {
+            if recovered[i] != poly[i] {
+                t.Fatalf("NTT round-trip failed at index %d: "+
+                    "got %d, want %d", i, recovered[i], poly[i])
+            }
+        }
+    })
+}
+\end{lstlisting}
+
+\subsection{Running Go Fuzz Tests}
+
+\begin{lstlisting}[language=bash,caption={Running Go fuzz tests}]
+# Run fuzz test for 60 seconds
+go test -fuzz FuzzNTTRoundTrip -fuzztime 60s
+
+# Run with race detector (slower but catches data races)
+go test -fuzz FuzzNTTRoundTrip -fuzztime 60s -race
+
+# Run with address sanitizer (catches memory bugs in cgo)
+CGO_ENABLED=1 go test -fuzz FuzzNTTRoundTrip -fuzztime 60s \
+    -asan
+
+# Reproduce a failing input from the corpus
+go test -run FuzzNTTRoundTrip/corpus_entry_name
+\end{lstlisting}
+
+\subsection{Coverage-Guided Mutation}
+
+Go's fuzzer uses coverage-guided mutation: it instruments the code to track which
+branches are taken, then mutates inputs to explore new branches. This is critical for
+cryptographic code where interesting behavior often hides behind conditional branches
+(e.g., modular reduction triggered only when a coefficient exceeds $q$).
+
+The fuzzer maintains a \emph{corpus}: a set of inputs that collectively maximize branch
+coverage. New inputs are added to the corpus only if they cover a previously uncovered
+branch.
+
+\subsection{Properties for Polynomial Arithmetic}
+
+\begin{lstlisting}[language=Go,caption={Property-based fuzz tests for polynomial arithmetic}]
+// Commutativity: a * b == b * a
+func FuzzPolyMulCommutative(f *testing.F) {
+    f.Fuzz(func(t *testing.T, seed1, seed2 []byte) {
+        a := polyFromSeed(seed1)
+        b := polyFromSeed(seed2)
+
+        ab := PolyMul(a, b)
+        ba := PolyMul(b, a)
+
+        requirePolyEqual(t, ab, ba)
+    })
+}
+
+// Distributivity: a * (b + c) == a*b + a*c
+func FuzzPolyMulDistributive(f *testing.F) {
+    f.Fuzz(func(t *testing.T, s1, s2, s3 []byte) {
+        a := polyFromSeed(s1)
+        b := polyFromSeed(s2)
+        c := polyFromSeed(s3)
+
+        lhs := PolyMul(a, PolyAdd(b, c))
+        rhs := PolyAdd(PolyMul(a, b), PolyMul(a, c))
+
+        requirePolyEqual(t, lhs, rhs)
+    })
+}
+
+// NTT preserves multiplication:
+// NTT(a * b) == NTT(a) . NTT(b) (pointwise)
+func FuzzNTTHomomorphism(f *testing.F) {
+    f.Fuzz(func(t *testing.T, s1, s2 []byte) {
+        a := polyFromSeed(s1)
+        b := polyFromSeed(s2)
+
+        // Multiply then transform
+        ab := PolyMul(a, b)
+        nttAB := NTT(ab)
+
+        // Transform then pointwise multiply
+        nttA := NTT(a)
+        nttB := NTT(b)
+        nttProd := PointwiseMul(nttA, nttB)
+
+        requirePolyEqual(t, nttAB, nttProd)
+    })
+}
+\end{lstlisting}
+
+\subsection{FHE Noise Budget Properties}
+
+FHE (Fully Homomorphic Encryption) ciphertexts carry a \emph{noise budget}: each
+operation increases noise, and when the budget is exhausted, decryption fails. We fuzz
+test noise properties:
+
+\begin{lstlisting}[language=Go,caption={FHE noise budget fuzz test}]
+func FuzzFHENoiseGrowth(f *testing.F) {
+    f.Fuzz(func(t *testing.T, plaintext1, plaintext2 uint64) {
+        // Constrain to valid plaintext space
+        p1 := plaintext1 % PlaintextModulus
+        p2 := plaintext2 % PlaintextModulus
+
+        // Encrypt
+        ct1 := Encrypt(publicKey, p1)
+        ct2 := Encrypt(publicKey, p2)
+
+        // Add ciphertexts
+        ctSum := Add(ct1, ct2)
+
+        // Noise must not exceed budget
+        noise := EstimateNoise(ctSum, secretKey)
+        if noise > NoiseBudget {
+            t.Fatalf("noise budget exceeded after addition: "+
+                "noise=%d, budget=%d", noise, NoiseBudget)
+        }
+
+        // Decrypt must succeed
+        result := Decrypt(secretKey, ctSum)
+        expected := (p1 + p2) % PlaintextModulus
+        if result != expected {
+            t.Fatalf("decryption failed: got %d, want %d",
+                result, expected)
+        }
+    })
+}
+\end{lstlisting}
+
+%% ============================================================

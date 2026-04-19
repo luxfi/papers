@@ -1,0 +1,114 @@
+\section{Post-Quantum Security}
+\label{sec:pq}
+%% ============================================================
+
+The Lux ecosystem has achieved comprehensive post-quantum (PQ)
+coverage across all cryptographic layers. This section documents the
+deployed PQ stack and the Cloud HSM integration that protects master
+key material.
+
+\subsection{PQ Scorecard}
+
+\begin{table}[H]
+\centering
+\caption{Complete post-quantum scorecard. All layers are PQ-safe
+  except EVM chain signing (immutable protocol constraint).}
+\label{tab:pq-scorecard}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Layer} & \textbf{Algorithm} & \textbf{PQ Status} & \textbf{Status} \\
+\midrule
+Disk encryption     & AES-256 (sqlcipher)          & Safe (128-bit PQ)    & Deployed \\
+HKDF derivation     & HKDF-SHA-256                 & Safe (128-bit PQ)    & Deployed \\
+Field encryption    & AES-256-GCM                  & Safe (128-bit PQ)    & Deployed \\
+S3 backup           & age ML-KEM-768+X25519 (\texttt{age1pq}) & Safe (FIPS 203) & Deployed \\
+TLS                 & X25519MLKEM768 (first curve) & Safe (hybrid PQ)     & Deployed \\
+JWT signing         & ML-DSA-65 (FIPS 204)         & Safe (Module-LWE+SIS)& Deployed \\
+JWKS validation     & ML-DSA-65                    & Safe                 & Deployed \\
+MPC transport       & Hybrid KEM (X25519+ML-KEM-768) & Safe              & Deployed \\
+MPC key shares      & PQ KEM encryption            & Safe                 & Deployed \\
+Master keys         & Cloud HSM (FIPS 140-2 L3)    & Hardware isolation   & Deployed \\
+Chain signing       & secp256k1 ECDSA              & \textbf{Not PQ-safe} & EVM constraint \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent The only remaining non-PQ component is EVM chain signing
+(secp256k1 ECDSA), which is an immutable constraint of the Ethereum
+Virtual Machine specification. All other layers are PQ-safe.
+
+\subsection{S3 Backup Encryption (Deployed)}
+
+All age encryption now uses ML-KEM-768 + X25519 hybrid recipients,
+available natively in age v1.3.0+ via the \texttt{HybridRecipient}
+construction. Recipient public keys use the \texttt{age1pq} prefix.
+
+Key encapsulation produces two shared secrets $ss_1$ (X25519) and
+$ss_2$ (ML-KEM-768), combined via:
+\begin{equation}
+  \text{file\_key} = \text{HKDF-SHA256}(ss_1 \| ss_2, \texttt{"age-hybrid-v1"})
+\end{equation}
+An attacker must break \emph{both} X25519 and ML-KEM-768 to recover
+the file key. Label enforcement prevents mixing PQ and classical
+recipients (no downgrade).
+
+\subsection{TLS Post-Quantum (Deployed)}
+
+All TLS 1.3 connections use X25519MLKEM768 as the first curve in the
+supported groups list. Servers and clients negotiate the hybrid
+key exchange, providing PQ protection for data in transit. Classical
+X25519 remains as fallback for clients that do not support PQ TLS.
+
+\subsection{JWT Signing with ML-DSA-65 (Deployed)}
+
+Hanzo IAM issues JWT tokens signed with ML-DSA-65 (FIPS~204),
+replacing ECDSA. The JWKS endpoint exposes the ML-DSA-65 public key.
+All services validate JWTs using the PQ-safe ML-DSA-65 signature.
+
+ML-DSA-65 provides EUF-CMA security under the Module-LWE and
+Module-SIS hardness assumptions, ensuring that a quantum adversary
+cannot forge valid JWT tokens.
+
+\subsection{MPC Transport and Key Shares (Deployed)}
+
+MPC node-to-node communication uses hybrid KEM (X25519 + ML-KEM-768)
+for key agreement. MPC key shares at rest are encrypted with PQ KEM
+encryption, ensuring that captured key shares remain confidential
+against future quantum attacks.
+
+\subsection{Cloud HSM for Master Keys (Deployed)}
+
+Master encryption keys are stored in Cloud HSM (GCP Cloud KMS,
+FIPS~140-2 Level~3 certified Cavium HSMs). The master key never
+leaves the HSM boundary:
+
+\begin{itemize}[nosep]
+  \item \textbf{Wrap}: Application sends plaintext DEK to HSM API;
+    HSM encrypts with master key internally; returns wrapped DEK.
+  \item \textbf{Unwrap}: Application sends wrapped DEK to HSM API;
+    HSM decrypts with master key internally; returns plaintext DEK.
+  \item \textbf{Sign}: Application sends message hash to HSM API;
+    HSM signs with ML-DSA-65 private key internally; returns signature.
+\end{itemize}
+
+Three keyrings per ecosystem, 12 keys total:
+\begin{itemize}[nosep]
+  \item \texttt{lux-devnet}, \texttt{lux-testnet}, \texttt{lux-mainnet}
+  \item Mainnet keys use HSM protection level (FIPS 140-2 L3);
+    devnet/testnet use SOFTWARE protection for cost efficiency.
+\end{itemize}
+
+Key rotation creates a new key version. Old wrapped DEKs remain
+decryptable with the old version. New wrap operations use the latest
+version. Formal proofs of HSM key isolation, wrap/unwrap correctness,
+and key rotation are in \texttt{proofs/lean/Crypto/HSM.lean}.
+
+\subsection{Harvest-Now-Decrypt-Later: Closed}
+
+The combination of ML-KEM-768 hybrid encryption (S3 backups),
+X25519MLKEM768 TLS (transit), and ML-DSA-65 JWT signing (auth)
+closes the harvest-now-decrypt-later attack vector. An adversary
+who captures encrypted data today cannot decrypt it with a future
+quantum computer, because every layer uses a PQ-safe algorithm.
+
+%% ============================================================

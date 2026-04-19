@@ -1,0 +1,90 @@
+\section{Threshold Signing Architecture}
+
+\label{sec:threshold}
+%% =========================================================================
+
+The MPC cluster exposes a unified signing interface regardless of the underlying cryptographic protocol. The interface is defined at \texttt{github.com/luxfi/crypto/threshold}.
+
+\subsection{Protocol Selection}
+
+\begin{definition}[Unified Threshold Interface]
+\label{def:threshold-iface}
+The threshold signing interface exposes three operations:
+\begin{itemize}[nosep]
+  \item $\mathrm{KeyGen}(t, n, \mathsf{curve}) \to (\mathsf{pk}, \{\mathsf{sk}_i\}_{i=1}^{n})$
+  \item $\mathrm{Sign}(m, S) \to \sigma$ where $|S| \geq t$
+  \item $\mathrm{Verify}(\mathsf{pk}, m, \sigma) \to \{0, 1\}$
+\end{itemize}
+The $\mathsf{curve}$ parameter selects the concrete protocol:
+\end{definition}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{llll}
+\toprule
+\textbf{Protocol} & \textbf{Curve} & \textbf{Chains} & \textbf{Signature Size} \\
+\midrule
+CGGMP21 & secp256k1 & EVM, XRP, Cosmos & 65 bytes (r,s,v) \\
+FROST   & Ed25519   & Solana, TON, Sui, Aptos & 64 bytes (R,s) \\
+FROST   & secp256k1 (BIP-340) & Bitcoin Taproot & 64 bytes (Schnorr) \\
+BLS     & BLS12-381 & Lux Warp internal & 48 bytes (compressed) \\
+\bottomrule
+\end{tabular}
+\caption{Threshold protocol selection by chain family}
+\label{tab:protocols}
+\end{table}
+
+\subsection{CGGMP21 for EVM Chains}
+
+EVM chains verify signatures via the \texttt{ecrecover} precompile, which expects ECDSA signatures on the secp256k1 curve. CGGMP21~\cite{cggmp21} provides threshold ECDSA with identifiable abort: if a participant deviates from the protocol, the honest majority can identify the cheater and exclude them.
+
+Key properties:
+\begin{itemize}[nosep]
+  \item $t$-of-$n$ threshold with $t = 2, n = 3$ default (production configuration).
+  \item 4-round signing protocol (can be preprocessed to 1 effective round).
+  \item Signatures are indistinguishable from standard ECDSA: no on-chain changes required.
+  \item Forgery probability: $2^{-139.6}$ for $t = 67$-of-$n = 100$~\cite{luxbridge2023}.
+\end{itemize}
+
+\subsection{FROST for Bitcoin Taproot and EdDSA Chains}
+
+FROST~\cite{frost} provides threshold Schnorr signatures. For Bitcoin Taproot (BIP-340), FROST produces 64-byte Schnorr signatures that spend from a Taproot address derived from the group public key. For Ed25519 chains, FROST produces standard EdDSA signatures.
+
+\begin{property}[FROST Two-Round Signing]
+FROST signing completes in exactly 2 rounds:
+\begin{enumerate}[nosep]
+  \item Commitment round: each signer broadcasts $(D_i, E_i)$.
+  \item Signature round: each signer produces partial signature $z_i$; aggregator computes $\sigma = (R, s)$.
+\end{enumerate}
+\end{property}
+
+\subsection{BLS for Lux Warp}
+
+Intra-Lux transfers bypass the MPC cluster entirely. Appchain validators sign Warp messages using their BLS12-381 keys. The destination appchain verifies the aggregate signature via precompile, checking that the signing set represents $\geq 2/3$ of the source appchain's staked weight.
+
+\subsection{Implementation: \texttt{luxfi/crypto/threshold}}
+
+The Go implementation provides a single entry point:
+
+\begin{lstlisting}[language=Go,caption={Threshold signing entry point}]
+package threshold
+
+type Signer interface {
+    KeyGen(ctx context.Context, t, n int,
+           curve Curve) (*KeyShare, error)
+    Sign(ctx context.Context, msg []byte,
+         participants []PartyID) (*Signature, error)
+}
+
+type Curve int
+const (
+    Secp256k1 Curve = iota // CGGMP21
+    Ed25519                // FROST
+    BIP340                 // FROST (Schnorr)
+    BLS12381               // BLS aggregate
+)
+\end{lstlisting}
+
+The caller specifies the curve; the library selects the protocol. No protocol-specific API is exposed to bridge logic.
+
+%% =========================================================================

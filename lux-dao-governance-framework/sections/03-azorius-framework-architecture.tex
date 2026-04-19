@@ -1,0 +1,282 @@
+\section{Azorius Framework Architecture}
+
+
+\subsection{Design Principles}
+
+The Azorius framework is built on four core design principles:
+
+\paragraph{Modularity} Each component has a single responsibility and communicates through well-defined interfaces. This enables independent development, testing, and deployment of governance features.
+
+\paragraph{Extensibility} New voting strategies, proposer adapters, and freeze mechanisms can be added without modifying core contracts. The system is designed for evolution.
+
+\paragraph{Security by Composition} Rather than implementing all functionality in a monolithic contract, Azorius delegates to specialized, audited components. This reduces attack surface and enables formal verification.
+
+\paragraph{Zodiac Compatibility} Full adherence to the Zodiac module standard ensures compatibility with existing Safe tooling and future Zodiac extensions.
+
+\subsection{Core Components}
+
+\subsubsection{ModuleAzoriusV1: The Proposal Manager}
+
+ModuleAzoriusV1 serves as the central coordinator for all governance activities. Key responsibilities include:
+
+\begin{lstlisting}[caption=ModuleAzoriusV1 Core Structure]
+contract ModuleAzoriusV1 is
+    IModuleAzoriusV1,
+    GuardableModule,
+    Ownable2StepUpgradeable,
+    UUPSUpgradeable,
+    ERC165
+{
+    struct Proposal {
+        address strategy;        // Voting strategy contract
+        Transaction[] txs;       // Executable transactions
+        uint32 timelockPeriod;  // Delay before execution
+        uint32 executionPeriod; // Window for execution
+        uint256 executedTxCount; // Partial execution tracking
+    }
+
+    mapping(uint32 => Proposal) proposals;
+    uint32 totalProposalCount;
+    uint32 defaultTimelockPeriod;
+    uint32 defaultExecutionPeriod;
+    IStrategyV1 defaultStrategy;
+}
+\end{lstlisting}
+
+\paragraph{Proposal Lifecycle}
+
+\begin{enumerate}
+    \item \textbf{Submission}: Any authorized proposer can submit a proposal with transactions and metadata
+    \item \textbf{Voting Initialization}: The specified strategy initializes voting parameters
+    \item \textbf{Voting Period}: Token holders cast votes through the strategy
+    \item \textbf{Timelock}: Passed proposals wait during the timelock period
+    \item \textbf{Execution Window}: Proposals can be executed during this period
+    \item \textbf{Execution}: Transactions are executed through Safe's \texttt{execTransactionFromModule()}
+\end{enumerate}
+
+\paragraph{Partial Execution}
+
+A critical innovation in Azorius is support for partial proposal execution. If some transactions in a proposal fail, successful transactions can still be executed:
+
+\begin{lstlisting}[caption=Partial Execution Logic]
+function executeProposal(uint32 proposalId, bytes32[] calldata txHashes)
+    external
+{
+    Proposal storage proposal = proposals[proposalId];
+
+    for (uint256 i = 0; i < txHashes.length; i++) {
+        if (!_transactionExecuted(proposal, txHashes[i])) {
+            bool success = _executeTransaction(proposal.txs[i]);
+            if (success) {
+                proposal.executedTxCount++;
+                emit ProposalTxExecuted(proposalId, txHashes[i]);
+            }
+        }
+    }
+}
+\end{lstlisting}
+
+This design enables gas-efficient execution and graceful handling of failures.
+
+\subsubsection{StrategyV1: The Voting Engine}
+
+StrategyV1 implements the voting logic and rules. It delegates vote weight calculation and vote recording to pluggable adapters:
+
+\begin{lstlisting}[caption=StrategyV1 Architecture]
+contract StrategyV1 is
+    IStrategyV1,
+    LightAccountValidator,
+    ERC165
+{
+    struct ProposalVotingDetails {
+        uint256 yesVotes;
+        uint256 noVotes;
+        uint256 abstainVotes;
+        uint32 startBlock;
+        uint32 endBlock;
+    }
+
+    VotingConfig[] votingConfigs;
+    address[] proposerAdapters;
+    uint32 votingPeriod;
+    uint256 quorumThreshold;
+    uint256 basisNumerator; // e.g., 500000 = 50%
+
+    mapping(uint32 => ProposalVotingDetails) proposalVotingDetails;
+}
+\end{lstlisting}
+
+\paragraph{Voting Configurations}
+
+Each StrategyV1 can have multiple voting configurations, enabling hybrid voting systems:
+
+\begin{lstlisting}[caption=Voting Configuration Structure]
+struct VotingConfig {
+    address votingWeight;     // Weight calculator (ERC20, ERC721)
+    address voteTracker;      // Vote recording mechanism
+    uint256 weight;           // Proportional weight in decision
+}
+\end{lstlisting}
+
+For example, a DAO might use:
+\begin{itemize}
+    \item 70\% weight from ERC20 token holdings
+    \item 20\% weight from ERC721 NFT ownership
+    \item 10\% weight from Hats Protocol roles
+\end{itemize}
+
+\paragraph{Quorum and Approval Calculation}
+
+\begin{algorithm}
+\caption{Vote Tallying and Approval}
+\begin{algorithmic}[1]
+\Function{IsProposalPassed}{$proposalId$}
+    \State $details \gets proposalVotingDetails[proposalId]$
+    \State $totalVotes \gets details.yesVotes + details.noVotes + details.abstainVotes$
+
+    \If{$totalVotes < quorumThreshold$}
+        \State \Return \texttt{false}
+    \EndIf
+
+    \State $yesPercent \gets \frac{details.yesVotes \times 1000000}{totalVotes}$
+
+    \State \Return $yesPercent \geq basisNumerator$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Voting Adapters}
+
+Voting adapters implement two key interfaces:
+
+\paragraph{VotingWeight Interface} Calculates voting power for an address:
+
+\begin{lstlisting}[caption=VotingWeight Interface]
+interface IVotingWeightV1 {
+    function getVotingWeight(
+        address voter,
+        uint32 snapshotBlock
+    ) external view returns (uint256);
+}
+\end{lstlisting}
+
+Example implementations:
+\begin{itemize}
+    \item \textbf{VotingWeightERC20V1}: Returns token balance at snapshot block
+    \item \textbf{VotingWeightERC721V1}: Returns NFT count at snapshot block
+\end{itemize}
+
+\paragraph{VoteTracker Interface} Records and retrieves votes:
+
+\begin{lstlisting}[caption=VoteTracker Interface]
+interface IVoteTrackerV1 {
+    function castVote(
+        uint32 proposalId,
+        address voter,
+        uint8 voteType,
+        uint256 weight
+    ) external;
+
+    function hasVoted(
+        uint32 proposalId,
+        address voter
+    ) external view returns (bool);
+}
+\end{lstlisting}
+
+\subsubsection{Proposer Adapters}
+
+Proposer adapters control who can create proposals. Multiple adapters can be active simultaneously:
+
+\begin{lstlisting}[caption=Proposer Adapter Examples]
+// Token-based proposing
+contract ProposerAdapterERC20V1 {
+    uint256 public requiredBalance;
+
+    function isProposer(address account)
+        external view returns (bool)
+    {
+        return token.balanceOf(account) >= requiredBalance;
+    }
+}
+
+// Role-based proposing via Hats Protocol
+contract ProposerAdapterHatsV1 {
+    uint256 public requiredHatId;
+
+    function isProposer(address account)
+        external view returns (bool)
+    {
+        return hatsProtocol.isWearerOfHat(account, requiredHatId);
+    }
+}
+\end{lstlisting}
+
+\subsection{Parent-Child DAO Hierarchies}
+
+\subsubsection{ModuleFractalV1}
+
+ModuleFractalV1 enables parent DAOs to execute transactions on child DAOs, creating organizational hierarchies:
+
+\begin{lstlisting}[caption=Parent-Child Relationship]
+contract ModuleFractalV1 is Module {
+    // Installed on child DAO's Safe
+    // Owned by parent DAO's Safe
+
+    function executeTransaction(
+        address to,
+        uint256 value,
+        bytes calldata data
+    ) external onlyOwner {
+        // Execute on child's Safe
+        exec(to, value, data, Enum.Operation.Call);
+    }
+}
+\end{lstlisting}
+
+Use cases include:
+\begin{itemize}
+    \item Emergency intervention by parent DAO
+    \item Coordinated multi-DAO operations
+    \item Hierarchical treasury management
+    \item Organizational restructuring
+\end{itemize}
+
+\subsubsection{Freeze Mechanism}
+
+The freeze mechanism provides a safety valve for parent DAOs to temporarily halt child DAO operations:
+
+\begin{lstlisting}[caption=Freeze Guard Architecture]
+contract FreezeGuardAzoriusV1 is BaseGuard {
+    mapping(address => bool) public isFrozen;
+
+    function checkTransaction(
+        address,
+        uint256,
+        bytes memory,
+        Enum.Operation,
+        uint256,
+        uint256,
+        uint256,
+        address,
+        address payable,
+        bytes memory,
+        address
+    ) external view override {
+        require(!isFrozen[msg.sender], "DAO is frozen");
+    }
+}
+\end{lstlisting}
+
+\paragraph{Freeze Voting Workflow}
+
+\begin{enumerate}
+    \item Parent DAO token holders initiate freeze vote via FreezeVotingV1
+    \item If threshold reached, child DAO is frozen via FreezeGuard
+    \item Child DAO cannot execute any transactions while frozen
+    \item Parent DAO executes corrective actions via ModuleFractalV1
+    \item Parent DAO unfreezes child or freeze expires automatically
+\end{enumerate}
+
+This mechanism provides crucial safety for organizational hierarchies without requiring trust in a centralized administrator.
+

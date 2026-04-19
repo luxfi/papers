@@ -1,0 +1,67 @@
+\section{Protocol Description}
+
+\label{sec:protocol}
+%% ═══════════════════════════════════════════════════════════════════════════
+
+\subsection{Bridge Operations}
+
+The protocol supports four atomic operations, each protected by threshold signature verification and nonce uniqueness.
+
+\paragraph{Lock.} User deposits asset $A$ of amount $a$ on source chain $C_s$ into the YieldBridgeVault. The vault emits:
+\[
+  \texttt{Lock}(C_s, C_d, \nu, A, a, r)
+\]
+where $C_d$ is the destination chain, $\nu$ is a monotonically increasing nonce, and $r$ is the recipient address on $C_d$.
+
+\paragraph{Mint.} MPC signer set $\mathcal{S}$ observes the Lock event, reaches quorum ($\geq t$ signers agree), and produces threshold signature $\sigma$ over:
+\begin{equation}
+  \label{eq:deposit-msg}
+  m = H\bigl(\texttt{"DEPOSIT"} \,\|\, C_s \,\|\, \nu \,\|\, T \,\|\, r \,\|\, a\bigr)
+\end{equation}
+where $H$ is keccak256 for EVM chains or SHA-256 for non-EVM, and $T$ is the bridge token address. Any relayer submits $(C_s, \nu, T, r, a, \sigma)$ to the OmnichainRouter on $C_d$.
+
+The router:
+\begin{enumerate}[nosep]
+  \item Verifies $\sigma$ against the MPC public key
+  \item Checks $\mathcal{N}(C_s, \nu) = 0$ (nonce not processed)
+  \item Checks daily mint limit: $\texttt{dailyMinted}[T] + a \leq \texttt{dailyMintLimit}[T]$
+  \item Sets $\mathcal{N}(C_s, \nu) \leftarrow 1$ (marks nonce processed)
+  \item Computes fee: $f = a \cdot f_b / 10{,}000$
+  \item Mints $(a - f)$ tokens to recipient $r$
+  \item Distributes fee: $f \cdot f_s / 10{,}000$ to stakeholder vault, remainder to treasury
+\end{enumerate}
+
+\paragraph{Burn.} User burns bridge tokens on $C_d$, emitting:
+\[
+  \texttt{Burn}(C_d, C_s, \nu', T, a, r')
+\]
+This is fully permissionless---no MPC signature required.
+
+\paragraph{Release.} MPC produces $\sigma'$ over:
+\begin{equation}
+  m' = H\bigl(\texttt{"RELEASE"} \,\|\, C_d \,\|\, \nu' \,\|\, T \,\|\, r' \,\|\, a\bigr)
+\end{equation}
+Note the distinct prefix (\texttt{"RELEASE"} vs \texttt{"DEPOSIT"}) for domain separation, preventing cross-operation signature reuse.
+
+\subsection{Nonce Management}
+
+Each OmnichainRouter maintains a per-source-chain nonce bitmap:
+\begin{equation}
+  \mathcal{N}: \mathbb{Z}_{\text{chainId}} \times \mathbb{Z}_{\text{nonce}} \rightarrow \{0, 1\}
+\end{equation}
+
+The check-and-set operation $\bigl(\text{assert } \mathcal{N}(C_s, \nu) = 0; \text{ set } \mathcal{N}(C_s, \nu) \leftarrow 1\bigr)$ executes atomically within a single transaction. Combined with the deterministic message hash, this ensures each deposit is processed exactly once across all destination chains.
+
+\subsection{Backing Attestation}
+
+Every 12 hours, the MPC signer set attests to the total backing on each source chain:
+\begin{equation}
+  \sigma_b = \text{Sign}\bigl(H(\texttt{"BACKING"} \,\|\, T \,\|\, B \,\|\, \tau)\bigr)
+\end{equation}
+where $B$ is the total backing amount and $\tau$ is a monotonically increasing timestamp. If:
+\begin{equation}
+  \frac{B}{\texttt{totalMinted}[T]} < 0.985
+\end{equation}
+the OmnichainRouter automatically sets $\texttt{paused} \leftarrow \texttt{true}$. Unpausing requires a separate MPC signature.
+
+%% ═══════════════════════════════════════════════════════════════════════════
