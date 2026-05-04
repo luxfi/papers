@@ -77,33 +77,37 @@ performance --- the production runtime is honest about what it can do
 on every host. The single 0.83$\times$ outlier (KS PN10QP27) sits within
 microbench noise at \texttt{iters=100}.
 
-\paragraph{1000-seed CPU\,$\leftrightarrow$\,CUDA-dispatch byte-equivalence.}
-\texttt{fhe\_dispatch\_equiv\_test} draws 1000 deterministic 32-byte
-seeds (SHA-256-chained from the root literal
-\texttt{"lux-fhe-dispatch-equiv-v1"}) and exercises every public surface
-under both backends:
+\paragraph{Two complementary byte-equivalence tests.}
+The dispatch surface and the backend-selector surface are exercised
+separately; each draws 1000 deterministic seeds across the three
+production parameter sets, yielding $2 \times 3 \times 1000 = 6000$
+byte-equality assertions per CI run.
 
-\begin{enumerate}
-\item \texttt{keygen\_from\_seed} on \texttt{Backend::CPU} and \texttt{Backend::CUDA},
-asserting byte-equal $(sk, pk, ek)$.
-\item \texttt{encrypt\_bit} for $b \in \{0, 1\}$, asserting byte-equal
-$(c_0, c_1)$.
-\item \texttt{decrypt\_bit} round-trip, asserting the bit returns.
-\item \texttt{eval\_bootstrap}, asserting byte-equal refreshed
-ciphertext.
-\end{enumerate}
+\begin{itemize}
+\item \texttt{fhe\_dispatch\_equiv\_test} (root: \texttt{"lux-fhe-dispatch-equiv-v1"}).
+  Exercises \emph{every} public surface --- \texttt{keygen\_from\_seed},
+  \texttt{encrypt\_bit}, \texttt{decrypt\_bit} round-trip,
+  \texttt{eval\_bootstrap} --- on both \texttt{Backend::CPU} and
+  \texttt{Backend::CUDA}, asserting byte-equal $(sk, pk, ek)$ from
+  keygen, $(c_0, c_1)$ from encrypt, and the refreshed ciphertext from
+  bootstrap. Result on M1 Max (2026-05-04): \textbf{3000/3000
+  byte-equal}, wall time $\approx 9.3$\,s.
+\item \texttt{fhe\_backend\_equiv\_test --sweep 1000} (root:
+  \texttt{"lux-fhe-backend-equiv-sweep-v1"}). Replays the four-entry
+  KAT corpus first, then runs an orthogonal 1000-seed sweep --- distinct
+  seed schedule from the dispatch test --- exercising
+  \texttt{eval\_bootstrap} byte-equality on the backend-selector
+  surface. Result on M1 Max (2026-05-04): \textbf{KAT 4/4 byte-equal,
+  sweep 3000/3000 byte-equal}, wall time $\approx 5.0$\,s.
+\end{itemize}
 
-Across the three production parameter sets (\texttt{PN10QP27},
-\texttt{PN11QP54}, \texttt{PN9QP28\_STD128}) this yields
-$3 \times 1000 = 3000$ exercises per run. Result on M1 Max (2026-05-04):
-\textbf{3000/3000 byte-equal}, wall time $\approx 70$ s.
-
-The test passes tautologically on a CPU-only host because the CUDA
-dispatch surface routes to the CPU oracle by LP-167 \S``CPU fallback.''
-The same binary on a CUDA host with \texttt{CRYPTO\_HAS\_CUDA=1} drives
-the device kernels; any divergence between the GPU output and the CPU
-oracle on \emph{any} of the 3000 (param-set, seed) tuples surfaces as a
-byte mismatch. The test is the gate that prevents drift across hosts.
+Both tests pass tautologically on a CPU-only host because the CUDA
+arm routes to the CPU oracle by LP-167 \S``CPU fallback.'' The same
+binaries on a CUDA host with \texttt{CRYPTO\_HAS\_CUDA=1} drive the
+device kernels; any divergence between the GPU output and the CPU
+oracle on \emph{any} of the 6000 (test, param-set, seed) tuples
+surfaces as a byte mismatch. The two tests together are the gate that
+prevents drift across hosts.
 
 \paragraph{NVIDIA H100 lane (target window, not measured this report).}
 The dev box on which the 2026-05-04 measurements were taken (Apple M1
@@ -112,9 +116,17 @@ Max, Darwin arm64) has no NVIDIA device; \texttt{nvidia-smi} returns
 \texttt{luxcpp/crypto/.github/workflows/crypto-cuda-tests.yml} runs the
 same byte-equality tests on a \texttt{hanzo-build-linux-amd64}
 self-hosted runner with \texttt{CRYPTO\_HAS\_CUDA=1}; that lane
-inherits the 3000-seed exercise as a dispatch-surface gate. H100
-median + p99 numbers in the table below are targets derived from the
-existing \texttt{ntt/gpu/cuda/} kernel set (2082 LoC, Cooley-Tukey +
+inherits the 6000-seed exercise as a dispatch-surface gate.
+
+CI runs attempted on 2026-05-04: workflow ids \texttt{25304130314}
+(06:17 UTC), \texttt{25311210772} (09:21 UTC), \texttt{25313586744}
+(10:18 UTC), \texttt{25314213586} (10:34 UTC, queued at session-start).
+All four either cancelled at the 60-minute timeout or remained queued
+indefinitely --- the \texttt{hanzo-build-linux-amd64} scale set is
+either CPU-only or saturated. Until a CUDA-elevated lane lands (LP-167
+queues this as v0.2.0 work), the H100 median + p99 numbers in the
+table below remain targets derived from the existing
+\texttt{ntt/gpu/cuda/} kernel set (2082 LoC, Cooley-Tukey +
 Gentleman-Sande + Barrett, parameter-pinned for the FHE moduli) and
 will be replaced with measured numbers when the CI lane completes
 on a real device:
@@ -151,8 +163,8 @@ The encrypted ADD and MUL targets match LP-013 \S Performance targets
 within 2$\,\times$ (the F-Chain wave-tick lane is faster because the
 scheduler pipelines ciphertext fetch with key-switching).
 
-\paragraph{Reproducibility.}
-The full CPU + CUDA-dispatch reproduction recipe (CPU host) is:
+\paragraph{Reproducibility (CPU host).}
+The full CPU + CUDA-dispatch reproduction recipe is:
 \begin{verbatim}
 cd luxcpp/crypto && cmake -B build -DCRYPTO_BUILD_BENCHES=ON \
   -DCRYPTO_BUILD_TESTS=ON .  # CPU + CUDA-dispatch routed through oracle
@@ -162,21 +174,55 @@ cmake --build build --target fhe_bench_ntt fhe_bench_keyswitch \
 build/fhe/fhe_bench_ntt 200
 build/fhe/fhe_bench_keyswitch 100
 build/fhe/fhe_bench_bootstrap 30
-build/fhe_dispatch_equiv_test 1000     # 1000-seed CPU<->CUDA-dispatch
-build/fhe_backend_equiv_test  fhe/test/kat
-build/fhe_kat_replay_test     fhe/test/kat
+build/fhe_dispatch_equiv_test 1000          # 3000/3000 byte-equal
+build/fhe_backend_equiv_test fhe/test/kat \
+  --sweep 1000                              # KAT 4/4 + sweep 3000/3000
+build/fhe_kat_replay_test    fhe/test/kat
 build/fhe_smoke_test
 build/fhe_ntt_equiv_test
 \end{verbatim}
 
-On a CUDA host the same commands work with the addition of
-\texttt{-DCRYPTO\_ENABLE\_CUDA=ON} at \texttt{cmake} time (which
-implicitly turns on \texttt{LUX\_FHE\_BACKEND\_CUDA=ON}). The CMake
-driver locates \texttt{nvcc} via the standard \texttt{CUDA\_HOME}
-environment variable; the workflow file
+\paragraph{Reproducibility (CUDA host).}
+On a host with a real NVIDIA device, the same recipe with the
+\texttt{-DCRYPTO\_ENABLE\_CUDA=ON} flag locks in the CUDA backend
+(which implicitly enables \texttt{LUX\_FHE\_BACKEND\_CUDA=ON}). The
+build expects \texttt{CUDA\_HOME=/usr/local/cuda} (default) or any
+override pointing at a 12.x toolkit; the workflow file
 \texttt{.github/workflows/crypto-cuda-tests.yml} pins CUDA 12.4 and
-exercises the byte-equality contract under
 \texttt{CRYPTO\_HAS\_CUDA=1}.
+
+\begin{verbatim}
+# 1. Validate device presence
+nvidia-smi               # must show a device; if missing, abort
+
+# 2. Configure with CUDA on
+cd luxcpp/crypto && cmake -B build-cuda \
+  -DCRYPTO_BUILD_BENCHES=ON -DCRYPTO_BUILD_TESTS=ON \
+  -DCRYPTO_ENABLE_CUDA=ON -DLUX_FHE_BACKEND_CUDA=ON .
+
+# 3. Build the benches and the two equivalence tests
+cmake --build build-cuda --target fhe_bench_ntt fhe_bench_keyswitch \
+  fhe_bench_bootstrap fhe_dispatch_equiv_test fhe_backend_equiv_test
+
+# 4. Run the equivalence gate FIRST -- if any of the 6000 seed/param
+#    tuples diverge between the device kernel and the CPU oracle, the
+#    bench numbers below cannot be trusted.
+LUX_FHE_BACKEND=cuda build-cuda/fhe_dispatch_equiv_test 1000
+LUX_FHE_BACKEND=cuda build-cuda/fhe_backend_equiv_test fhe/test/kat \
+  --sweep 1000
+
+# 5. Bench under each backend; report median + p99
+LUX_FHE_BACKEND=cuda build-cuda/fhe/fhe_bench_ntt        200
+LUX_FHE_BACKEND=cuda build-cuda/fhe/fhe_bench_keyswitch  100
+LUX_FHE_BACKEND=cuda build-cuda/fhe/fhe_bench_bootstrap   30
+LUX_FHE_BACKEND=cpu  build-cuda/fhe/fhe_bench_ntt        200
+LUX_FHE_BACKEND=cpu  build-cuda/fhe/fhe_bench_keyswitch  100
+LUX_FHE_BACKEND=cpu  build-cuda/fhe/fhe_bench_bootstrap   30
+\end{verbatim}
+
+The two-stage recipe (equivalence gate $\to$ bench) is mandatory: a
+host that fails the 6000-seed gate is reporting bench numbers from a
+broken kernel and the speedup ratio is meaningless.
 
 \subsection{KAT byte-equality posture}
 
