@@ -1,0 +1,117 @@
+\section{Methodology}
+\label{sec:methodology}
+
+\subsection{Measurement target}
+
+The benchmark target is the canonical Lux Pulsar NTT primitive:
+forward Number-Theoretic Transform over
+$R_q = \mathbb{Z}_q[X]/(X^N+1)$ with $N = 256$ and
+$q = 0x1000000004A01$. Roots are bit-reversed Montgomery-form
+constants generated once at SubRing construction (the same
+$\mathsf{GenSubRingRoots}$ used by every Lux protocol).
+
+The reference CPU body is
+\texttt{lux::crypto::ringtail::lattice\_ring::NTTStandard} in
+\texttt{ringtail/cpp/lattice\_ring.cpp}. It is byte-equal to
+the upstream Lattigo \texttt{ring.SubRing.NTT} (validated by
+\texttt{ringtail\_canonical\_lattice\_ring\_kat} which replays a
+6-op $\times$ 64-entry corpus). The Metal kernel is at
+\texttt{ringtail/gpu/metal/canonical\_lattice\_ring.metal}; the
+WGSL kernel is at \texttt{ringtail/gpu/wgsl/canonical\_lattice\_ring.wgsl}.
+All three produce byte-identical output by KAT
+(\texttt{ringtail\_canonical\_lattice\_ring\_metal\_kat\_test} and
+\texttt{ringtail\_canonical\_lattice\_ring\_wgsl\_kat\_test}).
+
+\subsection{Measurement host}
+
+Hardware: Apple M1 Max, 10-core (8P + 2E), 64 GB unified memory,
+32-core integrated GPU. macOS 14.5, clang 17, CMake 4.3.2.
+
+GPU runtime: Apple Metal 3 native; wgpu-native 29.0.0 from Homebrew
+(\texttt{libwgpu\_native.dylib}, dispatching to Metal under the hood
+on Darwin).
+
+CPU runtime: Apple's loop-unrolled-by-16 NTT
+(\texttt{nttUnrolled16Lazy}) with Montgomery reduction. No SIMD
+GOEXPERIMENT path on arm64; the relevant Apple silicon hand-tuning
+in the Lattigo port has been validated to match the Go reference
+output bit-for-bit.
+
+\subsection{Bench harness}
+
+Source: \texttt{luxcpp/crypto/ringtail/test/lattice\_ring\_sweep\_bench.cpp}
+(this paper's primary artefact).
+
+For each batch size $n \in \{1, 4, 16, 64, 256, 1024, 2688, 4096,
+16384, 65536\}$:
+\begin{enumerate}[nosep,leftmargin=2em]
+\item Construct $n$ random polynomials with deterministic seed
+(\texttt{coeff[i] = (sample\_input[i] + k * 0x9e3779b1) mod q}).
+\item For each lane $\in \{$CPU, Metal, WGSL$\}$:
+\begin{enumerate}[nosep,leftmargin=2em]
+\item Warmup: 4 calls.
+\item Timed loop: $\mathrm{iters}$ calls, where
+$\mathrm{iters} = \min(\max(\lceil 2^{18}/n \rceil, 4), 2000)$.
+The aggregate target is $\sim 256K$ polys per timed run, capped
+at 2{,}000 iterations to keep wall time bounded.
+\item Wall-clock measured by \texttt{std::chrono::steady\_clock}.
+The output buffer's first uint64 is XORed back into the input to
+defeat the optimizer.
+\end{enumerate}
+\item Report \texttt{per-batch} latency (one full $n$-poly NTT
+batch wall-clock) and \texttt{per-poly} latency
+(\texttt{per-batch / n}).
+\end{enumerate}
+
+\subsection{What is being timed}
+
+For Metal: one
+\texttt{canonical\_lattice\_ring\_metal\_ntt\_batch} call per
+iteration. Internally this loads the metallib (cached after first
+call), creates one MTLCommandBuffer with $n$ threadgroups, dispatches,
+and waits until completion. The per-call fixed cost is
+$\sim 1.5$ ms.
+
+For WGSL via wgpu-native: one
+\texttt{lux\_ringtail\_lattice\_ring\_wgpu\_ntt} call per iteration.
+Internally this allocates 11 buffers (3 storage + 6 uniform + 2
+copy targets), encodes a compute pass with one bind group, submits
+to the device queue, and reads back via a mapped staging buffer.
+The per-call fixed cost is $\sim 2.7$ ms (slightly higher than Metal
+because of the staging-buffer readback).
+
+For CPU: $n$ serial calls to the scalar
+\texttt{NTTStandard}. There is no batched CPU primitive — the CPU
+is fully synchronous, scalar Montgomery arithmetic.
+
+\subsection{Threats to validity}
+
+\paragraph{Cold dispatch dominates at small batches.}
+Both GPU backends pay a fixed per-call cost. At $n=1$ this
+swamps any per-poly throughput advantage. We deliberately include
+$n=1$ in the sweep to ground the fixed-cost constant, but the
+production-relevant sizes are $n \geq 256$.
+
+\paragraph{Buffer reuse not amortized.}
+The bench allocates and destroys all GPU buffers per iteration (it
+does not pool them across iterations). A production driver that
+caches the bind group + command encoder for steady-state batches
+would reduce the per-call fixed cost. Since the bench measures every
+iteration with full alloc/free, the reported numbers are a
+\emph{conservative} lower bound on GPU performance — a tuned
+production driver would do at least this well, plausibly $1.5\times$
+to $2\times$ better at small batches.
+
+\paragraph{No multi-stream concurrency.}
+Both Metal and WGSL paths submit one command buffer per call and
+wait for completion before returning. A real production deployment
+would pipeline command buffers (submit batch $k+1$ before batch $k$
+finishes) and bury the dispatch cost. We measured the single-stream
+synchronous case to bound the worst-case latency.
+
+\paragraph{Single hardware target.}
+This paper measures Apple M1 Max only. NVIDIA H100 + AMD MI300X
+characterizations are out of scope (no hardware on the measurement
+host); the CUDA driver compiles cleanly and the KAT contract
+holds, but absolute GPU/CPU ratios on those targets will differ
+in both magnitude and sign of the curve.

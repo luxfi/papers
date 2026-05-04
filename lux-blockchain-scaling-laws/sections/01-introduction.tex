@@ -1,0 +1,59 @@
+\section{Introduction}
+\label{sec:intro}
+
+A standard claim in the post-quantum-blockchain literature is that
+GPU acceleration delivers an order-of-magnitude speedup for lattice
+operations. We measured this on shipping hardware and find the claim
+is half-true: it depends entirely on \emph{batch size}.
+
+Lux runs a post-quantum threshold signature (Pulsar / LP-073) whose
+hot path is the canonical Number-Theoretic Transform over the ring
+$R_q = \mathbb{Z}_q[X]/(X^{256}+1)$ with $q = 0x1000000004A01$
+(49 bits, NTT-friendly: $q - 1 = 2^{49} - \cdot$ divisible by $2N$
+for $N = 256$). Every signature, every key share rotation, every
+threshold ceremony reduces to thousands of these NTTs. The CPU
+implementation is the canonical Lattigo-derived Montgomery body
+(luxfi/math/ntt at LP-107 v1.4.0); the same kernel is realized as
+a Metal shader and a WGSL shader, byte-equal to CPU by KAT
+construction.
+
+This paper reports the empirical per-polynomial throughput on
+Apple M1 Max across the three backends as a function of batch size,
+identifies the crossover where each GPU backend first beats CPU,
+and derives three scaling laws that govern when GPU acceleration
+actually pays off for blockchain workloads.
+
+\paragraph{Summary of findings.}
+On Apple M1 Max:
+\begin{itemize}
+\item CPU per-NTT cost is essentially flat at $\sim 1.4$ \textmu s
+across batch sizes 1 to 65{,}536, indicating near-perfect SIMD
+saturation of the underlying loop-unrolled-by-16 path.
+\item Metal pays a fixed $\sim 1.5$ ms per command-buffer dispatch.
+At $n_\text{polys} = 1$ this is $\sim 1{,}100\times$ slower than CPU;
+at $n_\text{polys} = 16{,}384$ Metal first ties CPU
+($1.19$ \textmu s vs $1.49$ \textmu s); at $n_\text{polys} = 65{,}536$
+Metal is $1.48\times$ faster ($0.93$ \textmu s vs $1.38$ \textmu s).
+\item WGSL via wgpu-native is faster than Metal at small batches
+($n \in [16, 2688]$) because the wgpu-native command pipeline
+setup is lighter than per-call metallib reload. WGSL never crosses
+CPU on this hardware though — peaks at $0.89\times$ at
+$n = 16{,}384$ — because per-thread arithmetic in the WGSL kernel
+is uint32-emulated (WebGPU has no native uint64) and the constant
+factor exceeds Metal's native uint64 path.
+\item The Pulsar production hot path dispatches $M \cdot N_\text{vec}
+\cdot \bar{D} = 8 \cdot 7 \cdot 48 = 2{,}688$ NTTs per signature. At
+this batch size CPU and Metal are within $2\times$ of each other —
+neither path is dramatically better.
+\end{itemize}
+
+\paragraph{What this paper claims.} Three empirical scaling laws
+that should govern any honest claim about GPU acceleration in a
+blockchain context. \S\ref{sec:scaling-laws} states them; they fall
+out of the data with one fitted constant each.
+
+\paragraph{What this paper does NOT claim.} CUDA throughput on
+NVIDIA hardware is out of scope; we have no NVIDIA device on the
+measurement host. The CUDA driver compiles cleanly and ships with
+the same KAT contract, but absolute numbers will land in a follow-on
+paper once a CUDA host is in CI. (See \S\ref{sec:honesty}.)
