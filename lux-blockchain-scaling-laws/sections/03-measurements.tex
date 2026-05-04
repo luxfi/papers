@@ -1,0 +1,147 @@
+\section{Measurements}
+\label{sec:measurements}
+
+\subsection{NTT throughput sweep}
+
+Table~\ref{tab:ntt-sweep} reports the per-polynomial NTT cost on
+Apple M1 Max as a function of batch size $n$, for each of the three
+backends (CPU scalar, Metal native, WGSL via wgpu-native). All three
+produce byte-equal output by KAT construction.
+
+\begin{table}[H]
+\centering
+\caption{NTT throughput by batch size, M1 Max, 2026-05-04. CPU is
+\texttt{lattice\_ring::NTTStandard}; Metal is the
+\texttt{canonical\_lattice\_ring.metal} kernel via metallib; WGSL is
+the same kernel via wgpu-native 29.0.0 (real WebGPU, not polyfill).}
+\label{tab:ntt-sweep}
+\small
+\begin{tabular}{rrrrrrrr}
+\toprule
+$n$ & CPU/poly & Metal/poly & WGSL/poly & CPU/batch & Metal/batch & WGSL/batch & iters \\
+    & (\textmu s) & (\textmu s) & (\textmu s) & (\textmu s) & (\textmu s) & (\textmu s) & \\
+\midrule
+1     & 1.36 & 1481.36 & 2731.92 &      1.36 &  1481.36 &  2731.92 & 2000 \\
+4     & 1.34 &  505.23 &  692.78 &      5.35 &  2020.93 &  2771.13 & 2000 \\
+16    & 1.36 &  186.58 &  172.38 &     21.76 &  2985.26 &  2758.04 & 2000 \\
+64    & 1.36 &   89.51 &   56.31 &     86.75 &  5728.54 &  3604.07 & 2000 \\
+256   & 1.35 &   23.55 &   15.29 &    346.59 &  6029.91 &  3914.81 & 1024 \\
+1024  & 1.41 &    6.55 &    4.58 &   1445.17 &  6706.20 &  4688.74 & 256 \\
+2688  & 1.38 &    3.20 &    2.65 &   3705.77 &  8588.15 &  7117.69 & 97 \\
+4096  & 1.54 &    2.32 &    2.25 &   6328.00 &  9509.79 &  9215.33 & 64 \\
+16384 & 1.49 &    1.19 &    1.68 &  24473.82 & 19518.02 & 27534.67 & 16 \\
+65536 & 1.38 &    0.93 &    1.58 &  90652.03 & 61190.16 &103545.52 & 4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Speedup curves}
+
+The per-poly speedup of each GPU backend over CPU
+(\texttt{CPU/poly} $\div$ \texttt{GPU/poly}) at each batch size:
+
+\begin{table}[H]
+\centering
+\caption{GPU-vs-CPU speedup by batch size. Values $> 1.0$ mean GPU
+beats CPU.}
+\label{tab:speedup}
+\small
+\begin{tabular}{rcc}
+\toprule
+$n$ & Metal speedup & WGSL speedup \\
+\midrule
+1     & 0.001× & 0.000× \\
+4     & 0.003× & 0.002× \\
+16    & 0.007× & 0.008× \\
+64    & 0.015× & 0.024× \\
+256   & 0.057× & 0.089× \\
+1024  & 0.215× & 0.308× \\
+2688  & 0.431× & 0.521× \\
+4096  & 0.665× & 0.687× \\
+\textbf{16384} & \textbf{1.254×} & 0.889× \\
+\textbf{65536} & \textbf{1.481×} & 0.875× \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Crossover.}
+Metal crosses CPU between $n = 4{,}096$ ($0.67\times$) and $n = 16{,}384$
+($1.25\times$). The crossover batch size is therefore in the range
+$n^*_{\text{Metal}} \in (4{,}096, 16{,}384]$; a finer sweep would
+pin the exact value. WGSL via wgpu-native does NOT cross CPU on this
+hardware up to $n = 65{,}536$.
+
+\paragraph{Production hot path.}
+Pulsar's Round-1 dispatches $M \cdot N_\text{vec} \cdot \bar{D}
+= 8 \cdot 7 \cdot 48 = 2{,}688$ NTTs per signature. At
+$n = 2{,}688$:
+\begin{itemize}[nosep]
+\item CPU: $3.71$ ms total ($1.38$ \textmu s/poly).
+\item Metal: $8.59$ ms total ($3.20$ \textmu s/poly, $2.32\times$ slower than CPU).
+\item WGSL: $7.12$ ms total ($2.65$ \textmu s/poly, $1.92\times$ slower than CPU).
+\end{itemize}
+
+For one threshold signature, neither GPU lane wins on M1 Max. The
+GPU lanes only become competitive when the consensus aggregator
+batches signatures from multiple validators OR the workload itself
+has natural parallelism beyond a single Round-1 mat-mul.
+
+\subsection{Adjacent workload measurements}
+
+The NTT sweep is the primitive-level data; the production-relevant
+question is what happens at the workload level. Three direct
+measurements taken from the same Lux Go test harnesses on the same
+M1 Max box, 2026-05-04:
+
+\begin{table}[H]
+\centering
+\caption{Workload-level Lux measurements, M1 Max, 2026-05-04.
+\texttt{ZAPThroughput}: single-message PQ-TLS roundtrip latency.
+\texttt{BootstrapSingle}: one TFHE bootstrap operation in
+\texttt{luxfi/fhe} pure-Go.}
+\label{tab:workload}
+\small
+\begin{tabular}{lrl}
+\toprule
+Workload & Wall-clock per op & Throughput \\
+\midrule
+ZAP message round-trip   & 5.47 \textmu s    & 183K msgs/sec \\
+FHE bootstrap (single)   & 119.9 ms          & 8.34 ops/sec  \\
+Pulsar reshare $n{=}21$  & 12.67 s / 21 = 0.60 s   & 1.65 ceremonies/sec \\
+Pulsar reshare $n{=}64$  & 156.61 s / 64 = 2.45 s  & 0.41 ceremonies/sec \\
+Pulsar reshare $n{=}128$ & 1212.74 s / 128 = 9.47 s & 0.106 ceremonies/sec \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The reshare numbers come from
+\texttt{threshold/protocols/lss/lss\_pulsar\_bench\_test.go}; ZAP
+from \texttt{consensus/bench/zap\_throughput\_test.go}; FHE from
+\texttt{fhe/bench\_crdt\_test.go::BenchmarkBootstrapSingle}.
+
+\subsection{What is missing from this report}
+
+Three workload categories that the introduction promises but the
+v0.1.x measurements cannot cover honestly:
+\begin{enumerate}[nosep,leftmargin=2em]
+\item \textbf{Block-STM parallel EVM execution at GPU-native scale.}
+\texttt{evm/core/parallel/blockstm.go} ships, but no benchmark
+harness exists for it; nothing exercises the parallel execution
+path under contention. A workload-level bench requires a synthetic
+contention model (read/write set generator + version-conflict
+distribution) that is not in tree.
+
+\item \textbf{DEX matching engine throughput.}
+\texttt{lx/dex} (the matching engine, accessed in this tree as the
+symlink \texttt{$\sim$/work/lux/dex}) has no GPU surface today.
+Reporting "DEX on GPU" numbers would require either porting the
+match path to a compute kernel or measuring the existing CPU path
+and labelling it as such; neither is in scope of this paper.
+
+\item \textbf{End-to-end consensus + EVM + DEX + FHE pipeline.}
+The Lux components ship as separate Go modules with no integrated
+bench harness; building one is a v0.3.0 deliverable.
+\end{enumerate}
+
+\S\ref{sec:honesty} pins down exactly what we measured vs what is
+extrapolated.

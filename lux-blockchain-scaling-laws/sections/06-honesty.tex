@@ -1,0 +1,143 @@
+\section{Honest Scope Statement}
+\label{sec:honesty}
+
+This paper reports what we measured. It does not extrapolate to
+hardware we do not own or workloads we did not run. This section
+pins the boundary explicitly.
+
+\subsection{What was directly measured}
+
+\begin{itemize}[nosep,leftmargin=2em]
+\item NTT throughput sweep on Apple M1 Max: 10 batch sizes $\times$
+3 backends (CPU, Metal native, WGSL via wgpu-native 29.0.0). Source:
+\texttt{luxcpp/crypto/ringtail/test/lattice\_ring\_sweep\_bench.cpp}
+($\sim$\,260 LoC) commit \texttt{luxcpp/crypto@bb9e9613}. Raw TSV in
+\texttt{papers/lux-blockchain-scaling-laws/data/}.
+
+\item ZAP message round-trip: \texttt{luxfi/consensus/bench/
+zap\_throughput\_test.go::BenchmarkZAPThroughput} on M1 Max,
+\texttt{benchtime=2s}, $5.47$ \textmu s/op.
+
+\item TFHE bootstrap: \texttt{luxfi/fhe/bench\_crdt\_test.go::
+BenchmarkBootstrapSingle}, $119.9$ ms/op single-threaded pure-Go.
+
+\item Pulsar reshare $n \in \{21, 64, 128\}$:
+\texttt{luxfi/threshold/protocols/lss/lss\_pulsar\_bench\_test.go::
+BenchmarkPulsarReshare}, single-process serial, $12.67$/$156.61$/$1212.74$ s
+end-to-end.
+
+\item Cross-runtime KAT release gates (Go $\leftrightarrow$ C++):
+$991$ assertions across codec / modarith / NTT / sample. All pass
+byte-equal.
+\end{itemize}
+
+\subsection{What was NOT measured}
+
+\begin{itemize}[nosep,leftmargin=2em]
+\item \textbf{NVIDIA H100 / RTX / consumer GPU throughput.} No NVIDIA
+hardware on the measurement host. The CUDA driver compiles but live
+device dispatch needs CI-runner provisioning. CI workflow IDs
+attempted on 2026-05-04 (\texttt{25304130314}, \texttt{25311210772},
+\texttt{25313586744}, \texttt{25314213586}) all cancelled or stayed
+queued; runner pool was either CPU-only or saturated.
+
+\item \textbf{Block-STM parallel EVM throughput.}
+\texttt{luxfi/evm/core/parallel/blockstm.go} ships, with unit tests
+passing, but no Go-side \texttt{Benchmark} harness exercises it
+under contention. Adding one (with synthetic read/write set
+generator + version-conflict distribution) is roughly a day of work
+and is queued for v0.3.0.
+
+\item \textbf{DEX matching engine throughput.} The Lux DEX matching
+engine lives at \texttt{$\sim$/work/lx/dex} (accessed in this tree
+as the symlink \texttt{$\sim$/work/lux/dex}). It has no GPU surface
+today; reporting "DEX on GPU" would require either porting the
+match path to a compute kernel or measuring the existing CPU path
+under realistic order-book load. Neither is in scope of this paper.
+
+\item \textbf{End-to-end consensus + EVM + DEX + FHE pipeline.}
+The Lux components ship as separate Go modules with no integrated
+bench harness. Construction of one is a v0.3.0 deliverable (it
+requires harmonizing goroutine schedules, shared bus, and KAT
+gating across four runtimes that today don't share a process).
+
+\item \textbf{precompile crypto package perf.} The 30+ packages in
+\texttt{$\sim$/work/lux/precompile} (BLS / curves / hashes / VRF /
+ZK / pairing-based) have their own scattered benchmark files. We
+did not aggregate or measure them for this paper. The
+\texttt{luxfi/math} substrate currently covers params + backend +
+codec + modarith + NTT + poly + RNS + sample only — not curves,
+not hashes, not pairings.
+
+\item \textbf{WGSL on non-Apple silicon.} Our WGSL number is
+wgpu-native dispatching to Metal under the hood on Darwin arm64.
+On a Linux x86 host with Vulkan, or a D3D12 host on Windows, the
+WGSL crossover may move. We did not measure those.
+\end{itemize}
+
+\subsection{Honest "one and only one way" status}
+
+The architectural commitment from LP-107 is "one and only one way to
+do everything." The math substrate now has that property for its 8
+packages (params / backend / codec / modarith / NTT / poly / RNS /
+sample) — every consumer (\texttt{luxfi/pulsar/wire},
+\texttt{luxfi/lens/wire}, \texttt{luxfi/fhe/wire},
+\texttt{luxfi/lattice/wire}) consumes the same canonical body, and
+$991$ cross-runtime KATs gate any drift. The \texttt{luxfi/math}
+\texttt{ntt/canonical/} body owns the Lattigo-derived Montgomery NTT;
+\texttt{luxfi/lattice/ring/modular\_reduction.go} is a thin shim
+over it.
+
+The architectural commitment is NOT yet met for:
+\begin{itemize}[nosep,leftmargin=2em]
+\item \textbf{Curves.} Each precompile curve package
+(BLS12-381, secp256k1, Ed25519, ...) has its own implementation. A
+\texttt{luxfi/math/curve} substrate to consolidate them is queued.
+\item \textbf{Hashes.} Each precompile hash (BLAKE3, Keccak, Poseidon)
+has its own implementation. A \texttt{luxfi/math/hash} substrate is queued.
+\item \textbf{ML-DSA / ML-KEM / SLH-DSA.} The pqcrypto packages live
+in \texttt{$\sim$/work/lux/precompile/} with their own implementations.
+Substrate consolidation queued.
+\end{itemize}
+
+These gaps are real. v0.1.x ships the substrate for the lattice/PQ
+threshold path because that's the production hot path Lux currently
+runs on; the curve / hash / pqcrypto consolidation is a v0.2.0+
+deliverable.
+
+\subsection{Reproduce}
+
+\begin{lstlisting}[basicstyle=\small\ttfamily,frame=single,
+                   xleftmargin=0pt, framesep=4pt]
+# 1. NTT throughput sweep
+cd ~/work/luxcpp/crypto
+brew install wgpu-native    # macOS — provides libwgpu_native
+cmake -B build -DCRYPTO_BUILD_TESTS=ON \
+      -DCRYPTO_ENABLE_METAL=ON -DCRYPTO_ENABLE_WGSL=ON
+cmake --build build --target ringtail_lattice_ring_sweep_bench
+cd build && \
+  CRYPTO_RINGTAIL_LATTICE_RING_METALLIB=$PWD/canonical_lattice_ring.metallib \
+  ./ringtail_lattice_ring_sweep_bench \
+  ../ringtail/test/kat/montgomery_ntt.json
+
+# 2. ZAP throughput
+cd ~/work/lux/consensus
+GOWORK=off go test -bench=BenchmarkZAPThroughput -benchtime=5s \
+  -run='^$' ./bench/
+
+# 3. FHE bootstrap
+cd ~/work/lux/fhe
+GOWORK=off go test -bench=BenchmarkBootstrapSingle -benchtime=5s \
+  -run='^$' ./
+
+# 4. Pulsar reshare
+cd ~/work/lux/threshold
+GOWORK=off go test -bench='BenchmarkPulsarReshare' -benchtime=1x \
+  -timeout=60m -run='^$' ./protocols/lss/...
+\end{lstlisting}
+
+Hardware: Apple M1 Max, macOS 14.5, clang 17, Go 1.26.1,
+wgpu-native 29.0.0, CMake 4.3.2. The exact M1 Max numbers in
+this paper come from a single warm-CPU run on 2026-05-04 evening
+post-fuzz-battery; reruns on the same hardware land within $\pm 5\%$
+on the per-poly measurements.

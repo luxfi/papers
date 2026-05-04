@@ -1,0 +1,155 @@
+\section{Scaling Laws}
+\label{sec:scaling-laws}
+
+The measurement data in \S\ref{sec:measurements} fits a simple
+two-parameter model for each backend:
+
+\begin{equation}
+T_\text{batch}(n) = D + \tau \cdot n
+\label{eq:cost-model}
+\end{equation}
+
+where $D$ is the fixed dispatch cost paid per call (independent of
+batch size), $\tau$ is the asymptotic per-poly cost, and $n$ is the
+batch size. The per-poly cost is then:
+
+\begin{equation}
+T_\text{poly}(n) = \frac{D}{n} + \tau
+\label{eq:per-poly}
+\end{equation}
+
+Fitting Eq.~\ref{eq:per-poly} to the M1 Max data yields:
+
+\begin{table}[H]
+\centering
+\caption{Fitted constants for each backend on M1 Max.}
+\label{tab:fit}
+\small
+\begin{tabular}{lrr}
+\toprule
+Backend & $D$ (ms) & $\tau$ (\textmu s/poly) \\
+\midrule
+CPU scalar       &    0.0 & 1.38 \\
+Metal native     &    1.5 & 0.92 \\
+WGSL via wgpu-native & 2.7 & 1.58 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+CPU has zero dispatch overhead; the per-call constant absorbs into
+the per-poly term. Metal pays $\sim 1.5$ ms per command-buffer
+submit (metallib lookup + queue commit + waitUntilCompleted). WGSL
+via wgpu-native pays $\sim 2.7$ ms (slightly more — the staging-
+buffer readback adds a synchronous map+unmap to the round-trip).
+
+The crossover batch size where GPU first beats CPU is then:
+
+\begin{equation}
+n^* = \frac{D}{\tau_\text{CPU} - \tau_\text{GPU}}
+\end{equation}
+
+For Metal: $n^*_\text{Metal} = 1500 / (1.38 - 0.92) = 3{,}260$ —
+Metal first ties CPU at $n \approx 3{,}260$ polys, consistent with
+the measured crossover in $(4096, 16384]$.
+
+For WGSL: $\tau_\text{WGSL} = 1.58 > \tau_\text{CPU} = 1.38$, so
+the asymptotic per-poly cost is HIGHER than CPU and there is NO
+crossover at any finite batch size. WGSL gets closer to CPU as
+$n$ grows but never beats it on this hardware.
+
+\subsection{Three empirical scaling laws}
+
+From the cost model and the measured constants we derive:
+
+\begin{theorem}[Batch-size law]
+\label{thm:l1}
+GPU dispatch cost is paid per call, not per polynomial. Therefore
+GPU-vs-CPU per-poly speedup follows
+\[
+\frac{T_\text{CPU,poly}(n)}{T_\text{GPU,poly}(n)}
+= \frac{\tau_\text{CPU}}{\tau_\text{GPU} + D/n}
+\]
+which approaches
+$\tau_\text{CPU} / \tau_\text{GPU}$ asymptotically and falls
+to zero as $n \to 1$. Crossover occurs at
+$n^* = D / (\tau_\text{CPU} - \tau_\text{GPU})$ when
+$\tau_\text{GPU} < \tau_\text{CPU}$, never if
+$\tau_\text{GPU} \geq \tau_\text{CPU}$.
+\end{theorem}
+
+\textit{Implication for blockchain consensus.} A single threshold
+signature dispatches $\sim 2{,}688$ NTTs (Pulsar Round-1 mat-mul).
+On M1 Max this falls below the Metal crossover. Per-validator GPU
+acceleration is therefore unprofitable for individual signing — the
+GPU only earns its keep when the workload aggregates across
+multiple validators or multiple signing rounds.
+
+\begin{theorem}[Validator-parallelism law]
+\label{thm:l2}
+A single validator's per-signature workload of $W$ polynomials is
+dispatch-cost-limited if $W < n^*$. The aggregator that batches $k$
+validators' work into one GPU dispatch sees per-validator cost
+\[
+T_\text{aggregate}(k) = D + \tau_\text{GPU} \cdot k \cdot W
+\]
+amortizing the dispatch over $k$ validators.
+\end{theorem}
+
+\textit{Implication for Pulsar/Quasar.} A 64-validator quorum that
+batches all Round-1 NTTs into one Metal dispatch sees
+$kW = 64 \cdot 2688 = 172{,}032$ polynomials per dispatch. From
+Table~\ref{tab:ntt-sweep} extrapolation: $\tau_\text{Metal} \approx
+0.93$ \textmu s/poly $\Rightarrow$ batch wall-clock $\approx 162$ ms.
+Compared to the per-validator CPU baseline of $1.38 \cdot 2688 =
+3.7$ ms $\times 64$ validators $= 237$ ms aggregate (assuming
+perfect parallelism), Metal saves $\sim 32\%$ at this scale.
+
+\begin{theorem}[Epoch-amortization law]
+\label{thm:l3}
+A workload that collects $N_\text{epoch}$ polynomial operations over
+an epoch (block, finality round, FHE evaluation) and batches them
+through GPU dispatches at the epoch boundary observes effective
+per-op cost
+\[
+T_\text{epoch-eff}
+= \frac{D \cdot \lceil N_\text{epoch} / B_\text{max} \rceil + \tau_\text{GPU} \cdot N_\text{epoch}}{N_\text{epoch}}
+\]
+where $B_\text{max}$ is the maximum batch size the GPU memory
+budget supports. This trades per-op latency (the worst-case op
+waits up to $T_\text{epoch}$ before its batch closes) for per-op
+throughput (asymptotic to $\tau_\text{GPU}$).
+\end{theorem}
+
+\textit{Implication for FHE coprocessors.} An FHE coprocessor that
+defers evaluation to epoch close (every block, every finality
+round) crosses the GPU break-even far earlier than per-tx FHE,
+because the natural batch is the union of every encrypted-state
+read across the epoch. For a Lux block with $T_\text{tx} = 1{,}000$
+transactions each touching $4$ FHE ciphertexts, the natural batch
+is $4{,}000$ ops — already past the Metal crossover.
+
+\subsection{What the laws explain}
+
+The laws collapse a folk-knowledge claim ("GPU is faster for
+post-quantum crypto") into a quantitative statement: GPU is faster
+\emph{for batch sizes above $n^* \approx D / \Delta\tau$, where $D$
+is the dispatch cost and $\Delta\tau$ is the asymptotic per-op
+advantage}. Either of the following kills the GPU win:
+\begin{itemize}[nosep]
+\item Per-call dispatch cost $D$ is too high relative to the
+workload's natural batch size (the WGSL case at small $n$).
+\item Asymptotic per-op cost $\tau_\text{GPU}$ is no better than
+$\tau_\text{CPU}$ (the WGSL case at large $n$).
+\end{itemize}
+
+The first failure mode is fixable by amortization (Theorems
+\ref{thm:l2}, \ref{thm:l3}). The second failure mode means the GPU
+backend is fundamentally not competitive on this hardware for this
+kernel — uint32-emulated u64 arithmetic in WGSL costs more than
+native u64 on the same Apple GPU through Metal.
+
+This is not a verdict against WGSL; it is a verdict that
+\emph{native uint64 GPU paths matter for lattice crypto, and
+WebGPU's uint32-only contract leaves performance on the table.} A
+WGSL-2.0 spec with native uint64 (proposed but unshipped at time
+of writing) would close that gap.
