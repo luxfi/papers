@@ -1,0 +1,115 @@
+\section{Implications for Lux Production Deployment}
+\label{sec:implications}
+
+\subsection{When Lux should dispatch to GPU}
+
+The three scaling laws (Theorems~\ref{thm:l1}--\ref{thm:l3}) yield
+a small set of decision rules for the Lux production stack:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{Per-validator threshold signing.} A single validator's
+Round-1 + Round-2 NTT batch is $\sim 2{,}688$ polys (sub-crossover).
+\textbf{Stay on CPU.} Pure-Go pure-CPU is the default policy
+(\texttt{backend.PolicyPureGo}); GPU dispatch is opt-in.
+
+\item \textbf{Aggregator-side signature combining.} The
+combine/finalize stage of Pulsar reads partial signatures from $k$
+validators and aggregates. If the aggregator processes work from
+$k \geq 32$ validators in one dispatch, GPU pays off
+(Theorem~\ref{thm:l2}). \textbf{Use \texttt{PolicyGPUPreferred} on the
+aggregator path.}
+
+\item \textbf{FHE evaluation at epoch close.} An FHE coprocessor that
+batches per-block ciphertext operations at the block boundary easily
+crosses the crossover (Theorem~\ref{thm:l3}).
+\textbf{Use \texttt{PolicyGPUPreferred} on the FHE evaluator.}
+
+\item \textbf{Validator key-share rotation (HJKY97 reshare).} Reshare
+at $n \in \{21, 64, 128\}$ measures $0.6$/$2.4$/$9.5$ s per party
+on CPU (Table~\ref{tab:workload}). The math hot path is a single
+mat-mul per party at sub-crossover batch — \textbf{stay on CPU}; the
+WAN-RTT cost dominates anyway.
+
+\item \textbf{Wire-format decode hot path.} Bounded codec
+(\texttt{luxfi/math/codec}) parses untrusted lattice frames; the
+work is a few dozen $u64$ reads with bound checks.
+\textbf{Stay on CPU} — there is no useful GPU dispatch for
+sub-microsecond serial work.
+\end{enumerate}
+
+\subsection{What this means for the LP-107 \texttt{backend.Policy} default}
+
+The \texttt{backend.Policy} enum in \texttt{luxfi/math/backend} has
+four values: \texttt{PureGo}, \texttt{NativeCPU},
+\texttt{GPUPreferred}, \texttt{GPURequired}. The scaling laws say:
+
+\begin{itemize}[nosep,leftmargin=2em]
+\item Default for consensus paths: \texttt{PolicyPureGo}.
+The Pulsar protocol's hot batch is sub-crossover; pure-Go is the
+deterministic, no-surprise path.
+\item Default for aggregator paths: \texttt{PolicyGPUPreferred}.
+At $k \geq 32$ validators the cross-batch dispatch wins. Falls back
+to native-CPU then pure-Go on hosts without a GPU; transcript bytes
+unchanged across all backends by KAT contract.
+\item Default for FHE evaluator paths: \texttt{PolicyGPUPreferred}.
+Per-block batch sizes naturally exceed the crossover.
+\item Reserved for proof-of-compute lanes: \texttt{PolicyGPURequired}.
+Used only by ZK prover lanes that demand a hardware-attested device;
+errors out (\texttt{ErrUnavailable}) if no GPU is registered.
+\end{itemize}
+
+\subsection{The Pulsar batching opportunity}
+
+The Round-1 mat-mul in \texttt{pulsar/sign/sign.go} dispatches NTTs
+sequentially across the $M \times N_\text{vec}$ matrix and the
+$\bar{D}+1$ challenge slots. The current code does $2{,}688$ separate
+serial NTT calls per validator per signature. With the GPU bridge
+in place (\texttt{luxcpp/crypto/math/ntt/c-abi/c\_math\_ntt.h}),
+a future Pulsar-GPU lane could:
+
+\begin{itemize}[nosep]
+\item Batch all $2{,}688$ NTTs into one GPU dispatch.
+At sub-crossover $n=2{,}688$ this is currently SLOWER than CPU on
+M1 Max, so by itself it doesn't help.
+\item Pipeline two batches: while batch $k$ is on the GPU, batch
+$k+1$'s setup runs on CPU. This buries the dispatch cost behind
+useful work and effectively halves $D$.
+\item Aggregator-side multi-validator batch: combine $k$ validators'
+Round-1 work into one $k \cdot 2{,}688$-poly dispatch.
+At $k = 8$ this is $21{,}504$ polys (above the crossover) and
+yields the asymptotic Metal $1.5\times$ speedup measured at
+$n = 65{,}536$.
+\end{itemize}
+
+The code path exists; the production wiring is queued for v0.3.0.
+
+\subsection{The CKKS / TFHE path}
+
+FHE bootstrap on M1 Max measured $119.9$ ms per op pure-Go
+(Table~\ref{tab:workload}). Bootstrap at scale is a long polynomial
+multiplication chain — exactly the workload Theorem~\ref{thm:l3}
+addresses. A GPU-batched bootstrap that processes $k$ pending
+bootstraps at epoch close should see $k \times$ throughput up to
+the $B_\text{max}$ memory limit, then plateau. The exact constant
+needs measurement on a host with sufficient GPU memory; M1 Max's
+$32$ GB unified memory budget supports the necessary batch sizes
+in principle, but the FHE-CUDA bench harness in
+\texttt{luxcpp/crypto/fhe/} has not been run on real CUDA hardware
+yet (CI runner pool starved at the time of this report).
+
+\subsection{What this paper's numbers do NOT support}
+
+\begin{itemize}[nosep,leftmargin=2em]
+\item \textbf{No claim about NVIDIA H100 throughput.} CUDA path
+compiles cleanly via the same C-ABI bridge but absolute numbers
+will land in a follow-on once a CUDA host is in CI.
+\item \textbf{No claim about end-to-end blockchain TPS.} A
+consensus-layer TPS number requires running ZAP+EVM+DEX+FHE in one
+pipeline; that integration is queued for v0.3.0.
+\item \textbf{No claim about EVM Block-STM throughput.}
+\texttt{evm/core/parallel/blockstm.go} ships, but no benchmark
+harness measures it under contention. Adding one is queued.
+\item \textbf{No claim about WGSL on non-Apple hardware.} The WGSL
+result is M1 Max (wgpu-native dispatching to Metal under the hood).
+On a Vulkan/D3D12 backend the WGSL crossover may differ.
+\end{itemize}
