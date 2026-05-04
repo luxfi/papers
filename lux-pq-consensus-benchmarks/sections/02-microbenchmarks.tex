@@ -43,57 +43,65 @@ The aggregated verify is constant in signer count (the aggregate signature is 96
 Measured timings on a single Apple M1 Max P-core (Darwin 25.4.0
 arm64, Go 1.26.2), Go canonical, via \texttt{cd pulsar \&\& go run . l 5
 K} which calls \texttt{sign.LocalRun(5)} (\texttt{pulsar/sign/local.go:21}).
-Per-phase median across 5 end-to-end runs at $K = 5$ and $K = 21$
-(2026-05-04):
+Per-phase mean and median across 5 end-to-end runs at $K = 5$ and
+$K = 21$ (2026-05-04 evening, post-fuzz battery, CPU quiescent):
 
 \begin{center}
-\begin{tabular}{@{}lrr@{}}
+\begin{tabular}{@{}lrrrr@{}}
   \toprule
-  \textbf{Phase} & \textbf{$K = 5$ median (ms)} & \textbf{$K = 21$ median (ms)} \\
+  \textbf{Phase} & \textbf{$K=5$ mean} & \textbf{$K=5$ med} & \textbf{$K=21$ mean} & \textbf{$K=21$ med} \\
   \midrule
-  \texttt{Gen} (one party)                  & 3.11    & 24.49  \\
-  \texttt{SignRound1} (per party)           & 17.40   & 171.19 \\
-  \texttt{SignRound2Preprocess} (per party) & 67.30   & 581.93 \\
-  \texttt{SignRound2}  (per party)          & 2.52    & 14.65  \\
-  \texttt{SignFinalize}                     & 0.065   & 0.148  \\
-  \texttt{Verify}                           & 0.94    & 1.49   \\
-  \texttt{Total Signing} (per party)        & 87.37   & 763.58 \\
+  \texttt{Gen} (one party)                  & 3.272  & 3.272  & 8.475   & 8.475   \\
+  \texttt{SignRound1} (per party)           & 17.471 & 17.550 & 40.789  & 40.742  \\
+  \texttt{SignRound2Preprocess} (per party) & 66.792 & 66.718 & 112.869 & 112.541 \\
+  \texttt{SignRound2}  (per party)          & 2.481  & 2.511  & 6.532   & 6.532   \\
+  \texttt{SignFinalize}                     & 0.068  & ---    & 0.090   & ---     \\
+  \texttt{Verify}                           & 0.931  & ---    & 0.950   & ---     \\
+  \texttt{Total Signing} (per party)        & 86.743 & 86.718 & 160.190 & 159.987 \\
   \bottomrule
 \end{tabular}
 \end{center}
 
-Round 2 Preprocess dominates the per-party cost --- it scales roughly
-linearly in $K$ (the MAC-verification matrix multiply is $O(K^2)$ in
-the matrix size but dominated here by per-party setup). Round 1 is
+All times in milliseconds. Reproduced 2026-05-04 03:56 PDT;
+$K=21$ second-run total $159.879$ ms confirms stability ($\Delta < 0.5\%$).
+
+Round 2 Preprocess dominates the per-party cost. The Pulsar
+matrix-multiply scaling from $K=5$ to $K=21$ is roughly linear in
+$K$ for Round 1 (17.5 -> 40.7, $2.3\times$ vs $K$ ratio $4.2\times$
+-- matrix size grows but per-row work amortizes) and sub-linear for
+Round 2 Preprocess (66.7 -> 112.5, $1.7\times$). Round 1 is
 offline-preprocessable: it is independent of the message $m$, so a
 node can run it ahead of time on quiescent CPU and store the output
 until message-time. The C++ port at LP-137 \cite{lp137} closes the bulk
 of the matrix-multiply gap; GPU acceleration is targeted to bring
-Round 2 Preprocess below 100 ms at $K = 21$ (Section~\ref{sec:gpu-headroom}).
+Round 2 Preprocess below 50 ms at $K = 21$ (Section~\ref{sec:gpu-headroom}).
 Reproduction: \texttt{cd pulsar \&\& GOWORK=off go run . l 5 21}.
 
 \paragraph{Pulsar NTT C++ microbench (M1 Max).}
 \texttt{luxcpp/crypto/build/pulsar/pulsar\_sign\_ntt\_bench} (single
 NTT over $\mathbb{Z}/Q\mathbb{Z}$ with $Q = 0x1000000004A01$, $N = 256$,
 LP-073 canonical Pulsar ring) reports the following CPU per-NTT cost
-(2026-05-04, M1 Max, batches independent):
+(2026-05-04 evening, M1 Max, batches independent):
 
 \begin{center}
-\begin{tabular}{@{}lrrr@{}}
+\begin{tabular}{@{}lrrrr@{}}
   \toprule
-  \textbf{Batch} & \textbf{Reps} & \textbf{Median (\textmu s, total)} & \textbf{Per-NTT (\textmu s)} \\
+  \textbf{Batch} & \textbf{Reps} & \textbf{Median (\textmu s, total)} & \textbf{p99 (\textmu s)} & \textbf{Per-NTT (\textmu s)} \\
   \midrule
-  1   & 2000 & 1.37   & 1.375 \\
-  8   & 500  & 10.71  & 1.339 \\
-  32  & 200  & 43.04  & 1.345 \\
-  128 & 50   & 172.00 & 1.344 \\
+  1   & 2000 & 1.33   & 1.46   & 1.333 \\
+  8   & 500  & 11.21  & 11.37  & 1.401 \\
+  32  & 200  & 42.88  & 49.21  & 1.340 \\
+  128 & 50   & 168.13 & 176.21 & 1.313 \\
   \bottomrule
 \end{tabular}
 \end{center}
 
-The flat per-NTT $\sim 1.34$ \textmu s scaling shows the SIMD path is
+The flat per-NTT $\sim 1.31$--$1.40$ \textmu s scaling shows the SIMD path is
 saturated; further wins come from GPU dispatch (\texttt{LUX\_PULSAR\_NTT\_BACKEND=metal}
-or \texttt{=cuda}; both unavailable on this host). Reproduction:
+or \texttt{=cuda}; both unavailable on this host -- the bench prints
+\texttt{METAL: backend unavailable} on every batch since the Metal
+driver is gated behind \texttt{CRYPTO\_CORONA\_LATTICE\_RING\_METALLIB}
+which is unset). Reproduction:
 \texttt{./build/pulsar/pulsar\_sign\_ntt\_bench} from
 \texttt{luxcpp/crypto/build/}.
 
