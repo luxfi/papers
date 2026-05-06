@@ -98,7 +98,7 @@ For papers spanning multiple organizations:
 ### Lux Papers (24)
 - Consensus protocols (Wave, Focus, Quasar, FPC)
 - Chain architectures (A-Chain, G-Chain, M-Chain, Z-Chain)
-- Post-quantum cryptography (ETHFALCON, NTT, Corona)
+- Post-quantum cryptography (ETHFALCON, NTT, Pulsar)
 - DeFi protocols (DEX, Credit, Oracle, Perpetuals)
 - Identity (IAM, DID)
 - Governance (DAO)
