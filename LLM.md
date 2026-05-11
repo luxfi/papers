@@ -1,5 +1,31 @@
 # Lux Papers -- LLM.md
 
+## Post-E2E-PQ State (current)
+
+Papers in this repo are the LaTeX backing for the LP / HIP proposal
+set. Pulsar-M (HIP-0084 / LP-171) and Z-Wing (LP-9702 — hybrid PQ secure
+channel) are the new additions this session.
+
+### Recent significant commits
+
+| SHA | Impact |
+|-----|--------|
+| `9bae519` | LP-9702: Z-Wing hybrid PQ secure channel |
+| `ee5f6d2` | PQ canonical terminology (FIPS 203/204/205 + Pulsar + Lamport) |
+| `75b2ab8` | Warp 2.0 canonical naming (Beam + ML-DSA + Pulse) + Lux Teleport rebrand |
+| `d747bfe` | lux-nist-mptc-submission: convert .md → .tex (LaTeX-only rule) |
+| `e7b9509` | lp-103: T-Chain (FHE) → F-Chain per LP-134 |
+| `78371e8` | M/F/Z-Chain canonical naming per LP-134 |
+
+### Rules
+
+- LaTeX only. Per user CLAUDE.md: papers, proofs, audits MUST be `.tex`
+  (no `.md`). Translation of any prior `.md` is a one-shot conversion.
+- Cross-references between LP-020 (Quasar) and the proofs repo are
+  kept explicit via `\cite{qcert-proof}`.
+
+---
+
 ## LP-020: Quasar Consensus (`lp-020-quasar-consensus.tex`)
 
 Main protocol paper. 19 pages. Sections:
