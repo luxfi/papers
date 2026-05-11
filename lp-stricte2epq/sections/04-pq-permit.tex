@@ -1,0 +1,206 @@
+\section{PQPermit and the PQAuth precompile}
+\label{sec:pq-permit}
+
+\subsection{What it replaces}
+
+EIP-2612 \cite{eip2612} is the canonical Ethereum permit primitive: a token
+holder signs an EIP-712 structured-data digest authorising a spender to move a
+value up to a deadline; the verifying contract calls
+\texttt{ecrecover} on \texttt{permit(owner, spender, value, deadline,
+v, r, s)} and grants the allowance. Every DeFi protocol with one-click flows
+sits on top of EIP-2612 or a near-equivalent.
+
+EIP-712 \cite{eip712} is structurally sound but uses ECDSA underneath. A
+Shor-capable adversary forges every EIP-2612 permit in flight. A strict-PQ
+chain needs a permit primitive that (1) signs under an ML-DSA-family scheme,
+(2) binds the verifying contract identity into the digest so a permit cannot
+be replayed across contracts, and (3) integrates with the
+\texttt{ChainSecurityProfile} so the contract-side verifier can refuse a
+permit signed under the wrong scheme.
+
+\texttt{PQPermit} (\texttt{luxfi/consensus@v1.23.7},
+\texttt{protocol/auth/permit.go:70}) is that primitive.
+
+\subsection{The 11 fields}
+
+\begin{table}[H]
+\centering
+\caption{PQPermit field list. Source: \texttt{protocol/auth/permit.go:70}.}
+\label{tab:pq-permit-fields}
+\begin{tabular}{llp{6.5cm}}
+\toprule
+\# & Field & Role \\
+\midrule
+1  & \texttt{Version}            & permit version (uint16). $v=1$ on strict-PQ. \\
+2  & \texttt{ProfileID}          & profile under which signed. \\
+3  & \texttt{ChainID}            & destination chain id. \\
+4  & \texttt{VerifyingContract}  & 48-byte contract address (PQ-native, not 20-byte). \\
+5  & \texttt{OwnerAccountID}     & 48-byte owner account identifier. \\
+6  & \texttt{Spender}            & 48-byte spender account identifier. \\
+7  & \texttt{Value}              & 32-byte permitted value (token-defined units). \\
+8  & \texttt{Nonce}              & uint64 per-owner permit nonce. \\
+9  & \texttt{Deadline}           & uint64 chain height after which permit invalid. \\
+10 & \texttt{AuthSchemeID}       & contract auth scheme (matches contract's profile). \\
+11 & \texttt{HashSuiteID}        & hash family (matches \texttt{profile.HashSuiteID}). \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The 11 fields are the contract-permit equivalents of the 17 transaction
+fields, minus the consensus-side identifiers (\texttt{NetworkID},
+\texttt{ZIdentityRoot}, \texttt{AccountStateRoot}, \texttt{CallRoot},
+\texttt{AccessListRoot}, \texttt{FeePayer}, \texttt{GasLimit},
+\texttt{MaxFee}, \texttt{ExpiryHeight}, \texttt{PublicKeyRef}) and plus the
+permit-side identifiers (\texttt{VerifyingContract},
+\texttt{OwnerAccountID}, \texttt{Spender}, \texttt{Value},
+\texttt{Deadline}). \texttt{Nonce} appears in both because both need
+per-account replay protection.
+
+\subsection{Digest}
+
+\begin{lstlisting}[language=Go,caption={\texttt{Digest} for \texttt{PQPermit}.
+Source: \texttt{protocol/auth/permit.go:95}.}]
+func (p *PQPermit) Digest() [48]byte {
+    parts := [][]byte{
+        []byte(pqPermitProtocolTag),     // "Lux/PQPermit/v1"
+        u16BE(p.Version),
+        {byte(p.ProfileID)},
+        u32BE(p.ChainID),
+        p.VerifyingContract[:],
+        p.OwnerAccountID[:],
+        p.Spender[:],
+        p.Value[:],
+        u64BE(p.Nonce),
+        u64BE(p.Deadline),
+        {byte(p.AuthSchemeID)},
+        {byte(p.HashSuiteID)},
+    }
+    return tupleHash48(parts, pqPermitDigestCustomization)
+}
+\end{lstlisting}
+
+Customization string: \texttt{LUX\_PQ\_PERMIT\_V1}. Distinct from
+\texttt{LUX\_TX\_AUTH\_V1} so a transaction-envelope signature cannot replay
+as a permit (or vice-versa), even if the data bytes happen to align.
+
+\subsection{ContractAuthProfile}
+
+A contract that consumes \texttt{PQPermit} declares its admitted schemes via
+a \texttt{ContractAuthProfile} (\texttt{protocol/auth/contract\_profile.go}).
+The profile is a small struct carrying:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \texttt{ContractAuthIDs}: the list of \texttt{AuthSchemeID} values
+    the contract will accept (e.g., \texttt{\{ML-DSA-65\}}, optionally
+    \texttt{\{ML-DSA-65, ML-DSA-87\}}).
+  \item \texttt{HashSuiteID}: the hash family the contract accepts (must
+    match \texttt{profile.HashSuiteID} on strict-PQ).
+  \item \texttt{MinSecurityLevel}: a one-byte enum lower bound; refuses
+    permits signed under a scheme below this floor.
+  \item \texttt{AllowedPermitTypes}: a small bitmap of permit-type flags
+    (e.g., transfer, approve, withdraw).
+\end{itemize}
+
+The verifier function \texttt{VerifyPQPermit} (\texttt{permit.go:VerifyPQPermit})
+runs the same fail-closed sequence as the transaction verifier
+(Section~\ref{sec:tx-auth-envelope}): structural, profile/id match,
+profile/suite match, contract-profile match, deadline, nonce, signature.
+
+\subsection{The PQAuth precompile at 0x012202}
+
+EVM contracts call \texttt{PQAuth.verifyPermit(...)} as a Solidity library
+that internally dispatches to the \texttt{PQAuth} precompile at address
+\texttt{0x012202}. The precompile is the EVM-side entry point to the Go
+\texttt{VerifyPQPermit} (\texttt{luxfi/contracts@cb13a04},
+\texttt{contracts/precompiles/PQAuth.sol}, \texttt{IPQVerify.sol}).
+
+The split is deliberate:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item Pure-Solidity ML-DSA verification \cite{ethdilithium}, even with
+    EIP-8051-style expanded-pubkey form, costs \emph{8.1M gas} on a single
+    permit. That is unaffordable on a hot path.
+  \item Native ML-DSA verification at the precompile, with the
+    expanded-pubkey form, costs \emph{$\approx 130$k gas} per call
+    (Section~\ref{sec:evaluation}). That is $62\times$ cheaper.
+  \item The precompile bypasses Solidity opcode metering entirely for the
+    lattice math; only the call dispatch and the result decoding count
+    against the calling contract's gas budget.
+\end{itemize}
+
+The address \texttt{0x012202} is allocated in the \texttt{0x012200} block,
+which HIP-0084 §3 designates as the auth-precompile block. Adjacent
+precompiles (\texttt{0x012201}: signature batch verify; \texttt{0x012203}:
+session pubkey lookup) round out the auth surface.
+
+\subsection{IPQVerify interface}
+
+The Solidity interface is a single function:
+
+\begin{lstlisting}[language=Java,caption={IPQVerify.sol --- contract-side
+entry point. Source: \texttt{luxfi/contracts@cb13a04},
+\texttt{contracts/precompiles/IPQVerify.sol}.}]
+interface IPQVerify {
+    function verifyPermit(
+        bytes calldata permit,        // wire-encoded PQPermit
+        bytes calldata signature,     // ML-DSA-65 signature
+        bytes32 expectedAccountId,    // OwnerAccountID anchor
+        bytes32 expectedProfileHash   // ChainSecurityProfile digest
+    ) external view returns (bool valid, uint256 reasonCode);
+}
+\end{lstlisting}
+
+The contract is responsible for two things the precompile cannot do on its
+own: (1) supplying the \texttt{expectedAccountId} that the contract was
+constructed against, and (2) checking that the returned
+\texttt{reasonCode} is zero before granting the allowance. If either step
+is skipped, the contract has a logic bug; the precompile cannot defend
+against that. The PQAuth.sol library wraps the call in a fail-closed
+helper that enforces both.
+
+\subsection{Why expanded-pubkey is mandatory}
+
+EIP-8051 \cite{eip8051} proposed an expanded-pubkey form for ML-DSA
+verification on the EVM: the contract carries the full A-matrix expansion
+rather than the seed, in exchange for skipping the SHAKE expansion at
+verification time. The pubkey is much larger (60.6 KB for ML-DSA-65 expanded
+vs. 1.952 KB for the seeded form) but verification is cheaper by a constant
+factor.
+
+Strict-PQ \emph{requires} expanded-pubkey for the precompile path. The
+seeded form has variable verification cost (the SHAKE expansion runs every
+call); the expanded form has constant verification cost (just the lattice
+math). For a precompile metered in gas, predictable cost is more important
+than pubkey size. The contract's per-permit storage cost is one
+\texttt{bytes32} hash --- a reference to the expanded pubkey held in a
+side-channel pubkey store. Lookups against the pubkey store are batched and
+amortised by the Z-Chain identity rollup
+(Section~\ref{sec:zchain-rollup}); the per-permit overhead is two storage
+reads.
+
+\subsection{Comparison to EIP-2612 economics}
+
+\begin{table}[H]
+\centering
+\caption{Permit primitive comparison. Numbers from
+Section~\ref{sec:evaluation} bench harness; ECDSA cost is the canonical EVM
+\texttt{ecrecover} cost.}
+\label{tab:permit-econ}
+\begin{tabular}{lrrrl}
+\toprule
+Primitive & Sig size & PQ? & Gas / verify & Replay protection \\
+\midrule
+EIP-2612 + EIP-712 (ECDSA) & 65 B   & no  & 3{,}000    & domain + nonce + deadline \\
+ETHDILITHIUM Solidity      & 3309 B & yes & 8{,}100{,}000 & domain + nonce + deadline \\
+\texttt{PQPermit} + \texttt{PQAuth.sol} & 3309 B & yes & $\approx$ 130{,}000   & 11 fields TupleHash256 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The strict-PQ permit is $43\times$ more expensive in verification gas than
+the classical ECDSA permit, but $62\times$ cheaper than the naive
+pure-Solidity PQ alternative. The signature is $51\times$ larger than ECDSA
+in bytes. Section~\ref{sec:evaluation} carries the full microbenchmark; the
+short answer is that the cost is acceptable on every contract that is
+willing to pay 130k gas for a one-click flow, which is approximately every
+DeFi user-facing contract.

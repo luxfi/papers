@@ -1,0 +1,163 @@
+\section{P2P: ML-KEM + ML-DSA peer handshake}
+\label{sec:p2p-pq}
+
+\subsection{Why the P2P layer matters}
+
+A chain whose consensus, transaction authorisation, and contract permits are
+all post-quantum is still classically vulnerable if peers connect over a
+classical Diffie-Hellman handshake. A Shor-capable adversary on the wire
+breaks the handshake, recovers the session key, and replays / forges peer
+messages with the same confidentiality guarantees as the original. The peer
+authentication primitive is the gating point.
+
+Classical Lux peers used ed25519-static-keys + X25519-ephemeral-keys for the
+Noise-XK handshake. Both are classical: Shor breaks them. Strict-PQ replaces
+both: ML-KEM for the key exchange, ML-DSA for the static identity. The
+reference impl is \texttt{luxfi/node@dc906d281b}.
+
+\subsection{Construction}
+
+The handshake is a Noise-XK variant where:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item The static identity key is ML-DSA-65 (matching the chain's
+    \texttt{IdentitySchemeID}).
+  \item The ephemeral key encapsulation is ML-KEM-768 by default, ML-KEM-1024
+    for high-value links (validator-to-validator, bridge-to-bridge).
+  \item The session key derivation hashes through five cSHAKE customizations
+    that domain-separate the handshake stages.
+\end{itemize}
+
+The five cSHAKE customizations are:
+
+\begin{table}[H]
+\centering
+\caption{P2P handshake cSHAKE customizations. Each stage of the handshake
+uses an independent customization to prevent cross-stage replay.}
+\label{tab:p2p-cust}
+\begin{tabular}{lp{7cm}}
+\toprule
+Customization & Stage \\
+\midrule
+\texttt{LUX\_P2P\_HANDSHAKE\_INIT\_V1}   & initial KEM ciphertext binding \\
+\texttt{LUX\_P2P\_HANDSHAKE\_RESP\_V1}   & responder KEM commitment binding \\
+\texttt{LUX\_P2P\_HANDSHAKE\_AUTH\_V1}   & static-key authentication binding \\
+\texttt{LUX\_P2P\_HANDSHAKE\_KEY\_V1}    & session key derivation \\
+\texttt{LUX\_P2P\_HANDSHAKE\_REKEY\_V1}  & rekey rotation derivation \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Each cSHAKE call binds the customization string plus the relevant
+transcript bytes. The handshake transcript binds: protocol version, both
+parties' ML-DSA-65 identity-pubkey hashes, ML-KEM-768 / 1024 ciphertext,
+the responder's confirmation byte, and the negotiated session parameters.
+
+\subsection{Why ML-KEM-768 by default and ML-KEM-1024 for high-value links}
+
+ML-KEM-768 is NIST Level 3 (192-bit). ML-KEM-1024 is NIST Level 5
+(256-bit). The cost ratio is:
+
+\begin{table}[H]
+\centering
+\caption{ML-KEM cost comparison. Numbers from FIPS 203 §8.2 reference impl
+on commodity x86-64.}
+\label{tab:mlkem-cost}
+\begin{tabular}{lrrr}
+\toprule
+Variant & Pubkey & Ciphertext & Keygen + Encaps + Decaps (\texttt{$\mu$s}) \\
+\midrule
+ML-KEM-512   & 800 B    & 768 B    & 25 \\
+ML-KEM-768   & 1{,}184 B & 1{,}088 B & 35 \\
+ML-KEM-1024  & 1{,}568 B & 1{,}568 B & 55 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+For peer-to-peer links among $\sim 10^4$ peers handshaking $\sim 10^2$ times
+per peer per hour, the bandwidth difference between ML-KEM-768 and
+ML-KEM-1024 is $\sim 2$ MB / hour --- negligible. For validator-to-validator
+links handshaking many times per minute and carrying high-value finality
+traffic, the 256-bit security floor is worth the cost. The strict-PQ
+profile pins per-link KEM choice based on the link's classification
+(validator, bridge, regular peer); the default is ML-KEM-768.
+
+\subsection{Handshake flow}
+
+The Noise-XK variant:
+
+\begin{algorithm}
+\caption{Strict-PQ peer handshake (Noise-XK over ML-KEM + ML-DSA-65)}
+\label{alg:p2p-handshake}
+\begin{algorithmic}[1]
+\Require Initiator $I$ with static ML-DSA-65 key $(\textsc{sk}_I, \textsc{pk}_I)$
+\Require Responder $R$ with static ML-DSA-65 key $(\textsc{sk}_R, \textsc{pk}_R)$
+\Require Initiator knows $\textsc{pk}_R$ a priori (Noise-XK property)
+\State $I$ samples ephemeral ML-KEM keypair $(\textsc{kpk}_I, \textsc{ksk}_I)$
+\State $I$ sends $\langle \textsc{kpk}_I, \textsc{tag}_1 \rangle$ where $\textsc{tag}_1 = \textsc{cSHAKE256}(\texttt{INIT}, \textsc{kpk}_I)$
+\State $R$ encapsulates against $\textsc{kpk}_I$, deriving shared secret $s_1$
+\State $R$ sends $\langle \textsc{ct}_R, \textsc{aead}_{s_1}(\textsc{pk}_R), \textsc{tag}_2 \rangle$
+  where $\textsc{tag}_2 = \textsc{cSHAKE256}(\texttt{RESP}, \textsc{ct}_R, \textsc{enc}(\textsc{pk}_R))$
+\State $I$ decapsulates, recovers $s_1$, AEAD-decrypts $\textsc{pk}_R'$, confirms $\textsc{pk}_R' = \textsc{pk}_R$
+\State $I$ samples second ephemeral ML-KEM keypair, encapsulates against $\textsc{pk}_R$
+  to derive $s_2$
+\State $I$ sends $\langle \textsc{ct}_I, \textsc{aead}_{s_2}(\textsc{pk}_I, \textsc{sig}_I), \textsc{tag}_3 \rangle$
+  where $\textsc{sig}_I = \textsc{ML-DSA-65.Sign}_{\textsc{sk}_I}(\textsc{cSHAKE256}(\texttt{AUTH}, \ldots))$
+\State $R$ verifies $\textsc{sig}_I$, derives session key $K = \textsc{cSHAKE256}(\texttt{KEY}, s_1, s_2)$
+\State Both parties begin AEAD-protected data exchange under $K$
+\State Rekey at message-count or time-bound thresholds using $\texttt{REKEY}$
+\end{algorithmic}
+\end{algorithm}
+
+Two ML-KEM encapsulations form the session key. The first binds the
+responder's identity; the second binds the initiator's identity. ML-DSA-65
+authenticates the initiator over the bound transcript. The responder is
+authenticated by Noise-XK's a-priori-pubkey property (the initiator confirms
+$\textsc{pk}_R$ during step 5).
+
+\subsection{Five customizations, not one}
+
+Why five customization strings? The naive design uses a single
+\texttt{LUX\_P2P\_V1} customization for every cSHAKE call. The five-cust
+design is the audit-driven minimum that closes:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \textbf{Cross-stage replay} (between INIT, RESP, AUTH, KEY, REKEY)
+    is closed by per-stage customizations.
+  \item \textbf{Initiator-impersonating-responder} attacks (where an
+    attacker sends an INIT-tagged message to a peer expecting RESP) are
+    closed by distinct INIT and RESP customizations.
+  \item \textbf{Rekey-as-fresh-session} attacks (where a rekeyed session is
+    misinterpreted as a fresh session) are closed by the dedicated REKEY
+    customization.
+\end{itemize}
+
+The five-cust design is the Noise-protocol-framework minimum applied
+verbatim to cSHAKE256.
+
+\subsection{Static identity in Z-Chain}
+
+Peer static ML-DSA-65 keys are registered in the Z-Chain identity rollup
+under \texttt{OpRegisterKey} alongside transaction-signing keys. The
+\texttt{AccountID} of a peer is the chain's canonical peer identifier (which
+HIP-0077 §3 names \texttt{TypedNodeID} --- see
+Section~\ref{sec:cpx-coverage}). The handshake's static-pubkey verification
+walks back to the Z-Chain identity rollup; the peer is admitted iff its
+pubkey is on the active set at the current epoch.
+
+This integrates the P2P identity primitive with the chain identity primitive:
+a peer that loses validator status (revoked, rotated) is automatically
+dropped from the peer set at the next epoch transition. The current-epoch
+\texttt{IdentityRoot} is the source of truth.
+
+\subsection{No classical fallback}
+
+The handshake refuses classical primitives. There is no Curve25519
+fallback, no ed25519 fallback, no AES-GCM-with-classical-KEM mode. A peer
+that advertises only classical primitives is refused at the version
+negotiation step (the protocol version byte is checked before any KEM /
+DSA work, so the refusal is cheap).
+
+Classical-compat peers (running the permissive profile) reach the strict-PQ
+chain only through a translation gateway --- they cannot directly join the
+peer mesh.

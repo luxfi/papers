@@ -1,0 +1,248 @@
+\section{ChainSecurityProfile: the locked profile}
+\label{sec:profile}
+
+\subsection{Struct}
+
+The profile is a single Go struct (\texttt{luxfi/consensus@v1.23.6},
+\texttt{config/security\_profile.go:244}) with eleven enum-or-flag fields, two
+ordered-set aggregator lists, two numeric floors, and a SHA3-384 self-hash. We
+quote the production canonical:
+
+\begin{lstlisting}[language=Go,caption={ChainSecurityProfile fields.
+\texttt{luxfi/consensus@v1.23.6}, \texttt{config/security\_profile.go:244}.
+Comments shortened for the paper; canonical comments live with the source.}]
+type ChainSecurityProfile struct {
+    ProfileID uint32
+
+    ProfileName string
+    ProfileHash [48]byte   // SHA3-384 over the canonical encoding
+
+    HashSuiteID       HashSuiteID    // single mandatory hash family
+    IdentitySchemeID  SigSchemeID    // validator identity
+    FinalitySchemeID  SigSchemeID    // finality lane
+    HighValueSchemeID SigSchemeID    // governance / treasury
+
+    ProofPolicyID         ProofPolicyID
+    AllowedProofBackends  []ProofBackendID
+    AllowedProofFormats   []ProofFormatID
+
+    MinSoundnessBits  uint16
+    MinHashOutputBits uint16
+
+    RequireTransparent      bool
+    ForbidPairings          bool
+    ForbidKZG               bool
+    ForbidTrustedSetup      bool
+    ForbidClassicalSNARKs   bool
+    ForbidDevProofs         bool
+    ForbidFallbacks         bool
+
+    RequireTypedTxAuth      bool
+    WalletSchemeID          WalletSchemeID
+    ContractAuthSchemeID    ContractAuthID
+
+    BridgeProfileID         BridgeProfileID
+    DRBGSchemeID            DRBGSchemeID
+}
+\end{lstlisting}
+
+\subsection{Zero-value-invalid by construction}
+
+Every enum field is zero-value-invalid. The constants
+\texttt{HashSuiteNone}, \texttt{SigSchemeNone}, \texttt{ProofPolicyNone},
+\texttt{WalletSchemeNone}, \texttt{ContractAuthNone},
+\texttt{BridgeProfileNone}, \texttt{DRBGSchemeNone} all evaluate to zero and
+\emph{none of them} are accepted by \texttt{Validate}. A profile that was
+zero-initialised --- the canonical Go-default ``empty struct'' --- fails
+validation \emph{at the first enum field validation step}, before any byte of
+profile state is consulted. This closes the ``forgot to load the profile''
+class of bug: there is no permissive default; an unloaded profile is a fatal
+profile.
+
+\subsection{HashSuiteID}
+
+\texttt{HashSuiteID} pins the single mandatory hash family. The strict-PQ
+profile sets
+
+\[
+  \texttt{HashSuiteID} = \texttt{HashSuiteSHA3-384-cSHAKE256}.
+\]
+
+cSHAKE256 \cite{sp800185} is the customisable Keccak permutation underneath
+SP 800-185's TupleHash, ParallelHash, and KMAC constructions. Every signing
+transcript in the profile (Sections~\ref{sec:tx-auth-envelope}--\ref{sec:zchain-rollup})
+binds its customization string into cSHAKE256, so two different protocols
+sharing inputs cannot produce colliding digests.
+
+A profile change to a non-SHA3 hash family bumps the customization tag at
+every transcript site (\texttt{LUX\_TX\_AUTH\_V1} $\to$ \texttt{LUX\_TX\_AUTH\_V2}, etc.)
+and changes \texttt{ComputeHash}. That is a hard fork.
+
+\subsection{The three scheme fields}
+
+\texttt{IdentitySchemeID}, \texttt{FinalitySchemeID}, and
+\texttt{HighValueSchemeID} are three independent signature schemes:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \texttt{IdentitySchemeID} signs validator registration, rotation,
+    revocation, and session authorisation. Strict-PQ pins it to raw FIPS 204
+    ML-DSA-65 (\texttt{0x40}-block).
+  \item \texttt{FinalitySchemeID} signs the Pulsar-M finality certificate.
+    Strict-PQ pins it to Pulsar-M-65 (\texttt{0x50}-block).
+  \item \texttt{HighValueSchemeID} signs governance checkpoints and treasury
+    actions. Strict-PQ pins Pulsar-M-65 or Pulsar-M-87 --- never
+    Pulsar-M-44, which is devnet-only.
+\end{itemize}
+
+The three schemes are independent: an attacker who breaks ML-DSA-65 but not
+Pulsar-M loses identity but not finality, and vice-versa. The defence-in-depth
+posture is the point of giving the three lanes different schemes.
+
+\subsection{Proof posture}
+
+The proof-posture group is \texttt{ProofPolicyID}, \texttt{AllowedProofBackends},
+\texttt{AllowedProofFormats}, \texttt{MinSoundnessBits},
+\texttt{MinHashOutputBits}, and the six \texttt{Forbid*} flags.
+
+Strict-PQ sets:
+
+\begin{table}[H]
+\centering
+\caption{Proof-posture pinning under LUX\_STRICT\_E2E\_PQ.}
+\label{tab:proof-posture}
+\begin{tabular}{lll}
+\toprule
+Field & Strict-PQ value & Rationale \\
+\midrule
+\texttt{ProofPolicyID}   & \texttt{ProofPolicy128bitPQ}    & 128-bit PQ soundness floor \\
+\texttt{AllowedProofBackends} & \{\texttt{p3q}, \texttt{Plonky3-SHA3}\} & STARK / FRI only \\
+\texttt{AllowedProofFormats}  & \{\texttt{p3q-v0.1}\}      & expanded-pubkey form \\
+\texttt{MinSoundnessBits}     & $128$                       & matches MLWE assumption \\
+\texttt{MinHashOutputBits}    & $384$                       & SHA3-384 Merkle width \\
+\texttt{RequireTransparent}   & \texttt{true}               & STARK/FRI transparent \\
+\texttt{ForbidPairings}       & \texttt{true}               & no BN254 / BLS12-381 \\
+\texttt{ForbidKZG}            & \texttt{true}               & no polynomial trapdoors \\
+\texttt{ForbidTrustedSetup}   & \texttt{true}               & no SRS \\
+\texttt{ForbidClassicalSNARKs}& \texttt{true}               & no Groth16 wrappers \\
+\texttt{ForbidDevProofs}      & \texttt{true}               & refuse \texttt{0x70} block \\
+\texttt{ForbidFallbacks}      & \texttt{true}               & fail-closed, no downgrades \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The six \texttt{Forbid*} bits exist as defence in depth against the four
+classes of attack HIP-0078 §4 enumerates: (1) classical pairings smuggled
+through under a relaxed backend list; (2) KZG polynomial-commitment trapdoors;
+(3) trusted-setup SRS compromise; (4) classical-SNARK wrappers around an
+otherwise PQ proof. Setting all four to \texttt{true} closes the four classes
+simultaneously. Setting all four is what \emph{makes} the profile
+``strict''.
+
+\subsection{Wallet / contract auth / bridge / DRBG}
+
+The remaining four enum fields cover the surfaces consensus does not see:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \texttt{RequireTypedTxAuth} (\texttt{true}): every transaction
+    admitted to the mempool MUST be a \texttt{TxAuthEnvelope}. Legacy
+    RLP-keccak transactions are refused by the
+    \texttt{ClassicalCompatRegistry} (Section~\ref{sec:cpx-coverage}).
+  \item \texttt{WalletSchemeID}: the wallet-side signing scheme. Strict-PQ
+    pins this to ML-DSA-65 (matching \texttt{IdentitySchemeID} on this
+    profile; not coincidentally the wallet and the validator are the same
+    scheme).
+  \item \texttt{ContractAuthSchemeID}: the contract-side permit scheme.
+    Strict-PQ pins ML-DSA-65; HIP-0083 lays the groundwork for ML-DSA-87
+    on high-value contracts.
+  \item \texttt{BridgeProfileID}: the bridge admission profile. See
+    Section~\ref{sec:bridge-pq}.
+  \item \texttt{DRBGSchemeID}: the deterministic random-bit-generator
+    scheme for chain-level randomness sources. Strict-PQ pins
+    \texttt{Hash\_DRBG-SHA3-384} (NIST SP 800-90A
+    \cite{sp80090a}).
+\end{itemize}
+
+\subsection{ComputeHash and the golden vector}
+
+\texttt{ComputeHash} (\texttt{security\_profile.go:835}) is the canonical
+self-hash:
+
+\begin{lstlisting}[language=Go,caption={\texttt{ComputeHash} construction
+sketch. Real code at \texttt{security\_profile.go:835} is byte-faithful;
+shown here for the paper.}]
+func (p *ChainSecurityProfile) ComputeHash() ([48]byte, error) {
+    if err := p.Validate(); err != nil {
+        return [48]byte{}, err
+    }
+    parts := [][]byte{
+        []byte("Lux/ChainSecurityProfile/v1"),
+        u32BE(uint32(p.ProfileID)),
+        []byte(p.ProfileName),
+        []byte{byte(p.HashSuiteID)},
+        []byte{byte(p.IdentitySchemeID)},
+        []byte{byte(p.FinalitySchemeID)},
+        []byte{byte(p.HighValueSchemeID)},
+        []byte{byte(p.ProofPolicyID)},
+        canonicaliseBackends(p.AllowedProofBackends),
+        canonicaliseFormats(p.AllowedProofFormats),
+        u16BE(p.MinSoundnessBits),
+        u16BE(p.MinHashOutputBits),
+        []byte{boolByte(p.RequireTransparent)},
+        []byte{boolByte(p.ForbidPairings)},
+        []byte{boolByte(p.ForbidKZG)},
+        []byte{boolByte(p.ForbidTrustedSetup)},
+        []byte{boolByte(p.ForbidClassicalSNARKs)},
+        []byte{boolByte(p.ForbidDevProofs)},
+        []byte{boolByte(p.ForbidFallbacks)},
+        []byte{boolByte(p.RequireTypedTxAuth)},
+        []byte{byte(p.WalletSchemeID)},
+        []byte{byte(p.ContractAuthSchemeID)},
+        []byte{byte(p.BridgeProfileID)},
+        []byte{byte(p.DRBGSchemeID)},
+    }
+    return tupleHash48(parts, "LUX_CHAIN_SECURITY_V1"), nil
+}
+\end{lstlisting}
+
+\texttt{Validate} runs first, so a malformed profile never reaches the hash.
+The list of parts is canonicalised in declaration order. The customization
+\texttt{LUX\_CHAIN\_SECURITY\_V1} pins the layout: re-ordering, dropping, or
+adding any part bumps the customization to \texttt{V2} and is a hard fork.
+
+For the production strict-PQ profile, the golden vector is:
+\[
+\boxed{\texttt{93efd103\ldots323bfcd0}.}
+\]
+
+This 48-byte digest is the entire E2E security claim, byte-equal, across every
+Lux node that boots under LUX\_STRICT\_E2E\_PQ. The Go test
+\texttt{TestChainSecurityProfile\_GoldenHash} (\texttt{security\_profile\_test.go})
+asserts this digest equals the production canonical at commit
+\texttt{12097034}. The strict-e2e-pq Lean 4 module
+(\texttt{StrictE2EPQ.lean}, see Section~\ref{sec:related-work}) re-states the
+golden vector as a Lean-level proposition; the strict-e2e-pq TLA+ module
+(\texttt{StrictPQProfile.tla}) consumes it as a model parameter.
+
+\subsection{Genesis pinning and boot}
+
+\texttt{ChainSecurityProfile} loads from genesis at \texttt{luxfi/node@9df72a6f55}
+during node startup. The boot path:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item Read the profile manifest from the genesis snapshot.
+  \item Compute the hash. If \texttt{ComputeHash} returns an error, abort.
+  \item Compare against the pinned digest. If different, abort with a
+    \texttt{PROFILE\_HASH\_MISMATCH} fatal.
+  \item Emit the \texttt{SECURITY PROFILE} banner with the profile ID, the
+    profile name, and the digest's hex prefix.
+  \item Wire the profile into every subsystem that consults it
+    (\texttt{auth}, \texttt{zchain}, \texttt{qchain}, \texttt{pulsar-m},
+    \texttt{p3q}, \texttt{net}, \texttt{bridge}).
+\end{enumerate}
+
+The banner is the canonical operator-visible affirmation that the strict
+profile is loaded. The hex prefix is the first eight bytes
+(\texttt{93efd103} on production); the operator confirms by visual diff
+against a printed reference card. The banner is the only place in the boot
+where a human sees the profile identity; everywhere else, the profile is
+consumed by digest.
