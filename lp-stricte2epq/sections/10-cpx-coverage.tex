@@ -1,0 +1,204 @@
+\section{C-Chain / P-Chain / X-Chain coverage}
+\label{sec:cpx-coverage}
+
+\subsection{Three execution chains, one identity layer}
+
+The Lux network ships three execution chains and one identity chain:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \textbf{C-Chain}: EVM-compatible smart-contract chain.
+  \item \textbf{P-Chain}: platform / staking / governance chain.
+  \item \textbf{X-Chain}: UTXO-style asset chain.
+  \item \textbf{Z-Chain}: PQ identity rollup
+    (Section~\ref{sec:zchain-rollup}).
+\end{itemize}
+
+Each execution chain has its own VM, its own state tree, and its own
+finality cadence, but they share a single identity layer (Z-Chain), a
+single finality lane (Q-Chain via Pulsar-M), and a single security
+profile. This section covers what changes on each chain under
+LUX\_STRICT\_E2E\_PQ.
+
+\subsection{TypedNodeID and ValidatorSchemeID}
+
+Classical Avalanche-family node identifiers were
+\texttt{NodeID = SHA256(ECDSA pubkey)[:20]} --- a 20-byte hash of the
+classical pubkey. The hash is fine but the pubkey it indexes is classical.
+
+The strict-PQ replacement is \texttt{TypedNodeID}
+(\texttt{luxfi/ids@v1.2.10}, \texttt{node\_id\_typed.go}). A
+\texttt{TypedNodeID} carries:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item A 1-byte \texttt{ValidatorSchemeID} indicating which scheme the
+    underlying pubkey belongs to.
+  \item A 48-byte digest of the pubkey under
+    \texttt{cSHAKE256(LUX\_NODE\_ID\_V1)}.
+\end{itemize}
+
+The \texttt{ValidatorSchemeID} is a registry-style byte (HIP-0077 §2):
+
+\begin{table}[H]
+\centering
+\caption{Validator scheme registry under LUX\_STRICT\_E2E\_PQ.}
+\label{tab:validator-schemes}
+\begin{tabular}{ll}
+\toprule
+ID & Scheme \\
+\midrule
+\texttt{0x00} & invalid (zero-value-invalid; refused at boot) \\
+\texttt{0x40} & ML-DSA-65 (strict-PQ default) \\
+\texttt{0x41} & ML-DSA-87 (high-value variant) \\
+\texttt{0x42} & ML-DSA-44 (devnet-only; refused on strict profile) \\
+\texttt{0x50} & Pulsar-M-65 (finality lane only) \\
+\texttt{0x51} & Pulsar-M-87 \\
+\texttt{0x80} & SLH-DSA-SHAKE-256s (FIPS 205 fallback identity) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The \texttt{0x40} block is ML-DSA (FIPS 204), the \texttt{0x50} block is
+Pulsar-M, the \texttt{0x80} block is SLH-DSA (FIPS 205). The block
+structure is HIP-0077 §2's design: each high nibble denotes a primitive
+family, the low nibble the security level.
+
+The strict profile pins \texttt{IdentitySchemeID = 0x40}
+(ML-DSA-65). \texttt{ValidatorSchemeID} on every \texttt{TypedNodeID}
+appearing in the validator set must match the profile.
+
+\subsection{SchemeGate at boot}
+
+\texttt{SchemeGate} (\texttt{luxfi/node@v1.26.10},
+\texttt{snow/engine/scheme\_gate.go}) is the boot-time gate that refuses
+to start a node whose ValidatorSchemeID doesn't match the profile. The
+gate runs after profile load and before validator-set construction:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item Load profile, compute hash, confirm against genesis pin.
+  \item For each entry in the genesis validator set:
+    \begin{enumerate}[leftmargin=2em,nosep,label=\alph*.]
+      \item Parse \texttt{TypedNodeID}.
+      \item Confirm \texttt{ValidatorSchemeID == profile.IdentitySchemeID}.
+      \item If not, abort with \texttt{SCHEME\_GATE\_MISMATCH} fatal.
+    \end{enumerate}
+  \item Proceed to consensus.
+\end{enumerate}
+
+The gate is the canonical answer to ``what if the genesis is wrong'': the
+node refuses to start, the operator sees a clear error, and no chain state
+is corrupted by a misconfigured boot.
+
+\subsection{C-Chain: EVM-compatible PQ}
+
+The C-Chain runs the EVM. The strict-PQ posture on the C-Chain has four
+moving parts:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item Every transaction is a \texttt{TxAuthEnvelope}
+    (Section~\ref{sec:tx-auth-envelope}). The mempool admits no other
+    transaction type under \texttt{RequireTypedTxAuth = true}.
+  \item Smart contract permits use \texttt{PQPermit} via the
+    \texttt{PQAuth} precompile (Section~\ref{sec:pq-permit}).
+  \item The signature precompiles for ML-DSA-65, ML-KEM-768, and SLH-DSA
+    are exposed at well-known addresses (HIP-0084).
+  \item The \texttt{mldsafx} fork --- the multi-EVM hard fork (HIP-0089)
+    --- closes legacy precompiles that depend on classical primitives
+    (Groth16 verifier, KZG point evaluation).
+\end{itemize}
+
+The \texttt{mldsafx} fork is the C-Chain's strict-PQ inflection. Before the
+fork, the EVM admits both classical and PQ transactions through the
+\texttt{ClassicalCompatRegistry} (below); after the fork, the registry is
+empty and only \texttt{TxAuthEnvelope} transactions exist.
+
+\subsection{ClassicalCompatRegistry: the transition mechanism}
+
+A migration path is impossible without admitting classical transactions
+during the migration window. The \texttt{ClassicalCompatRegistry}
+(\texttt{luxfi/node}, \texttt{mempool/registry.go}) is the allowlist of
+classical transaction types the mempool admits while the network is on the
+permissive profile.
+
+The registry is a small list:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \texttt{LegacyRLP} (Ethereum tx-type 0x00, raw RLP) ---
+    \emph{admitted only during the migration window}.
+  \item \texttt{EIP2930} (tx-type 0x01, access list) --- admitted.
+  \item \texttt{EIP1559} (tx-type 0x02, dynamic fee) --- admitted.
+  \item \texttt{EIP4844} (tx-type 0x03, blob) --- admitted on the
+    blob-enabled testnets; not on mainnet C-Chain at this writing.
+  \item \texttt{TypedTxAuth} (Lux-canonical tx-type 0x04,
+    \texttt{TxAuthEnvelope}) --- always admitted; the only type on strict-PQ.
+\end{itemize}
+
+EVM tx-type \texttt{0x05} is a placeholder reserved for a future
+\texttt{TxAuthEnvelopeV2} variant (HIP-0089-future scoping). The current
+strict-PQ profile accepts \texttt{0x04} only.
+
+On the strict-PQ profile, \texttt{RequireTypedTxAuth = true} forces the
+registry to a single-entry set $\{0x04\}$. Any classical tx-type submitted
+to the mempool is rejected before signature verification with reason code
+\texttt{TX\_TYPE\_FORBIDDEN}.
+
+\subsection{P-Chain and X-Chain}
+
+The P-Chain (platform / staking) and X-Chain (UTXO assets) follow the same
+pattern as the C-Chain:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item All P-Chain operations (validator registration, delegation, reward
+    claim, governance) are wrapped in \texttt{TxAuthEnvelope}-equivalents
+    --- the P-Chain VM consumes the same envelope shape with chain-specific
+    \texttt{CallRoot} interpretations.
+  \item All X-Chain UTXO spends sign under the asset's owner's ML-DSA-65
+    key via \texttt{TxAuthEnvelope}. The asset itself can declare its own
+    \texttt{ContractAuthProfile} (Section~\ref{sec:pq-permit}) for
+    high-value spends.
+  \item The classical-compat registry is empty on both chains under
+    strict-PQ.
+\end{itemize}
+
+The two chains do not have a fork name equivalent to \texttt{mldsafx} (the
+C-Chain's term); the equivalent transition on P-Chain is the
+\texttt{PChainPQActivation} epoch and on X-Chain is the
+\texttt{XChainPQEpoch}. Both are pinned in the genesis configuration and
+both gate the activation on the profile being LUX\_STRICT\_E2E\_PQ.
+
+\subsection{S-VM mempool gating}
+
+Sandbox VMs (S-VMs) running on top of the C-Chain follow the same
+\texttt{TxAuthEnvelope}-only rule. The S-VM mempool admits a transaction
+iff:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item The outer C-Chain transaction is a \texttt{TxAuthEnvelope}.
+  \item The inner S-VM call carries an S-VM-specific transcript that the
+    S-VM verifies under the S-VM's own scheme (which inherits from the
+    outer profile but may declare additional fields).
+\end{enumerate}
+
+A failed S-VM admission is reported as part of the outer transaction
+receipt; the outer transaction's gas is consumed, but the S-VM state is
+not modified. This is the standard EVM revert semantics applied to S-VM.
+
+\subsection{Mempool gating summary}
+
+\begin{table}[H]
+\centering
+\caption{Mempool admission under \texttt{RequireTypedTxAuth = true}.}
+\label{tab:mempool-gate}
+\begin{tabular}{lll}
+\toprule
+Chain & Admitted type & Refused types \\
+\midrule
+C-Chain & \texttt{TypedTxAuth} (0x04)             & 0x00, 0x01, 0x02, 0x03, 0x05+ \\
+P-Chain & \texttt{TypedTxAuth} (P-Chain variant)   & all legacy P-Chain types \\
+X-Chain & \texttt{TypedTxAuth} (X-Chain variant)   & all legacy X-Chain types \\
+S-VM    & inherits outer C-Chain                  & all \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This is the canonical statement: under strict-PQ, exactly one mempool entry
+class exists per chain. There is no admission of any other type.

@@ -18,6 +18,7 @@ Auto-generated catalogue of research papers.
 | `lp-305-quantum-secure-assets` | ✓ | `lp-305-quantum-secure-assets/lp-305-quantum-secure-assets.tex` |
 | `lp-306-lx-social-dex` | ✓ | `lp-306-lx-social-dex/lp-306-lx-social-dex.tex` |
 | `lp-307-quantum-consensus-protocol` | ✓ | `lp-307-quantum-consensus-protocol/lp-307-quantum-consensus-protocol.tex` |
+| `lp-stricte2epq` | (uncompiled) | `lp-stricte2epq/lp-stricte2epq.tex` |
 | `lp-308-quantum-amm` | ✓ | `lp-308-quantum-amm/lp-308-quantum-amm.tex` |
 | `lp-309-quantum-network-comparison` | ✓ | `lp-309-quantum-network-comparison/lp-309-quantum-network-comparison.tex` |
 | `lp-checkpoint-anchor` | ✓ | `lp-checkpoint-anchor/lp-checkpoint-anchor.tex` |
@@ -126,4 +127,4 @@ Auto-generated catalogue of research papers.
 | `post-quantum-securities` | ✓ | `post-quantum-securities/post-quantum-securities.tex` |
 | `threshold-fhe-compliance` | ✓ | `threshold-fhe-compliance/threshold-fhe-compliance.tex` |
 
-**Total**: 120 papers, 120 PDFs compiled
+**Total**: 121 papers, 120 PDFs compiled (lp-stricte2epq awaiting first compile)

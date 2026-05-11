@@ -1,0 +1,160 @@
+\section{Introduction}
+\label{sec:intro}
+
+\subsection{The gap end-to-end PQ closes}
+
+The post-quantum blockchain literature has converged on a fast answer: replace
+the consensus signature. Threshold ML-DSA \cite{tmldsa2025}, Threshold Raccoon
+\cite{thresholdraccoon}, lattice-based DKGs \cite{krt24,gks24}, and the Lux
+Pulsar family \cite{lp073} all PQ-harden the certificate that closes a block.
+None of them PQ-harden the bytes that authorise the transactions \emph{inside}
+the block, the bytes that authorise the cross-chain handshakes around the
+block, the bytes that authorise the smart-contract spend, or the trusted-setup
+SRS that the proof system underneath assumes.
+
+A Shor-capable adversary against the resulting stack does not need to attack
+the threshold lane. The adversary forges an ECDSA transaction signature, an
+EIP-2612 permit, a BLS bridge admission, a Diffie-Hellman handshake, or a
+Groth16 verification key. Any one of those primitives is sufficient to drain
+funds, hijack a contract, or admit a malicious block.
+
+The NIST Multi-Party Threshold Cryptography report
+\cite{nistir8214c} names this layer (the ``cryptographic surface'') and lists
+fourteen categories of bytes that participate in chain state transitions. A
+proper PQ posture binds \emph{every} category to a quantum-resistant primitive.
+Anything less is theatre.
+
+LUX\_STRICT\_E2E\_PQ is the locked profile under which every one of those
+fourteen surfaces is pinned to a FIPS 203 / 204 / 205 primitive
+\cite{fips203,fips204,fips205} or a SHA3-family hash
+\cite{fips202,sp800185}, and that pinning is consumed at boot, at handshake,
+at transaction admission, at contract permit verification, at finality
+sealing, at bridge admission, and at every other gating point in the stack.
+
+\subsection{What the profile is, mechanically}
+
+The profile is a single Go struct, \texttt{ChainSecurityProfile}
+(\texttt{luxfi/consensus@v1.23.6}, \texttt{config/security\_profile.go:244}),
+with the following well-known forms:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \texttt{ProfileLuxStrictPQ} --- the locked production profile this
+    paper specifies, golden hash \texttt{93efd103\ldots323bfcd0}.
+  \item \texttt{ProfileLuxFIPS} --- equivalent posture, FIPS-only branding,
+    distinct hash for audit attestation.
+  \item \texttt{ProfileLuxPermissive} --- testnet / devnet profile with
+    classical-compat affordances; \emph{never loaded on mainnet}.
+\end{itemize}
+
+The struct has eleven enum-or-flag fields plus aggregator lists; \emph{every}
+enum field is zero-value-invalid. A profile produced by zero-initialising the
+struct fails \texttt{Validate} (\texttt{security\_profile.go:Validate}) at
+boot. The profile's identity is its SHA3-384 digest under
+\texttt{ComputeHash} (\texttt{security\_profile.go:835}), which is in turn
+TupleHash256-bound under customization \texttt{LUX\_CHAIN\_SECURITY\_V1} so any
+byte flip changes the digest. The digest is what genesis pins. A divergent
+node sees a different digest and refuses to start.
+
+\subsection{What surface coverage means}
+
+Surface coverage is the proposition: every byte that the consensus engine,
+the execution engine, the bridge, the wallet, or a peer treats as
+authoritative for a state transition is bound, through transcripts and
+signatures, to a post-quantum primitive.
+
+The fourteen surfaces, in dependence order:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item \textbf{Profile boot.} \texttt{ChainSecurityProfile} loaded from
+    genesis, \texttt{ComputeHash} matches pinned digest, banner emitted on
+    boot (\texttt{luxfi/node@9df72a6f55}).
+  \item \textbf{Identity registration.} Validator pubkeys (FIPS 204 ML-DSA)
+    are registered through Z-Chain \texttt{OpRegisterKey} with a proof of
+    possession over the new key's own AccountID.
+  \item \textbf{Identity rotation.} \texttt{OpRotateKey} signed under the
+    \emph{outgoing} key, gated by the profile's
+    \texttt{IdentitySchemeID}.
+  \item \textbf{Identity revocation.} \texttt{OpRevokeKey} signed under the
+    revoked key plus a profile-pinned reason code.
+  \item \textbf{Session authorisation.} \texttt{OpAuthorizeSession} binds an
+    ephemeral session pubkey under an account's long-term identity key, for
+    bounded TTL and bounded capability scope.
+  \item \textbf{Transaction authorisation.}
+    \texttt{TxAuthEnvelope} (\texttt{protocol/auth/tx\_envelope.go:108}),
+    17 fields TupleHash256-bound under \texttt{LUX\_TX\_AUTH\_V1}. Replaces
+    RLP-keccak for raw transactions.
+  \item \textbf{Smart-contract permits.} \texttt{PQPermit}
+    (\texttt{protocol/auth/permit.go:70}), 11 fields under
+    \texttt{LUX\_PQ\_PERMIT\_V1}. Replaces EIP-2612.
+  \item \textbf{Z-Chain commitment.} \texttt{ZRegistryRoots} seven-root
+    aggregator (\texttt{registry/roots.go:40}) bound under
+    \texttt{LUX\_ZCHAIN\_REGISTRY\_ROOTS\_V1}.
+  \item \textbf{Execution-side auth verification.}
+    \texttt{VerifyAuthPassed} (\texttt{registry/auth\_proof.go:118}) hot-path
+    Merkle-inclusion-proof verifier consumed by the EVM, S-VM, and X-VM
+    state transition functions.
+  \item \textbf{Finality binding.} Q-Chain
+    \texttt{ComputeRoundDigest} binds 23 axes (canonical QBlock layout)
+    consumed by the Pulsar-M finality certificate.
+  \item \textbf{Finality signature.} Pulsar-M-65
+    (\texttt{luxfi/pulsar-m@v0.1.0}), Module-LWE threshold scheme over a
+    43-of-64 committee with identifiable abort. No BLS fallback.
+  \item \textbf{Proof verification.} p3q
+    (\texttt{luxfi/p3q@v0.0.1}, ten crates on crates.io) --- STARK / FRI
+    over SHA3 Merkle commitments. No KZG, no BN254, no Groth16 wrapper.
+  \item \textbf{P2P transport.} ML-KEM-768 / ML-KEM-1024 KEM and ML-DSA-65
+    static identity (\texttt{luxfi/node@dc906d281b}), five cSHAKE
+    customizations.
+  \item \textbf{Bridge admission.} \texttt{BridgeProfile}
+    (\texttt{luxfi/bridge@v1.0.7}) refused-primitive list, \texttt{RPC} label
+    \texttt{post\_quantum\_end\_to\_end} as the affirmative public statement.
+\end{enumerate}
+
+This paper is the surface-by-surface specification of the fourteen claims.
+
+\subsection{Why not just classical compat}
+
+Two well-defined regimes coexist on Lux: the strict-PQ regime LUX\_STRICT\_E2E\_PQ
+specifies, and a classical-compat regime under
+\texttt{ProfileLuxPermissive} that the testnet / devnet uses for migration
+testing and that retains an EIP-1559 / EIP-2930 / legacy raw-tx path. The
+classical-compat regime is the responsibility of the
+\texttt{ClassicalCompatRegistry} (\texttt{luxfi/node}, mempool admission), is
+gated by the profile bit \texttt{RequireTypedTxAuth}, and never appears on a
+locked production profile. Section~\ref{sec:security-considerations}
+discusses what classical-compat means precisely; the short answer is that on
+LUX\_STRICT\_E2E\_PQ the mempool refuses any transaction that is not a
+\texttt{TxAuthEnvelope}, full stop.
+
+The classical-compat path exists because a phased migration is the only
+realistic posture for a chain that hosts billions of dollars of incumbent
+contracts. The strict-PQ path is what mainnet finalises under once the
+migration window closes (HIP-0078 §6 names the cut-over event). This paper
+specifies the strict-PQ path. The permissive path is not a fallback at the
+strict-PQ profile level; it is a distinct profile with its own digest.
+
+\subsection{Document map}
+
+Section~\ref{sec:profile} specifies the \texttt{ChainSecurityProfile} struct
+and the golden vector. Section~\ref{sec:tx-auth-envelope} specifies the
+17-field signing digest, the wire codec, and the verification gate.
+Section~\ref{sec:pq-permit} specifies the 11-field permit, the contract-side
+auth profile, and the \texttt{PQAuth} precompile at \texttt{0x012202}.
+Section~\ref{sec:zchain-rollup} specifies the Z-Chain identity rollup --- the
+five ops, the seven-root aggregator, the Merkle-inclusion-proof hot-path
+verifier. Section~\ref{sec:qchain-finality} specifies the 23-axis QBlock
+binding and the Pulsar-M finality certificate. Section~\ref{sec:pulsar-m}
+specifies the Pulsar-M Module-LWE threshold scheme. Section~\ref{sec:p3q}
+specifies the p3q STARK / FRI stack. Section~\ref{sec:p2p-pq} specifies the
+ML-KEM + ML-DSA P2P handshake. Section~\ref{sec:cpx-coverage} specifies the
+C-Chain / P-Chain / X-Chain coverage. Section~\ref{sec:bridge-pq} specifies
+the bridge \texttt{BridgeProfile}. Section~\ref{sec:evaluation} reports
+gas-cost and signature-size measurements. Section~\ref{sec:security-considerations}
+states what is PQ versus what remains classical-compat.
+Section~\ref{sec:related-work} locates this work in the surrounding
+literature.
+
+The companion artefacts are LP-strict-e2e-pq (this paper), HIP-0077..0104
+(specs), LP-168..179 (Lux mirrors), ZIP-0809..0820 (Zoo mirrors), and
+the strict-e2e-pq Lean 4 + TLA+ + Go property tree in
+\texttt{luxfi/proofs/strict-e2e-pq/} \cite{luxstricte2epqproofs}.
