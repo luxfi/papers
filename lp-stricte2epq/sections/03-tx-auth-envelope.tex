@@ -1,0 +1,228 @@
+\section{TxAuthEnvelope: a 17-field signed transaction}
+\label{sec:tx-auth-envelope}
+
+\subsection{What it replaces}
+
+Every classical Ethereum-family transaction lineage --- legacy raw RLP,
+EIP-2930 access list, EIP-1559 dynamic fee, EIP-4844 blob --- shares the same
+authorisation primitive: ECDSA over keccak256 of an RLP-encoded payload. The
+payload format changes across tx types but the authorisation primitive is
+fixed. Both are classical: ECDSA falls to Shor, keccak is fine but the
+domain-separation gaps in RLP encoding admit cross-version replays
+\cite{eip2718,eip7932}.
+
+A strict-PQ chain needs a transaction-authorisation primitive that (1) signs
+under ML-DSA-65 or another FIPS-204 scheme, (2) binds every security-relevant
+field via TupleHash256 so a single byte flip on any field breaks the
+signature, (3) carries the profile identity on the wire so cross-profile
+replays are impossible, and (4) survives lazy-deserialiser bugs by refusing to
+admit a transaction whose decoded fields disagree with its decoded digest.
+
+\texttt{TxAuthEnvelope} (\texttt{luxfi/consensus@v1.23.6},
+\texttt{protocol/auth/tx\_envelope.go:108}) is that primitive.
+
+\subsection{The 17 fields}
+
+\begin{table}[H]
+\centering
+\caption{TxAuthEnvelope field list. Source:
+\texttt{protocol/auth/tx\_envelope.go:108}.}
+\label{tab:tx-auth-fields}
+\begin{tabular}{llp{7cm}}
+\toprule
+\# & Field & Role \\
+\midrule
+1  & \texttt{Version}          & envelope version (uint16). $v=1$ on strict-PQ. \\
+2  & \texttt{ProfileID}        & profile under which signed. \\
+3  & \texttt{ChainID}          & destination chain id. \\
+4  & \texttt{NetworkID}        & destination network id (mainnet / testnet). \\
+5  & \texttt{AccountID}        & 48-byte signer account identifier. \\
+6  & \texttt{Nonce}            & uint64 monotonic per-account nonce. \\
+7  & \texttt{ExpiryHeight}     & uint64 chain height after which envelope is invalid. \\
+8  & \texttt{WalletSchemeID}   & signature scheme (matches \texttt{profile.WalletSchemeID}). \\
+9  & \texttt{HashSuiteID}      & hash suite (matches \texttt{profile.HashSuiteID}). \\
+10 & \texttt{FeePayer}         & 48-byte account paying gas. \\
+11 & \texttt{GasLimit}         & uint64 gas allowance. \\
+12 & \texttt{MaxFee}           & 32-byte EIP-1559-style fee cap. \\
+13 & \texttt{CallRoot}         & 32-byte hash of the call payload. \\
+14 & \texttt{AccessListRoot}   & 32-byte hash of the access list. \\
+15 & \texttt{ZIdentityRoot}    & 32-byte Z-Chain identity root binding. \\
+16 & \texttt{AccountStateRoot} & 32-byte expected account state root at submit. \\
+17 & \texttt{PublicKeyRef}     & 32-byte SHA3-256 of the signer's full ML-DSA pubkey. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The 17 fields are the security-relevant inputs to the signing transcript. The
+sole non-transcript field is \texttt{Signature}, which carries the
+3309-byte ML-DSA-65 signature itself (variable-length under other schemes).
+
+The choice of 17 fields is the smallest set that closes \emph{every} replay
+class the protocol team enumerated in HIP-0085 §3:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \textbf{Cross-chain replay} is closed by \texttt{ChainID} and
+    \texttt{NetworkID}.
+  \item \textbf{Cross-profile replay} is closed by \texttt{ProfileID}.
+  \item \textbf{Cross-version replay} is closed by \texttt{Version}.
+  \item \textbf{Cross-account replay} is closed by \texttt{AccountID} and
+    \texttt{PublicKeyRef}.
+  \item \textbf{Cross-fee-payer replay} is closed by \texttt{FeePayer},
+    \texttt{GasLimit}, \texttt{MaxFee}.
+  \item \textbf{Stale state replay} is closed by \texttt{ExpiryHeight},
+    \texttt{AccountStateRoot}, and \texttt{ZIdentityRoot}.
+  \item \textbf{Cross-permission-set replay} is closed by
+    \texttt{AccessListRoot}.
+  \item \textbf{Same-account same-state different-call replay} is closed by
+    \texttt{CallRoot}.
+  \item \textbf{Cross-scheme replay} is closed by \texttt{WalletSchemeID}
+    and \texttt{HashSuiteID}.
+\end{itemize}
+
+Dropping any field would re-open a replay class. The 17-field minimum is
+audit-driven.
+
+\subsection{SigningDigest}
+
+\texttt{SigningDigest} (\texttt{tx\_envelope.go:148}) is what the wallet signs:
+
+\begin{lstlisting}[language=Go,caption={\texttt{SigningDigest} construction.
+Source: \texttt{protocol/auth/tx\_envelope.go:148}. Hash family is cSHAKE256
+under \texttt{LUX\_TX\_AUTH\_V1}, independent of \texttt{HashSuiteID} which
+is bound as data into the transcript.}]
+func (e *TxAuthEnvelope) SigningDigest() [48]byte {
+    parts := [][]byte{
+        []byte(txAuthProtocolTag),       // "Lux/TxAuthEnvelope/v1"
+        u16BE(e.Version),
+        {byte(e.ProfileID)},
+        u32BE(e.ChainID),
+        u32BE(e.NetworkID),
+        e.AccountID[:],
+        u64BE(e.Nonce),
+        u64BE(e.ExpiryHeight),
+        {byte(e.WalletSchemeID)},
+        {byte(e.HashSuiteID)},
+        e.FeePayer[:],
+        u64BE(e.GasLimit),
+        e.MaxFee[:],
+        e.CallRoot[:],
+        e.AccessListRoot[:],
+        e.ZIdentityRoot[:],
+        e.AccountStateRoot[:],
+        e.PublicKeyRef[:],
+    }
+    return tupleHash48(parts, txAuthSigningCustomization)
+}
+\end{lstlisting}
+
+The hash family is cSHAKE256, output truncated to 48 bytes; the customization
+string is \texttt{LUX\_TX\_AUTH\_V1}. \texttt{HashSuiteID} is bound \emph{as
+data} into the transcript --- it is not the hash family of the transcript
+itself. This means a profile change to \texttt{HashSuiteID} bumps the
+customization (\texttt{LUX\_TX\_AUTH\_V1} $\to$ \texttt{V2}) at the same time
+it changes the data byte. Both changes are observable in the digest.
+
+\subsection{Verification gate}
+
+\texttt{VerifyTxAuthEnvelope} (\texttt{protocol/auth/tx\_envelope.go}) is the
+profile-gated verifier. The order matters; we list it explicitly because
+the order is the security-relevant claim:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item \textbf{Structural.} Envelope non-nil, profile non-nil,
+    \texttt{Version} supported, every field bytes-of-the-right-width.
+  \item \textbf{Profile/id match.} \texttt{envelope.ProfileID} equals
+    \texttt{profile.ProfileID}.
+  \item \textbf{Profile/scheme match.} \texttt{envelope.WalletSchemeID}
+    equals \texttt{profile.WalletSchemeID}.
+  \item \textbf{Profile/suite match.} \texttt{envelope.HashSuiteID} equals
+    \texttt{profile.HashSuiteID}.
+  \item \textbf{Profile typed-auth gate.}
+    \texttt{profile.RequireTypedTxAuth} is \texttt{true}; if false this
+    code path is not reached at all.
+  \item \textbf{Z-Chain binding.} \texttt{ZIdentityRoot} matches the
+    current Z-Chain identity root for this epoch (look-up against
+    \texttt{ZRegistryRoots.IdentityRoot}, Section~\ref{sec:zchain-rollup}).
+  \item \textbf{Account state binding.} \texttt{AccountStateRoot} matches
+    the current account state root.
+  \item \textbf{Account / pubkey binding.} The resolved pubkey hashes to
+    \texttt{PublicKeyRef}, and the pubkey is on the active key list for
+    \texttt{AccountID} as of \texttt{ZIdentityRoot}.
+  \item \textbf{Expiry.} Current chain height $\le$ \texttt{ExpiryHeight}.
+  \item \textbf{Nonce.} \texttt{envelope.Nonce} equals
+    \texttt{account.Nonce} (no fast-forward, no replay).
+  \item \textbf{Signature.} ML-DSA-65 verify of \texttt{Signature} over
+    \texttt{SigningDigest()} under the resolved pubkey, FIPS 204 §5.2 ctx
+    set to a per-profile constant.
+\end{enumerate}
+
+Steps 2--5 reject before the expensive signature verification runs. Step 6--8
+reject before a stale-state replay can land. Step 11 is the only step that
+runs the lattice signature primitive, which is the only PQ-expensive step.
+
+\subsection{Comparison to EIP-7932}
+
+EIP-7932 \cite{eip7932} proposes a signature registry for EVM transactions
+that lets new schemes plug in at the transaction-type byte. The EIP is
+structurally compatible with this paper's goals --- it would allow a chain to
+admit ML-DSA-65 transactions alongside ECDSA transactions --- but it falls
+short in two ways:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item EIP-7932 does not standardise the \emph{transcript}. Each scheme
+    declares its own signing digest. Two schemes sharing inputs can produce
+    different digests because the scheme-byte appears in the wrapper but
+    not in the inner transcript. TupleHash256 with a single customization
+    closes that gap.
+  \item EIP-7932 does not standardise the profile binding. A transaction
+    signed under scheme A on chain X can be replayed as a scheme-A
+    transaction on chain Y if both chains admit scheme A in their
+    registry. \texttt{ProfileID} closes that gap.
+\end{itemize}
+
+Bullets aside, the two designs converge: a strict-PQ chain that wants to
+expose a 7932-style registry to other chains can declare exactly one entry
+(\texttt{TxAuthEnvelope}) and exactly one scheme (ML-DSA-65), and the
+externally-observable behaviour is equivalent. The Lux production canonical
+takes the simpler path: no in-chain registry, a single mandatory envelope.
+
+\subsection{Wire codec}
+
+\texttt{TxAuthEnvelope} serialises as a deterministic big-endian layout
+(\texttt{tx\_envelope.go:178}):
+
+\begin{table}[H]
+\centering
+\caption{TxAuthEnvelope wire layout, fixed-width except \texttt{signature}.}
+\begin{tabular}{lll}
+\toprule
+Offset & Size & Field \\
+\midrule
+$0$    & $2$   & \texttt{version}            (uint16 BE) \\
+$2$    & $1$   & \texttt{profile\_id}        (uint8) \\
+$3$    & $4$   & \texttt{chain\_id}          (uint32 BE) \\
+$7$    & $4$   & \texttt{network\_id}        (uint32 BE) \\
+$11$   & $48$  & \texttt{account\_id} \\
+$59$   & $8$   & \texttt{nonce}              (uint64 BE) \\
+$67$   & $8$   & \texttt{expiry\_height}     (uint64 BE) \\
+$75$   & $1$   & \texttt{wallet\_scheme\_id} (uint8) \\
+$76$   & $1$   & \texttt{hash\_suite\_id}    (uint8) \\
+$77$   & $48$  & \texttt{fee\_payer} \\
+$125$  & $8$   & \texttt{gas\_limit}         (uint64 BE) \\
+$133$  & $32$  & \texttt{max\_fee} \\
+$165$  & $32$  & \texttt{call\_root} \\
+$197$  & $32$  & \texttt{access\_list\_root} \\
+$229$  & $32$  & \texttt{z\_identity\_root} \\
+$261$  & $32$  & \texttt{account\_state\_root} \\
+$293$  & $32$  & \texttt{public\_key\_ref} \\
+$325$  & $4$   & \texttt{sig\_length}        (uint32 BE) \\
+$329$  & $\le$ 3309 & \texttt{signature}     (ML-DSA-65) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The 329-byte fixed header followed by a length-prefixed signature is the
+entire wire format. There is no nested encoding, no varints, no RLP
+ambiguity, no field-ordering choice. A naive decoder that consumes the bytes
+in order produces the canonical envelope; \emph{any} ambiguity in decoding is
+a fatal decoder bug, not a protocol question.

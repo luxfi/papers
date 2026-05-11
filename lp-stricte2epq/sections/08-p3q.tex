@@ -1,0 +1,164 @@
+\section{p3q: STARK / FRI over SHA3}
+\label{sec:p3q}
+
+\subsection{Why not KZG, BN254, or Groth16}
+
+The classical SNARK stack on Ethereum is built on KZG polynomial commitments
+\cite{kzg2010} over BN254 \cite{bn254}, with Groth16 \cite{groth2016} as the
+PLONK / R1CS proof wrapper. Every component of that stack is classical:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item BN254 is a pairing-friendly elliptic curve; Shor breaks the
+    discrete log; the security claim is gone.
+  \item KZG requires a structured reference string (SRS). Compromising the
+    SRS (via toxic waste from the trusted setup) forges proofs.
+  \item Groth16 requires a per-circuit SRS, multiplying the trusted-setup
+    risk per deployed circuit.
+\end{itemize}
+
+A strict-PQ chain refuses the entire stack. The replacement is a
+STARK / FRI proof system over SHA3 Merkle commitments:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \textbf{Transparent.} No SRS, no trusted setup.
+  \item \textbf{Hash-based.} Soundness reduces to collision-resistance of
+    cSHAKE256 / SHA3-384, which is conjectured PQ-secure.
+  \item \textbf{FRI-based.} The polynomial-commitment trapdoor is replaced
+    by the Fast Reed-Solomon Interactive Oracle Proof of Proximity, which
+    is collision-resistant under the same hash assumption.
+\end{itemize}
+
+The Lux reference is p3q (\texttt{luxfi/p3q@v0.0.1}), ten crates shipped on
+crates.io.
+
+\subsection{The ten crates}
+
+\begin{table}[H]
+\centering
+\caption{p3q v0.0.1 crate inventory. All crates published on crates.io;
+canonical at \url{https://github.com/luxfi/p3q}.}
+\label{tab:p3q-crates}
+\begin{tabular}{lp{8cm}}
+\toprule
+Crate & Role \\
+\midrule
+\texttt{p3q-core}        & shared types, traits, error model \\
+\texttt{p3q-field}       & PQ-friendly finite-field arithmetic (BabyBear / KoalaBear / Goldilocks variants) \\
+\texttt{p3q-sha3}        & SHA3-384 / cSHAKE256 wrappers, KECCAK-permutation primitives \\
+\texttt{p3q-merkle}      & SHA3 Merkle trees with leaf/node cust separation \\
+\texttt{p3q-challenger}  & Fiat-Shamir challenger over cSHAKE256 \\
+\texttt{p3q-fri}         & Fast Reed-Solomon IOP of Proximity \\
+\texttt{p3q-stark}       & STARK proof construction \& verification \\
+\texttt{p3q-recursion}   & recursive STARK composition \\
+\texttt{p3q-verifier}    & no-std verifier crate for embedded / EVM / WASM targets \\
+\texttt{p3q-zchain}      & Z-Chain rollup state-transition prover \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The crate split is the Rust idiom (small crates, clear dependencies). The
+\texttt{p3q-verifier} crate is \texttt{no\_std} so it can be embedded in
+WASM, in the EVM precompile, and in mobile-class verifiers. The
+\texttt{p3q-zchain} crate is the Z-Chain-specific state-transition prover;
+other chains' provers (Q-Chain finality validation, C-Chain state proof)
+will live in their own \texttt{p3q-*chain} crates as they ship.
+
+\subsection{Profile binding}
+
+\texttt{ChainSecurityProfile.AllowedProofBackends} pins the admitted backends.
+Under strict-PQ the list is \{\texttt{p3q}, \texttt{Plonky3-SHA3}\}:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \texttt{p3q} is the production-default canonical.
+  \item \texttt{Plonky3-SHA3} is the SHA3-Merkle variant of Plonky3
+    \cite{plonky3}, listed as a permitted alternative for circuits that
+    are easier to express in Plonky3's AIR than in p3q's. The
+    \texttt{-SHA3} suffix is the SHA3-Merkle variant exclusively; the
+    classical Plonky3-Poseidon variant is \emph{not} permitted because the
+    Poseidon hash family is not part of FIPS 202.
+\end{itemize}
+
+\texttt{AllowedProofFormats} pins \texttt{p3q-v0.1}, the v0.1 wire format.
+Future format versions bump the format ID.
+
+The profile floors \texttt{MinSoundnessBits} $= 128$ (FRI-soundness $\ge
+128$ bits) and \texttt{MinHashOutputBits} $= 384$ (SHA3-384). The
+\texttt{ForbidPairings}, \texttt{ForbidKZG}, \texttt{ForbidTrustedSetup},
+\texttt{ForbidClassicalSNARKs} bits all hold; any backend that wraps a
+STARK in a Groth16 verifier to cheapen EVM verification is refused.
+
+\subsection{The expanded-pubkey wire form}
+
+The verifier consumes proofs in EIP-8051-style \emph{expanded-pubkey} form.
+EIP-8051 \cite{eip8051} was originally proposed for ML-DSA verification:
+the contract carries the full A-matrix expansion rather than the seed, in
+exchange for skipping the SHAKE expansion at verification time. p3q
+generalises this to proof verification: the proof carries pre-expanded
+commitment data so the verifier never re-expands a seed at proof check
+time.
+
+Concretely, an expanded p3q proof carries:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item All Merkle commitment trees in pre-built form.
+  \item All FRI query positions resolved into leaf-path bundles.
+  \item All Fiat-Shamir challenges resolved against the bound challenger
+    state.
+\end{itemize}
+
+The verifier walks the pre-built structure with no PRG / SHAKE expansion in
+the hot loop. The result is that a STARK verifier in \texttt{no\_std} is
+predictable in cost (no allocation, no SHAKE expansion), which makes it
+suitable for the EVM precompile path.
+
+The cost is proof size: an expanded proof is $\approx 5\times$ larger than
+a seeded proof. The trade-off is the same as the ML-DSA expanded-pubkey
+trade: predictability over compactness.
+
+\subsection{Proof verification cost}
+
+\begin{table}[H]
+\centering
+\caption{p3q proof verification cost (single STARK). Benchmark hardware:
+Apple M2 Pro, 12 cores, 32 GB. Numbers from
+\texttt{luxfi/p3q@v0.0.1/bench/} harness. Comparison to Plonky3 / Halo2 /
+Groth16 for context; Groth16 is forbidden by profile.}
+\label{tab:p3q-bench}
+\begin{tabular}{lrrr}
+\toprule
+Backend & Proof size & Verify time & Verify gas (EVM, expanded) \\
+\midrule
+\texttt{p3q v0.0.1}      & $\approx$ 290 KB & 7 ms  & $\approx$ 750{,}000 \\
+\texttt{Plonky3-SHA3}    & $\approx$ 260 KB & 9 ms  & $\approx$ 820{,}000 \\
+\texttt{Halo2}           & $\approx$  60 KB & 18 ms & $\approx$ 1{,}500{,}000 \\
+\texttt{Groth16}         & 256 B            & 1.5 ms & $\approx$ 250{,}000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+p3q is $3\times$ more expensive than Groth16 in EVM gas and is much larger
+on the wire, but Groth16 is \emph{forbidden}. Among the permitted choices,
+p3q is the cheapest verifier and the smallest proof. The cost is
+acceptable for the rollup commit path (one verify per epoch) and for the
+high-value contract path; it is not acceptable for the per-transaction
+path, which uses \texttt{TxAuthEnvelope}-direct signature verification.
+
+\subsection{Recursion}
+
+\texttt{p3q-recursion} supports recursive STARK composition: a verifier
+circuit that verifies a previous proof inside a new proof. The use cases
+are:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item Folding a sequence of Z-Chain epoch transitions into a single
+    aggregate proof.
+  \item Bridge-side verification of a Lux chain state proof inside a
+    proof on the destination chain.
+  \item Cross-chain Warp envelope verification (HIP-0080) where the
+    source-chain finality certificate is verified inside a destination-chain
+    proof.
+\end{itemize}
+
+Recursion in p3q does not require a new SRS (the construction is
+transparent). The recursion overhead is approximately $2\times$ the base
+proof verification cost.
