@@ -1,0 +1,198 @@
+\section{Bridge: refused primitives and the PQ admission profile}
+\label{sec:bridge-pq}
+
+\subsection{Why bridges are different}
+
+The bridge surface is the only Lux surface where the counterparty is not a
+Lux subsystem. Every other transcript in the strict-PQ profile is signed by
+a key registered in the Z-Chain identity rollup; bridges transact with
+external chains, external custodians, and external admission keys.
+
+A strict-PQ chain can choose to refuse classical bridges entirely (the
+maximally-paranoid posture: no classical signer is ever admitted), or it can
+admit classical bridges under a clearly-labelled, profile-gated path (the
+operationally-realistic posture: existing classical infrastructure remains
+usable during migration but cannot claim the post-quantum end-to-end label).
+
+LUX\_STRICT\_E2E\_PQ takes the second posture for a specific reason: a
+locked profile cannot mandate the world is post-quantum. It can mandate
+that \emph{this chain} is post-quantum. The bridge admission profile is
+how a strict-PQ chain declares which counterparties it accepts and what
+label it claims about itself.
+
+The reference impl is the \texttt{BridgeProfile} in
+\texttt{luxfi/bridge@v1.0.7} integrated through
+\texttt{luxfi/consensus@v1.23.3}.
+
+\subsection{BridgeProfile struct}
+
+\begin{lstlisting}[language=Go,caption={BridgeProfile fields. Source:
+\texttt{luxfi/bridge@v1.0.7}, \texttt{bridge/profile.go}.}]
+type BridgeProfile struct {
+    ProfileID             BridgeProfileID
+    ProfileName           string
+
+    AllowedAdmissionSchemes []SigSchemeID  // schemes admitted for bridge admission
+
+    RefusedPrimitives []RefusedPrimitive   // explicitly-named refused primitives
+
+    AllowsClassicalAdmin   bool  // false on strict-PQ
+    PostQuantumEndToEnd    bool  // true iff E2E PQ; gated on AllowsClassicalAdmin=false
+    RequireZChainBinding   bool  // every admission carries ZChain anchor
+    RequireFinalityProof   bool  // every admission carries Pulsar-M cert
+
+    AdmissionScheme        SigSchemeID    // the admission key's own scheme
+    BridgeHashSuiteID      HashSuiteID    // bridge transcript hash family
+}
+\end{lstlisting}
+
+The strict-PQ instance pins:
+
+\begin{table}[H]
+\centering
+\caption{Strict-PQ BridgeProfile field values.}
+\label{tab:bridge-profile-strict}
+\begin{tabular}{ll}
+\toprule
+Field & Value \\
+\midrule
+\texttt{ProfileID}              & \texttt{BridgeProfileStrictPQ} \\
+\texttt{AllowedAdmissionSchemes} & \{\texttt{ML-DSA-65}, \texttt{ML-DSA-87}\} \\
+\texttt{RefusedPrimitives}      & see Table~\ref{tab:bridge-refused} \\
+\texttt{AllowsClassicalAdmin}   & \texttt{false} \\
+\texttt{PostQuantumEndToEnd}    & \texttt{true} \\
+\texttt{RequireZChainBinding}   & \texttt{true} \\
+\texttt{RequireFinalityProof}   & \texttt{true} \\
+\texttt{AdmissionScheme}        & ML-DSA-65 \\
+\texttt{BridgeHashSuiteID}      & SHA3-384 / cSHAKE256 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Refused primitives}
+
+The refused-primitive list is the affirmative statement of what the strict-PQ
+bridge cannot accept:
+
+\begin{table}[H]
+\centering
+\caption{Refused bridge primitives on the strict-PQ profile.}
+\label{tab:bridge-refused}
+\begin{tabular}{ll}
+\toprule
+Primitive & Reason \\
+\midrule
+ECDSA secp256k1     & Shor breaks the scheme \\
+ECDSA secp256r1     & Shor breaks the scheme \\
+ed25519             & Shor breaks the scheme \\
+ed448               & Shor breaks the scheme \\
+BLS12-381 (any agg) & Shor breaks the pairing \\
+RSA-2048 / RSA-3072 & Shor breaks integer factorisation \\
+BN254 (Groth16 verifier) & Shor breaks pairing; trusted-setup risk \\
+KZG (BN254 / BLS12-381)  & Shor breaks pairing; SRS trapdoor risk \\
+SHA-1 / SHA-2 (chain mode) & not part of FIPS 202; \texttt{HashSuiteID} mismatch \\
+HMAC-SHA-256 (bridge MAC)  & not part of FIPS 202 SHA3 family \\
+ECDH X25519 / X448  & Shor breaks Diffie-Hellman \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The list is exhaustive of the classical primitives that bridges in 2026 use.
+Adding a primitive to the list is a profile bump --- the existing strict-PQ
+profile stays as-is; a new \texttt{BridgeProfileStrictPQ-v2} variant
+includes the newly-refused primitive.
+
+\subsection{AllowsClassicalAdmin and PostQuantumEndToEnd}
+
+The two booleans are not independent. The constraint:
+
+\[
+\texttt{PostQuantumEndToEnd} = \texttt{true} \quad \Longrightarrow \quad
+\texttt{AllowsClassicalAdmin} = \texttt{false}.
+\]
+
+A bridge profile that has \texttt{AllowsClassicalAdmin = true} is, by
+definition, \emph{not} post-quantum end-to-end --- a classical admission
+signer is the weak link. The profile constructor (\texttt{NewBridgeProfile})
+refuses any combination where \texttt{PostQuantumEndToEnd = true} and
+\texttt{AllowsClassicalAdmin = true}. The strict-PQ \texttt{Validate}
+re-asserts this on every profile load.
+
+This is the formal version of ``you cannot claim PQ E2E if you have a
+classical admin key''. The profile cannot \emph{say} the chain is PQ-E2E if
+it admits classical primitives.
+
+\subsection{RequireZChainBinding}
+
+Every bridge admission --- every event admitted onto Lux as a
+deposit / mint / lock --- must carry a Z-Chain identity anchor: the
+admission key is registered in \texttt{ZRegistryRoots.IdentityRoot} at the
+admitting epoch. The verifier walks the inclusion proof against the bound
+root.
+
+This means a bridge admission key cannot be a wholly-external classical
+key: even when the admission is signed off-chain, the signing key's
+\texttt{ML-DSA-65} pubkey must be on Z-Chain.
+
+The classical-bridge migration story is therefore: existing bridges
+register a new ML-DSA-65 key in the Z-Chain identity rollup, sign all
+new admissions under that key, and retire the classical key. The bridge
+software runs both keys during the migration window; the strict-PQ profile
+admits only the ML-DSA-65-signed events.
+
+\subsection{RequireFinalityProof}
+
+Every admission also carries a Pulsar-M-65 finality certificate
+(Section~\ref{sec:pulsar-m}) over the source-chain block height the
+admission references. The certificate is verified against the
+\texttt{FinalitySchemeID} on the chain admitting the event. For
+inter-Lux-chain bridges (C-Chain to X-Chain, etc.), the certificate is the
+Q-Chain Pulsar-M cert directly. For external chains, the bridge software
+maintains a translator that signs an attestation under ML-DSA-65 over the
+external chain's finality artifact; the strict-PQ profile admits the
+attestation iff the attestation key is in Z-Chain.
+
+\subsection{RPC label: post\_quantum\_end\_to\_end}
+
+The bridge JSON-RPC exposes a \texttt{bridge\_profile} endpoint that
+returns the profile's public claims. The returned object includes a
+\texttt{label} field; the strict-PQ profile sets:
+
+\begin{lstlisting}[language=Java,caption={Bridge profile RPC response.}]
+{
+    "profile_id": "BridgeProfileStrictPQ",
+    "profile_hash": "93efd103...323bfcd0",
+    "label": "post_quantum_end_to_end",
+    "allowed_admission_schemes": ["ML-DSA-65", "ML-DSA-87"],
+    "refused_primitives": ["ecdsa-secp256k1", "ed25519", ...],
+    "allows_classical_admin": false,
+    "post_quantum_end_to_end": true,
+    "require_zchain_binding": true,
+    "require_finality_proof": true
+}
+\end{lstlisting}
+
+The \texttt{label} field is a structured public claim. A monitoring service
+that scrapes the field is the canonical way to confirm the bridge's
+posture; a classical-compat bridge returns
+\texttt{label: "classical\_compat"} instead, and the monitor sees the
+difference.
+
+\subsection{Permissive profile reciprocal}
+
+The classical-compat bridge profile (\texttt{BridgeProfilePermissive}) is
+the reciprocal:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \texttt{AllowsClassicalAdmin = true}
+  \item \texttt{PostQuantumEndToEnd = false}
+  \item \texttt{AllowedAdmissionSchemes} includes both ML-DSA-65 and
+    ECDSA-secp256k1
+  \item \texttt{RefusedPrimitives} is empty (or short)
+\end{itemize}
+
+The permissive profile is used by testnets and by chains in active
+migration. The strict-PQ profile loads at the end of the migration window.
+Bridges that have not migrated by the cut-over event are not admitted on
+the strict-PQ chain; their classical-compat counterparts continue to
+operate on testnet / devnet under the permissive profile.

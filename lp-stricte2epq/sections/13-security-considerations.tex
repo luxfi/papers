@@ -1,0 +1,229 @@
+\section{Security considerations}
+\label{sec:security-considerations}
+
+\subsection{What is PQ}
+
+Under LUX\_STRICT\_E2E\_PQ, the following surfaces are bound to a FIPS-203 /
+FIPS-204 / FIPS-205 primitive or a SHA3-family transcript:
+
+\begin{table}[H]
+\centering
+\caption{PQ surfaces under strict-PQ. Every surface is gated on a FIPS-PQ
+primitive plus a TupleHash256 transcript binding.}
+\label{tab:pq-surfaces}
+\begin{tabular}{lll}
+\toprule
+Surface & Primitive & Transcript binding \\
+\midrule
+Profile boot                 & SHA3-384 / cSHAKE256 & \texttt{LUX\_CHAIN\_SECURITY\_V1} \\
+Identity registration        & ML-DSA-65            & \texttt{LUX\_OP\_REGISTER\_KEY\_V1} \\
+Identity rotation            & ML-DSA-65            & \texttt{LUX\_OP\_ROTATE\_KEY\_V1} \\
+Identity revocation          & ML-DSA-65            & \texttt{LUX\_OP\_REVOKE\_KEY\_V1} \\
+Session authorisation        & ML-DSA-65            & \texttt{LUX\_OP\_AUTHORIZE\_SESSION\_V1} \\
+Transaction authorisation    & ML-DSA-65            & \texttt{LUX\_TX\_AUTH\_V1} \\
+Contract permits             & ML-DSA-65            & \texttt{LUX\_PQ\_PERMIT\_V1} \\
+Z-Chain root aggregation     & SHA3-384             & \texttt{LUX\_ZCHAIN\_REGISTRY\_ROOTS\_V1} \\
+Z-Chain inclusion proofs     & SHA3-384             & \texttt{LUX\_MERKLE\_LEAF\_V1, NODE\_V1} \\
+Q-Chain QBlock digest        & SHA3-384             & \texttt{LUX\_QBLOCK\_V1} \\
+Finality cert                & Pulsar-M-65 (M-LWE)  & (Pulsar-M challenge) \\
+Proof verification           & p3q / Plonky3-SHA3   & FRI under cSHAKE256 \\
+P2P handshake KEM            & ML-KEM-768 / 1024    & five-cust transcripts \\
+P2P handshake auth           & ML-DSA-65            & \texttt{LUX\_P2P\_HANDSHAKE\_AUTH\_V1} \\
+DRBG                         & Hash\_DRBG-SHA3-384  & (NIST SP 800-90A) \\
+Bridge admission             & ML-DSA-65            & (bridge profile transcript) \\
+Wallet signing scheme        & ML-DSA-65            & (matches profile) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A Shor-capable adversary against any one of these surfaces is reduced to
+breaking the underlying primitive --- ML-DSA-65 (FIPS 204), ML-KEM-768 / 1024
+(FIPS 203), Pulsar-M-65 (Module-LWE), p3q (FRI / SHA3) --- or the
+SHA3-family hash. None of these primitives is known to be vulnerable to a
+quantum adversary; the lattice schemes' security reduces to the worst-case
+hardness of Module-LWE \cite{regev2009,mlwe} and the hash scheme reduces
+to collision-resistance of cSHAKE256, both of which are open conjectures.
+
+\subsection{What remains classical-compat}
+
+The strict-PQ profile is the locked production profile. The permissive
+profile (\texttt{ProfileLuxPermissive}) admits classical-compat affordances
+during the migration window:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item Legacy EVM transaction types (\texttt{0x00}, \texttt{0x01},
+    \texttt{0x02}, \texttt{0x03}) under the \texttt{ClassicalCompatRegistry}
+    allowlist.
+  \item Classical bridges under \texttt{BridgeProfilePermissive}.
+  \item Classical peers via a translation gateway (not directly into the
+    peer mesh).
+\end{itemize}
+
+\textbf{None of these appear on a chain running LUX\_STRICT\_E2E\_PQ.}
+The permissive profile is loaded by testnet / devnet only. A node that
+attempts to load the permissive profile on a chain whose genesis pins the
+strict-PQ profile fails at boot (Section~\ref{sec:profile}).
+
+The future EVM tx-type \texttt{0x05} (a \texttt{TxAuthEnvelopeV2} variant
+with extensions) is deferred to HIP-0089-future. The current strict-PQ
+profile admits exactly one EVM tx-type: \texttt{0x04}
+(\texttt{TxAuthEnvelope}).
+
+\subsection{Threat model}
+
+The strict-PQ posture assumes the standard Lux Byzantine fault model
+($f < n/3$ malicious validators), plus a \emph{Shor-capable adversary} on
+every classical primitive. Specifically:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item ECDSA, EdDSA, RSA, ECDH, BLS, KZG, pairings are all assumed broken
+    by a polynomial-time quantum algorithm. The strict-PQ profile refuses
+    every one of these primitives by name on every surface.
+  \item SHAKE256, cSHAKE256, SHA3-384 are assumed quantum-collision-resistant
+    in the standard model (Grover gives a $2^{-n/3}$ collision search vs.
+    $2^{-n/2}$ classical; the 384-bit output gives a 128-bit quantum
+    collision floor and a 192-bit classical collision floor).
+  \item ML-DSA-65 is assumed EUF-CMA-secure under Module-LWE
+    \cite{dilithium,fips204}. ML-KEM-768 / 1024 is assumed IND-CCA-secure
+    under MLWE \cite{fips203}.
+  \item Pulsar-M-65 is assumed EUF-CMA-secure under M-LWE plus the
+    rejection-sampling-soundness argument of Algorithm
+    \ref{alg:pulsar-m-two-round}.
+  \item p3q / FRI is assumed sound under collision-resistance of
+    cSHAKE256 plus the Reed-Solomon proximity testing argument
+    \cite{fri}.
+\end{itemize}
+
+The standard non-cryptographic threat model assumptions hold: synchronous
+networks for liveness, partial synchrony for safety; no clock-skew-based
+attacks; standard side-channel hygiene on validator hardware.
+
+\subsection{Profile drift defence}
+
+The single highest-impact strict-PQ defence is the
+\texttt{ComputeHash} digest pinning (Section~\ref{sec:profile}). A node
+that attempts to relax any field --- weaker \texttt{HashSuiteID}, weaker
+\texttt{IdentitySchemeID}, lower \texttt{MinSoundnessBits},
+relaxed \texttt{Forbid*} bits --- produces a different
+\texttt{ProfileHash}, fails the genesis-pinned digest check, and refuses
+to start. This is the structural defence against the ``configuration drift
+under operator pressure'' attack: there is no way to relax the profile
+without changing the digest, and there is no way to start the node with a
+different digest without re-genesis.
+
+The locked-profile design is what makes strict-PQ a \emph{single
+verifiable claim} rather than a set of independent assertions an auditor
+must verify one-by-one. The single claim is the digest.
+
+\subsection{Defence-in-depth across the three scheme fields}
+
+The three independent schemes (\texttt{IdentitySchemeID},
+\texttt{FinalitySchemeID}, \texttt{HighValueSchemeID}) give the profile
+defence-in-depth across the three Lux operational lanes:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item An attack against the ML-DSA-65 identity scheme costs identity
+    forgery but does not enable finality forgery (which is gated on
+    Pulsar-M).
+  \item An attack against Pulsar-M costs finality forgery but does not
+    enable identity forgery.
+  \item An attack against the high-value scheme (Pulsar-M-87) costs
+    treasury / governance forgery but does not enable everyday
+    transaction forgery.
+\end{itemize}
+
+The three lanes use different primitives by design: ML-DSA-65 and
+Pulsar-M-65 share the M-LWE assumption but operate over different rings
+($q_\textsc{ML-DSA} = 2^{23}-2^{13}+1$ vs. $q_\textsc{Pulsar-M} \approx
+2^{48}$) and different challenge constructions. A break of one is
+not automatically a break of the other.
+
+\subsection{Cryptographic agility through profile bumps}
+
+Profile bumps (LUX\_STRICT\_E2E\_PQ-v1 $\to$ -v2) are the canonical
+cryptographic-agility mechanism. A new profile version bumps:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item The customization tag (e.g., \texttt{LUX\_CHAIN\_SECURITY\_V1 $\to$
+    \_V2}) at every transcript site.
+  \item The \texttt{ProfileID} byte.
+  \item The pinned \texttt{ProfileHash} digest.
+\end{itemize}
+
+A v2 profile is a hard fork of the v1 profile: the chain stops accepting
+v1 envelopes at the cut-over epoch and starts accepting only v2 envelopes
+from then on. The migration window between profiles uses the
+\texttt{ProfileLuxPermissive} variant, which admits both v1 and v2
+envelopes for the window's duration.
+
+This is how the chain upgrades from ML-DSA-65 to ML-DSA-87, or from
+Pulsar-M-65 to a hypothetical Pulsar-M-1024 in a future quantum-attack
+threat regime. The mechanism is the same as the initial migration from
+classical to PQ: a profile bump, a permissive transition window, then the
+new locked profile.
+
+\subsection{Side-channel and hardware considerations}
+
+The strict-PQ posture does not specify a hardware-side defence beyond the
+standard guidance:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item Validator keys are held in HSM where possible. ML-DSA-65 HSM
+    support is widely available (Yubico, Thales, AWS CloudHSM) as of 2026.
+  \item P2P session keys are held in-process; rekey is mandatory at
+    message-count thresholds (default $10^9$) and time thresholds (default
+    1 hour).
+  \item Pulsar-M signing parties are encouraged to rotate masking-key
+    seeds between rounds; the LSS framework \cite{luxlssmpc} provides the
+    proactive-refresh mechanism.
+\end{itemize}
+
+These are operational guidelines, not profile-pinned constraints. A node
+that does not follow them is not refused at the chain level; the chain
+trusts the operator on hardware hygiene.
+
+\subsection{Known limitations}
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \textbf{Bridge counterparty risk.} A strict-PQ chain can refuse
+    classical primitives at its own boundary, but cannot guarantee the
+    counterparty chain is post-quantum. The \texttt{post\_quantum\_end\_to\_end}
+    RPC label is a public claim about the strict-PQ chain only.
+  \item \textbf{Pre-strict-PQ artefacts.} Historical chain state (blocks,
+    transactions, account balances) produced before the cut-over to
+    strict-PQ are immutable. The state itself is hashed under SHA3-384 via
+    Pulsar-M finality (PQ-secure), but the signatures that authored the
+    historical state are ECDSA-classical. A Shor-capable adversary could
+    forge a \emph{historical} ECDSA signature, but cannot use that
+    forgery to alter the chain state --- the state is hash-pinned and
+    the consensus has finalised it. The adversary's forgery is
+    indistinguishable from the original at the consensus level; it is
+    only useful for historical-attribution arguments, not state
+    modification.
+  \item \textbf{No KEM-based encryption-at-rest.} The strict-PQ profile
+    does not mandate ML-KEM-based encryption-at-rest for validator state.
+    Operators handle their own at-rest encryption; the chain does not
+    enforce it.
+\end{itemize}
+
+\subsection{Formal verification status}
+
+The strict-e2e-pq Lean 4 / TLA+ / Go property tree
+(\texttt{luxfi/proofs/strict-e2e-pq/}) carries machine-checked statements
+of the propositions in this section. The relevant assertions:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \texttt{StrictE2EPQ.lean}: the 14-path PQ coverage proposition,
+    provable iff every \texttt{Forbid*} bit and every scheme field matches
+    strict-PQ values.
+  \item \texttt{StrictPQProfile.tla}: the profile state machine; the
+    safety invariant is ``every signer is gated through
+    \texttt{profile.WalletScheme}''.
+  \item \texttt{strict\_pq\_test.go}: property tests asserting that
+    profiles with \texttt{AllowsClassicalAdmin=true} cannot also have
+    \texttt{PostQuantumEndToEnd=true}, plus the soundness
+    statements above.
+\end{itemize}
+
+Section~\ref{sec:related-work} discusses how this work fits within the
+landscape of formal verification of PQ blockchain stacks.

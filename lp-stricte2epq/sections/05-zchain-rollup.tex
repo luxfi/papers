@@ -1,0 +1,254 @@
+\section{Z-Chain: the identity rollup}
+\label{sec:zchain-rollup}
+
+\subsection{Why a rollup}
+
+Sections~\ref{sec:tx-auth-envelope} and \ref{sec:pq-permit} both leave one
+question open: \emph{where does the verifier get the ML-DSA public key}?
+\texttt{TxAuthEnvelope.PublicKeyRef} is a 32-byte hash and
+\texttt{PQPermit.OwnerAccountID} is a 48-byte identifier; neither is the
+1{,}952-byte (or 60.6-KB expanded) pubkey the lattice verifier needs.
+
+The naive answer --- carry the pubkey on the wire with every transaction or
+permit --- is unaffordable. ML-DSA-65 pubkeys are 1{,}952 B; an
+expanded pubkey is 60.6 KB. A chain with $10^8$ daily transactions at
+1{,}952 B per pubkey is moving $186$ GB of pubkey duplication \emph{per day}.
+
+The right answer is an identity rollup: pubkeys are registered once,
+revoked or rotated as needed, and committed via a Merkle root that
+\texttt{TxAuthEnvelope.ZIdentityRoot} binds. The verifier looks up the
+pubkey by \texttt{PublicKeyRef} against the rollup state at the bound
+root, with a small inclusion proof.
+
+Z-Chain (\texttt{luxfi/consensus@v1.23.7},
+\texttt{protocol/zchain/registry/}) is that rollup. HIP-0078 §4 defines its
+shape.
+
+\subsection{PQKeyRecord}
+
+The leaf of the identity rollup is \texttt{PQKeyRecord}
+(\texttt{protocol/zchain/registry/key\_record.go}):
+
+\begin{lstlisting}[language=Go,caption={PQKeyRecord leaf. Source:
+\texttt{protocol/zchain/registry/key\_record.go}.}]
+type PQKeyRecord struct {
+    AccountID      [48]byte    // owner identifier
+    SchemeID       SigSchemeID // ML-DSA-65 etc.
+    CompactPubkey  []byte      // seed form (1952 B for ML-DSA-65)
+    ExpandedRef    [32]byte    // SHA3-256 of the expanded-pubkey form
+    Status         KeyStatus   // Active / Revoked / Rotated
+    EpochRegistered uint64
+    EpochExpiry     uint64     // 0 = no expiry
+}
+\end{lstlisting}
+
+\texttt{Status} is one of \texttt{KeyStatusActive}, \texttt{KeyStatusRevoked},
+\texttt{KeyStatusRotated}. The verifier accepts only \texttt{KeyStatusActive}
+records. \texttt{ExpandedRef} is the link into the side-channel pubkey store
+(Section~\ref{sec:pq-permit}); the precompile dereferences this when it
+needs the expanded form.
+
+The leaf hash \texttt{PQKeyRecord.Hash()} is TupleHash256 over the leaf
+fields under customization \texttt{LUX\_PQ\_KEY\_RECORD\_V1}. Two leaves
+differing in any field have different hashes; therefore the Merkle tree
+detects any modification.
+
+\subsection{The five operations}
+
+The Z-Chain accepts five operation types
+(\texttt{protocol/zchain/registry/ops.go}). Each carries a TupleHash256
+signing digest under an op-specific customization, plus a FIPS 204 §5.2
+\texttt{ctx} of \texttt{LUX\_ZCHAIN\_REGISTRY\_V1} (\texttt{ops.go:43}) on
+every ML-DSA signature. The op-specific customization plus the registry-wide
+\texttt{ctx} are independent layers of domain separation; replaying a
+signature from one op as another fails on both.
+
+\begin{table}[H]
+\centering
+\caption{Z-Chain registry operations. Source:
+\texttt{protocol/zchain/registry/ops.go}.}
+\label{tab:zchain-ops}
+\begin{tabular}{llp{7cm}}
+\toprule
+Op & Customization & Action \\
+\midrule
+\texttt{OpRegisterKey}      & \texttt{LUX\_OP\_REGISTER\_KEY\_V1}      & Insert fresh key; proof of possession self-sig. \\
+\texttt{OpRotateKey}        & \texttt{LUX\_OP\_ROTATE\_KEY\_V1}        & Replace one key with another; sig under outgoing key. \\
+\texttt{OpRevokeKey}        & \texttt{LUX\_OP\_REVOKE\_KEY\_V1}        & Mark a key revoked; sig under the revoked key (plus profile-pinned reason). \\
+\texttt{OpAuthorizeSession} & \texttt{LUX\_OP\_AUTHORIZE\_SESSION\_V1} & Bind an ephemeral session pubkey to a long-term account. \\
+\texttt{OpCommitTxAuthBatch} & \texttt{LUX\_OP\_COMMIT\_TX\_AUTH\_BATCH\_V1} & Commit a batch of \texttt{TxAuthEnvelope} hashes for later inclusion proofs. \\
+\texttt{OpCommitPermitBatch} & \texttt{LUX\_OP\_COMMIT\_PERMIT\_BATCH\_V1}   & Commit a batch of \texttt{PQPermit} hashes for later inclusion proofs. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Strictly six operations, not five, once \texttt{OpCommitPermitBatch} is
+counted alongside \texttt{OpCommitTxAuthBatch}. The HIP-0078 informal
+``five-op'' framing groups the two commit ops because they share their
+verifier; the canonical six are documented in \texttt{ops.go}. We carry the
+informal framing in the paper title but use the precise count here.
+
+\subsubsection{OpRegisterKey}
+
+The proof of possession is the canonical: a registrant signs their own
+\texttt{AccountID} transcript under the key they're registering. Without
+this, an attacker could re-register a victim's pubkey as their own and
+intercept the victim's future transactions. The signing digest
+(\texttt{ops.go:66}) binds:
+
+\[
+\text{digest} = \texttt{TupleHash256}\left(\begin{aligned}
+& \texttt{"Lux/OpRegisterKey/v1"}, \\
+& \texttt{NewRecord.AccountID}, \\
+& \texttt{NewRecord.Hash()}
+\end{aligned}\right) \quad \text{cust = LUX\_OP\_REGISTER\_KEY\_V1}.
+\]
+
+The customization plus the record hash plus the AccountID bind every byte
+that defines ``this key, for this account, under this op''.
+
+\subsubsection{OpRotateKey}
+
+\texttt{OpRotateKey} binds the outgoing record's hash, the incoming record's
+hash, and the AccountID. The signature is under the \emph{outgoing} key:
+the existing key authorises its own succession. The verifier checks the
+chain (\texttt{outgoing.AccountID == incoming.AccountID},
+\texttt{outgoing.SchemeID == incoming.SchemeID}, \texttt{outgoing.Status ==
+Active}, \texttt{incoming.Status == Active}), then runs ML-DSA verify against
+the outgoing key. Atomically, the outgoing record transitions to
+\texttt{KeyStatusRotated}, and the incoming record becomes the active key
+for the AccountID.
+
+\subsubsection{OpRevokeKey}
+
+\texttt{OpRevokeKey} carries a profile-pinned \texttt{Reason} byte
+(compromise, lost, lifecycle, governance). The signature is under the
+revoked key. After acceptance, the record's \texttt{Status} is
+\texttt{KeyStatusRevoked} and the \texttt{RevocationRoot} aggregator (below)
+includes the leaf.
+
+\subsubsection{OpAuthorizeSession}
+
+A session key is an ephemeral pubkey with a TTL and a capability scope. The
+holder of the long-term identity key signs an authorisation binding the
+ephemeral pubkey hash, the expiry epoch, and the capability bitmap. The
+session key can sign transactions whose
+\texttt{TxAuthEnvelope.WalletSchemeID} matches the session scheme; the
+verifier looks up the session key against \texttt{SessionKeyRoot} and
+confirms the binding. Session keys do not appear in \texttt{IdentityRoot};
+they appear in \texttt{SessionKeyRoot} only. The two roots are independent
+to support cheap session-key rotation without changing
+\texttt{IdentityRoot}.
+
+\subsubsection{OpCommitTxAuthBatch and OpCommitPermitBatch}
+
+These two ops commit Merkle roots over batches of accepted
+\texttt{TxAuthEnvelope} or \texttt{PQPermit} hashes, so the execution-side
+verifier on later chains (e.g., the EVM verifying a permit inside a
+transaction) can supply a Merkle inclusion proof rather than the full
+envelope. The batch root is signed by the consensus committee under the
+\texttt{FinalitySchemeID}; the committee is the same one running the
+Pulsar-M finality lane (Section~\ref{sec:qchain-finality}).
+
+\subsection{ZRegistryRoots}
+
+The seven-root aggregator (\texttt{registry/roots.go:40}):
+
+\begin{lstlisting}[language=Go,caption={ZRegistryRoots aggregator. Source:
+\texttt{protocol/zchain/registry/roots.go:40}.}]
+type ZRegistryRoots struct {
+    IdentityRoot       [48]byte   // active PQKeyRecord set
+    AccountKeyRoot     [48]byte   // same set indexed by AccountID
+    RevocationRoot     [48]byte   // revoked / rotated AccountIDs
+    SessionKeyRoot     [48]byte   // authorised session keys
+    ContractPolicyRoot [48]byte   // per-contract policy hashes
+    TxAuthRoot         [48]byte   // OpCommitTxAuthBatch roots
+    PermitAuthRoot     [48]byte   // OpCommitPermitBatch roots
+}
+
+func (r *ZRegistryRoots) Hash() [48]byte {
+    parts := [][]byte{
+        []byte("Lux/ZRegistryRoots/v1"),
+        r.IdentityRoot[:],  r.AccountKeyRoot[:],
+        r.RevocationRoot[:], r.SessionKeyRoot[:],
+        r.ContractPolicyRoot[:], r.TxAuthRoot[:],
+        r.PermitAuthRoot[:],
+    }
+    return tupleHash48(parts, "LUX_ZCHAIN_REGISTRY_ROOTS_V1")
+}
+\end{lstlisting}
+
+The aggregator hash rides as \texttt{EpochCommitment.zchain\_state\_root} on
+the Q-Chain. Q-Chain does not look inside; it consumes the 48-byte digest
+and binds it into \texttt{ComputeRoundDigest}
+(Section~\ref{sec:qchain-finality}). Adding a root bumps the customization
+\texttt{V1 $\to$ V2} and is a hard fork --- the wire layout and the bound
+set are both pinned by the tag.
+
+The seven roots are decomposed because the verifier hot path consumes only
+a subset:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \texttt{IdentityRoot} is consumed by \texttt{TxAuthEnvelope}
+    verification (Step 6 in Section~\ref{sec:tx-auth-envelope}).
+  \item \texttt{AccountKeyRoot} is the AccountID-indexed lookup tree for
+    execution-side calls.
+  \item \texttt{RevocationRoot} is consumed when checking that an
+    AccountID has no live revocation entries.
+  \item \texttt{SessionKeyRoot} is consumed when validating a
+    session-key-signed envelope.
+  \item \texttt{ContractPolicyRoot} is consumed by
+    \texttt{ContractAuthProfile} lookups.
+  \item \texttt{TxAuthRoot} and \texttt{PermitAuthRoot} support
+    inclusion-proof verification of historical envelopes.
+\end{itemize}
+
+\subsection{VerifyAuthPassed: the hot-path inclusion verifier}
+
+\texttt{VerifyAuthPassed} (\texttt{registry/auth\_proof.go:118}) is the
+verifier the EVM (and S-VM / X-VM) calls when it needs to confirm that a
+\texttt{TxAuthEnvelope} or \texttt{PQPermit} hash was committed by the
+Z-Chain. The function signature is roughly:
+
+\begin{lstlisting}[language=Go,caption={\texttt{VerifyAuthPassed} signature.
+Source: \texttt{protocol/zchain/registry/auth\_proof.go:118}.}]
+func VerifyAuthPassed(
+    profile  *config.ChainSecurityProfile,
+    root     [48]byte,           // ZRegistryRoots.TxAuthRoot or PermitAuthRoot
+    leaf     [48]byte,           // hash of the envelope / permit
+    proof    MerkleProof,
+) (bool, error)
+\end{lstlisting}
+
+The verifier:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item Confirms the proof's \texttt{HashSuiteID} matches
+    \texttt{profile.HashSuiteID}.
+  \item Walks the proof, reconstructing the root via the leaf cust
+    \texttt{LUX\_MERKLE\_LEAF\_V1} and the node cust
+    \texttt{LUX\_MERKLE\_NODE\_V1}.
+  \item Returns \texttt{(true, nil)} iff the reconstructed root equals the
+    bound root.
+\end{enumerate}
+
+The two customizations are critical: a leaf hash cannot be confused with an
+internal-node hash, so a proof cannot be smuggled by re-interpreting a leaf
+as an internal node (the classical ``second preimage on Merkle trees''
+attack). cSHAKE256 with distinct customizations prevents the collision
+structurally.
+
+\subsection{Why this is a rollup, not a state tree}
+
+The seven roots aggregate \emph{commitments}, not state. The full identity
+state lives in the Z-Chain's own state tree. The seven roots are
+EpochCommitment-level digests that the Q-Chain finalises. This is the same
+pattern an optimistic / ZK rollup follows on Ethereum: the rollup chain runs
+its own VM and produces a commitment that the L1 chain accepts.
+
+The difference is that Z-Chain is co-validated by the same committee that
+validates the C-Chain, P-Chain, and X-Chain --- there is no separate rollup
+operator. The finality lane (Section~\ref{sec:qchain-finality}) signs every
+Z-Chain commitment with Pulsar-M-65, the same lane that finalises the other
+chains. The result is a single PQ identity layer shared by every execution
+chain on Lux.
