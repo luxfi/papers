@@ -92,7 +92,7 @@ Auto-generated catalogue of research papers.
 | `lux-ray-protocol` | ✓ | `lux-ray-protocol/lux-ray-protocol.tex` |
 | `lux-reproducible-builds` | ✓ | `lux-reproducible-builds.tex` |
 | `lux-restaking` | ✓ | `lux-restaking/lux-restaking.tex` |
-| `lux-ringtail-pq` | ✓ | `lux-ringtail-pq/lux-ringtail-pq.tex` |
+| `lux-corona-pq` | ✓ | `lux-corona-pq/lux-corona-pq.tex` |
 | `lux-secure-messaging` | ✓ | `lux-secure-messaging/lux-secure-messaging.tex` |
 | `lux-security-token-standard` | ✓ | `lux-security-token-standard/lux-security-token-standard.tex` |
 | `lux-smart-contract-auditing` | ✓ | `lux-smart-contract-auditing/lux-smart-contract-auditing.tex` |
