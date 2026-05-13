@@ -42,6 +42,45 @@ make all
 
 See [INDEX.md](INDEX.md) for full catalogue of papers.
 
+## Defense Pack
+
+`defense-pack.yaml` is the authoritative manifest of the curated bundle
+distributed via [GitHub Releases](https://github.com/luxfi/papers/releases)
+under the `defense-pack-*` tag prefix. Each entry maps an output filename
+to its source repository + relative path (`luxfi/papers` or `hanzoai/papers`),
+so the pack is fully reproducible from git state — no ad-hoc copies.
+
+Build locally:
+
+```bash
+# Default: sibling clone at ../../hanzo/papers
+bash tools/build-defense-pack.sh
+
+# Custom hanzoai/papers location
+HANZO_PAPERS_DIR=/path/to/hanzoai-papers bash tools/build-defense-pack.sh
+
+# Skip UNRESOLVED entries (manifest items with no source yet)
+ALLOW_UNRESOLVED=1 bash tools/build-defense-pack.sh
+```
+
+Outputs land in `dist/`:
+- `<release>.tar.gz`             — bundled PDFs under `Lux-Hanzo-Defense-Pack/`
+- `<release>.tar.gz.sha256`      — archive digest
+- `<release>.manifest.txt`       — per-file sha256 digests, sorted
+
+CI: pushing a `defense-pack-*` tag triggers `.github/workflows/defense-pack.yml`,
+which checks out both repos, builds via the same script, and attaches the
+tarball + sha256 + per-file manifest to the GitHub Release. Manual dispatch
+also uploads workflow artifacts for inspection.
+
+**Reproducibility caveat.** The build script makes the *archive layer*
+reproducible (sorted entries, zeroed uid/gid, fixed mtime, gzip without
+filename). PDF *content* itself is non-deterministic across `latexmk` runs
+unless `SOURCE_DATE_EPOCH` is pinned at compile time — see
+`tools/build-defense-pack.sh` and follow-up in `FOLLOW-UPS-2026-05-12.md`.
+Use `<release>.manifest.txt` to check whether a divergence is in a single
+PDF or in the archive layer.
+
 ## Conventions
 
 1. **One paper, one directory**. No top-level .tex files.
