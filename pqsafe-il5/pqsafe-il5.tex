@@ -164,10 +164,17 @@ storage system's TLS terminator.
 \item \textbf{Audit is tamper-evident, not secret-bearing.} Only
   hashes of envelope manifest, sender identity certificate, and the
   ordered recipient set go on the audit log.
-\item \textbf{Forward secrecy at the channel layer.} Z-Wing uses
-  ephemeral X-Wing per session and AEAD nonce sequence numbers so
-  past sessions cannot be decrypted if a long-term identity key is
-  later compromised.
+\item \textbf{Forward secrecy at the channel layer; explicit policy
+  for stored envelopes.} Z-Wing/PQ-RNS use ephemeral X-Wing per
+  session and AEAD nonce sequence numbers so past sessions cannot be
+  decrypted if a long-term identity key is later compromised.
+  Stored envelopes target long-term recipient keys and therefore
+  require complementary key-rotation, rewrap, revocation, and
+  recovery policies (see Section~\ref{sec:pfs}).
+\item \textbf{Domain separation everywhere.} Every HKDF and every
+  signature carries an explicit context string identifying the
+  protocol layer and version (see Section~\ref{sec:domsep}). No two
+  layers ever derive a key from the same transcript.
 \end{enumerate}
 
 % ===========================================================================
@@ -229,31 +236,97 @@ Category~1 (ML-KEM-512) is not used: the marginal performance gain
 does not justify diverging from the production default for an
 operationally simple stack.
 
-\subsection{Perfect forward secrecy for AEAD}
+\subsection{Forward secrecy --- transport vs.\ stored envelopes}
 \label{sec:pfs}
 
-Z-Wing and the AEAD chunk layer both provide forward secrecy:
+Transport forward secrecy and stored-envelope forward secrecy are
+\emph{different problems with different solutions}. The paper makes the
+distinction explicit so the security claim does not over-reach.
 
-\begin{itemize}[leftmargin=*,itemsep=0pt]
-\item \textbf{Channel (Z-Wing).} For every session, both peers
-  generate a fresh X-Wing keypair; the ephemeral private keys are
-  zeroed after the shared secret is derived. The session key derives
-  from $\textsf{HKDF}(\textsf{X-Wing shared}\,\|\,\textsf{transcript})$.
-  A future compromise of either long-term identity key
-  (Ed25519 \emph{or} ML-DSA-65) cannot decrypt recorded sessions: the
-  ephemeral component is gone. Both legs must break for retrospective
-  decryption.
-\item \textbf{Chunk AEAD.} Each 64-KiB chunk is encrypted with a
-  unique nonce $(N_0\,\|\,\text{seq})$ where $N_0$ is a 12-byte random
-  nonce-seed bound into the manifest and $\text{seq}$ is a 4-byte
-  big-endian chunk index. The DEK itself is rotated every $2^{32}$
-  chunks (256~TiB) via HKDF re-keying chained from the manifest's
-  ratchet seed; a compromise of the DEK does not decrypt chunks
-  emitted before the most recent re-key. For interactive transfer
-  this is irrelevant (files fit under the rotation limit); for
-  long-lived replication streams (Section~\ref{sec:replication}) it
-  prevents one DEK compromise from leaking the entire history.
-\end{itemize}
+\paragraph{Transport (Z-Wing, PQ-RNS) --- full hybrid FS.}
+For every session, both peers generate fresh X25519 and ML-KEM-768
+ephemeral keypairs. After each session establishes its key, the
+ephemeral private keys and any intermediate HKDF material are zeroed.
+The session key derives from
+$$K_\text{sess} = \textsf{HKDF-Extract-Then-Expand}\bigl(
+\,\textsf{X25519}_\text{eph-eph}\,\|\,\textsf{ML-KEM-768}_\text{eph-eph}\,,\
+\textsf{context}=\textsf{``ZWING-SESSION-v1''}\,\|\,H(\text{transcript})\bigr).$$
+A future compromise of either long-term key (Ed25519 \emph{or}
+ML-DSA-65) lets the adversary impersonate the identity going forward
+\emph{but cannot decrypt previously recorded sessions}: the ephemeral
+half is gone. Retrospective decryption requires recovering \emph{both}
+classical and lattice ephemerals for every recorded link, which is
+the hybrid FS contract. Long-term keys are used \emph{only} to
+authenticate the ephemeral key-exchange transcript; they never directly
+wrap session traffic.
+
+\paragraph{Chunk AEAD --- intra-file FS via HKDF re-key.}
+Each 64-KiB chunk is encrypted with a unique nonce
+$(N_0\,\|\,\text{seq})$ where $N_0$ is a 12-byte random nonce-seed
+bound into the manifest and $\text{seq}$ is a 4-byte big-endian chunk
+index. The DEK itself is rotated every $2^{32}$ chunks (256~TiB) via
+HKDF re-keying chained from the manifest's ratchet seed; compromise of
+a re-keyed-DEK does not decrypt chunks emitted before the most recent
+re-key. For interactive transfer this is irrelevant (files fit under
+the rotation limit); for long-lived replication streams it prevents
+one DEK compromise from leaking the entire history.
+
+\paragraph{Stored envelopes --- DEK is wrapped to long-term recipient
+keys, so naive FS does not apply.}
+Each recipient's capsule wraps the per-file DEK under the recipient's
+long-term X-Wing public key. If the recipient's long-term X-Wing
+\emph{private} key is later compromised, every capsule that targeted
+that recipient becomes decryptable, \emph{including capsules created
+before the compromise}. This is the well-known property of any
+recipient-targeted file-encryption scheme (PGP, age, S/MIME); it is
+\emph{not} a defect of PQSAFE, but a property the operator must
+manage. Five complementary controls reduce the residual risk:
+
+\begin{enumerate}[leftmargin=*,itemsep=0pt]
+\item \textbf{KMS/HSM-mediated unwrap.} Recipient long-term private
+  keys live inside an HSM (Hanzo KMS / luxfi/kms). The HSM enforces
+  policy at unwrap time (recipient identity, manifest TTL,
+  revocation status, optional dual-control authorisation). A leaked
+  recipient \emph{credential} (smartcard PIN) without HSM access
+  does not unwrap capsules. The HSM is itself audit-logged.
+\item \textbf{Short-lived recipient wrapping keys.} Recipients
+  maintain a hierarchy: a long-term identity key (HSM-bound) and a
+  shorter-lived wrapping subkey (rotated daily/weekly). Capsules
+  target the wrapping subkey. Subkey expiry truncates the
+  retrospective-decryption window if the subkey leaks.
+\item \textbf{Epoch keys.} The wrapping subkey is parameterised by a
+  monotonic epoch identifier $e$ ($1\text{ day}, 1\text{ week},
+  1\text{ month}$, by policy). Capsules embed the epoch. Verifiers
+  refuse capsules outside the active epoch window; the policy
+  registry rotates the active set. An attacker who recovers an
+  epoch-$e$ key can only decrypt envelopes sealed during epoch $e$.
+\item \textbf{Rewrap-on-access (key rotation without re-encrypt).}
+  When the recipient's wrapping key rotates, the sender (or a
+  delegated rewrap service) re-encapsulates the DEK for each
+  outstanding capsule under the new recipient key. The bulk chunks
+  are untouched. Old capsules are deleted from storage; the
+  ciphertext is now only decryptable by the new wrapping key.
+\item \textbf{Threshold release.} Sensitive historical envelopes
+  wrap the DEK under a Shamir-shared $(t, n)$ set of recipient
+  keys. No single compromised recipient unwraps the DEK; $t$
+  recipients must cooperate (see §\ref{sec:recovery}).
+\end{enumerate}
+
+\paragraph{Summary security statement.}
+\emph{Confidentiality is provided by hybrid X-Wing key
+establishment (X25519 + ML-KEM-768) with HKDF domain separation per
+protocol layer. Authenticity is provided by detached hybrid
+signatures (Ed25519 + ML-DSA-65) over canonical CBOR/COSE manifests
+and transcript-bound capability negotiation. Bulk payload encryption
+uses AES-256-GCM for the FIPS-oriented profile or ChaCha20-Poly1305
+for the software profile, with sequence-numbered nonces, per-object
+domain separation, and HKDF re-keying before nonce exhaustion.
+Transport forward secrecy is provided when both classical and PQ
+session secrets are ephemeral and erased after derivation; compromise
+of long-term signing or identity keys does not decrypt prior sessions
+but may enable impersonation until revocation. Stored envelopes use
+DEK wrapping and require separate key-rotation, rewrap, revocation,
+and recovery policy (see Section~\ref{sec:keys}).}
 
 \subsection{Lamport / SLH-DSA / XMSS for the long-term root}
 
@@ -763,7 +836,7 @@ pqsafe seal \
 # Open a sealed envelope
 pqsafe open --in report.pdf.pqsafe --out report.pdf
 
-# Verify only (no decrypt) — checks manifest signatures + Merkle root
+# Verify only (no decrypt) - checks manifest signatures + Merkle root
 pqsafe verify --in report.pdf.pqsafe
 
 # Revoke
