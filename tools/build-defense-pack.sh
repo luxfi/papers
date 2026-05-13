@@ -125,6 +125,8 @@ while IFS=$'\t' read -r name repo path pdf; do
     case "$repo" in
         luxfi/papers)   src_root="$repo_root" ;;
         hanzoai/papers) src_root="$hanzo_dir" ;;
+        luxfi/*)        src_root="${repo_root}/../$(echo "$repo" | cut -d/ -f2)" ;;
+        hanzoai/*)      src_root="${hanzo_dir%/papers}/$(echo "$repo" | cut -d/ -f2)" ;;
         *) echo "error: unknown repo '$repo' for $pdf" >&2; missing=$((missing + 1)); continue ;;
     esac
 
