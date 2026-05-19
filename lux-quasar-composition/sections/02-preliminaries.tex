@@ -1,0 +1,223 @@
+\section{Preliminaries}
+\label{sec:prelim}
+
+\subsection{Notation}
+
+Throughout, $\lambda$ denotes a security parameter (set to $128$ for
+NIST PQ Category 3). For a finite set $S$, $x \xleftarrow{\$} S$ denotes
+uniform sampling. A function $\epsilon(\lambda)$ is \emph{negligible}
+if for every polynomial $p$, $\epsilon(\lambda) < 1/p(\lambda)$ for
+all sufficiently large $\lambda$; we write $\mathsf{negl}(\lambda)$.
+The notation $H_X$ denotes a hash function modeled as a random oracle
+in domain-separated context $X$. The string $\mathsf{ctx}_X$ denotes
+the FIPS 204 \S5 context byte string for purpose $X$, fixed in
+Table~\ref{tab:domsep}.
+
+\subsection{Validator set}
+
+A Lux chain at consensus epoch $e$ has a validator set
+$\mathcal{V}_e = \{v_1, \ldots, v_n\}$ with stake distribution
+$\mathrm{stk}: \mathcal{V}_e \to \mathbb{N}$ and total stake
+$S_e = \sum_i \mathrm{stk}(v_i)$. Each validator $v_i$ holds:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item a BLS12-381 keypair $(\mathit{sk}_i^{\mathrm{BLS}},\,
+      \mathit{pk}_i^{\mathrm{BLS}})$ with proof of possession;
+\item a Pulsar threshold-secret share $\mathit{sk}_i^{\mathrm{Puls}}$
+      over the joint Pulsar group public key
+      $\mathit{pk}^{\mathrm{Puls}}$, produced by the Pulsar DKG
+      \cite{pulsarrepo};
+\item on the Aurora and Polaris profiles, a Corona share
+      $\mathit{sk}_i^{\mathrm{Cor}}$ over a joint
+      $\mathit{pk}^{\mathrm{Cor}}$ \cite{coronarepo};
+\item on the Polaris profile, a Magnetar share
+      $\mathit{sk}_i^{\mathrm{Mag}}$ over a joint
+      $\mathit{pk}^{\mathrm{Mag}}$ \cite{magnetarrepo};
+\item a per-validator ML-DSA-65 keypair $(\mathit{sk}_i^{\mathrm{ML}},
+      \mathit{pk}_i^{\mathrm{ML}})$ used for the Z-Chain rollup leg.
+\end{itemize}
+
+The Byzantine threshold is $f < n/3$ in count and $f < S_e/3$ in
+stake. The quorum threshold $\tau = \lfloor 2n/3 \rfloor + 1$ in count
+(or $\lceil 2 S_e / 3 \rceil$ in stake) is the minimum signer set
+required to assemble a valid leg. The validator set is committed to a
+Merkle root $\mathsf{validator\_root}_e$ at epoch boundaries.
+
+\subsection{Round digest}
+
+Each consensus round produces a \emph{round digest} $\mu$ that all legs
+sign or prove against. The round digest is defined as
+
+\begin{equation}
+\mu \;=\; H_{\mathsf{round}}\!\bigl(\mathsf{chain\_id}\,\|\, e\,\|\, r\,\|\,
+\mathsf{validator\_root}_e\,\|\, \mathsf{block\_hash}\bigr),
+\end{equation}
+
+where $\mathsf{chain\_id}$ is the 32-byte unique chain identifier, $e$
+is the epoch, $r$ is the round number, and $\mathsf{block\_hash}$ is
+the structural hash of the block being finalized. The digest is a
+32-byte SHA3-256 / Keccak-256 output. This binding makes cross-chain
+and cross-epoch replay structurally impossible (Theorem~\ref{thm:replay}).
+
+\subsection{BLS12-381 aggregate signatures}
+
+We use the proof-of-possession variant of BLS aggregation~\cite{ietfbls,
+boneh2001short,bonehshorth}: keys are generated as
+$\mathit{sk} \xleftarrow{\$} \mathbb{Z}_r$,
+$\mathit{pk} = \mathit{sk} \cdot G_2 \in \mathbb{G}_2$, each public
+key is published with a proof of possession (a BLS signature on the
+public key under itself, in a domain-separated context); signatures
+are $\sigma = \mathit{sk} \cdot H_{\mathbb{G}_1}(\mu) \in \mathbb{G}_1$;
+aggregation is point addition, $\sigma_{\mathrm{agg}} = \sum_{i \in Q}
+\sigma_i$; verification is
+$e(G_2, \sigma_{\mathrm{agg}}) = e(\mathit{apk}, H_{\mathbb{G}_1}(\mu))$
+with aggregated public key $\mathit{apk} = \sum_{i \in Q} \mathit{pk}_i$.
+Aggregated signatures are 48 bytes (compressed $\mathbb{G}_1$);
+verification cost is $O(1)$ in $|Q|$ and dominated by two pairings.
+
+\paragraph{Security assumption.}
+BLS-PoP is EUF-CMA under the co-CDH assumption on
+$(\mathbb{G}_1, \mathbb{G}_2, \mathbb{G}_T)$ in the random oracle
+model \cite{boneh2001short,boldyreva2003,bonehshorth}. The co-CDH
+assumption is broken in BQP by Shor's algorithm on the discrete
+logarithm in $\mathbb{F}_{q^{12}}$, so BLS contributes no PQ
+security: it is the \emph{classical} fast-path leg.
+
+\subsection{Pulsar: threshold ML-DSA-65}
+
+Pulsar~\cite{pulsarrepo} is the Lux production fork of the threshold
+ML-DSA construction of Celi et al.~\cite{tmldsa2025}, integrated with
+the Lux Secret Sharing (LSS) lifecycle~\cite{luxlssmpc}. The signing
+output is byte-identical to a single-party FIPS 204
+\cite{fips204} ML-DSA-65 signature on the group public key
+$\mathit{pk}^{\mathrm{Puls}}$, so verification uses the unmodified
+NIST verifier. NIST MPTC \cite{nistir8214c} classifies this as Class
+N1 (single-party-compatible threshold signing); the Lux deployment
+adds Class N4 (public-key preservation across resharing).
+
+\paragraph{Security assumption.}
+Pulsar's unforgeability reduces to the EUF-CMA security of FIPS 204
+ML-DSA-65, which in turn reduces to MLWE and MSIS at NIST Category 3
+(${\sim}128$-bit quantum security). The v0.1 Pulsar deployment has
+an aggregator-as-TCB caveat: a malicious aggregator can refuse to
+produce a signature (a liveness fault) but cannot produce a forgery,
+because the aggregator never holds enough material to bypass the
+threshold; this is documented in the Pulsar deployment runbook
+\cite{pulsarrepo}.
+
+\subsection{Corona: threshold R-LWE}
+
+Corona~\cite{coronarepo,boschini2024corona} is a two-round lattice
+threshold signature over the polynomial ring $R_q = \mathbb{Z}_q[X]/
+(X^N+1)$ with the Lux production parameter set $N = 256$, $q =
+2^{48} + 2561$ (NTT-friendly), module dimension $\ell = 8$. It
+follows a Schnorr-with-aborts structure: each party samples a nonce
+$\mathbf{y}_i$, broadcasts a commitment $\mathbf{w}_i = \mathbf{A}
+\mathbf{y}_i$, the challenge is $c = H_{\mathsf{cor}}(\mu \,\|\, \sum_i
+\mathbf{w}_i)$, and the response is $\mathbf{z}_i = \mathbf{y}_i + c
+\cdot \mathit{sk}_i^{\mathrm{Cor}}$ (with rejection sampling).
+Combination is Lagrange interpolation over the ring; verification
+checks $\|\mathbf{z}\| \leq B$ and the Fiat--Shamir relation.
+
+\paragraph{Security assumption.}
+Corona is SUF-CMA under the Module-LWE and Module-SIS assumptions
+in the random oracle model \cite{boschini2024corona}. The R-LWE
+hardness is a separate algebraic-lattice assumption from the
+M-LWE that backs ML-DSA: structural attacks against ideal-lattice
+families have not transferred between R-LWE and M-LWE parameters
+at production sizes \cite{albrechtestimator,bdgl2016}.
+
+\subsection{Magnetar: threshold SLH-DSA}
+
+Magnetar~\cite{magnetarrepo} is a threshold construction of FIPS 205
+\cite{fips205} SLH-DSA via \emph{reveal-and-aggregate} over the
+SLH-DSA scheme seed. The DKG protocol shares the joint master seed
+$S$ via byte-wise Shamir secret sharing over $\mathrm{GF}(257)$
+\cite{shamir1979}, with $t$-of-$n$ reconstruction; signing
+reconstructs $S$ inside an aggregator's memory, calls
+\texttt{slhdsa.SignDeterministic} once on the reconstructed seed, and
+immediately zeroizes. The signature is byte-identical to a single-party
+FIPS 205 SLH-DSA signature on the joint group public key.
+
+\paragraph{Security assumption.}
+Magnetar's unforgeability reduces to SLH-DSA's EUF-CMA security,
+which in turn reduces to the second-preimage and target-collision
+resistance of SHA-3 / SHAKE-192 (or SHAKE-256, depending on
+parameter set). The v0.1 reveal-and-aggregate construction has an
+aggregator-as-TCB caveat identical in spirit to Pulsar v0.1: the
+aggregator briefly holds the reconstructed master seed and must
+zeroize. The Tier B status of Magnetar reflects that this caveat
+has not yet been audited end-to-end; production deployment of the
+Polaris profile is gated on Tier A audit of Magnetar
+\cite{magnetarrepo}.
+
+\subsection{Z-Chain Groth16 rollup of ML-DSA-65}
+
+The Z-Chain VM~\cite{chainsrepo} runs a Groth16~\cite{groth2016}
+prover for the relation
+
+\begin{equation}
+\mathcal{R}_{\mathrm{ZK}} \;=\; \Bigl\{\, (x;\, w)
+\;:\; x = (\mu, h_x),\;
+w = \bigl(\{\mathit{pk}_i^{\mathrm{ML}}\}_i,
+\{\sigma_i^{\mathrm{ML}}\}_i\bigr)\,\Bigr\},
+\end{equation}
+
+with predicate
+
+\begin{equation*}
+\Phi(x, w) \;\iff\;
+h_x = H_{\mathsf{Poseidon}}\!\bigl(\{\mathit{pk}_i^{\mathrm{ML}}\}_i\,\|\,\mu\bigr)
+\;\;\wedge\;\;
+\sum_i \bigl[\!\bigl[\,\mathsf{MLDSA.Verify}(\mathit{pk}_i^{\mathrm{ML}}, \mu, \sigma_i^{\mathrm{ML}}) = 1\,\bigr]\!\bigr]
+\;\geq\; \tau,
+\end{equation*}
+
+where $\tau = \lfloor 2n/3 \rfloor + 1$ and ML-DSA verification is
+the FIPS 204 algorithm. The Groth16 proof $\pi_{\mathrm{ZK}}$ is
+$(A, B, C) \in \mathbb{G}_1 \times \mathbb{G}_2 \times \mathbb{G}_1$,
+totalling $48 + 96 + 48 = 192$ bytes compressed.
+
+\paragraph{Security assumption.}
+Groth16 is knowledge-sound in the algebraic group model on
+BLS12-381 \cite{groth2016}; the verifying key $\mathit{vk}_Z$ is the
+output of a powers-of-tau ceremony plus a circuit-specific phase 2
+with $\geq 1024$ contributors \cite{bowegabizonmiers}. Knowledge
+soundness requires the BLS12-381 discrete log assumption and is
+therefore \emph{not} post-quantum: a quantum adversary running Shor
+on $\mathbb{F}_{q^{12}}$ can extract trapdoors and forge
+$\pi_{\mathrm{ZK}}$. However, $\pi_{\mathrm{ZK}}$ commits to the
+public-input hash $h_x$ which in turn commits to the validator set
+and round digest; forging $\pi_{\mathrm{ZK}}$ does not produce
+forged Pulsar / Corona / Magnetar signatures, so the conjunctive
+composition still requires breaking those PQ legs to forge the
+cert as a whole (Theorem~\ref{thm:composition}).
+
+\subsection{Hash functions and domain separation}
+
+All hash invocations use domain-separated contexts per FIPS 204 \S5
+and SP 800-185 (cSHAKE / KMAC). Table~\ref{tab:domsep} lists the
+context strings used by the QuasarCert legs.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Context string} & \textbf{Hash} & \textbf{Used by} \\
+\midrule
+\texttt{lux-quasar-cert-v1} & SHAKE-256 & Pulsar leg of QuasarCert \\
+\texttt{lux-corona-cert-v1} & SHAKE-256 & Corona leg of QuasarCert \\
+\texttt{lux-magnetar-cert-v1} & SHAKE-256 & Magnetar leg of QuasarCert \\
+\texttt{lux-quasar-zchain-witness-v1} & SHAKE-256 & per-validator ML-DSA into Groth16 \\
+\texttt{lux-quasar-bls-domain-v1} & SHA-256 & BLS hash-to-curve $H_{\mathbb{G}_1}$ \\
+\texttt{lux-quasar-round-digest-v1} & SHA3-256 & round-digest $\mu$ construction \\
+\texttt{lux-quasar-validator-root-v1} & SHA3-256 & validator-set Merkle root \\
+\bottomrule
+\end{tabular}
+\caption{Domain-separation contexts used by QuasarCert legs.
+Mismatches across legs prevent cross-leg signature transfer (e.g.,
+a BLS signature cannot be replayed as a Pulsar input even if the
+same byte string is presented).}
+\label{tab:domsep}
+\end{table}

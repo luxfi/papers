@@ -1,0 +1,182 @@
+\section{Consensus Engine Binding}
+\label{sec:binding}
+
+\subsection{The Lux consensus engine}
+
+The Lux consensus engine \cite{consensusrepo} is a unified driver for
+two modes: linear-chain (Nova) and DAG (Nebula). Both modes follow
+the same per-round protocol family --- Photon (committee selection),
+Wave (threshold voting + Fast Probabilistic Consensus), Focus
+(consecutive-success counter), Prism (DAG geometry / cuts), Flare
+(cert / skip via $2f+1$ quorum), Horizon (DAG safe-prefix), Ray
+(linear finality driver), Field (DAG finality driver). The full
+package layout is documented at \texttt{luxfi/consensus/protocol/}.
+
+Quasar lives at \texttt{protocol/quasar/} and is the cert-producing
+layer that the consensus driver invokes once a $2f+1$ quorum is
+observed. The driver does not know what kind of cert Quasar produces;
+it only knows that Quasar emits a \texttt{QuasarCert} byte string
+that it forwards to the block's \texttt{Cert} field. Verification on
+incoming blocks is symmetrical: the driver passes the cert bytes to
+\texttt{quasar.Verify}; the engine treats the result as a black-box
+boolean.
+
+This is the orthogonality discipline: the consensus engine handles
+ordering, voting, and reachability; Quasar handles cryptographic
+finality; the QuasarCert is the only shared interface between them.
+
+\subsection{Per-round witness pattern}
+
+A consensus round at height $h$ proceeds as follows. The committee
+$C_h$ is selected via Photon's $K$-of-$N$ scheme; the proposer
+broadcasts the block $B_h$ over the ZAP wire protocol
+\cite{lp020}; voting proceeds via Wave until a $2f+1$ quorum is
+observed; the engine invokes
+\texttt{quasar.Sign(committee, block, profile)} to produce
+$\mathcal{C}_h$.
+
+Inside \texttt{quasar.Sign}, the legs are signed in parallel:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item The BLS leg is the aggregate of per-validator BLS signatures
+      on the round digest $\mu$. Each validator signs locally and
+      broadcasts; the engine collects $\geq \tau$ signatures and
+      aggregates by point addition (Section~\ref{sec:prelim}).
+\item The Pulsar leg is produced by the Pulsar two-round threshold
+      protocol \cite{pulsarrepo}: Round-1 commitments
+      $\mathbf{w}_i = \mathbf{A}\mathbf{y}_i$ are broadcast; the
+      aggregator collects them, computes the challenge $c =
+      H_{\mathsf{Puls}}(\mu \,\|\, \sum_i \mathbf{w}_i)$, and
+      forwards to Round-2; validators emit $\mathbf{z}_i$; the
+      aggregator combines via Lagrange interpolation and emits the
+      byte-equal FIPS 204 signature.
+\item The Corona leg (on Aurora / Polaris) follows the same
+      two-round structure on the R-LWE ring
+      \cite{coronarepo,boschini2024corona}.
+\item The Magnetar leg (on Polaris) follows the v0.1 reveal-and-aggregate
+      protocol \cite{magnetarrepo}: validators emit Shamir shares of
+      the master seed; the aggregator reconstructs $S$, calls
+      \texttt{slhdsa.SignDeterministic}, and zeroizes $S$.
+\item The Z-Chain leg is produced asynchronously by Z-Chain validators:
+      per-validator ML-DSA-65 signatures are streamed to Z-Chain,
+      which produces a Groth16 proof of valid signature quorum over a
+      window of $W \approx 1024$ rounds. The proof is emitted once
+      per window, not per block; for blocks within a window without
+      a fresh proof, the cert carries the most recent valid proof
+      bound to the same epoch.
+\end{itemize}
+
+The legs are signed in parallel because they are independent
+cryptographic operations on the same round digest $\mu$. The cert is
+assembled by concatenating the leg bytes per the wire format of
+Section~\ref{sec:wire}, and is broadcast as part of the block's
+\texttt{Cert} field.
+
+\subsection{Verification flow}
+
+On the receiving side, the consensus engine invokes
+\texttt{quasar.Verify(cert, block, validators, profile)} which
+performs the predicate of Definition~\ref{def:verify}. The verify
+function is stateless --- it depends only on its arguments --- and
+returns a boolean. The engine accepts the block iff verify returns
+true; rejection causes the block to be dropped from the local DAG
+or chain.
+
+Because each leg has its own verifier, the legs may be verified in
+parallel. The Lux \texttt{quasar.Verify} implementation dispatches
+each leg to its primitive verifier as a goroutine, with a fast-fail:
+if any leg returns false, the others are cancelled. This achieves
+the lowest verify latency (bounded by the slowest leg, not the sum).
+
+\subsection{Quasar in the linear-chain and DAG drivers}
+
+In the linear-chain driver (\texttt{Nova}), Quasar is invoked once
+per finalized block. The cert is stored on the block and propagated
+to peers via ZAP.
+
+In the DAG driver (\texttt{Nebula}), Quasar is invoked once per
+finalized vertex along the DAG's safe-prefix commitment line
+\cite{lp020}. The cert is stored on the vertex and the DAG store
+(\texttt{core/dag/}) indexes certs by vertex ID for light-client
+querying.
+
+Both drivers use the \emph{same} \texttt{quasar.QuasarCert} byte
+structure --- the wire format is independent of the consensus mode.
+This is critical because Lux supports mixed-mode subnet topologies:
+a chain may run linear-chain consensus while its parent runs DAG
+consensus, and certs flow between them via Warp messaging.
+
+\subsection{Warp messaging carries cert finality}
+
+Cross-chain messaging on Lux uses the Warp protocol
+\cite{quasarcertsoundness,lp075}: a message from chain $c_1$ to
+chain $c_2$ is signed by $c_1$'s validators and is verified by
+$c_2$'s validators using $c_1$'s known public keys.
+
+A Warp message carries the source chain's QuasarCert as the
+finality witness. The destination chain runs
+\texttt{quasar.Verify(cert, block, validators, profile)} against the
+source chain's profile and validator set, then trusts the message
+as finalized.
+
+This means the QuasarCert is the universal finality envelope: every
+cross-chain interaction in the Lux ecosystem carries a verifiable
+PQ-finality witness. The wire-format stability commitment in
+Section~\ref{sec:wire} is what makes this work: a single
+\texttt{QuasarCert} can be verified against any Lux chain's
+validator set, profile, and primitives.
+
+\subsection{Z-Chain rollup async dependency}
+
+The Z-Chain Groth16 leg has a unique structure: it is not produced
+per-block on the source chain; it is produced asynchronously by
+Z-Chain validators over a window. This means the $\mathrm{ZK}$ leg
+of $\mathcal{C}_h$ may carry a Groth16 proof produced at height
+$h - k$ for some $k \in [0, W)$, where $W$ is the rollup window
+size.
+
+The freshness invariant is that the proof must be bound to the same
+\emph{epoch} as the block; an epoch boundary forces a fresh proof.
+This is enforced by the round-digest construction
+(Section~\ref{sec:prelim}): $\mu$ includes the epoch $e$, so a
+proof bound to epoch $e$ cannot be replayed for epoch $e' \neq e$.
+
+Within an epoch, the proof's freshness window provides bandwidth
+amortization: a single Groth16 proof can cover up to $W \approx 1024$
+blocks before a new proof is required. This amortizes the
+${\sim}400$ ms CPU prover time (or ${\sim}5$--$15$ ms GPU prover time;
+see Appendix B of \cite{quasarcertsoundness}) across the window.
+
+The trade-off: a block at height $h$ may carry a proof produced for
+the validator-set state at height $h - k$. If a validator changes
+keys mid-epoch, the proof remains valid against the older root, but
+new validators may not appear in the proof. This is acceptable
+because the validator set is stable within an epoch (validator-set
+rotations happen at epoch boundaries by construction).
+
+\subsection{Dynamic resharing}
+
+The Pulsar / Corona / Magnetar group public keys must remain stable
+across validator-set rotations, otherwise a key rotation would
+invalidate the cert format. This is achieved via verifiable
+secret resharing \cite{luxlssmpc}: when the validator set rotates
+from $\mathcal{V}_e$ to $\mathcal{V}_{e+1}$, each retiring validator
+shares its threshold secret with the incoming set under the same
+group public key.
+
+The Lux Secret Sharing (LSS) framework \cite{luxlssmpc} is the
+generic adapter for this lifecycle. Pulsar instantiates LSS with
+the Pulsar key-era / resharing / activation-cert lifecycle
+\cite{pulsarrepo}; Corona will do the same once its Tier A
+documentation completes (current status Tier A docs landed
+\cite{coronarepo}); Magnetar's reshare semantics under the v0.1
+reveal-and-aggregate construction are degenerate (because the
+master seed is the durable secret, not the per-party shares;
+resharing is a fresh DKG).
+
+The key observation is that resharing is \emph{orthogonal} to the
+QuasarCert format: the cert carries no resharing transcript; the
+resharing is governed by the LSS lifecycle and committed to the
+\texttt{validator\_root}$_e$ Merkle root at epoch boundaries. The
+cert sees only the post-resharing public keys, never the resharing
+process itself.
