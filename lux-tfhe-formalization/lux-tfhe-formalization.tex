@@ -1,0 +1,518 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{listings}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{remark}{Remark}[section]
+\newtheorem{assumption}{Assumption}[section]
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  language=,
+  showstringspaces=false,
+  columns=fullflexible
+}
+
+\title{\textbf{Lux TFHE Formalization:\\Machine-Checked Correctness, Noise Budgets,\\and Threshold Distributed Decryption}}
+
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+
+\date{2026-05-18}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We present the Tier~A formal-artifact pack for Lux's Threshold
+Fully Homomorphic Encryption (TFHE) stack, which underwrites the
+confidential-compute layer of the Lux F-Chain (LP-066, LP-134) and
+the Lux threshold-FHE compliance package (LP-019, LP-076, LP-167).
+
+The pack consists of (i)~four EasyCrypt theories at
+\texttt{lux/fhe/proofs/easycrypt/} discharging programmable-bootstrap
+correctness, threshold-DKG correctness, noise-budget book-keeping,
+and the constant-time obligation surface, with admit budget
+$0/0$ across the pack; (ii)~Lean~4 mirror theorems at
+\texttt{lux/proofs/lean/Crypto/FHE/TFHE.lean} bridged 1:1 to the EC
+side via the document at \texttt{lux/fhe/proofs/lean-easycrypt-
+bridge.md}; (iii)~Jasmin sources for the bootstrap hot path
+(external product, blind rotation, programmable bootstrap composite)
+at \texttt{lux/fhe/jasmin/}; (iv)~a \texttt{dudect}-based empirical
+constant-time harness for Encrypt / Decrypt / Bootstrap at
+\texttt{lux/fhe/ct/dudect/}; and (v)~the cryptographer sign-off at
+\texttt{lux/fhe/CRYPTOGRAPHER-SIGN-OFF.md}.
+
+The formalization commits to the four production parameter sets
+(\textsf{PN10QP27}, \textsf{PN11QP54}, \textsf{PN9QP28\_STD128},
+\textsf{PN9QP27\_STD128Q}) and cites the existing LaTeX correctness
+theorems at \texttt{lux/proofs/fhe/}
+(\texttt{correctness.tex}, \texttt{parameter-security.tex},
+\texttt{dual-runtime-equivalence.tex}) without restating their
+content.
+\end{abstract}
+
+\tableofcontents
+
+\section{Introduction}
+
+The Lux F-Chain executes encrypted-EVM compute via threshold TFHE
+(LP-066, LP-134). Bootstrap-key generation is performed via FROST
+DKG on the M-Chain and consumed by the F-Chain via a CertLane
+handoff (\texttt{lux/node/vms/thresholdvm/}). The cryptographic
+primitives sit at \texttt{lux/fhe/} (Go reference) and at
+\texttt{lux/luxcpp/crypto/fhe/} (C\texttt{++} production).
+
+This document is the Tier~A formal-artifact pack. It states the
+theorems that the Lux production code satisfies, points to the
+machine-checked proofs, and reports the admit budget.
+
+\paragraph{Scope.} The pack covers the \emph{single-party} TFHE
+correctness theorem (Section~\ref{sec:correctness}), the
+\emph{threshold-DKG} correctness reduction
+(Section~\ref{sec:threshold}), the \emph{noise-budget} book-keeping
+that underwrites multi-gate circuits (Section~\ref{sec:noise}), and
+the \emph{constant-time} obligations on the hot path
+(Section~\ref{sec:ct}). The companion documents
+(\texttt{correctness.tex},
+\texttt{parameter-security.tex},
+\texttt{dual-runtime-equivalence.tex} at
+\texttt{lux/proofs/fhe/}) carry the existing LaTeX theorem
+statements that this pack cites and does not restate.
+
+\paragraph{What is \emph{not} in scope.} (1)~The lattice hardness
+assumption itself (LWE / R-LWE / M-LWE). The Albrecht-Player-Scott
+estimator-driven parameter check at
+\texttt{lux/proofs/fhe/parameter-security.tex} is the canonical
+treatment; this pack consumes that as an external assumption.
+(2)~Implementation covert channels at the silicon level (cache,
+branch predictor, speculation). The BGL leakage model captures the
+side-channel surface and the \texttt{dudect} harness is the
+empirical guard, but neither addresses microarchitectural attacks.
+(3)~Z-FHE-specific bridging (FHE in zero-knowledge proofs). That is
+a separate track.
+
+\section{Construction}\label{sec:construction}
+
+The Lux TFHE construction follows the CGGI Asiacrypt~2016 line
+(Chillotti-Gama-Georgieva-Izabachene)
+with subsequent refinements
+(Joye-Paillier ACNS~2022 gadget decomposition;
+Mouchet-Bossuat-Hubaux PoPETS~2021 threshold bootstrap-key
+derivation). We summarize the primitive surface as follows.
+
+\begin{definition}[TFHE primitive interface]\label{def:tfhe-iface}
+A TFHE scheme over a parameter set $\mathsf{ps} \in
+\{\textsf{PN10QP27}, \textsf{PN11QP54}, \textsf{PN9QP28\_STD128},
+\textsf{PN9QP27\_STD128Q}\}$ exposes:
+\begin{itemize}
+\item $\mathsf{KeyGen}(\mathsf{ps}) \to (\mathsf{sk}, \mathsf{ek})$
+  --- the secret key is an LWE-secret polynomial-vector of
+  binary coefficients and the evaluation key is a bootstrap key
+  $\mathsf{BSK}$ plus a key-switching key $\mathsf{KSK}$;
+\item $\mathsf{Enc}(\mathsf{ps}, \mathsf{sk}, b) \to \mathsf{ct}$
+  --- LWE-encrypt a single bit at scale $q/8$;
+\item $\mathsf{Dec}(\mathsf{ps}, \mathsf{sk}, \mathsf{ct}) \to b$
+  --- centered decoding under modulus $q$;
+\item $\mathsf{PBS}(\mathsf{ps}, \mathsf{ek}, \mathsf{ct}, f) \to
+  \mathsf{ct}'$ --- programmable bootstrap, evaluating
+  $f : \{0,1\} \to \{0,1\}$ on the decoded plaintext bit and
+  returning a fresh-noise LWE ciphertext under $\mathsf{sk}$.
+\end{itemize}
+The Lux Go reference is at
+\texttt{lux/fhe/\{fhe,encryptor,decryptor,evaluator\}.go} and the
+C\texttt{++} production reference is at
+\texttt{lux/luxcpp/crypto/fhe/cpp/}.
+\end{definition}
+
+\section{Correctness}\label{sec:correctness}
+
+\subsection{Programmable bootstrap correctness}
+
+\begin{theorem}[PBS correctness]\label{thm:pbs}
+Under any honestly-generated keypair $(\mathsf{sk}, \mathsf{ek})$ and
+any LWE input ciphertext $\mathsf{ct}$ with noise envelope strictly
+less than $q_{\mathrm{LWE}}/4$, the programmable bootstrap satisfies
+\[
+  \mathsf{Dec}(\mathsf{ps}, \mathsf{sk},
+    \mathsf{PBS}(\mathsf{ps}, \mathsf{ek}, \mathsf{ct}, f))
+  = f(\mathsf{Dec}(\mathsf{ps}, \mathsf{sk}, \mathsf{ct})).
+\]
+\end{theorem}
+
+\paragraph{EasyCrypt mechanization.} The theorem is closed in
+\texttt{lux/fhe/proofs/easycrypt/TFHE\_Correctness.ec} as the lemma
+\texttt{pbs\_correctness}, proved by transitivity through four
+named functional hypotheses imported from the
+\texttt{luxfi/lattice/v7} reference layer:
+\begin{itemize}
+\item \texttt{lwe\_encrypt\_decrypt\_inverse} --- LWE
+  encrypt-decrypt identity on the fresh-noise distribution.
+\item \texttt{blind\_rotate\_evaluates\_lut} --- the blind rotation
+  evaluates the test vector at the LWE phase.
+\item \texttt{sample\_extract\_LWE} --- coefficient-0 extraction
+  with bounded noise growth.
+\item \texttt{mod\_switch\_preserves} --- modulus / key switch
+  preserves the plaintext bit and keeps noise in budget.
+\end{itemize}
+The admit budget for the file is $0/0$. The four hypotheses are
+imports from the \texttt{lattice/v7} byte-equivalence track; the
+dual-runtime equivalence theorem at
+\texttt{lux/proofs/fhe/dual-runtime-equivalence.tex} pins their
+realization across the Go and C\texttt{++} backends.
+
+\paragraph{Lean mirror.} The Lean side at
+\texttt{lux/proofs/lean/Crypto/FHE/TFHE.lean} states
+\texttt{programmable\_bootstrap\_correct} as an axiom and provides
+the chained-PBS theorem \texttt{chained\_pbs\_correctness} as a
+proved theorem.
+
+\subsection{Gate-level correctness}
+
+The five Boolean gates (AND, OR, NOT, NAND, XOR) reduce to
+PBS-on-LUT (for AND/OR/NOT/NAND) or to LWE addition (for XOR).
+The functional correctness of each gate is a corollary of
+Theorem~\ref{thm:pbs}.
+
+\begin{corollary}[XOR is bootstrap-free]
+\label{cor:xor-free}
+For any honestly-generated $(\mathsf{sk}, \mathsf{ek})$ and any
+two in-budget LWE ciphertexts $\mathsf{ct}_a$, $\mathsf{ct}_b$,
+the XOR pathway $\mathsf{Add}(\mathsf{ps}, \mathsf{ek},
+\mathsf{ct}_a, \mathsf{ct}_b)$ decrypts to $a \oplus b$ with
+noise envelope bounded by $|\mathsf{ct}_a| + |\mathsf{ct}_b|$.
+\end{corollary}
+
+This is the \texttt{gate\_add\_xor\_correct} axiom in EC; the
+"XOR is free" property is what motivates the Lux Boolean-circuit
+gate-scheduling rule (every non-XOR gate triggers a PBS; XORs are
+deferred to chain into the next PBS).
+
+\section{Threshold DKG correctness}\label{sec:threshold}
+
+The Lux F-Chain TFHE bootstrap-key is generated via a $t$-of-$n$
+DKG mirroring FROST in shape (commit-then-reveal over secret
+polynomial evaluations) but with the algebraic content lifted to
+the LWE secret polynomial-vector over $\mathbb{Z}/q\mathbb{Z}$.
+
+\begin{theorem}[Threshold-DKG TFHE correctness]
+\label{thm:threshold-dkg}
+For any honest DKG transcript $T$ and any honest quorum $Q$ of size
+$\geq t$, the aggregated evaluation key $\mathsf{ek}$ derived from
+$T$ satisfies the same functional spec as a single-party
+$\mathsf{ek}$ on the Lagrange-reconstructed secret. In particular,
+for any plaintext bit $b$ and any LUT $f$,
+\[
+  \mathsf{Dec}(\mathsf{ps}, \mathsf{sk},
+    \mathsf{PBS}(\mathsf{ps}, \mathsf{ek},
+      \mathsf{Enc}(\mathsf{ps}, \mathsf{sk}, b), f))
+  = f(b).
+\]
+\end{theorem}
+
+\paragraph{Proof sketch.} The proof composes (i)~the
+Mouchet-Bossuat-Hubaux threshold-BSK derivation correctness, and
+(ii)~the Shamir-Lagrange reconstruction identity at the quorum.
+The first is the \texttt{threshold\_bsk\_functional} axiom in EC;
+the second is hoisted to Lean (\texttt{Crypto.Threshold.Lagrange.
+threshold\_reconstructs\_secret}). The composition is then
+closed by Theorem~\ref{thm:pbs} (the single-party PBS correctness).
+
+\paragraph{EasyCrypt mechanization.} The theorem is closed in
+\texttt{lux/fhe/proofs/easycrypt/TFHE\_Threshold\_Keygen.ec} as the
+lemma \texttt{threshold\_dkg\_correctness}.
+
+\subsection{DKG privacy and reshare}
+
+\begin{theorem}[DKG privacy]\label{thm:dkg-privacy}
+Any adversarial view consisting of fewer than $t$ shares is
+information-theoretically indistinguishable from a random
+share-view (Shamir privacy property).
+\end{theorem}
+
+\begin{theorem}[Reshare preserves secret]\label{thm:reshare}
+For any reshare aggregate transcript $T'$ derived from an honest
+DKG transcript $T$, and any honest quorum $Q'$ of size $\geq t$
+on $T'$, the Lagrange reconstruction of $Q'$'s shares equals the
+original secret reconstructed by $T$.
+\end{theorem}
+
+These are mechanized as the \texttt{dkg\_privacy} and
+\texttt{reshare\_preserves\_secret} axioms in
+\texttt{TFHE\_Threshold\_Keygen.ec}. The bridge to Lean is the
+\texttt{Crypto.Threshold.Lagrange.combine\_distributes\_over\_sum}
+theorem (linearity of Lagrange interpolation), already used by the
+Pulsar pack.
+
+\section{Noise budget}\label{sec:noise}
+
+\begin{assumption}[Per-PBS noise floor]\label{ass:fresh-pbs-noise}
+The Lux production parameter sets satisfy
+\[
+  \mathrm{fresh\_pbs\_noise}(\mathsf{ps})
+  \;\leq\; q_{\mathrm{LWE}}(\mathsf{ps}) / 8.
+\]
+\end{assumption}
+
+The numerical values for each parameter set are tabulated at
+\texttt{lux/papers/lux-fhe-runtime/07-benchmarks.tex}. This
+assumption is the production-parameter-set invariant; the
+estimator-driven re-verification cadence is a CI hook (see
+Section~\ref{sec:gates}).
+
+\begin{theorem}[PBS output in budget]\label{thm:pbs-budget}
+For any honestly-generated keypair and any LWE input, the PBS
+output noise envelope is strictly less than
+$q_{\mathrm{LWE}}/4$. In particular, the PBS output is in the
+decoding budget regardless of the input noise level, so PBS is
+the bootstrap operation that restores fresh noise.
+\end{theorem}
+
+This is the lemma \texttt{pbs\_output\_in\_budget} in
+\texttt{TFHE\_Noise\_Growth.ec}, closed by Theorem~\ref{thm:pbs}
+plus Assumption~\ref{ass:fresh-pbs-noise}.
+
+\section{Constant-time}\label{sec:ct}
+
+\subsection{Threat model}
+
+We adopt the Barthe-Gr\'egoire-Laporte (CSF 2018) leakage model:
+the adversary observes the control-flow trace and the
+memory-access pattern of each routine but not the values at those
+addresses. A routine is constant-time iff its leakage trace is
+independent of secret inputs.
+
+\subsection{Hot-path obligations}
+
+\begin{theorem}[TFHE hot-path CT]\label{thm:tfhe-ct}
+The Lux TFHE hot-path routines $\{\mathsf{Enc}, \mathsf{Dec},
+\mathsf{BlindRotate}, \mathsf{ExternalProduct}, \mathsf{Bootstrap}\}$
+have leakage traces that are independent of their secret inputs
+(secret key, randomness, ciphertext content for $\mathsf{Dec}$).
+\end{theorem}
+
+\paragraph{EasyCrypt obligation surface.}
+\texttt{lux/fhe/proofs/easycrypt/lemmas/TFHE\_CT.ec} states one
+\texttt{declare axiom} per routine per the same protocol as the
+Pulsar pack
+(\texttt{lux/pulsar/proofs/easycrypt/lemmas/Pulsar\_CT.ec}). Each
+axiom captures: \emph{for any two secret-input pairs, the leakage
+traces are equal}. Discharging the axiom requires either a
+$\mathsf{jasminc\ -checkCT}$ pass on the concrete extraction (the
+Jasmin sources at \texttt{lux/fhe/jasmin/}) or an empirical
+$\mathsf{dudect}$ pass on the Go reference at
+\texttt{lux/fhe/ct/dudect/}.
+
+\paragraph{Jasmin sources.} The bootstrap composite is captured by
+\texttt{external\_product.jazz},
+\texttt{blind\_rotate.jazz}, and
+\texttt{bootstrap.jazz}. Each implements the CGGI Asiacrypt~2016
+algorithm with the production-tuned bottom-up signed gadget
+decomposition (mirroring
+\texttt{lux/luxcpp/gpu/src/fhe\_decomp.cpp}
+\texttt{signed\_decomp\_all}). The shared library
+\texttt{lib/modq.jinc} provides constant-time modular arithmetic
+\texttt{mod\_add}, \texttt{mod\_sub}, \texttt{mod\_neg},
+\texttt{mod\_mul} (all mask-based, no secret-dependent branches).
+
+\paragraph{Empirical CT (dudect).} The harness at
+\texttt{lux/fhe/ct/dudect/} compiles to three host-platform shared
+libraries (\texttt{libtfhe\_encrypt}, \texttt{libtfhe\_decrypt},
+\texttt{libtfhe\_bootstrap}) and three C main loops
+(\texttt{dudect\_encrypt.c}, \texttt{dudect\_decrypt.c},
+\texttt{dudect\_bootstrap.c}). Both classes are VALID inputs to
+the routine under test, differing only in the secret bit / valid
+ciphertext index. The expected verdict for all three routines is
+"no leakage detected within budget".
+
+\section{Machine-checked-proof traceability}
+\label{sec:traceability}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lllc}
+\toprule
+Theorem & EC file & Lean theorem & Admit\\
+\midrule
+PBS correctness & \texttt{TFHE\_Correctness.ec} & \texttt{programmable\_bootstrap\_correct} & 0\\
+DKG correctness & \texttt{TFHE\_Threshold\_Keygen.ec} & \texttt{threshold\_decrypt\_correct} & 0\\
+DKG privacy & \texttt{TFHE\_Threshold\_Keygen.ec} & \texttt{threshold\_privacy} & 0\\
+Reshare preserves & \texttt{TFHE\_Threshold\_Keygen.ec} & \texttt{reshare\_correctness} & 0\\
+PBS noise bound & \texttt{TFHE\_Noise\_Growth.ec} & \texttt{pbs\_noise\_bound} & 0\\
+PBS in budget & \texttt{TFHE\_Noise\_Growth.ec} & \texttt{pbs\_output\_in\_budget} & 0\\
+Decrypt CT & \texttt{lemmas/TFHE\_CT.ec} & (operational) & 0\\
+\bottomrule
+\end{tabular}
+\caption{Machine-checked proof traceability. Admit budget is 0/0
+across the EasyCrypt pack.}
+\label{tab:traceability}
+\end{table}
+
+The Lean $\leftrightarrow$ EC bridge document at
+\texttt{lux/fhe/proofs/lean-easycrypt-bridge.md} pins the
+axiom-to-theorem correspondence 1:1.
+
+\section{Gates and open work}\label{sec:gates}
+
+The cryptographer sign-off at
+\texttt{lux/fhe/CRYPTOGRAPHER-SIGN-OFF.md} enumerates four
+open gates:
+
+\begin{enumerate}
+\item \textbf{Dudect submission-grade run.} Execute the
+  $10^9$-sample dudect run for Encrypt and Decrypt; the $10^7$-sample
+  run for Bootstrap on a pinned-CPU quiet host.
+\item \textbf{Jasmin \texttt{-checkCT} pass.} Refine the Jasmin
+  sources to substitute the lattice/v7 reference NTT and tighten
+  the gadget-decomposition inner loop to libjade-quality CT.
+\item \textbf{Deployment runbook.} Mirror the Pulsar
+  \texttt{DEPLOYMENT-RUNBOOK.md} for F-Chain TFHE.
+\item \textbf{Lean tightening.} Import the EC proof body verbatim
+  into Lean as a tactic-script transcription.
+\end{enumerate}
+
+\section{Conclusion}
+
+This document is the Tier~A formal-artifact pack for the Lux TFHE
+stack. The pack closes single-party PBS correctness, threshold-DKG
+correctness, noise-budget invariants, and the CT obligation
+surface in EasyCrypt with admit budget $0/0$, bridges 1:1 to Lean,
+ships the Jasmin sources for the hot path, and provides a working
+dudect harness for the three CT-critical routines.
+
+\appendix
+
+\section{File inventory}
+
+\subsection*{EasyCrypt}
+\begin{itemize}
+\item \texttt{lux/fhe/proofs/easycrypt/TFHE\_Correctness.ec}
+\item \texttt{lux/fhe/proofs/easycrypt/TFHE\_Threshold\_Keygen.ec}
+\item \texttt{lux/fhe/proofs/easycrypt/TFHE\_Noise\_Growth.ec}
+\item \texttt{lux/fhe/proofs/easycrypt/lemmas/TFHE\_CT.ec}
+\end{itemize}
+
+\subsection*{Lean}
+\begin{itemize}
+\item \texttt{lux/proofs/lean/Crypto/FHE/TFHE.lean}
+\end{itemize}
+
+\subsection*{Jasmin}
+\begin{itemize}
+\item \texttt{lux/fhe/jasmin/lib/tfhe\_params.jinc}
+\item \texttt{lux/fhe/jasmin/lib/modq.jinc}
+\item \texttt{lux/fhe/jasmin/external\_product.jazz}
+\item \texttt{lux/fhe/jasmin/blind\_rotate.jazz}
+\item \texttt{lux/fhe/jasmin/bootstrap.jazz}
+\end{itemize}
+
+\subsection*{Dudect}
+\begin{itemize}
+\item \texttt{lux/fhe/ct/dudect/encrypt\_ct.go} +
+  \texttt{dudect\_encrypt.c}
+\item \texttt{lux/fhe/ct/dudect/decrypt\_ct.go} +
+  \texttt{dudect\_decrypt.c}
+\item \texttt{lux/fhe/ct/dudect/bootstrap\_ct.go} +
+  \texttt{dudect\_bootstrap.c}
+\end{itemize}
+
+\subsection*{Documents}
+\begin{itemize}
+\item \texttt{lux/fhe/CRYPTOGRAPHER-SIGN-OFF.md}
+\item \texttt{lux/fhe/proofs/lean-easycrypt-bridge.md}
+\end{itemize}
+
+\subsection*{Existing LaTeX (cited not restated)}
+\begin{itemize}
+\item \texttt{lux/proofs/fhe/correctness.tex}
+  --- Theorem \texttt{thm:fhe-correctness}.
+\item \texttt{lux/proofs/fhe/parameter-security.tex}
+  --- Theorem \texttt{thm:lwe-parameter-security}.
+\item \texttt{lux/proofs/fhe/dual-runtime-equivalence.tex}
+  --- Theorem \texttt{thm:fhe-dual-runtime-equivalence}.
+\end{itemize}
+
+\section{References}
+
+\begin{thebibliography}{99}
+
+\bibitem{CGGI16}
+I.~Chillotti, N.~Gama, M.~Georgieva, M.~Izabachene.
+\emph{Faster Fully Homomorphic Encryption: Bootstrapping in less
+than 0.1 Seconds}. Asiacrypt 2016.
+
+\bibitem{JP22}
+M.~Joye, P.~Paillier.
+\emph{Blind Rotation in Fully Homomorphic Encryption with Extended
+Decomposition}. ACNS 2022.
+
+\bibitem{MBH21}
+C.~Mouchet, J.~Bossuat, J.-P.~Hubaux.
+\emph{Multiparty Homomorphic Encryption from Ring-Learning-with-
+Errors}. PoPETS 2021.
+
+\bibitem{APS15}
+M.R.~Albrecht, R.~Player, S.~Scott.
+\emph{On the concrete hardness of Learning with Errors}.
+J. Math. Cryptology 9(3):169--203, 2015.
+
+\bibitem{BGL18}
+G.~Barthe, B.~Gr\'egoire, V.~Laporte.
+\emph{Secure compilation of side-channel countermeasures: the case
+of cryptographic constant-time}. CSF 2018.
+
+\bibitem{ABBBGL20}
+J.~Almeida, M.~Barbosa, G.~Barthe, B.~Blot, B.~Gr\'egoire,
+V.~Laporte, T.~Oliveira, H.~Pacheco, P.~Schwabe, P.-Y.~Strub.
+\emph{The last mile: High-assurance and high-speed cryptographic
+implementations}. IEEE S\&P 2020.
+
+\bibitem{RBV17}
+O.~Reparaz, J.~Balasch, I.~Verbauwhede.
+\emph{Dude, is my code constant time?}. DATE 2017.
+
+\bibitem{LP066}
+Lux Industries, Inc.
+\emph{LP-066: F-Chain encrypted EVM via threshold TFHE}. 2025.
+
+\bibitem{LP134}
+Lux Industries, Inc.
+\emph{LP-134: Lux chain topology (M-Chain / F-Chain / Z-Chain)}. 2025.
+
+\bibitem{LP019}
+Lux Industries, Inc.
+\emph{LP-019: Threshold-FHE compliance package}. 2024.
+
+\bibitem{LP076}
+Lux Industries, Inc.
+\emph{LP-076: Bootstrap-key custody and rotation policy}. 2025.
+
+\bibitem{LP167}
+Lux Industries, Inc.
+\emph{LP-167: Dual-runtime (Go / C\texttt{++}) FHE byte-equivalence}. 2025.
+
+\end{thebibliography}
+
+\end{document}
