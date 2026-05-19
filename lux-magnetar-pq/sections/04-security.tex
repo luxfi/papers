@@ -1,0 +1,417 @@
+\section{Security argument}
+\label{sec:security}
+
+This section states the v0.1 security claims and the proof roadmap. We
+state two theorems: (i) construction-equivalence to centralized FIPS 205
+SLH-DSA (the Class-N1-analog property), and (ii) tEUF-CMA in the
+aggregator-honest model under FIPS 205 SLH-DSA's UF-CMA assumption.
+
+We are honest about what is \emph{not} proved here: a full mechanised
+proof of either claim has not been built. The proof roadmap is in
+\S\ref{sec:security:roadmap}; this paper states the claims with
+informal-but-rigorous arguments and points at the planned mechanised
+companion.
+
+\subsection{Construction-equivalence (byte-equality)}
+\label{sec:security:byte-equality}
+
+\begin{theorem}[Class-N1-analog byte equality]
+\label{thm:magnetar-byte-equality}
+Fix a parameter set $\textsc{Mode} \in \{\mathrm{SHAKE\text{-}192s},
+\mathrm{SHAKE\text{-}192f},
+\mathrm{SHAKE\text{-}256s}\}$ and let
+$(n, t)$ be a valid threshold configuration. Let $\textsc{DKG}$
+complete honestly, producing a committee $\mathrm{Committee}$, joint
+public key $pk$, and share set $\{\textsc{KeyShare}_j\}_{j=1}^n$.
+Let $S$ be the master seed computed at DKG Round 3 (step 5 of
+\S\ref{sec:construction:dkg}).
+
+For any message $\mu$, context $\mathit{ctx}$, session identifier
+$\mathit{sid}$, attempt counter $\kappa$, and quorum $Q \subseteq [n]$
+with $|Q| = t$, if every party in $Q$ executes the threshold sign
+protocol of \S\ref{sec:construction:sign} honestly and the aggregator
+executes $\textsc{Combine}$ of \S\ref{sec:construction:combine}
+honestly with $\mathit{randomized} = \mathrm{false}$, then
+\begin{equation}
+  \textsc{Combine}(pk, \mu, \mathit{ctx}, \mathrm{false},
+    \mathit{sid}, \kappa, \mathrm{Quorum}, t,
+    \{\textsc{R1}_i, \textsc{R2}_i\}_{i \in Q},
+    \{\textsc{KeyShare}_j\}_{j=1}^n)
+  \;=\;
+  \textsc{slhdsa.SignDeterministic}(
+    \textsc{slhdsa.DeriveKey}(S), \mu, \mathit{ctx}).
+\label{eq:magnetar-byte-equality}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+By inspection of the protocol.
+
+\emph{Step 1: Quorum-independence of seed reconstruction.}
+\eqref{eq:dkg-correctness} shows that any quorum $Q$ of size $\ge t$
+reconstructs the same $\mathit{masterByteSum}$ from
+$\{\mathit{mySumShare}_i\}_{i \in Q}$ via Lagrange interpolation. By
+construction, $\textsc{Combine}$ step 4 performs exactly this Lagrange
+interpolation on the shares recovered from the Round-2 reveals (each
+$\mathit{share}_i$ recovered as $\mathit{masked}_i \oplus r_i$). Since
+the cSHAKE256 mix~\eqref{eq:seed-mix} is a deterministic function of
+$(\mathit{masterByteSum}, \mathit{committee\_root})$, and
+$\mathit{committee\_root}$ is computed from the same sorted committee
+in both DKG and $\textsc{Combine}$, the reconstructed master seed
+$S_{\mathrm{rec}}$ in $\textsc{Combine}$ step 6 equals the DKG master
+seed $S$.
+
+\emph{Step 2: Pubkey consistency.}
+$\textsc{Combine}$ step 7 computes $(sk_{\mathrm{rec}}, pk_{\mathrm{rec}})
+\gets \textsc{slhdsa.DeriveKey}(S_{\mathrm{rec}})$. Since
+$S_{\mathrm{rec}} = S$ (step 1), and FIPS 205 $\textsc{DeriveKey}$ is
+a deterministic function of its seed input, $pk_{\mathrm{rec}}
+= pk$ (step 8 of $\textsc{Combine}$ verifies this equality and aborts
+otherwise) and $sk_{\mathrm{rec}}$ is byte-identical to the
+$sk$ that a centralized signer would obtain.
+
+\emph{Step 3: Signature determinism.} $\textsc{Combine}$ step 9 invokes
+$\textsc{slhdsa.SignDeterministic}(sk_{\mathrm{rec}}, \mu,
+\mathit{ctx})$. Per FIPS 205~\S9.2, $\textsc{SignDeterministic}$ is a
+deterministic function of $(sk, \mu, \mathit{ctx})$. The output
+signature bytes are byte-identical to those a centralized signer with
+seed $S$ would produce on the same $(\mu, \mathit{ctx})$. \qed
+\end{proof}
+
+\paragraph{Empirical validation.} The byte-equality theorem is
+empirically validated by $\textsc{TestN1\_ByteEquality\_Threshold}$\-
+$\textsc{MatchesCentralized}$ \cite{magnetargo}, which runs the
+threshold protocol end-to-end against the centralized FIPS 205 path
+and asserts $\textsc{bytes.Equal}$ on the signature outputs. The
+test covers $(n, t) \in \{(3,2), (5,3), (7,4)\}$ when not running
+under $\mathit{-short}$; the short-form CI run executes only the
+$(3,2)$ configuration ($\sim 4.4$~s on M2 Pro).
+
+A complementary test
+$\textsc{TestN1\_ByteEquality\_DifferentQuorumsSameSignature}$
+exercises the quorum-independence corollary: two \emph{distinct}
+quorums $Q_A = \{0, 1, 2\}$ and $Q_B = \{2, 3, 4\}$ over the same
+DKG output produce \emph{byte-identical} signatures on the same
+message. This is the direct consequence of Theorem~\ref{thm:magnetar-byte-equality}'s
+quorum-independence step.
+
+\begin{corollary}[FIPS 205 verifier acceptance]
+\label{cor:fips205-acceptance}
+A Magnetar v0.1 signature produced by $\textsc{Combine}$ (with
+$\mathit{randomized} = \mathrm{false}$) is accepted by any unmodified
+FIPS 205 SLH-DSA verifier under the joint group public key $pk$.
+\end{corollary}
+
+\begin{proof}
+By Theorem~\ref{thm:magnetar-byte-equality}, the Magnetar signature
+bytes equal those of a centralized $\textsc{SignDeterministic}(
+\textsc{DeriveKey}(S), \mu, \mathit{ctx})$. Centralized FIPS 205
+signatures verify under their derived public key per FIPS 205~\S9.3.
+\qed
+\end{proof}
+
+\subsection{Aggregator-honest tEUF-CMA reduction}
+\label{sec:security:agg-honest}
+
+\begin{theorem}[Magnetar v0.1 tEUF-CMA, aggregator-honest model]
+\label{thm:magnetar-aggregator-honest}
+Let $\Pi_{\mathrm{Magnetar}}$ be the v0.1 construction of
+\S\ref{sec:construction} instantiated at parameter set
+$\textsc{Mode} \in \{\mathrm{SHAKE\text{-}192s}, \mathrm{SHAKE\text{-}192f},
+\mathrm{SHAKE\text{-}256s}\}$. Under
+\begin{itemize}[nosep,leftmargin=2em]
+  \item the UF-CMA security of FIPS 205 SLH-DSA at the chosen
+        parameter set \cite{fips205,sphincs};
+  \item the collision resistance of cSHAKE256 at output length
+        $32$~B (i.e., $2^{128}$-bit collision security);
+  \item the PRF security of cSHAKE256 with a high-entropy key;
+  \item the standard Shamir secret-sharing information-theoretic
+        privacy property over $\mathrm{GF}(257)$ for any
+        $(t{-}1)$-subset \cite{shamir1979};
+\end{itemize}
+in the \emph{aggregator-honest} model
+(Definition~\ref{def:agg-honest-teuf-cma}), with adversary
+$\mathcal{A}$ corrupting up to $t-1$ committee members and the
+network channel,
+\begin{equation}
+  \mathsf{Adv}^{\mathrm{tEUF\text{-}CMA\text{-}AH}}_{\Pi_{\mathrm{Magnetar}}, \mathcal{A}}(\lambda)
+  \;\le\;
+  \mathsf{Adv}^{\mathrm{UF\text{-}CMA}}_{\mathrm{SLH\text{-}DSA}, \mathcal{B}}(\lambda)
+  + \frac{Q_H + Q_S}{2^{256}}
+  + \frac{Q_S}{2^{128}},
+\label{eq:magnetar-aggregator-honest}
+\end{equation}
+where $\mathcal{B}$ is a black-box reduction running $\mathcal{A}$
+with $Q_S$ signing queries and $Q_H$ random-oracle queries, with
+running time within $\mathrm{poly}(\lambda)$ of $\mathcal{A}$.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+We construct a reduction $\mathcal{B}$ that converts a Magnetar
+forger $\mathcal{A}$ into an SLH-DSA forger.
+
+\emph{Setup.} $\mathcal{B}$ receives an SLH-DSA UF-CMA challenge
+$pk$. $\mathcal{B}$ runs the Magnetar DKG with $\mathcal{A}$ playing
+the corrupt parties; $\mathcal{B}$ programs the DKG so that the
+joint group public key equals the challenge $pk$. The
+programming exploits Shamir's information-theoretic privacy: for
+$|F| < t$, $\mathcal{A}$'s view of the shares
+$\{\mathit{share}_i\}_{i \in F}$ is statistically uniform regardless
+of the master seed (\cite{shamir1979,katzlindell}~Theorem~3.6),
+so $\mathcal{B}$ can simulate the corrupt parties' shares as
+uniform random and the honest parties' contributions as random
+strings consistent with the joint $pk$. This produces a perfect
+simulation of the honest DKG view modulo the negligible cSHAKE256
+collision probability on the transcript binding ($\le Q_H / 2^{256}$).
+
+\emph{Signing oracle.} For each adversary signing query $\mu_i$,
+$\mathcal{B}$ forwards $\mu_i$ to its SLH-DSA UF-CMA signing oracle
+and obtains a signature $\sigma_i = \textsc{SignDeterministic}(sk,
+\mu_i, \mathit{ctx})$. $\mathcal{B}$ then simulates the threshold
+protocol transcript by:
+\begin{enumerate}[nosep,leftmargin=2em]
+  \item Choosing a fresh $(\mathit{sid}_i, \kappa_i)$.
+  \item For each honest party in the quorum, sampling a fresh mask
+        $r_i$ uniformly and computing $\mathit{masked}_i =
+        \mathit{share}_i \oplus r_i$ as the protocol prescribes.
+  \item For the corrupt parties' contributions in the quorum,
+        using the values $\mathcal{A}$ supplies; if those values
+        cause a commit-bind check failure in $\textsc{Combine}$,
+        $\mathcal{B}$ aborts the simulation as the protocol does.
+  \item Returning $\sigma_i$ from its SLH-DSA oracle as the
+        Magnetar signature. By
+        Theorem~\ref{thm:magnetar-byte-equality}, this is
+        byte-identical to what $\textsc{Combine}$ would produce
+        on an honest run of this protocol given that the
+        reconstructed seed equals the DKG-output seed (which equals
+        the challenge $sk$'s seed by the DKG programming).
+\end{enumerate}
+The simulation is perfect except for: (i) a $Q_S / 2^{128}$ failure
+probability arising from $\mathit{sid}$ collisions (the simulator
+samples $\mathit{sid}_i$ from $\{0,1\}^{128}$); (ii) a
+$(Q_H + Q_S) / 2^{256}$ failure probability for cSHAKE256 collisions
+on the transcript hashes $\tau_1, \tau_{\mathrm{DKG}}$.
+
+\emph{Extraction.} If $\mathcal{A}$ produces a successful Magnetar
+forgery $(\mu^\star, \sigma^\star)$ with
+$\textsc{Verify}(pk, \mu^\star, \sigma^\star, \mathit{ctx}) = 1$,
+then by Corollary~\ref{cor:fips205-acceptance} $\sigma^\star$ is a
+valid FIPS 205 signature under $pk$. $\mathcal{B}$ outputs
+$(\mu^\star, \sigma^\star)$ as its UF-CMA forgery.
+
+\emph{Validity.} $\mathcal{B}$ wins the SLH-DSA UF-CMA game iff
+$\mu^\star \notin \{\mu_i\}$, which is exactly $\mathcal{A}$'s
+winning condition. The reduction loses the simulation failure
+probability, giving \eqref{eq:magnetar-aggregator-honest}. \qed
+\end{proof}
+
+\paragraph{Provable security level.}
+$\mathsf{Adv}^{\mathrm{UF\text{-}CMA}}_{\mathrm{SLH\text{-}DSA}}$ at
+the SHAKE-192s parameter set is
+upper-bounded by $\sim 2^{-192}$ classical and $\sim 2^{-128}$
+quantum (Grover); at SHAKE-256s, $\sim 2^{-256}$ classical and
+$\sim 2^{-128}$ quantum. The $Q_S / 2^{128}$ term in
+\eqref{eq:magnetar-aggregator-honest} dominates at the quantum bound
+once $Q_S$ approaches $2^{60}$; this is a non-tight reduction (the
+session-id collision term could be tightened via a stateful
+$\mathit{sid}$ enforcement that the consensus layer
+provides) but adequate at the operational scale of Lux Polaris
+($Q_S$ per epoch $\le 10^6$, well below the binding term).
+
+\subsection{The aggregator-honest assumption: honest disclosure}
+\label{sec:security:tcb}
+
+Theorem~\ref{thm:magnetar-aggregator-honest} is stated in the
+aggregator-honest model. This is the honest v0.1 trust caveat. The
+caveat covers exactly the in-memory lifetime of the reconstructed
+master seed $S$ inside $\textsc{Combine}$:
+
+\paragraph{In the TCB during $\textsc{Combine}$ steps 6--10:}
+\begin{itemize}[nosep,leftmargin=2em]
+  \item the master seed $S$ (length $\textsc{seed\_size}$);
+  \item the recovered SLH-DSA secret key $sk_{\mathrm{rec}}$
+        (FIPS 205 wire form);
+  \item the cSHAKE256 mix input $\mathit{mixInput}$
+        (length $2 \cdot \textsc{seed\_size} + 32$);
+  \item the reconstructed byte-sum vector
+        $\mathit{reconstructedByteSum}$
+        (length $2 \cdot \textsc{seed\_size}$);
+  \item the per-quorum recovered shares $\{\mathit{share}_i\}_{i \in Q}$.
+\end{itemize}
+
+\paragraph{Threat surface.} An adversary with arbitrary
+code-execution rights on the aggregator host during this window can
+exfiltrate $S$ via:
+\begin{itemize}[nosep,leftmargin=2em]
+  \item \texttt{/proc/<pid>/mem} read access (requires same UID or
+        \texttt{CAP\_SYS\_PTRACE});
+  \item ptrace-based debugging (same capability);
+  \item coredumps written to disk (requires \texttt{kernel.core\_pattern}
+        misconfiguration or signal-triggered crash);
+  \item swap-file or hibernation image leaks (requires swap enabled
+        or sleep-mode triggered);
+  \item a malicious kernel or hypervisor (requires platform-level
+        compromise).
+\end{itemize}
+
+\paragraph{Operational hardening.}
+\texttt{DEPLOYMENT-RUNBOOK.md}~\S``Aggregator hardening'' enumerates
+the production checklist:
+\begin{enumerate}[nosep,leftmargin=2em]
+  \item Run the aggregator in a memory-encrypted VM (AMD SEV-SNP or
+        Intel TDX) with attestation; verify attestation on every
+        signing session.
+  \item Disable coredumps (\texttt{ulimit -c 0},
+        \texttt{kernel.core\_pattern} pointing to \texttt{/dev/null}).
+  \item Disable swap (\texttt{swapoff -a}); disable hibernation
+        (\texttt{systemctl mask hibernate.target sleep.target}).
+  \item Disable ptrace (\texttt{kernel.yama.ptrace\_scope = 3});
+        bind the aggregator process under
+        \texttt{PR\_SET\_DUMPABLE = 0}.
+  \item Run the aggregator as a fork-per-signature process;
+        \texttt{execve} a fresh image and exit immediately after
+        $\textsc{Combine}$ returns. This bounds the in-memory
+        lifetime of $S$ to a single $\textsc{Combine}$ call ($\sim 1$--
+        $50$~ms wall-clock).
+  \item Bind under seccomp-bpf with a whitelist that forbids
+        \texttt{ptrace}, \texttt{process\_vm\_readv}, and arbitrary
+        \texttt{mmap} of \texttt{/proc/self/mem}.
+  \item Run on dedicated hardware: no other user-controlled processes
+        on the aggregator host.
+\end{enumerate}
+
+\paragraph{What the aggregator-honest assumption does NOT cover.}
+\begin{itemize}[nosep,leftmargin=2em]
+  \item A \emph{passive network observer} never sees $S$; round-1
+        commits and round-2 reveals carry $\mathit{share}_i$ values
+        only as XOR-masked outputs whose pre-images require
+        $t$-of-$n$ recovery.
+        Note: v0.1 DKG envelopes are plaintext (a network observer
+        \emph{can} see committee shares being distributed in DKG);
+        v0.2 closes this with ML-KEM-768 wrapping.
+  \item A \emph{single Byzantine committee member} cannot forge a
+        signature; forging requires reconstructing $S$, which
+        requires $t$ shares.
+  \item A \emph{Byzantine aggregator that has not received valid
+        Round-2 reveals} cannot forge a signature; the commit-bind
+        check rejects tampered reveals.
+\end{itemize}
+
+\subsection{Side-channel posture}
+\label{sec:security:sidechannel}
+
+The Magnetar v0.1 reference implementation is written in Go with the
+following constant-time-relevant properties:
+\begin{itemize}[nosep,leftmargin=2em]
+  \item \textbf{cSHAKE256 invocations.} The Keccak permutation is
+        implemented in \texttt{golang.org/x/crypto/sha3} with no
+        secret-dependent control flow. Constant-time.
+  \item \textbf{SLH-DSA invocations.} Delegated to
+        \texttt{cloudflare/circl/sign/slhdsa}~v1.6.3. The circl
+        implementation is constant-time per its documented design
+        \cite{circl}. Independent verification under \texttt{dudect}
+        \cite{dudect} is the outstanding obligation (BLOCKERS.md
+        BLK-7).
+  \item \textbf{Shamir Lagrange interpolation.}
+        \texttt{shamir.go}~lines 148--164 perform modular
+        exponentiation via square-and-multiply
+        ($\textsc{modPowSmall}$); the exponent
+        $p-2 = 255$ is a public constant, so the loop trip count
+        is independent of secret operands. The inner
+        multiplications are over $\mathrm{GF}(257)$ via 32-bit
+        arithmetic with no secret-dependent branching.
+  \item \textbf{Constant-time commit comparison.} The Round-2
+        commit-bind check uses $\textsc{ctEqual32}$
+        (\texttt{transcript.go}), implemented as a constant-time
+        OR-then-NEG-mask byte sequence.
+  \item \textbf{Zeroization.} Every secret-bearing buffer is
+        explicitly zeroized on every return path via
+        $\textsc{zeroizeBytes}$ (byte buffers) or
+        $\textsc{zeroizeU16Slice}$ (per-byte GF(257) vectors). No
+        $\textsc{defer}$ patterns --- explicit zeroization at each
+        return site keeps the secret lifetime locally legible.
+\end{itemize}
+
+\paragraph{Open obligations.} A \texttt{dudect} timing-equivalence
+sweep at $\ge 10^9$ samples across the v0.1 sign and combine paths
+is the outstanding side-channel deliverable. This is tracked as
+BLOCKERS.md BLK-7 and is a prerequisite for any Tier A claim.
+
+\subsection{Nonce-uniqueness invariant}
+\label{sec:security:nonce}
+
+The Round-1 mask $r_i$ is derived deterministically from
+$\mathit{rngBytes} \,\Vert\, \mathit{sid} \,\Vert\, \kappa
+\,\Vert\, \mathit{NodeID}_i$ via cSHAKE256. Two honest signers cannot
+produce the same $r_i$ unless $(\mathit{rngBytes}, \mathit{sid},
+\kappa, \mathit{NodeID})$ collides. With $\mathit{rngBytes}$ sampled
+from a CSPRNG (default \texttt{crypto/rand}), the per-session
+$r_i$ values are statistically distinct.
+
+In a fixed-$\mathit{rng}$ setting (deterministic KAT mode), Magnetar
+\emph{requires} that the consensus layer guarantees unique
+$(\mathit{sid}, \kappa)$ per attempt. Under Lux Quasar, $\mathit{sid}$
+is the (chain id, block height) pair whose monotonicity is enforced
+by P-Chain consensus \cite{lp020}; $\kappa$ is the rejection-restart
+counter (always $\ge 1$). This provides session-id uniqueness as a
+chain invariant rather than as a runtime obligation.
+
+\subsection{Composition with Polaris}
+\label{sec:security:polaris}
+
+Polaris is the Lux maximum-assurance cert profile pairing three
+independent threshold lanes: Pulsar (Module-LWE), Corona (Ring-LWE),
+and Magnetar (FIPS 205 SLH-DSA). The composed soundness theorem
+(Theorem~8 of \cite{quasarcertsoundness}, ``post-quantum safety'')
+bounds the adversary advantage by the \emph{minimum} of the per-lane
+advantages. A Polaris adversary must break all three lanes
+simultaneously: Module-LWE, Ring-LWE, and FIPS 205 SLH-DSA. No
+known reduction transfers a break of one to a break of another, so
+the conjunction is strictly harder than any single primitive.
+
+The role-binding invariant is enforced by Prism
+\cite{lp073pulsarpaper}~\S\ref{sec:related:lattice}: every Magnetar
+pulse hashes the certificate subject including
+$(\mathit{chain\_id}, \mathit{epoch}, \mathit{round},
+\mathit{KeyEraID}, \mathit{Generation})$, so cross-epoch replay
+reduces to cSHAKE256 collision resistance.
+
+\subsection{Proof roadmap}
+\label{sec:security:roadmap}
+
+The v0.1 paper states the security claims with informal proofs. The
+path to Tier A involves mechanising the claims into machine-checked
+proof artefacts.
+
+\paragraph{EasyCrypt.} The reveal-and-aggregate construction maps
+directly onto an EasyCrypt \cite{easycrypt} game-hop sequence:
+$\mathsf{Game}_0$ is the honest tEUF-CMA game; $\mathsf{Game}_1$
+replaces honest signing with the simulator of
+Theorem~\ref{thm:magnetar-aggregator-honest}; $\mathsf{Game}_2$
+returns SLH-DSA oracle signatures verbatim. The hops are bounded by
+the cSHAKE256 PRG / PRF security and Shamir privacy. This is BLK-7
+in \texttt{BLOCKERS.md}; the planned artefact lives at
+\texttt{proofs/easycrypt/Magnetar/} once the EasyCrypt theory ships.
+
+\paragraph{Lean 4.} A Lean 4 specification of the byte-equality
+theorem (Theorem~\ref{thm:magnetar-byte-equality}) is the lowest-
+hanging mechanisation target: it is a purely \emph{algorithmic}
+equivalence (no probabilistic reasoning), and the Lean
+\texttt{lux-formal-verification-lean4} \cite{lp-lean4} infrastructure
+already mechanises the Shamir Lagrange identity in
+\texttt{Crypto.Threshold.Reshare.reshare\_preserves\_secret}. Porting
+the identity to GF(257) and chaining through the cSHAKE256 mix is
+the v0.3 Tier A entry condition.
+
+\paragraph{Jasmin.} A Jasmin \cite{jasmin} reference implementation
+of the constant-time hot paths (Shamir interpolation, commit
+verification, zeroization) is the side-channel deliverable; this
+augments the \texttt{dudect} empirical pass with a machine-checked
+constant-time proof.
+
+\paragraph{Independent cryptographer review.} BLOCKERS.md BLK-9: an
+independent cryptographer sign-off is the human-checked Tier A
+gate. The review scope is the security argument
+(\S\ref{sec:security}), the FIPS 205 conformance trace
+(\texttt{FIPS-TRACEABILITY.md}), and the constant-time
+posture (\texttt{TRUSTED-COMPUTING-BASE.md}).

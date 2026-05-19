@@ -1,0 +1,192 @@
+\section{Path to full MPC threshold (v0.2 research direction)}
+\label{sec:fullmpc}
+
+This section sketches the research path from the v0.1
+reveal-and-aggregate construction to a v0.2 construction that drops
+the aggregator-TCB caveat by performing a true per-signature MPC over
+the SLH-DSA hash tree. We are deliberate about scope: this section
+\emph{does not} specify v0.2. It surveys the design space, identifies
+the load-bearing technical obstacles, and rules out the obvious
+candidate construction (Komlo-style two-round threshold).
+
+\subsection{Why Komlo-style two-round threshold does not apply}
+\label{sec:fullmpc:no-komlo}
+
+FROST \cite{frost,rfc9591} is the canonical two-round threshold
+construction for Schnorr signatures. Its core property is the
+\emph{linear share-aggregation identity}:
+\begin{equation}
+  z = \sum_{i \in T} z_i \quad \text{where} \quad z_i = k_i + c \cdot \lambda_i \cdot s_i,
+\end{equation}
+in which each $z_i$ is a per-party scalar and $z$ is the final scalar
+in the Schnorr signature. Adding the per-party contributions modulo
+the group order yields a valid signature without the aggregator ever
+seeing the private key $s$. This pattern generalises to:
+\begin{itemize}[nosep,leftmargin=2em]
+  \item Pulsar (M-LWE): per-party $z_i \in R_q^{n_{\mathrm{vec}}}$
+        adds linearly modulo $q$ to produce the joint $z$.
+  \item Corona (R-LWE): per-party $z_i \in R_q$ adds linearly
+        modulo $q$ to produce the joint $z$.
+  \item BLS aggregate: per-party signature $\sigma_i \in \mathbb{G}_1$
+        adds in the elliptic curve group to produce the joint
+        $\sigma$.
+\end{itemize}
+
+\paragraph{SLH-DSA has no such identity.} The FIPS 205 signature is a
+\emph{Merkle authentication path} composed with a \emph{WOTS+
+one-time signature} on a \emph{FORS digest}. There is no per-party
+scalar $z_i$ that adds linearly to produce the joint signature.
+Concretely:
+\begin{itemize}[nosep,leftmargin=2em]
+  \item The WOTS+ hash chains are evaluated via $w$-time hashing of
+        the FORS digest through a chain of $w$ public hash images.
+        Per-party shares of the chain endpoints do not combine
+        linearly --- hashing is non-linear.
+  \item The XMSS-HT authentication path is a sequence of Merkle
+        sibling hashes; each sibling is a hash of two child nodes,
+        and per-party shares of sibling hashes do not combine
+        linearly --- hash functions are not group homomorphisms.
+\end{itemize}
+
+A direct port of FROST/Pulsar's linear-aggregation pattern is
+\emph{ruled out by the SLH-DSA construction}. This is a load-bearing
+algorithmic obstacle: no choice of parameters, hash function family,
+or per-party masking can paper over the fact that SLH-DSA is not a
+linear scheme.
+
+\subsection{Candidate MPC topologies}
+\label{sec:fullmpc:topology}
+
+The v0.2 design space splits into three topologies, each with its
+own trade-off.
+
+\paragraph{Topology A: Distributed FORS evaluation.} The FORS few-time
+signature is the leaf of the SLH-DSA hypertree; it is evaluated once
+per signature. A v0.2 construction could perform a distributed
+evaluation of the FORS leaves under threshold (each party reveals
+its share of the FORS leaf nodes selected by the message hash; the
+aggregator XOR-combines them into the public leaf bytes). Trade-off:
+this halves the TCB exposure (only the FORS evaluation enters the
+MPC; the XMSS-HT path is precomputed at DKG time) but still requires
+the WOTS+ chains and Merkle path to be in plaintext on the
+aggregator.
+
+\paragraph{Topology B: Full hash-tree MPC.} The most thorough
+construction performs every hash invocation under MPC. Each
+$\mathbf{F}(\textsc{seed}, \textsc{ADRS}, m)$ call inside SLH-DSA
+becomes a secure two-party (or $t$-of-$n$) hash computation. This
+gives ideal threshold security: the aggregator never sees any secret
+material. Trade-off: SHAKE256 has on the order of $10^4$ invocations
+per SLH-DSA-SHAKE-192s signature, and a generic MPC for a SHAKE256
+permutation is at best 100--1000x slower than a plaintext
+evaluation. End-to-end signing latency would balloon to minutes per
+signature.
+
+\paragraph{Topology C: Hardware enclaves.} The pragmatic alternative
+is to keep the v0.1 reveal-and-aggregate construction but run the
+aggregator inside a hardware-attested enclave (AMD SEV-SNP with
+remote attestation, or Intel TDX, or future MPC-friendly hardware
+like RISC-V Keystone). This eliminates the in-process memory threat
+vector at the cost of adding hardware-vendor TCB. The end-to-end
+trust is shifted from ``aggregator software is honest'' to
+``aggregator hardware is honest'' --- a different posture, not
+necessarily a stronger one.
+
+\subsection{Suggested v0.2 direction}
+\label{sec:fullmpc:direction}
+
+The Magnetar v0.2 research target should be \emph{Topology A}
+(distributed FORS evaluation) augmented with \emph{Topology C}
+(hardware enclaves for the WOTS+ chains and XMSS-HT path). Topology A
+gives the cryptographic upgrade for the per-signature critical
+component (FORS, which is signed with the actual key material);
+Topology C gives the operational upgrade for the precomputed
+components.
+
+\paragraph{Why this hybrid.} The FORS leaves are the only SLH-DSA
+component derived from the per-signature randomiser $R$. The WOTS+
+chains and the XMSS-HT tree are derived solely from $(\mathit{SK.seed},
+\mathit{PK.seed})$, which can be \emph{precomputed at DKG} and stored
+in the aggregator enclave once. This precomputation amortises the
+hardware cost across a large number of signing sessions: the same
+WOTS+ chains and XMSS-HT path are reused (in different addressed
+positions) for every signature under the same key.
+
+\paragraph{The remaining MPC cost.} FORS has $k \cdot \log_2(t)$
+leaf nodes per signature (e.g., $k = 17$, $t = 2^{15}$ for
+SHAKE-192s), so the v0.2 MPC needs to perform $\sim 17 \cdot 15
+= 255$ hash invocations under threshold per signature. This is
+two orders of magnitude smaller than the full SLH-DSA $\sim 10^4$
+hash count, making Topology A practically tractable: at
+$\sim 10$~ms per MPC hash invocation, a single threshold signature
+would take $\sim 2.5$~s, comparable to the v0.1 latency at
+$(7, 4)$.
+
+\subsection{What v0.2 will \emph{not} solve}
+\label{sec:fullmpc:limits}
+
+Even a successful Topology-A+C v0.2 carries residual trust
+assumptions:
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \textbf{The hardware vendor.} Topology C's WOTS+/XMSS-HT
+        precomputation lives inside the enclave; the hardware vendor
+        is in the TCB for the persistent state. A vendor backdoor
+        or a side-channel break on the enclave (e.g., the
+        SEV-SNP attestation chain or the TDX measurement quote)
+        would compromise the persistent state.
+  \item \textbf{The FORS-MPC implementation.} A misimplemented
+        FORS-MPC that leaks any bit of the FORS secret to the
+        aggregator is no better than v0.1's reveal-and-aggregate.
+        Tier A for v0.2 requires a mechanised proof of the
+        FORS-MPC's privacy (EasyCrypt or equivalent).
+\end{itemize}
+
+We do not promise that v0.2 will be available in any specific
+release window. The research is open, and the path is not a
+straight-line extension of v0.1. The current Tier B status of
+Magnetar v0.2.0 is the operationally relevant fact: a deployment
+running Polaris today should treat Magnetar as one of three
+independent lanes with the v0.1 trust caveat documented in
+\texttt{DEPLOYMENT-RUNBOOK.md}, and should track the v0.2
+research progress separately.
+
+\subsection{Adjacent literature}
+\label{sec:fullmpc:litreview}
+
+The threshold-SLH-DSA literature is sparse compared to the
+threshold-lattice and threshold-ECDSA literatures.
+
+\paragraph{Cosmin and Khovratovich (SAC 2021) \cite{cosmin2021}.}
+The earliest dedicated treatment of threshold SLH-DSA (then
+``Threshold SPHINCS+''). The construction is a single-party
+SPHINCS+ where the WOTS+ secret is shared via Shamir over the
+hash function's output domain. The aggregator reconstructs the
+secret at sign time --- structurally identical to Magnetar v0.1's
+reveal-and-aggregate. Their analysis is in the random-oracle
+model with the same aggregator-honest caveat we make explicit in
+\S\ref{sec:security:tcb}.
+
+\paragraph{Komlo--Stebila--Sullivan (2025 forthcoming, MPTC).}
+A draft NIST MPTC project on threshold SLH-DSA via a
+distributed FORS evaluation; preliminary results suggest the
+Topology A approach is tractable. We track this work as a
+direct candidate for the Magnetar v0.2 reference.
+
+\paragraph{Threshold MAYO and Threshold UOV.} The
+multivariate-quadratic family (MAYO \cite{mayo}, UOV) has
+similar non-linearity issues; threshold constructions
+\cite{thresholduov} also rely on reveal-and-aggregate or
+hardware-enclave assumptions. The threshold-MAYO literature is
+even sparser than threshold-SLH-DSA. Both families share the
+``no linear share-aggregation identity'' obstacle that rules out
+FROST-style constructions.
+
+\paragraph{Generic-MPC threshold signatures.} A fully-generic
+secure-multiparty-computation framework (BGW \cite{bgw1988},
+GMW \cite{gmw1987}) could in principle compute any function ---
+including FIPS 205 SLH-DSA --- under threshold. The constant-factor
+overhead is the obstacle: per-gate costs in generic MPC are
+several orders of magnitude higher than per-gate costs in
+plaintext computation, and the SHAKE256 permutation has $\sim 10^5$
+gate operations per call. Generic MPC for full SLH-DSA is not
+operationally viable at present.
