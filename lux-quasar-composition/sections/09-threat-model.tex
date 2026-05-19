@@ -1,0 +1,172 @@
+\section{Threat Model}
+\label{sec:threat}
+
+\subsection{Adversarial setting}
+
+QuasarCert is designed against an adversary who controls a
+strict-minority subset of validators and observes all network
+traffic. Specifically:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Byzantine fraction}: $f < 1/3$ in count and stake.
+      Quorum threshold $\tau = \lfloor 2n/3 \rfloor + 1$.
+\item \textbf{Static vs adaptive corruption}: theorems are stated for
+      static corruption; adaptive corruption is handled via
+      programmable-RO or secure-erasure hybrids
+      \cite{fischlin2005} with $O(n \cdot Q_H)$ multiplicative loss.
+      Production deployment uses Go-side memory zeroing for all
+      per-signature randomness, satisfying the secure-erasure
+      precondition.
+\item \textbf{Network adversary}: full Dolev-Yao on the message
+      passing layer; the adversary can drop, reorder, replay, and
+      forge messages. Replay is prevented by round-digest binding
+      (Theorem~\ref{thm:replay}); message authentication is via the
+      cryptographic legs of the cert itself.
+\item \textbf{Quantum adversary} ($\mathcal{A}_Q$): polynomial-time on
+      a quantum Turing machine; runs Shor's algorithm on classical
+      discrete logarithms; has QROM access \cite{bellare1993}; subject
+      to Grover speedup against unstructured search. Under
+      $\mathcal{A}_Q$, the BLS and Z-Chain legs break in polynomial
+      time; the PQ legs remain hard
+      (Corollary~\ref{cor:diversification}).
+\item \textbf{Side-channel adversary}: passive timing / cache /
+      power-analysis observer of validator processes. All threshold
+      primitives are constant-time in their secret-dependent paths
+      (documented per-primitive in \texttt{CONSTANT-TIME-REVIEW.md}
+      / \texttt{ct/} subdirs).
+\end{itemize}
+
+\subsection{Threat surface boundaries}
+
+\paragraph{In scope.} The QuasarCert verifier is in scope.
+Specifically:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item Cert wire format and verification predicate
+      (Definition~\ref{def:verify}).
+\item Profile selection and profile invariants
+      (Section~\ref{sec:profiles}).
+\item Replay protection via round-digest binding
+      (Theorem~\ref{thm:replay}).
+\item Cross-primitive composition soundness
+      (Theorem~\ref{thm:composition}).
+\item Domain-separation contexts (Table~\ref{tab:domsep}).
+\item Per-leg primitive unforgeability (delegated to per-primitive
+      papers; see \cite{pulsarrepo,coronarepo,magnetarrepo,
+      quasarcertsoundness}).
+\end{itemize}
+
+\paragraph{Out of scope (delegated to other layers).}
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item Network-level partition tolerance: Lux uses a partial-synchrony
+      assumption; full asynchronous safety / liveness is a property
+      of the underlying Snow consensus family
+      \cite{lp020,garaybackbone}, not the cert verifier.
+\item Validator-set rotation: governed by the LSS framework
+      \cite{luxlssmpc} and the per-primitive resharing protocols
+      (\cite{pulsarrepo} for Pulsar, etc.). The cert sees only the
+      post-resharing public keys.
+\item Trusted setup for Z-Chain Groth16: governed by the
+      Bowe-Gabizon-Miers ceremony \cite{bowegabizonmiers}; the
+      verifying key is rooted on Z-Chain as
+      $\mathsf{zchain\_vk\_root}$.
+\item DKG-time security: each primitive runs its own DKG
+      independently; the umbrella spec does not coordinate DKGs.
+      Pulsar uses Pedersen-style DKG over $R_q$; Corona uses
+      a similar lattice DKG; Magnetar uses byte-wise Shamir VSS
+      over $\mathrm{GF}(257)$.
+\item EVM precompile bindings: each PQ verifier is exposed via an
+      EVM precompile (e.g., P3Q at slot \texttt{0x012205});
+      precompile-layer profile gating uses
+      \texttt{contract.RefuseUnderStrictPQ} in
+      \texttt{luxfi/evm/precompile/}; cert verification is
+      orthogonal to precompile verification.
+\end{itemize}
+
+\subsection{Failure modes}
+
+We enumerate the failure modes and their consequences.
+
+\paragraph{Single-primitive break.} An adversary breaks one PQ leg's
+underlying assumption (e.g., a cryptanalytic break against M-LWE
+specifically). On the Aurora profile, this would compromise the
+Pulsar leg. The cert remains unforgeable because the Corona leg
+(R-LWE) is independent and still valid (Corollary~\ref{cor:polaris}).
+The compromised leg's primitive must be deprecated and replaced;
+the wire format and other legs are unaffected.
+
+\paragraph{Cross-lattice break.} An adversary breaks both M-LWE and
+R-LWE (some breakthrough sieving / NTT-aware attack). On the
+Aurora profile, this would compromise both Pulsar and Corona; the
+profile no longer provides PQ security beyond the failing
+$\mathrm{ZK}$ leg's MLDSA witness (which is also lattice-based).
+On the Polaris profile, the Magnetar / hash-based leg remains
+valid. This is the cross-family insurance that motivates Polaris.
+
+\paragraph{Hash break.} An adversary breaks SHA-3 / SHAKE preimage
+or target-collision resistance. On any profile, the round-digest
+construction would be compromised. This is a catastrophic event
+that affects all of cryptography, not just QuasarCert; the
+remediation is to migrate to a different hash function and re-issue
+all validator keys. The QuasarCert wire format makes this swap
+non-disruptive in principle (replace $H_{\mathsf{round}}$ with a
+new hash) but the per-primitive keys would need full rotation.
+
+\paragraph{Trusted-setup compromise.} If an adversary compromises
+the Z-Chain Groth16 trusted setup (e.g., the $\geq 1024$-contributor
+ceremony \cite{bowegabizonmiers}), they can forge
+$\pi^{\mathrm{ZK}}$. By Theorem~\ref{thm:composition}, the cert is
+not forgeable because the other legs (BLS / Pulsar / Corona /
+Magnetar) remain unbroken. The Z-Chain $\mathit{vk}_Z$ would be
+rotated to a fresh ceremony output; the cert format is unchanged.
+
+\paragraph{Aggregator-as-TCB (Pulsar v0.1 / Magnetar v0.1).} A
+malicious aggregator can refuse to combine signatures (liveness
+fault) but cannot produce a forgery (the aggregator's material is
+purely derived from honest contributions; forging requires forging
+at the underlying primitive). The fault is identifiable abort
+\cite{cggmp21}; the consensus engine excludes the faulty aggregator
+from future rounds.
+
+\paragraph{Byzantine quorum.} An adversary controls $\geq 2/3$ of
+validators. The cert remains valid (because the Byzantine signers
+sign correctly under the protocol) but the consensus engine's
+safety property is violated: the adversary can finalize conflicting
+blocks. This is outside QuasarCert's scope --- QuasarCert is a
+finality certificate, not a Byzantine-quorum gate. Quorum
+intersection at $2f + 1$ of $3f + 1$ is proved by the Lean
+\texttt{lean/Consensus/BFT.lean}~\cite{quasarcertsoundness}.
+
+\subsection{Migration risk}
+
+The PQ-migration era is the period during which a quantum adversary
+becomes capable of breaking classical primitives in polynomial time
+but the legacy classical primitives are still deployed. QuasarCert
+addresses this risk in two ways:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item The PQ leg is always populated (profile invariant 2). A
+      chain configured with the Pulsar profile is PQ-safe from day
+      one; no migration is required.
+\item The classical BLS leg is supplementary, not load-bearing.
+      Under quantum attack, the BLS leg becomes trivially forgeable
+      ($\epsilon_{\mathrm{BLS}} = O(1)$); by
+      Corollary~\ref{cor:diversification}, the cert's
+      unforgeability is bounded by the PQ leg's hardness, which
+      remains intact.
+\end{itemize}
+
+The decision to keep BLS in the cert (rather than removing it
+entirely; see \cite{pqfinalitynobls} for the BLS-removal analysis)
+is a deployment-pragmatic one: BLS aggregate verify is
+sub-millisecond, much faster than any PQ verifier; on classical
+hardware, the cert verifies fast because BLS is checked first; on
+quantum hardware, the cert is still safe because the PQ leg is
+also verified.
+
+The reverse decision --- remove BLS, run only PQ legs --- is also
+implemented in \texttt{luxfi/consensus} as the ``pure PQ'' mode
+(\texttt{pq-finality-no-bls}), gated behind a chain-config flag.
+This is the migration target for chains that desire to retire all
+classical cryptography from the consensus path.

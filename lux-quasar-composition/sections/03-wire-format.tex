@@ -1,0 +1,232 @@
+\section{QuasarCert: Wire Format}
+\label{sec:wire}
+
+\subsection{The QuasarCert structure}
+
+The QuasarCert is the per-round wire-format certificate that carries
+the legs required by the chain's configured profile. The canonical Go
+definition lives at \texttt{luxfi/consensus/protocol/quasar/types.go}
+in the Lux consensus repository \cite{consensusrepo}; it is mirrored
+into the umbrella spec at \texttt{luxfi/quasar/SPEC.md}
+\cite{quasarrepo}.
+
+\begin{definition}[QuasarCert wire structure]
+\label{def:cert}
+A QuasarCert is the eight-field record
+\[
+\mathcal{C} \;=\; \bigl(\sigma^{\mathrm{BLS}},\;
+\sigma^{\mathrm{Puls}},\;
+\sigma^{\mathrm{Cor}},\;
+\sigma^{\mathrm{Mag}},\;
+\pi^{\mathrm{ZK}},\;
+e,\;
+T_{\mathrm{fin}},\;
+n_{\mathrm{val}}\bigr)
+\]
+where the cryptographic legs are:
+\begin{itemize}[leftmargin=2em,nosep]
+\item $\sigma^{\mathrm{BLS}} \in \{0,1\}^{384} \cup \{\varepsilon\}$ is
+      a 48-byte BLS12-381 aggregate (compressed $\mathbb{G}_1$), or
+      the empty byte string $\varepsilon$ when absent.
+\item $\sigma^{\mathrm{Puls}} \in \{0,1\}^{8 \cdot 3309}
+      \cup \{\varepsilon\}$ is a 3309-byte FIPS 204 ML-DSA-65 signature
+      (byte-equal to the single-party output of
+      $\mathsf{MLDSA.Sign}(\mathit{pk}^{\mathrm{Puls}}, \mu,
+      \mathsf{ctx})$ with $\mathsf{ctx} = \texttt{lux-quasar-cert-v1}$), or $\varepsilon$.
+\item $\sigma^{\mathrm{Cor}} \in \mathcal{B}^{\sim 33\text{ KB}} \cup
+      \{\varepsilon\}$ is a Corona threshold signature in native binary
+      form (length-prefixed concatenation of polynomial-ring marshal
+      bytes; see Section~\ref{sec:wire-corona}). Or $\varepsilon$.
+\item $\sigma^{\mathrm{Mag}} \in \{0,1\}^{8 \cdot 16224} \cup
+      \{\varepsilon\}$ is a 16{,}224-byte FIPS 205 SLH-DSA-SHAKE-192f
+      signature (byte-equal to the single-party output of
+      $\mathsf{SLHDSA.SignDeterministic}$ on the reconstructed master
+      seed), or $\varepsilon$.
+\item $\pi^{\mathrm{ZK}} \in \{0,1\}^{192 \cdot 8} \cup \{\varepsilon\}$
+      is a Groth16 proof (compressed $\mathbb{G}_1 \times \mathbb{G}_2
+      \times \mathbb{G}_1$, $48 + 96 + 48 = 192$ bytes), or
+      $\varepsilon$.
+\end{itemize}
+The metadata fields are:
+\begin{itemize}[leftmargin=2em,nosep]
+\item $e \in \mathbb{N}$ is the validator-set epoch.
+\item $T_{\mathrm{fin}}$ is the wall-clock finality timestamp (advisory).
+\item $n_{\mathrm{val}} \in \mathbb{N}$ is the validator-set size at
+      epoch $e$.
+\end{itemize}
+\end{definition}
+
+The Go canonical (verbatim from
+\texttt{luxfi/consensus/protocol/quasar/types.go}):
+
+\begin{verbatim}
+type QuasarCert struct {
+    BLS         []byte    // BLS12-381 aggregate, 48 bytes or empty
+    Pulsar      []byte    // FIPS 204 ML-DSA-65 byte-equal, 3309 B or empty
+    Corona      []byte    // Corona R-LWE threshold, ~33 KB or empty
+    Magnetar    []byte    // FIPS 205 SLH-DSA byte-equal, ~16 KB or empty
+    MLDSAProof  []byte    // Groth16 over BLS12-381, 192 B or empty
+    Epoch       uint64
+    Finality    time.Time
+    Validators  int
+}
+\end{verbatim}
+
+\subsection{Encoding rules}
+\label{sec:wire-corona}
+
+The QuasarCert is encoded via the native binary encoder at
+\texttt{luxfi/consensus/protocol/quasar/corona\_gob.go} (despite the
+file name, this is a custom length-prefixed encoder, not Go's
+\texttt{encoding/gob}; the file name is preserved for caller
+compatibility). The encoder uses three length-prefixed fields with
+big-endian four-byte length headers:
+
+\begin{verbatim}
+[4-byte BE C_len ][C bytes ]
+[4-byte BE Z_len ][Z bytes ]
+[4-byte BE Delta_len ][Delta bytes]
+\end{verbatim}
+
+This native encoder is $\sim$1.01$\times$ the size of Go gob (measured
+in \texttt{cert\_size\_compare\_test.go}) but is deterministic,
+language-agnostic, and stable across Go versions. The native encoding
+is the canonical wire byte string for cross-language verifiers
+(Rust, C++, Python, WASM).
+
+For the Corona leg specifically, $C$ is a single \texttt{ring.Poly}
+(a polynomial in $R_q = \mathbb{Z}_q[X]/(X^N+1)$), $Z$ is a
+\texttt{Vector[ring.Poly]} of length 8 (the module rank), and
+$\mathit{Delta}$ is another \texttt{Vector[ring.Poly]} of length 8.
+With $N = 256$ coefficients $\times$ 8 bytes per coefficient
+$\times$ 17 polynomials $= 34{,}816$ bytes raw; the measured native
+binary encoding is 33{,}052 bytes (the difference is from the modular
+coefficient packing).
+
+For the BLS leg, the 48-byte compressed $\mathbb{G}_1$ point uses
+the IETF BLS draft \cite{ietfbls} serialization with the
+$\mathsf{POP\_TAG}$ infinity / compression flag in the leading
+three bits.
+
+For the Pulsar leg, the FIPS 204 ML-DSA-65 signature is the
+byte-equal output of the single-party verifier; the signing context
+string is \texttt{lux-quasar-cert-v1}.
+
+For the Magnetar leg, the FIPS 205 SLH-DSA signature is the
+byte-equal output of the single-party verifier; the signing context
+string is \texttt{lux-magnetar-cert-v1}.
+
+For the $\pi^{\mathrm{ZK}}$ leg, the Groth16 proof uses compressed
+serialization of $(A, B, C) \in \mathbb{G}_1 \times \mathbb{G}_2
+\times \mathbb{G}_1$ per the BLS12-381 IETF draft.
+
+\subsection{Verification predicate}
+\label{sec:verify}
+
+\begin{definition}[QuasarCert verification]
+\label{def:verify}
+Given a profile $\mathcal{P}$ (\texttt{Pulsar}, \texttt{Aurora}, or
+\texttt{Polaris}) with populated-leg specification
+$\mathcal{L}(\mathcal{P}) \subseteq \{\mathrm{BLS}, \mathrm{Puls},
+\mathrm{Cor}, \mathrm{Mag}, \mathrm{ZK}\}$, a block $B$, a validator
+set $\mathcal{V}_e$, and a candidate cert $\mathcal{C}$,
+\textsf{VerifyQuasarCert}$(B, \mathcal{V}_e, \mathcal{C}, \mathcal{P})$
+returns $1$ iff:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{Profile match}: $\bigl\{\ell \;:\; \mathcal{C}.\ell \neq
+      \varepsilon\bigr\} = \mathcal{L}(\mathcal{P})$.
+      A cert with extra populated legs is malformed; a cert with
+      missing populated legs is malformed.
+\item \textbf{Validator count consistency}: $\mathcal{C}.n_{\mathrm{val}}
+      = |\mathcal{V}_e|$.
+\item \textbf{Round digest}: $\mu = H_{\mathsf{round}}(\mathsf{chain\_id}
+      \,\|\, e \,\|\, r \,\|\, \mathsf{validator\_root}_e \,\|\,
+      \mathsf{block\_hash})$ is recomputed locally from $B$ and
+      $\mathcal{V}_e$.
+\item \textbf{BLS leg}: if $\mathrm{BLS} \in \mathcal{L}(\mathcal{P})$,
+      then $e(G_2, \sigma^{\mathrm{BLS}}) = e(\mathit{apk}_{\mathrm{BLS}},
+      H_{\mathbb{G}_1}(\mu))$ where $\mathit{apk}_{\mathrm{BLS}}$ is
+      the aggregated public key of validators in the quorum.
+\item \textbf{Pulsar leg}: if $\mathrm{Puls} \in \mathcal{L}(\mathcal{P})$,
+      then $\mathsf{MLDSA.Verify}(\mathit{pk}^{\mathrm{Puls}}, \mu,
+      \mathsf{ctx},\, \sigma^{\mathrm{Puls}}) = 1$ with
+      $\mathsf{ctx} = \texttt{lux-quasar-cert-v1}$.
+\item \textbf{Corona leg}: if $\mathrm{Cor} \in \mathcal{L}(\mathcal{P})$,
+      then $\mathsf{Corona.Verify}(\mathit{pk}^{\mathrm{Cor}}, \mu,
+      \sigma^{\mathrm{Cor}}) = 1$.
+\item \textbf{Magnetar leg}: if $\mathrm{Mag} \in \mathcal{L}(\mathcal{P})$,
+      then $\mathsf{SLHDSA.Verify}(\mathit{pk}^{\mathrm{Mag}}, \mu,
+      \mathsf{ctx},\, \sigma^{\mathrm{Mag}}) = 1$ with
+      $\mathsf{ctx} = \texttt{lux-magnetar-cert-v1}$.
+\item \textbf{Z-Chain leg}: if $\mathrm{ZK} \in \mathcal{L}(\mathcal{P})$,
+      then $\mathsf{Groth16.Verify}(\mathit{vk}_Z, h_x, \pi^{\mathrm{ZK}})
+      = 1$ with $h_x = H_{\mathsf{Poseidon}}(\{\mathit{pk}_i^{\mathrm{ML}}\}\,\|\,\mu)$.
+\end{enumerate}
+\end{definition}
+
+The verification predicate is the strict conjunction of all populated
+legs. If even one populated leg fails, the entire cert is rejected.
+Verification is stateless: each call recomputes the round digest and
+validator roots from the supplied block and validator set, so there
+is no replay cache to corrupt.
+
+\subsection{Replay protection via round-digest binding}
+
+The round digest $\mu$ binds the cert to the chain ID, epoch, round,
+validator-set root, and block hash. Any change in any of these inputs
+produces a different $\mu$, and by collision resistance of SHA3-256
+the probability of matching a different cert's $\mu$ is bounded by
+$2^{-256}$.
+
+\begin{theorem}[Cross-chain / cross-epoch replay impossibility]
+\label{thm:replay}
+Let $\mathcal{C}$ be a QuasarCert that verifies for block $B$ on chain
+$c$ at epoch $e$, round $r$. For any block $B' \neq B$ on chain $c'$,
+epoch $e'$, round $r'$ such that $(c, e, r, \mathsf{block\_hash}) \neq
+(c', e', r', \mathsf{block\_hash'})$,
+$\textsf{VerifyQuasarCert}(B', \mathcal{V}_{e'}, \mathcal{C}, \mathcal{P})$
+returns $0$ except with negligible probability.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Suppose the verifier accepts $\mathcal{C}$ against $B'$. The verifier
+recomputes $\mu'$ from $B'$ and $\mathcal{V}_{e'}$; this is
+deterministic and depends only on the supplied block and validator
+set. If $(c, e, r, \mathsf{block\_hash}) \neq (c', e', r',
+\mathsf{block\_hash'})$, then $\mu' \neq \mu$ except with collision
+probability $\leq 2^{-256}$ over SHA3-256. Every populated leg of
+$\mathcal{C}$ was produced for $\mu$, not $\mu'$:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item BLS: EUF-CMA of BLS-PoP ensures
+      $e(G_2, \sigma^{\mathrm{BLS}}) \neq e(\mathit{apk}, H_{\mathbb{G}_1}(\mu'))$
+      because the signed message has changed.
+\item Pulsar: ML-DSA-65 EUF-CMA ensures rejection.
+\item Corona: SUF-CMA of Corona ensures rejection.
+\item Magnetar: SLH-DSA EUF-CMA ensures rejection.
+\item Z-Chain: Groth16 knowledge soundness ensures the proof bound to
+      $h_x = H_{\mathsf{Poseidon}}(\{\mathit{pk}_i^{\mathrm{ML}}\} \,\|\, \mu)$
+      does not also verify against $h_{x'} =
+      H_{\mathsf{Poseidon}}(\{\mathit{pk}_i^{\mathrm{ML}}\} \,\|\, \mu')$,
+      assuming Poseidon collision resistance.
+\end{itemize}
+
+Each populated leg independently rejects with overwhelming probability;
+by union bound, the cert is rejected except with probability
+$\leq 2^{-256} + |\mathcal{L}(\mathcal{P})| \cdot \mathsf{negl}(\lambda)
+= \mathsf{negl}(\lambda)$.
+\end{proof}
+
+\begin{corollary}[Profile non-substitutability]
+A cert valid under profile $\mathcal{P}$ cannot be presented as a
+cert under profile $\mathcal{P}' \neq \mathcal{P}$, because the
+profile-match clause (Definition~\ref{def:verify} clause 1) fails:
+either the populated-leg set is too big (downward substitution) or
+too small (upward substitution).
+\end{corollary}
+
+This structural binding is critical because it means the consensus
+engine does not need a separate replay cache or sequence-number
+tracker: the cert verifier is stateless and the binding is encoded
+in the cert bytes themselves.

@@ -1,0 +1,175 @@
+\section{Cert Profiles}
+\label{sec:profiles}
+
+A \emph{cert profile} fixes which legs of the QuasarCert are populated
+and verified. Profiles are runtime selectors: a single Lux chain is
+configured with one profile via the \texttt{FinalitySchemeID} field on
+its consensus config (see \texttt{luxfi/consensus/config/pq\_mode.go}).
+The profile is part of the chain's bootstrap genesis and may be
+rotated only via a coordinated multi-window upgrade
+(Section~\ref{sec:profile-rotation}).
+
+\subsection{Profile registry}
+\label{sec:profile-registry}
+
+Three profiles are defined.
+
+\subsubsection*{\texttt{Pulsar}: PQ floor}
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Composition}: $\mathrm{BLS} \,\|\, \mathrm{Puls} \,\|\, \mathrm{ZK}$.
+\item \textbf{Primitives}: BLS12-381 aggregate (classical), threshold
+      ML-DSA-65 (M-LWE), Z-Chain Groth16 rollup.
+\item \textbf{\texttt{FinalitySchemeID}}: \texttt{BLSPlusCorona} (legacy
+      enum name; the ``Corona'' label here historically referred to the
+      threshold-protocol family slot, now instantiated with Pulsar's
+      M-LWE kernel).
+\item \textbf{Cert size}: $48 + 3309 + 192 + \mathsf{meta} \approx 3549$
+      bytes per cert at $n = 21$ validators.
+\item \textbf{Use case}: Minimum PQ posture --- every cert carries a
+      NIST-standardized PQ threshold signature \emph{and} a classical
+      fast-path leg. This is the current production deployment on
+      Lux primary network's Q-Chain.
+\end{itemize}
+
+\subsubsection*{\texttt{Aurora}: intra-lattice diversity}
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Composition}: $\mathrm{BLS} \,\|\, \mathrm{Puls} \,\|\,
+      \mathrm{Cor} \,\|\, \mathrm{ZK}$.
+\item \textbf{Primitives}: BLS, threshold ML-DSA-65 (M-LWE), threshold
+      Corona (R-LWE), Z-Chain Groth16 rollup.
+\item \textbf{\texttt{FinalitySchemeID}}: \texttt{TripleQuantum} with
+      the Corona leg enabled.
+\item \textbf{Cert size}: $48 + 3309 + 33052 + 192 + \mathsf{meta}
+      \approx 37$ KB per cert.
+\item \textbf{Use case}: Defense in depth across two independent
+      lattice families. A cryptanalytic break that hits M-LWE
+      specifically (and not R-LWE, or vice versa) still leaves one
+      valid PQ leg on every cert. This is the migration target for
+      chains that desire intra-lattice diversification without
+      adopting Magnetar.
+\end{itemize}
+
+\subsubsection*{\texttt{Polaris}: cross-family maximum assurance}
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Composition}: $\mathrm{BLS} \,\|\, \mathrm{Puls} \,\|\,
+      \mathrm{Cor} \,\|\, \mathrm{Mag} \,\|\, \mathrm{ZK}$.
+\item \textbf{Primitives}: BLS, threshold ML-DSA-65, threshold Corona,
+      threshold SLH-DSA (hash-based), Z-Chain Groth16 rollup.
+\item \textbf{\texttt{FinalitySchemeID}}: \texttt{TripleQuantum} with
+      Corona AND Magnetar enabled.
+\item \textbf{Cert size}: $48 + 3309 + 33052 + 16224 + 192 + \mathsf{meta}
+      \approx 53$ KB per cert.
+\item \textbf{Use case}: Cross-family defense in depth. Lattice
+      (Pulsar / Corona) plus hash-based (Magnetar). A cryptanalytic
+      break against the entire lattice family does not break the cert.
+\item \textbf{Status}: Reserved. Magnetar is Tier B (v0.1 reveal-and-aggregate);
+      production deployment of the Polaris profile is gated on Tier A
+      audit of Magnetar's reveal-and-aggregate construction
+      (Section~\ref{sec:production}).
+\end{itemize}
+
+\subsection{Composition table}
+
+Table~\ref{tab:profiles} summarizes the legs per profile and the
+hardness assumptions invoked.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lcccccl@{}}
+\toprule
+\textbf{Profile} & \textbf{BLS} & \textbf{Puls} & \textbf{Cor} & \textbf{Mag} & \textbf{ZK} & \textbf{Hardness} \\
+\midrule
+\texttt{Pulsar}  & $\bullet$ & $\bullet$ & --- & --- & $\bullet$ & co-CDH $\wedge$ M-LWE/MSIS $\wedge$ KEA \\
+\texttt{Aurora}  & $\bullet$ & $\bullet$ & $\bullet$ & --- & $\bullet$ & co-CDH $\wedge$ M-LWE $\wedge$ R-LWE $\wedge$ KEA \\
+\texttt{Polaris} & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & co-CDH $\wedge$ M-LWE $\wedge$ R-LWE $\wedge$ SHA3-OW $\wedge$ KEA \\
+\bottomrule
+\end{tabular}
+\caption{Cert profile composition. ``Hardness'' is the conjunctive
+hardness assumption required to forge a cert under the profile
+(Theorem~\ref{thm:composition}). ``KEA'' is the knowledge-of-exponent /
+algebraic group assumption that backs Groth16; ``SHA3-OW'' is SHA-3
+one-wayness / SLH-DSA EUF-CMA.}
+\label{tab:profiles}
+\end{table}
+
+\subsection{Profile invariants}
+
+All profiles must satisfy:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{BLS classical leg is always populated.} The fast-path
+      requirement: a classical aggregate verifier on commodity CPU
+      gives sub-millisecond verification, which dominates the
+      hot-path block-propagation budget.
+\item \textbf{At least one PQ leg is always populated.} The PQ-finality
+      requirement: a chain whose finality verifier could be defeated
+      by a quantum adversary alone is not PQ-finalizing.
+\item \textbf{The set of populated cert legs matches the profile
+      selector exactly.} Extra populated legs or missing populated
+      legs is malformed (Definition~\ref{def:verify} clause 1).
+      This invariant is the load-bearing structural binding that
+      prevents profile substitution attacks.
+\item \textbf{Domain separation between legs is enforced.} The
+      context strings in Table~\ref{tab:domsep} ensure that a Pulsar
+      signature on $\mu$ cannot be replayed as a Corona signature on
+      $\mu$ (even though they sign the same round digest, they sign
+      with different domain-separation contexts).
+\item \textbf{Validator set is shared across legs at the same epoch.}
+      Each leg signs under the same set's primitive-specific public
+      keys; the BLS PoP, Pulsar group key, Corona group key, Magnetar
+      group key, and per-validator ML-DSA keys are all rooted in the
+      same \texttt{validator\_root}$_e$ Merkle commitment.
+\end{enumerate}
+
+\subsection{Profile rotation}
+\label{sec:profile-rotation}
+
+Profile rotation is a coordinated multi-window event because the cert
+wire format and the populated-leg set change. The rotation protocol is:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{Pre-window}. Both old and new profiles' primitives run in
+      parallel: validators produce certs under the old profile only,
+      but each validator already holds shares for the new profile's
+      legs (so the DKG ceremonies for added legs have completed before
+      the window opens).
+\item \textbf{Rotation window} of $W$ blocks ($W \approx 1000$ on Lux
+      production). During the window, blocks may carry either profile's
+      cert. Cert-acceptance logic accepts either profile.
+\item \textbf{Post-window}. Only the new profile's cert is accepted.
+      Blocks proposed with the old profile are rejected.
+\end{enumerate}
+
+This is documented in the deployment runbook at
+\texttt{luxfi/pulsar/DEPLOYMENT-RUNBOOK.md} for the
+Pulsar-leg-specific rotation, and generalises to all profile
+rotations in the umbrella spec's \texttt{PROFILES.md}.
+
+\subsection{Why three profiles and not one}
+
+The natural design temptation is to fix a single profile (probably
+Polaris, maximum assurance) and force every Lux chain to adopt it.
+We reject this for two reasons.
+
+First, \textbf{cert size and verify cost are not free}. The Polaris
+profile is roughly $15\times$ the size of the Pulsar profile and
+correspondingly more expensive to verify. For chains where the
+threat model does not warrant cross-family diversification, the
+extra cost is wasted.
+
+Second, \textbf{profile portability is a deployment guarantee}.
+Different Lux chains have different threat models: a public L1
+validator network might choose Aurora; a regulated-finance subnet
+might require Polaris; a high-throughput application chain might
+stay on Pulsar. Profile is per-chain, not global, so each chain can
+adopt the appropriate posture without forcing a network-wide upgrade.
+
+The profile selector is the single point of variation; everything
+else --- primitives, wire format, verification logic --- is shared
+across all chains. This is the Hickey-simple separation of concerns:
+one cert wire format, one verifier, one profile selector, three
+profile compositions.
