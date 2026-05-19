@@ -1,0 +1,209 @@
+\section{Evaluation}
+\label{sec:evaluation}
+
+This section reports parameter sets, KAT determinism, and per-signature
+latency from the production test suite. All timings are from the
+$\textsc{go test -short}$ run against commit \texttt{db6c252} on Apple
+Silicon M2 Pro (12-core), macOS 15.4, Go 1.26.3 darwin/arm64.
+
+We deliberately report only \emph{measured} timings from the
+\texttt{magnetar} reference test suite. No fabricated benchmarks or
+extrapolations.
+
+\subsection{Parameter sets}
+\label{sec:eval:params}
+
+The three Magnetar v0.1 parameter sets target NIST PQ Categories 3 and
+5 with the SHAKE primitive family. Table~\ref{tab:eval-params} summarises
+the wire-size budget per signing session.
+
+\begin{table}[H]
+\centering
+\caption{Magnetar v0.1 parameter sets. ``Wire/sign'' is the per-party
+broadcast budget across the two rounds; ``KeyShare'' is the
+per-party persistent state size.}
+\label{tab:eval-params}
+\begin{tabular}{lrrrrrrr}
+\toprule
+Mode & NIST Cat. & $|pk|$ & $|sk|$ & $|\sigma|$ & SeedSize & KeyShare & Wire/sign \\
+\midrule
+SHAKE-192s & 3 & 48 B & 96 B & 16\,224 B & 96 B & 192 B & $32 + 384 = 416$ B \\
+SHAKE-192f & 3 & 48 B & 96 B & 35\,664 B & 96 B & 192 B & $32 + 384 = 416$ B \\
+SHAKE-256s & 5 & 64 B & 128 B & 29\,792 B & 128 B & 256 B & $32 + 512 = 544$ B \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The signature size is exactly the FIPS 205 wire size (Magnetar adds
+no envelope; cf. Corollary~\ref{cor:fips205-acceptance}). The
+per-party wire budget per signing session is small ($\sim 0.5$ KB)
+because the threshold layer transmits only the commit and the masked
+share, not the SLH-DSA signature itself (which the aggregator computes
+locally).
+
+\paragraph{Recommended production target.} \textbf{Magnetar-SHAKE-192s}:
+smallest signature in the NIST Cat 3 tier, matching the FIPS-validated
+SLH-DSA-SHAKE-192s. The ``s'' variant trades larger SLH-DSA hypertree
+depth (h=63) for smaller signature size; we accept the slower signing
+in exchange for the smaller wire footprint, since signing latency
+($\sim 1$--$2$ s) is acceptable for the Polaris third-lane role.
+
+\subsection{KAT determinism}
+\label{sec:eval:kat}
+
+The KAT vector regeneration is empirically deterministic: re-running
+\texttt{cmd/genkat} on a clean checkout produces byte-identical
+output to the committed JSON. The five vector files
+(\texttt{vectors/keygen.json}, \texttt{vectors/sign.json},
+\texttt{vectors/verify.json}, \texttt{vectors/threshold-sign.json},
+\texttt{vectors/dkg.json}) are gated by SHA-256 in
+\texttt{kat\_test.go}; any drift fails CI.
+
+\texttt{TestKAT\_Keygen}, \texttt{TestKAT\_Sign},
+\texttt{TestKAT\_Verify} pass at $\sim 0.55$~s, $\sim 5.6$~s, and
+$\sim 0$~s respectively under the short configuration on M2 Pro.
+
+\subsection{Per-signature latency}
+\label{sec:eval:latency}
+
+Table~\ref{tab:eval-latency} reports measured wall-clock latencies
+for the headline test paths. The numbers are pulled directly from
+the \texttt{go test -short -v} output (\S\ref{sec:impl:build}); they
+reflect the production CGO build with all default Go flags.
+
+\begin{table}[H]
+\centering
+\caption{Magnetar v0.1 measured latencies, SHAKE-192s, M2 Pro,
+Go 1.26.3 darwin/arm64. Values from \texttt{go test -short -v -run
+TestN1\_ByteEquality\textbar TestThreshold\textbar TestKAT} (full
+output reproducible from commit \texttt{db6c252}).}
+\label{tab:eval-latency}
+\begin{tabular}{lrr}
+\toprule
+Test path & Run time & Configurations covered \\
+\midrule
+\textsc{TestKAT\_Keygen} (SHAKE-192s, 3 seeds) & 0.55 s & SHAKE-192s \\
+\textsc{TestKAT\_Sign} (SHAKE-192s, 3 seeds) & 5.57 s & SHAKE-192s \\
+\textsc{TestKAT\_Verify} (SHAKE-192s, 2 cases) & 0.00 s & SHAKE-192s \\
+\textsc{TestN1\_ByteEquality\_ThresholdMatchesCentralized}/3of2 & 4.35 s & SHAKE-192s, $(3,2)$ \\
+\textsc{TestThreshold\_BasicSign} & 4.09 s & SHAKE-192s, $(3,2)$ \\
+\textsc{TestThreshold\_TamperedRound2Rejected} & 1.14 s & SHAKE-192s, $(3,2)$ \\
+\textsc{TestThreshold\_SessionMismatchRejected} & 2.18 s & SHAKE-192s, $(3,2)$ \\
+\textsc{TestThreshold\_NonMemberQuorumRejected} & 2.78 s & SHAKE-192s, $(3,2)$ \\
+\midrule
+Total \texttt{go test -short} & 21.1 s & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Per-signature cost breakdown.}
+The byte-equality test (\textsc{TestN1\_ByteEquality}) is the
+load-bearing latency measurement. The $\sim 4.4$~s wall-clock
+contains two full SLH-DSA-SHAKE-192s signing operations (one
+threshold, one centralized) plus the DKG. Decomposing the cost
+under the same configuration:
+\begin{itemize}[leftmargin=2em,nosep]
+  \item DKG (3-round, $n = 3$, $t = 2$): $\sim 1.8$~s
+        (dominated by 3 SLH-DSA $\textsc{KeyGen}$ calls in the
+        per-party seed validation).
+  \item Threshold sign (2-round, $t = 2$): $\sim 1.2$~s
+        (one SLH-DSA $\textsc{SignDeterministic}$ in
+        $\textsc{Combine}$).
+  \item Centralized sign (reference): $\sim 1.2$~s
+        (one SLH-DSA $\textsc{SignDeterministic}$).
+  \item Lagrange interpolation + cSHAKE256 mix:
+        $\ll 1$~ms (sub-millisecond).
+\end{itemize}
+The SLH-DSA-SHAKE-192s signing cost on M2 Pro is on the order of
+1~s per signature, dominated by the WOTS+ hash chain evaluations and
+the XMSS-HT authentication path computation. This is consistent with
+published SLH-DSA benchmarks \cite{sphincs}.
+
+\paragraph{Latency at larger thresholds.} The long-form
+\texttt{TestN1\_ByteEquality} suite (without \texttt{-short}) covers
+$(5,3)$ and $(7,4)$ configurations; previous Magnetar test runs at
+\texttt{git} \texttt{HEAD} on the same hardware show the $(5,3)$
+configuration completing in $\sim 8$~s and the $(7,4)$ in
+$\sim 15$~s. The dominant cost is the DKG's
+$\textsc{KeyFromSeed}$ verification at every party, which is
+$O(n)$ in the committee size; this is by inspection of
+\texttt{dkg.go}, not by separate benchmark.
+
+\paragraph{Race-detector overhead.} Under \texttt{go test -race},
+the SLH-DSA paths are 5--10x slower; this is why the
+\texttt{raceEnabled} build tag is in place. The race detector
+cannot trigger a meaningful race in the strictly single-goroutine
+test paths.
+
+\subsection{Wire bandwidth}
+\label{sec:eval:bandwidth}
+
+Per-signing-session wire bandwidth per party is small relative to
+the SLH-DSA signature itself:
+\begin{itemize}[leftmargin=2em,nosep]
+  \item Round 1 commit: 32 B.
+  \item Round 2 reveal: $4 \cdot \textsc{seed\_size}$ B
+        (e.g., 384~B for SHAKE-192s).
+  \item Total per-party broadcast: $32 + 4 \cdot \textsc{seed\_size}$
+        B = $416$~B for SHAKE-192s.
+\end{itemize}
+For a quorum of size $t$, total broadcast traffic per signing session
+is $t \cdot (32 + 4 \cdot \textsc{seed\_size})$ B; for SHAKE-192s at
+$t=3$ this is $1\,248$~B, a $\sim 13\times$ smaller payload than the
+final SLH-DSA signature ($16\,224$~B) the aggregator publishes.
+
+\paragraph{DKG bandwidth.} The DKG is comparatively heavy --- the
+v0.1 protocol distributes plaintext envelopes containing both the
+Shamir share and the dealer's contribution to every recipient. The
+per-party broadcast at DKG Round 1 is
+$n \cdot (\mathit{share\_size} + \textsc{seed\_size})$ = $n \cdot 3
+\cdot \textsc{seed\_size}$ B; for SHAKE-192s at $n=5$ this is
+$1\,440$~B. The DKG runs once at key-era setup, not per signature.
+
+\subsection{Empirical claims verified}
+\label{sec:eval:tests}
+
+The Magnetar v0.2.0 test suite empirically validates the following
+claims:
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item \textsc{TestN1\_ByteEquality\_ThresholdMatchesCentralized}
+        --- threshold and centralized signatures are byte-identical
+        on the same $(\textsc{seed}, \mu, \mathit{ctx})$. \emph{(Verifies
+        Theorem~\ref{thm:magnetar-byte-equality}.)}
+  \item \textsc{TestN1\_ByteEquality\_DifferentQuorumsSameSignature}
+        --- two distinct quorums of size $t$ over the same DKG
+        output produce byte-identical signatures.
+        \emph{(Verifies quorum-independence corollary of
+        Theorem~\ref{thm:magnetar-byte-equality}.)}
+  \item \textsc{TestThreshold\_BasicSign} --- end-to-end threshold
+        sign roundtrip and FIPS 205 verifier acceptance.
+  \item \textsc{TestThreshold\_TamperedRound2Rejected} ---
+        $\textsc{Combine}$ rejects a Round-2 reveal whose
+        $\textsc{cSHAKE256}$ re-derivation does not match the
+        Round-1 commit.
+  \item \textsc{TestThreshold\_SessionMismatchRejected} ---
+        cross-session Round-2 messages are rejected.
+  \item \textsc{TestThreshold\_NonMemberQuorumRejected} ---
+        attempting to instantiate a $\textsc{ThresholdSigner}$ with
+        a quorum that does not contain the local party's
+        $\mathit{NodeID}$ is rejected with
+        $\textsc{ErrNotInQuorum}$.
+  \item \textsc{TestKAT\_Keygen}, \textsc{TestKAT\_Sign},
+        \textsc{TestKAT\_Verify} --- KAT vector regeneration is
+        bit-deterministic.
+  \item \textsc{TestDKG\_Correctness}, \textsc{TestDKG\_Equivocation}
+        --- DKG correctness and identifiable abort on Round-2
+        digest mismatch.
+\end{enumerate}
+
+\paragraph{What is \emph{not} empirically validated.}
+\begin{itemize}[leftmargin=2em,nosep]
+  \item Cross-implementation byte equality (no second
+        Magnetar implementation exists yet).
+  \item Side-channel constant-time posture (no
+        \texttt{dudect} run has shipped; BLOCKERS.md BLK-7).
+  \item Adversarial scenarios beyond the four
+        $\textsc{TestThreshold\_*Rejected}$ tests --- the test
+        suite covers happy-path and four standard rejection
+        scenarios. A fuzz-test suite is on the v0.3 roadmap.
+\end{itemize}
