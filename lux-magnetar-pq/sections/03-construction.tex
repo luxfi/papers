@@ -1,0 +1,423 @@
+\section{Construction}
+\label{sec:construction}
+
+This section specifies the Magnetar v0.1 reveal-and-aggregate
+construction byte-for-byte. The pseudocode is keyed to the Go canonical
+at \texttt{ref/go/pkg/magnetar/} \cite{magnetargo}; line references are
+to commit \texttt{db6c252} (Tier B graduation).
+
+\subsection{Hash-domain separation}
+\label{sec:construction:domains}
+
+Every cryptographic hash invocation in Magnetar is cSHAKE256
+\cite{sp800185} with function-name string \texttt{"Magnetar"} and a
+per-purpose customisation string. The seven canonical tags are listed
+in Table~\ref{tab:magnetar-tags}.
+
+\begin{table}[H]
+\centering
+\caption{Magnetar v0.1 cSHAKE256 domain separation. Every secret-bearing
+hash invocation is bound to exactly one tag; cross-tag replay reduces
+to cSHAKE256 collision resistance.}
+\label{tab:magnetar-tags}
+\begin{tabular}{lp{8.5cm}}
+\toprule
+Tag & Purpose \\
+\midrule
+\texttt{MAGNETAR-DKG-COMMIT-V1} & committee-root digest (sorted committee binding) \\
+\texttt{MAGNETAR-DKG-TRANSCRIPT-V1} & DKG transcript digest (Round-2 equivocation check) \\
+\texttt{MAGNETAR-SIGN-R1-V1} & threshold-sign Round-1 commit $D_i$ \\
+\texttt{MAGNETAR-SIGN-R1-MAC-V1} & (reserved for v0.2 per-pair MAC layer) \\
+\texttt{MAGNETAR-SIGN-MASK-V1} & per-attempt mask $r_i$ derivation \\
+\texttt{MAGNETAR-SEED-SHARE-V1} & Shamir coefficient stream + final seed mix \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The protocol-wide domain separation context is the byte string
+\texttt{"lux-magnetar-v0.1"} (\texttt{tagDomainSep}). It is prepended to
+the DKG transcript binding so that a separate Magnetar version (or a
+different Lux PQ primitive that happened to reuse the same hash
+function) cannot collide.
+
+\subsection{DKG protocol}
+\label{sec:construction:dkg}
+
+The DKG is a three-round broadcast-channel protocol over the canonical
+sorted committee. Round 1 distributes Shamir-shared dealer
+contributions; Round 2 commits each party to its local view of the
+ordered envelope set; Round 3 detects equivocation and produces the
+final key shares.
+
+\paragraph{Round 1 (dealer $P_i$, \texttt{dkg.go:137}).}
+\begin{enumerate}[nosep,leftmargin=2em]
+  \item Sample $c_i \overset{\$}{\gets} \{0,1\}^{8 \cdot
+        \textsc{seed\_size}}$ from $\mathit{rng}$.
+  \item Sample $2(t-1) \cdot \textsc{seed\_size}$ bytes of
+        coefficient material from $\mathit{rng}$. If short, stretch
+        via $\textsc{cSHAKE256}(\cdot, \mathrm{S} =
+        \text{``MAGNETAR-SEED-SHARE-V1''})$.
+  \item For each byte position $b \in [0, \textsc{seed\_size})$,
+        define the polynomial
+        $f_{b,i}(x) = c_i[b] + \sum_{j=1}^{t-1}
+        a_{b,j,i} \cdot x^j \pmod{257}$
+        with the $a_{b,j,i}$ unpacked from the coefficient stream
+        ($2$~bytes per coefficient, taken modulo $257$).
+  \item For each recipient $P_k$ (committee order, $k = 1, \ldots, n$),
+        compute $\mathit{share}_{i \to k}[b] = f_{b,i}(x_k) \bmod 257$
+        for every $b$ via Horner's method (\texttt{shamir.go:111}).
+  \item Construct the envelope
+        $\mathrm{Env}_{i \to k} = (\mathit{share}_{i \to k}, c_i)$
+        for every $k$. Note: the dealer's full $c_i$ is duplicated
+        into every envelope --- this is the v0.1 reveal-and-aggregate
+        compromise (every committee member learns every other
+        dealer's contribution). v0.2 closes this by wrapping each
+        envelope under $\textsc{ML-KEM-768}$ keyed to the recipient's
+        long-term identity public key (BLOCKERS.md CR-8).
+  \item Broadcast $\textsc{DKGRound1Msg}_i = (\mathit{NodeID}_i,
+        \{\mathrm{Env}_{i \to k}\}_{k=1}^n)$.
+\end{enumerate}
+
+\paragraph{Round 2 (party $P_i$, \texttt{dkg.go:185}).}
+\begin{enumerate}[nosep,leftmargin=2em]
+  \item Validate every received $\textsc{DKGRound1Msg}_j$
+        contains an envelope for every committee member (no
+        omissions), with the expected wire sizes for every share and
+        every contribution. Reject malformed messages with
+        $\textsc{ErrDKGMissingEnvelope}$,
+        $\textsc{ErrDKGShareSize}$, or
+        $\textsc{ErrDKGContribSize}$.
+  \item Compute the transcript digest:
+        \begin{align*}
+          \tau_{\mathrm{DKG}} \;=\; & \texttt{"lux-magnetar-v0.1"} \,\Vert\,
+            \mathrm{Mode} \,\Vert\, t_{\mathrm{LE}} \,\Vert\, n_{\mathrm{LE}}
+            \,\Vert\,
+            \mathit{NodeID}_1 \,\Vert\, \cdots \,\Vert\,
+            \mathit{NodeID}_n \\
+          D \;=\; & \textsc{cSHAKE256}\bigl(
+            \tau_{\mathrm{DKG}} \,\Vert\,
+            \mathrm{for\_each\_dealer}_j(\mathrm{for\_each\_recipient}_k(
+            \mathrm{share}_{j \to k} \,\Vert\, c_j)),
+            \\
+            & \quad
+            \mathrm{N} = \text{``Magnetar''},
+            \mathrm{S} = \text{``MAGNETAR-DKG-TRANSCRIPT-V1''},
+            32\,\mathrm{B}\bigr).
+        \end{align*}
+  \item Broadcast $\textsc{DKGRound2Msg}_i = (\mathit{NodeID}_i, D)$.
+\end{enumerate}
+
+\paragraph{Round 3 (party $P_i$, \texttt{dkg.go:278}).}
+\begin{enumerate}[nosep,leftmargin=2em]
+  \item Validate every $\textsc{DKGRound2Msg}_j$.$D = D$ (computed
+        locally). A mismatch is an \emph{identifiable abort} ---
+        $\textsc{AbortEvidence}_{\mathrm{Equivocation}}$ names the
+        offending dealer $P_j$ and carries the conflicting digest
+        pair as on-chain slashing evidence.
+  \item Compute the per-party share of the master byte-sum
+        $\mathit{mySumShare}_i$ by adding the per-byte shares received
+        from every dealer:
+        $\mathit{mySumShare}_i[b] = \sum_{j=1}^n
+        \mathit{share}_{j \to i}[b] \bmod 257$, for $b \in [0,
+        \textsc{seed\_size})$.
+  \item Compute the master byte-sum (also derivable as the sum of
+        every dealer's contribution):
+        $\mathit{masterByteSum}[b] = \sum_{j=1}^n c_j[b] \bmod 257$,
+        for $b \in [0, \textsc{seed\_size})$.
+  \item Compute the committee root:
+        \[
+          \mathit{committee\_root}
+          = \textsc{cSHAKE256}\bigl(
+            \text{``MAGNETAR-COMMITTEE-V1''} \,\Vert\,
+            \mathrm{sorted\_committee},
+            \mathrm{N} = \text{``Magnetar''},
+            \mathrm{S} = \text{``MAGNETAR-DKG-COMMIT-V1''},
+            32\,\mathrm{B}\bigr).
+        \]
+        The committee is canonically sorted ascending by
+        $\mathit{NodeID}$ (\texttt{dkg.go:423}).
+  \item Mix to the master seed via equation~\eqref{eq:seed-mix}:
+        $S = \textsc{cSHAKE256}(
+        \mathit{masterByteSum}_\mathit{BE} \,\Vert\,
+        \mathit{committee\_root},
+        \mathrm{N} = \text{``Magnetar''},
+        \mathrm{S} = \text{``MAGNETAR-SEED-SHARE-V1''},
+        \textsc{seed\_size}\,\mathrm{B})$.
+  \item Derive the SLH-DSA secret key:
+        $(sk, pk) \gets \textsc{circl.slhdsa.Scheme}(\mathit{ID}).
+        \textsc{DeriveKey}(S)$.
+        Verify the resulting public key matches what every other
+        honest party would compute (this is automatic: every party
+        has identical $\mathit{masterByteSum}$ and
+        $\mathit{committee\_root}$ inputs).
+        \emph{Discard} $sk$; publish $pk$ as the joint group public
+        key.
+  \item Compute the chain-pinned transcript hash binding
+        $(\mathit{committee\_root}, pk, t)$:
+        $\tau_{\mathrm{out}} = \textsc{transcriptHash}(
+        \text{``MAGNETAR-DKG-TRANSCRIPT-V1''},
+        \text{``lux-magnetar-v0.1''},
+        \mathit{committee\_root},
+        pk_\mathrm{bytes},
+        t_{\mathrm{LE}})$.
+  \item Output:
+        $\textsc{KeyShare}_i = (\mathit{NodeID}_i, x_i = i,
+        \mathit{Share} =
+        \mathit{mySumShare}_{i,\mathit{BE}},
+        \mathit{Pub} = pk,
+        \mathrm{Mode})$
+        and $\tau_{\mathrm{out}}$.
+  \item Zeroize all intermediate buffers: $S$, the recovered $sk$,
+        $\mathit{mySumShare}_i$ wire-form, $\mathit{masterByteSum}$,
+        the mix input, $c_i$, and every per-byte share $f_{b,i}(x_k)$
+        ($\textsc{zeroizeBytes}$ / $\textsc{zeroizeU16Slice}$ /
+        $\textsc{zeroizePrivateKey}$).
+\end{enumerate}
+
+\paragraph{DKG correctness.} For any quorum $Q \subseteq [n]$ with
+$|Q| \ge t$, Lagrange interpolation of
+$\{(x_i, \mathit{mySumShare}_i)\}_{i \in Q}$ at $x = 0$ recovers
+$\mathit{masterByteSum}$:
+\begin{equation}
+  \sum_{i \in Q} \lambda_i^Q(0) \cdot \mathit{mySumShare}_i[b]
+  \;=\;
+  \sum_{i \in Q} \lambda_i^Q(0) \cdot
+    \sum_{j=1}^n f_{b,j}(x_i)
+  \;=\;
+  \sum_{j=1}^n \underbrace{\sum_{i \in Q} \lambda_i^Q(0) \cdot
+    f_{b,j}(x_i)}_{= c_j[b]}
+  \;=\;
+  \mathit{masterByteSum}[b],
+  \label{eq:dkg-correctness}
+\end{equation}
+where the inner Lagrange sum recovers $f_{b,j}(0) = c_j[b]$ by the
+standard Shamir reconstruction property. The cSHAKE256 mix
+\eqref{eq:seed-mix} is deterministic, so the reconstructed master seed
+is identical to the master seed computed at DKG Round 3. \qed
+
+\subsection{Threshold sign protocol}
+\label{sec:construction:sign}
+
+The sign protocol is a two-round commit-and-reveal between a quorum
+$T \subseteq [n]$ of size $t$.
+
+\paragraph{Round 1 (signer $P_i$ for $i \in T$,
+\texttt{threshold.go:150}).}
+\begin{enumerate}[nosep,leftmargin=2em]
+  \item Sample raw entropy
+        $\mathit{rngBytes} \overset{\$}{\gets} \{0,1\}^{16 \cdot
+        \textsc{seed\_size}}$ from $\mathit{rng}$.
+  \item Derive per-attempt mask via cSHAKE256:
+        \[
+          r_i = \textsc{cSHAKE256}\bigl(
+            \mathit{rngBytes} \,\Vert\,
+            \mathit{sid} \,\Vert\,
+            \kappa_\mathit{BE} \,\Vert\,
+            \mathit{NodeID}_i,
+            \mathrm{N} = \text{``Magnetar''},
+            \mathrm{S} = \text{``MAGNETAR-SIGN-MASK-V1''},
+            2 \cdot \textsc{seed\_size}\,\mathrm{B}\bigr).
+        \]
+        The mask-mix construction ensures that even a deterministic
+        $\mathit{rng}$ that emits the same bytes across two attempts
+        produces distinct masks per attempt (the $\kappa_\mathit{BE}$
+        field rules out cross-attempt collision).
+  \item Compute the byte-wise XOR-masked share
+        $\mathit{masked}_i[b] = \mathit{share}_i[b] \oplus r_i[b]$
+        for $b \in [0, 2 \cdot \textsc{seed\_size})$.
+  \item Build the Round-1 transcript $\tau_1$ binding
+        $(\mathit{sid}, \kappa, \mathrm{Quorum}, \mathit{NodeID}_i,
+        pk, \mu)$ in NIST SP 800-185 encoded form
+        (\texttt{threshold.go:230}):
+        \[
+          \tau_1 =
+            \textsc{leftEncode}(|\mathrm{parts}|) \,\Vert\,
+            \textsc{encodeString}(\mathit{sid}) \,\Vert\,
+            \textsc{encodeString}(\kappa) \,\Vert\,
+            \cdots \,\Vert\,
+            \textsc{encodeString}(\mu).
+        \]
+  \item Compute the commit:
+        \[
+          D_i = \textsc{cSHAKE256}\bigl(
+            r_i \,\Vert\, \mathit{masked}_i \,\Vert\, \tau_1,
+            \mathrm{N} = \text{``Magnetar''},
+            \mathrm{S} = \text{``MAGNETAR-SIGN-R1-V1''},
+            32\,\mathrm{B}\bigr).
+        \]
+  \item Broadcast $\textsc{Round1Message}_i = (\mathit{NodeID}_i,
+        \mathit{sid}, \kappa, D_i)$.
+  \item \emph{Retain} $r_i, \mathit{masked}_i, \tau_1$ locally for
+        Round 2 reveal. Wipe $\mathit{rngBytes}$ and the mask-mix
+        input.
+\end{enumerate}
+
+\paragraph{Round 2 (signer $P_i$, \texttt{threshold.go:198}).}
+\begin{enumerate}[nosep,leftmargin=2em]
+  \item Validate received Round-1 messages: every
+        $\textsc{Round1Message}_j$ must carry the same
+        $(\mathit{sid}, \kappa)$ as the local state. Reject
+        cross-session messages with $\textsc{ErrSessionMismatch}$,
+        cross-attempt with $\textsc{ErrAttemptMismatch}$.
+  \item Construct the reveal
+        $\textsc{PartialSig}_i = r_i \,\Vert\, \mathit{masked}_i$
+        ($4 \cdot \textsc{seed\_size}$ bytes).
+  \item Broadcast $\textsc{Round2Message}_i = (\mathit{NodeID}_i,
+        \mathit{sid}, \kappa, \textsc{PartialSig}_i)$.
+\end{enumerate}
+
+\subsection{Combine (aggregator)}
+\label{sec:construction:combine}
+
+$\textsc{Combine}$ is a deterministic pure function executed by the
+aggregator (any party in the quorum, or an external aggregator with
+read access to the share directory). \texttt{combine.go:47}.
+
+\paragraph{Inputs:} $(pk, \mu, \mathit{ctx}, \mathit{randomized},
+\mathit{sid}, \kappa, \mathrm{Quorum}, t,
+\{\textsc{R1}_i\}, \{\textsc{R2}_i\},
+\{\textsc{KeyShare}_j\}_{j=1}^n)$.
+
+\paragraph{Steps:}
+\begin{enumerate}[nosep,leftmargin=2em]
+  \item Index $\{\textsc{R1}_i\}$ by sender $\mathit{NodeID}_i$.
+        Reject cross-session messages.
+  \item For each $\textsc{R2}_i$ in the quorum:
+        \begin{enumerate}[nosep,leftmargin=2em]
+          \item Parse $r_i \Vert \mathit{masked}_i =
+                \textsc{PartialSig}_i$.
+          \item Re-derive $D_i' = \textsc{cSHAKE256}(
+                r_i \,\Vert\, \mathit{masked}_i \,\Vert\, \tau_{1,i},
+                \mathrm{N} = \text{``Magnetar''},
+                \mathrm{S} = \text{``MAGNETAR-SIGN-R1-V1''},
+                32\,\mathrm{B})$ with $\tau_{1,i}$ reconstructed from
+                public inputs.
+          \item Compare $D_i'$ against $\textsc{R1}_i.D_i$ in
+                constant time (\texttt{ctEqual32}). On mismatch:
+                reject with $\textsc{ErrRound2CommitBad}$.
+          \item Recover $\mathit{share}_i = \mathit{masked}_i \oplus
+                r_i$.
+        \end{enumerate}
+  \item Pair each recovered share with the matching $\textsc{KeyShare}$
+        entry's $x_i$ (the aggregator gets the directory of
+        $\{\textsc{KeyShare}_j\}_{j=1}^n$ so it can recover
+        evaluation points).
+  \item Run Lagrange reconstruction over $\mathrm{GF}(257)$ at $x = 0$
+        per equation~\eqref{eq:shamir-lagrange} on the first $t$
+        recovered shares, yielding $\mathit{reconstructedByteSum}
+        \in [0, 257)^{\textsc{seed\_size}}$.
+  \item Compute $\mathit{committee\_root}$ from the
+        full directory of $\{\textsc{KeyShare}_j\}_{j=1}^n$ (the same
+        definition as DKG Round 3 step 4).
+  \item Reconstruct the master seed via equation~\eqref{eq:seed-mix}:
+        $S = \textsc{cSHAKE256}(
+        \mathit{reconstructedByteSum}_\mathit{BE} \,\Vert\,
+        \mathit{committee\_root},
+        \mathrm{N} = \text{``Magnetar''},
+        \mathrm{S} = \text{``MAGNETAR-SEED-SHARE-V1''},
+        \textsc{seed\_size}\,\mathrm{B})$.
+  \item Derive the centralized FIPS 205 secret key:
+        $(sk_{\mathrm{rec}}, pk_{\mathrm{rec}}) \gets
+        \textsc{circl.slhdsa.Scheme}(\mathit{ID}).
+        \textsc{DeriveKey}(S)$.
+  \item Verify $pk_{\mathrm{rec}} = pk$. On mismatch: zeroize secret
+        material and return $\textsc{ErrPubkeyMismatch}$.
+  \item Compute the FIPS 205 signature:
+        $\sigma = \begin{cases}
+          \textsc{slhdsa.SignDeterministic}(sk_{\mathrm{rec}}, \mu,
+            \mathit{ctx}) & \text{if } \mathit{randomized} = \mathit{false},\\
+          \textsc{slhdsa.SignRandomized}(sk_{\mathrm{rec}}, \mathit{rng},
+            \mu, \mathit{ctx}) & \text{if } \mathit{randomized} = \mathit{true}.
+        \end{cases}$
+  \item Zeroize $S$, $sk_{\mathrm{rec}}$, the mix input,
+        $\mathit{reconstructedByteSum}$, and the recovered
+        $\{\mathit{share}_i\}$. Return $\sigma$.
+\end{enumerate}
+
+\paragraph{Determinism and byte equality.} With $\mathit{randomized} =
+\mathit{false}$ (the default), the FIPS 205
+$\textsc{SignDeterministic}$ output is a deterministic function of
+$(sk_{\mathrm{rec}}, \mu, \mathit{ctx})$. Since
+$sk_{\mathrm{rec}}$ is itself a deterministic function of $S$, and $S$
+is a deterministic function of the share set (independent of which
+quorum of size $\ge t$ is used), every quorum produces the same
+$\sigma$. This is the empirical content of
+$\textsc{TestN1\_ByteEquality\_DifferentQuorumsSameSignature}$
+(\S\ref{sec:evaluation:tests}).
+
+\subsection{Verify (FIPS 205 passthrough)}
+\label{sec:construction:verify}
+
+$\textsc{Verify}$ \texttt{verify.go:32} is a single dispatch to
+$\textsc{circl.slhdsa.PublicKey.UnmarshalBinary}(pk.\mathit{Bytes})$
+followed by
+$\textsc{slhdsa.Verify}(\mathit{pk}, \textsc{NewMessage}(\mu), \sigma,
+\mathit{ctx})$. \emph{No Magnetar-specific envelope or wrapper}. This
+is the Class-N1-analog property: the produced signatures live in the
+exact FIPS 205 signature space and any FIPS 205 verifier accepts them
+unmodified.
+
+\subsection{Identifiable abort}
+\label{sec:construction:abort}
+
+The v0.1 protocol commits to identifiable abort: every detected
+misbehaviour produces verifiable on-chain evidence suitable for
+slashing.
+
+\begin{table}[H]
+\centering
+\caption{Identifiable abort taxonomy in Magnetar v0.1.}
+\label{tab:abort}
+\begin{tabular}{lll}
+\toprule
+Complaint & Detected at & Evidence \\
+\midrule
+$\textsc{ComplaintEquivocation}$ & DKG Round 3 & $(\mathit{digest}_{\mathrm{honest}},
+\mathit{digest}_{\mathrm{accused}})$ \\
+$\textsc{ComplaintBadDelivery}$ & DKG Round 2 & malformed envelope (parsed bytes) \\
+$\textsc{ErrRound2CommitBad}$ & $\textsc{Combine}$ step 2c & $(\textsc{R1}_i, \textsc{R2}_i)$ pair \\
+$\textsc{ErrPubkeyMismatch}$ & $\textsc{Combine}$ step 8 & quorum + share set \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The v0.1 protocol \emph{omits} the per-pair MAC layer that Pulsar uses
+to authenticate Round 1 against tampering by a network attacker
+(BLOCKERS.md CR-7). The omission is documented; v0.2 adds the MAC
+layer once the trust model tightens to include passive-network-observer
+secrecy of envelopes.
+
+\subsection{Wire format}
+\label{sec:construction:wire}
+
+The wire formats are byte-exact specifications that gate
+cross-implementation interoperability. Magnetar's wire bytes are
+defined by the Go canonical's serialisation in \texttt{types.go} and
+must match across any future port (C++, Rust, hardware).
+
+\begin{table}[H]
+\centering
+\caption{Magnetar v0.1 wire-format sizes. ``Conceptual size'' is the
+serialised payload; the actual envelope adds an SP 800-185 leftEncode
+length prefix per field.}
+\label{tab:wire-sizes}
+\begin{tabular}{lr}
+\toprule
+Object & Size (bytes) \\
+\midrule
+$\textsc{Round1Message}$ commit $D_i$ & 32 \\
+$\textsc{Round2Message}$ partial sig $r_i \Vert \mathit{masked}_i$ &
+$4 \cdot \textsc{seed\_size}$ (e.g., 384 for SHAKE-192s) \\
+$\textsc{KeyShare}$ share buffer & $2 \cdot \textsc{seed\_size}$ \\
+$\textsc{DKGShareEnvelope}$ $(\mathit{share}, c)$ &
+$3 \cdot \textsc{seed\_size}$ \\
+$\textsc{Signature.Bytes}$ (SHAKE-192s) & 16\,224 \\
+$\textsc{Signature.Bytes}$ (SHAKE-192f) & 35\,664 \\
+$\textsc{Signature.Bytes}$ (SHAKE-256s) & 29\,792 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The signature wire format is \emph{exactly} the FIPS 205 wire format
+(per FIPS 205 \S9.4); there is no Magnetar prefix, suffix, or
+envelope.

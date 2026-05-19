@@ -89,6 +89,7 @@ Auto-generated catalogue of research papers — regenerated 2026-05-18.
 | `lux-lightspeed-dex` | `lux-lightspeed-dex/lux-lightspeed-dex.tex` | ✓ |
 | `lux-liquid-staking` | `lux-liquid-staking/lux-liquid-staking.tex` | ✓ |
 | `lux-lss-mpc` | `lux-lss-mpc/lux-lss-mpc.tex` | ✓ |
+| `lux-magnetar-pq` | `lux-magnetar-pq/lux-magnetar-pq.tex` | ✓ |
 | `lux-market-nft` | `lux-market-nft/lux-market-nft.tex` | ✓ |
 | `lux-master-security-model` | `lux-master-security-model/lux-master-security-model.tex` | ✓ |
 | `lux-mchain-mpc` | `lux-mchain-mpc/lux-mchain-mpc.tex` | ✓ |
@@ -111,6 +112,7 @@ Auto-generated catalogue of research papers — regenerated 2026-05-18.
 | `lux-quantum-consensus` | `lux-quantum-consensus/lux-quantum-consensus.tex` | ✓ |
 | `lux-quantum-threat-blockchain` | `lux-quantum-threat-blockchain/lux-quantum-threat-blockchain.tex` | ✓ |
 | `lux-quasar-benchmarks` | `lux-quasar-benchmarks/lux-quasar-benchmarks.tex` | ✓ |
+| `lux-quasar-composition` | `lux-quasar-composition/lux-quasar-composition.tex` | ✓ |
 | `lux-quasar-consensus` | `lux-quasar-consensus/lux-quasar-consensus.tex` | ✓ |
 | `lux-quasar-horizon` | `lux-quasar-horizon/lux-quasar-horizon.tex` | ✓ |
 | `lux-ray-protocol` | `lux-ray-protocol/lux-ray-protocol.tex` | ✓ |

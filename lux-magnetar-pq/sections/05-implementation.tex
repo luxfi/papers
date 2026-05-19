@@ -1,0 +1,232 @@
+\section{Implementation}
+\label{sec:implementation}
+
+The Magnetar reference implementation is the Go canonical at
+\texttt{github.com/luxfi/magnetar} \cite{magnetargo}, tag
+\texttt{v0.2.0} (Tier B graduation). The implementation totals
+$\sim 3\,992$ lines of Go across 12 production source files plus 9
+test files. This section maps the protocol of
+\S\ref{sec:construction} to the source layout.
+
+\subsection{File layout}
+\label{sec:impl:layout}
+
+\begin{table}[H]
+\centering
+\caption{Magnetar v0.2.0 file layout. Line counts measured by \texttt{wc -l}
+on commit \texttt{db6c252}; total \emph{production} LOC excluding tests
+is $\sim 1\,940$.}
+\label{tab:magnetar-files}
+\begin{tabular}{lrp{7cm}}
+\toprule
+File & LOC & Role \\
+\midrule
+\multicolumn{3}{l}{\emph{Production sources}} \\
+\midrule
+\texttt{doc.go}        &  44 & Package doc + invariant summary \\
+\texttt{params.go}     & 205 & FIPS 205 parameter table; Mode dispatch \\
+\texttt{types.go}      & 230 & Wire types (Round1Msg, Round2Msg, KeyShare, Signature, AbortEvidence) \\
+\texttt{transcript.go} & 190 & cSHAKE256 helpers, SP 800-185 leftEncode / encodeString \\
+\texttt{shamir.go}     & 226 & Byte-wise Shamir over GF(257); deal, reconstruct, modular inverse \\
+\texttt{keygen.go}     & 129 & Single-party FIPS 205 KeyGen / DeriveKey passthrough \\
+\texttt{sign.go}       &  92 & Single-party FIPS 205 SignDeterministic / SignRandomized dispatch \\
+\texttt{verify.go}     & 110 & FIPS 205 Verify passthrough (no Magnetar envelope) \\
+\texttt{dkg.go}        & 456 & 3-round DKG: contribution, transcript binding, share output \\
+\texttt{threshold.go}  & 248 & 2-round threshold sign: ThresholdSigner.Round1/Round2 \\
+\texttt{combine.go}    & 206 & Aggregator: commit-bind check, Lagrange, mix, FIPS 205 sign \\
+\texttt{zeroize.go}    &  50 & Constant-time wipes for bytes, uint16 slices, PrivateKeys \\
+\midrule
+\multicolumn{3}{l}{\emph{Test sources}} \\
+\midrule
+\texttt{shamir\_test.go}             & 170 & GF(257) primitives \\
+\texttt{keygen\_test.go}             & 100 & KeyFromSeed determinism \\
+\texttt{sign\_test.go}               & 112 & Single-party sign roundtrip \\
+\texttt{dkg\_test.go}                & 212 & DKG correctness, equivocation \\
+\texttt{threshold\_test.go}          & 206 & Threshold roundtrip + tamper rejection \\
+\texttt{n1\_byte\_equality\_test.go} & 260 & Headline byte-equality empirical gate \\
+\texttt{kat\_test.go}                & 220 & KAT vector regeneration \\
+\texttt{test\_helpers\_test.go}      & 140 & detReader, committee helpers \\
+\texttt{race\_off\_test.go}          &  19 & \texttt{!race} build-tag: raceEnabled=false \\
+\texttt{race\_on\_test.go}           &  12 & \texttt{race} build-tag: raceEnabled=true \\
+\midrule
+\multicolumn{3}{l}{\emph{KAT generator}} \\
+\midrule
+\texttt{cmd/genkat/main.go}     & 355 & Deterministic KAT regeneration binary \\
+\midrule
+\textbf{Total}              & \textbf{3\,992} & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The strict layering invariant: every file's package-public surface
+calls only into lower-level packages (cSHAKE256, Shamir, FIPS 205);
+no cross-file circular dependency. The reveal-and-aggregate
+construction is implemented top-down with $\textsc{Combine}$
+sitting at the highest layer, calling $\textsc{shamirReconstructGF}$,
+then the cSHAKE256 mix, then FIPS 205 $\textsc{slhSign}$.
+
+\subsection{Dependencies}
+\label{sec:impl:deps}
+
+The dependency graph is deliberately narrow.
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \texttt{github.com/cloudflare/circl}~v1.6.3 \cite{circl}:
+        FIPS 205 SLH-DSA reference (BSD-3-Clause). Magnetar uses
+        \texttt{circl/sign/slhdsa} for $\textsc{KeyGen}$ /
+        $\textsc{DeriveKey}$ / $\textsc{SignDeterministic}$ /
+        $\textsc{SignRandomized}$ / $\textsc{Verify}$. The circl
+        implementation is the most widely-deployed Go FIPS 205
+        backend; its constant-time posture has been audited under
+        Cloudflare's internal review and is used in
+        \texttt{cloudflare/cf-mldsa-precompile} in production.
+  \item \texttt{golang.org/x/crypto}~v0.32.0: provides
+        \texttt{sha3.NewCShake256} for cSHAKE256 and the SP 800-185
+        encoding primitives. Standard-library-adjacent dependency.
+  \item \texttt{golang.org/x/sys}~v0.29.0 (indirect): platform
+        syscall layer used by \texttt{crypto/rand}.
+\end{itemize}
+
+The dependency on \texttt{circl} is the load-bearing one. If circl
+\texttt{v1.6.3} were ever to be deprecated or its FIPS 205
+implementation found to be non-conformant, Magnetar would need to
+switch to a different FIPS 205 backend. Two alternative backends are
+candidate: a future Go \texttt{crypto/slhdsa} once Go's
+\texttt{crypto} package gains FIPS 205 support, and a vendored
+Magnetar copy of the NIST FIPS 205 reference C implementation
+wrapped via cgo. Both are tracked in
+\texttt{TRUSTED-COMPUTING-BASE.md}.
+
+\subsection{Build and test discipline}
+\label{sec:impl:build}
+
+The reproducible build is:
+\begin{lstlisting}[language=bash,caption={Magnetar reproducible build.}]
+cd ref/go
+GOWORK=off go build ./...
+GOWORK=off go test -short ./pkg/magnetar/
+\end{lstlisting}
+
+The \texttt{GOWORK=off} flag is required to suppress a workspace
+file that overlays unrelated Lux packages; without it, Go's module
+loader pulls in transitive paths that may not be on the developer's
+machine. (This is a long-standing Lux-internal annoyance, not a
+Magnetar-specific quirk.)
+
+The \texttt{-short} flag selects the fast CI configuration: the
+$\textsc{TestN1\_ByteEquality}$ runs only the $(3,2)$ configuration,
+and the $\textsc{TestThreshold\_VariousConfigurations}$ test skips
+SLH-DSA-heavy configurations. Long-form CI (\texttt{go test} without
+\texttt{-short}) exercises all configurations and takes $\sim 5$
+minutes per backend.
+
+\paragraph{Race detector pattern.} The \texttt{raceEnabled} build-tag
+pattern at \texttt{race\_off\_test.go} / \texttt{race\_on\_test.go}
+gates SLH-DSA-heavy tests behind \texttt{!race}; the race detector
+adds 5--10x overhead on the SLH-DSA hot path, and the tests are
+\emph{single-goroutine} so they cannot detect a race regardless.
+This pattern is shared with Pulsar and Corona and is documented in
+their respective READMEs.
+
+\paragraph{KAT regeneration.} The KAT generator at
+\texttt{cmd/genkat} accepts a single 48-byte master seed
+(\texttt{masterSeedHex}) and produces five JSON vector files
+(\texttt{keygen}, \texttt{sign}, \texttt{verify},
+\texttt{threshold-sign}, \texttt{dkg}). Re-running the binary on a
+clean checkout produces byte-identical output --- this is the
+deterministic-fixture gate. Drift between committed JSON and
+freshly-regenerated output is a CI failure.
+
+\subsection{KAT vector format}
+\label{sec:impl:kats}
+
+The KAT vectors at \texttt{vectors/} are pinned by SHA-256 in
+\texttt{kat\_test.go}. Each JSON file contains an array of KAT
+records.
+
+\begin{lstlisting}[language=javascript,caption={Magnetar threshold-sign KAT record format.}]
+{
+  "mode":       "Magnetar-SHAKE-192s",
+  "n":          5,
+  "t":          3,
+  "message":    "<hex>",
+  "public_key": "<hex>",
+  "signature":  "<hex>",
+  "quorum":     ["<NodeID_hex>", ...],
+  "session_id": "<hex 16 bytes>",
+  "attempt":    1
+}
+\end{lstlisting}
+
+The KAT vector format mirrors Pulsar's
+\texttt{vectors/} layout for tooling compatibility (the same KAT
+parser handles both schemes). A \texttt{TestKAT\_Threshold} test
+loads each record, runs the threshold protocol against a
+deterministic \texttt{detReader} seeded with the master seed and the
+record index, and asserts the resulting signature matches the
+expected bytes byte-for-byte.
+
+\subsection{Configuration-as-data}
+\label{sec:impl:config}
+
+The Mode-to-Params dispatch in \texttt{params.go} is a static table
+with no runtime logic:
+\begin{lstlisting}[language=go,caption={Mode dispatch in \texttt{params.go}.}]
+var ParamsM192s = &Params{
+    Mode:           ModeM192s,
+    N:              24,
+    PublicKeySize:  48,
+    PrivateKeySize: 96,
+    SignatureSize:  16224,
+    SeedSize:       96,
+    ID:             slhdsa.SHAKE_192s,
+    ShamirPrime:    257,
+}
+\end{lstlisting}
+
+The \texttt{Params.Validate()} method checks that a supplied
+\texttt{*Params} matches one of the canonical tables exactly. Any
+deviation --- a tampered \texttt{ShamirPrime}, a wrong
+\texttt{SeedSize}, an unsupported \texttt{Mode} --- is rejected at
+the entry point of $\textsc{DKG}$, $\textsc{Sign}$,
+$\textsc{Combine}$, and $\textsc{Verify}$. The \texttt{*Params}
+argument is the single point where parameter selection enters the
+crypto path; this matches the ``one and only one way to do
+everything'' discipline.
+
+\subsection{Concurrency posture}
+\label{sec:impl:concurrency}
+
+The Magnetar v0.2.0 reference is \emph{strictly single-goroutine}.
+Every protocol function takes its inputs as immutable slices and
+returns its outputs as freshly-allocated buffers. There is no
+shared mutable state across goroutines, no channels, and no
+locks. This is by design: cryptographic primitives are
+data-parallel at the call-site level (a deployment running many
+concurrent signing sessions allocates one \texttt{ThresholdSigner}
+per session in its own goroutine), but the per-session code path
+is sequential. The \texttt{raceEnabled} pattern at
+\texttt{race\_off\_test.go} encodes this assumption: the tests
+themselves contain no concurrency, so race-detector overhead is
+pure dead-weight.
+
+\subsection{Lux Polaris integration}
+\label{sec:impl:polaris}
+
+Magnetar plugs into the Lux Polaris cert profile at the LSS
+\cite{luxlssmpc} adapter layer. The integration is intentionally
+mirror-symmetric with Pulsar and Corona: a Polaris signer is the
+composition $\textsc{PolarisSigner} = (\textsc{PulsarSigner},
+\textsc{CoronaSigner}, \textsc{MagnetarSigner})$, with the three
+lanes signing the same Prism-bound transcript. The composition
+preserves the LSS lifecycle (key-era management, resharing,
+activation certs) by treating each lane as an independent LSS
+kernel.
+
+The Polaris activation cert binds all three lanes against the
+unchanged group public keys; a Polaris generation transition
+requires three independent activation certs, one per lane. The
+LSS adapter contract \cite{luxlssmpc} is primitive-agnostic at
+its boundary; Magnetar implements the same five-method interface
+($\textsc{DKG}$, $\textsc{Sign}$, $\textsc{Combine}$,
+$\textsc{Verify}$, $\textsc{ResharePreserve}$) as Pulsar.
