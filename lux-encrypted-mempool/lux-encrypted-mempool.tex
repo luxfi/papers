@@ -1,0 +1,531 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{listings}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{multirow}
+
+\geometry{margin=1in}
+
+\definecolor{luxblue}{RGB}{30,64,175}
+\definecolor{codebg}{RGB}{245,245,245}
+\definecolor{darkgray}{RGB}{60,60,60}
+\definecolor{statusdone}{RGB}{0,128,64}
+\definecolor{statusdev}{RGB}{200,120,0}
+\definecolor{statustodo}{RGB}{180,40,40}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=darkgray,
+  urlcolor=luxblue,
+  citecolor=darkgray,
+}
+
+\lstset{
+  basicstyle=\small\ttfamily,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  framerule=0pt,
+  breaklines=true,
+  columns=fullflexible,
+  literate={\_}{\_}1,
+}
+
+\titleformat{\section}{\Large\bfseries}{}{0em}{}[\vspace{-0.5em}\rule{\textwidth}{0.4pt}]
+\titleformat{\subsection}{\large\bfseries}{}{0em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries}{}{0em}{}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\textit{Lux --- GPU-Native Encrypted Mempool}}
+\fancyhead[R]{\small\textit{Lux Industries, Inc.}}
+\fancyfoot[C]{\small\thepage}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}{Proposition}
+
+\newcommand{\done}{\textcolor{statusdone}{\textbf{SHIPPED}}}
+\newcommand{\indev}{\textcolor{statusdev}{\textbf{IN BUILD}}}
+\newcommand{\todesign}{\textcolor{statustodo}{\textbf{SPEC ONLY}}}
+
+\begin{document}
+
+\begin{center}
+{\Huge\bfseries A GPU-Native Encrypted Mempool}\\[0.5em]
+{\Large Threshold TFHE with Deferred Decryption at Block Construction}\\[1.5em]
+{\large Lux Industries, Inc.}\\
+\texttt{lux.network}\\[0.5em]
+{\small \today}
+\end{center}
+
+\vspace{1em}
+
+\begin{abstract}
+\noindent
+The Lux protocol stack ships a fully homomorphic encryption (FHE)
+precompile at \texttt{0x0700\dots} on every EVM-compatible chain in
+the family. This paper specifies an end-to-end encrypted-mempool
+protocol layered on the existing precompile: clients encrypt order
+intents under a network-wide threshold TFHE public key; validators
+admit ciphertexts to the mempool on signature, fee, and a NIZK
+well-formedness proof; the block proposer threshold-decrypts the
+batch at block construction time and feeds plaintext intents to the
+matching engine. The entire pipeline runs natively on GPU --- client
+encryption via WebGPU, CUDA, or Metal Performance Shaders depending
+on the consumer; validator partial-decryption on the same H100/H200
+fleet already provisioned for the TEE attestation precompile
+(\texttt{0x7201}). The design eliminates classical maximal
+extractable value (MEV) on the protected surface --- sandwich and
+priority-front-running attacks become computationally infeasible
+under TFHE semantic security --- without requiring users to opt in
+per trade, choose a builder, or route through a private relay. We
+give the protocol, the GPU-native pipeline, the security argument,
+and a punch list of remaining work against the existing upstream
+modules \texttt{luxfi/fhe}, \texttt{luxfi/threshold},
+\texttt{luxfi/node}, \texttt{luxfi/consensus}, \texttt{luxfi/dex},
+\texttt{luxfi/vm}, and \texttt{luxfi/bridge}.
+\end{abstract}
+
+\tableofcontents
+\vspace{1em}
+
+% ================================================================
+\section{Introduction}
+% ================================================================
+
+A pending transaction on a public mempool is a public broadcast:
+anyone can read it, compute the effect of executing it, and
+synthesise transactions that profit at the submitter's expense ---
+sandwich attacks, front-running of liquidations, time-bandit
+re-orgs, priority-gas auctions. The Lux stack's existing answer to
+this is multifaceted: validator sets that may be configured
+permissionless or permissioned per chain, an FHE precompile
+already activated at \texttt{0x0700\dots} for encrypted state, and
+a threshold-signature substrate (\texttt{luxfi/threshold}) that
+gates cross-chain and consensus signatures behind $M$-of-$N$ share
+holders.
+
+What is missing from the surface today is a single ingredient: the
+glue that combines those pieces into an end-to-end encrypted
+mempool. The FHE precompile can decrypt; the mempool cannot
+currently admit ciphertexts; the proposer cannot currently invoke a
+batch decryption at block construction. This paper specifies that
+glue, GPU-native, and tracks the build against existing upstream
+tickets.
+
+% ================================================================
+\section{Threat Model}
+% ================================================================
+
+\subsection{Attacker Capabilities}
+
+We assume an attacker with the following standard MEV capabilities:
+
+\begin{enumerate}[nosep,label=\textbf{C\arabic*.}]
+\item Observe every pending transaction in any public mempool.
+\item Submit transactions of arbitrary size at arbitrary fee.
+\item Collude with a subset of validators bounded below the
+  byzantine threshold of the consensus protocol.
+\item Operate flash-loan markets to access arbitrary short-duration
+  capital.
+\item Observe and re-org public chains within the network's
+  finality depth.
+\end{enumerate}
+
+\noindent We do \emph{not} assume the attacker can break standard
+cryptographic primitives (ECDSA, BLS, ML-KEM-768, ML-DSA-65, TFHE
+under Ring-LWE hardness) or break the TEE attestation primitives
+that the platform's compliance sidecars rely on.
+
+% ================================================================
+\section{Protocol}
+% ================================================================
+
+\subsection{Pipeline}
+
+\begin{enumerate}[nosep,label=\textbf{P\arabic*.}]
+\item Client encrypts the order tuple
+  $(\text{symbol}, \text{side}, \text{quantity}, \text{limit})$
+  under the network's threshold TFHE public key. Attaches a NIZK
+  proof of well-formedness.
+\item Encrypted intent enters the mempool. Validators see a
+  ciphertext, the fee bid, a signature over the
+  ciphertext-hash, and the NIZK proof. They do not see content.
+\item Validators order pending intents by arrival time (FIFO),
+  per-account partitioned to prevent self-flooding.
+\item At block construction the proposer batches $N$ encrypted
+  intents and invokes the FHE precompile to threshold-decrypt
+  the batch. The proposer's GPU sidecar produces its partial
+  decryption; the proposer collects $M$-of-$N$ partials from peer
+  sidecars over the intra-cluster mesh; the precompile combines
+  them.
+\item The DEX matching engine executes the plaintext batch
+  against orderbook state in the chosen FIFO order, within the
+  2~s block window.
+\end{enumerate}
+
+\subsection{Wire format}
+
+A new transaction type (\texttt{EncryptedPayloadTx}) carries:
+
+\begin{itemize}[nosep]
+\item \texttt{ciphertext}: SnP-packed TFHE ciphertext, $\sim$10--30~KB.
+\item \texttt{nizk\_proof}: well-formedness proof; constant-size,
+  $\sim$1~KB.
+\item Plaintext metadata: signature, fee bid, sender, expiry,
+  bootstrap-budget bid.
+\end{itemize}
+
+\subsection{Reference precompile address space}
+
+The Lux EVM reserves \texttt{0x0700\dots} for privacy and encryption
+precompiles. The FHE precompile occupies the first slot in that
+range, with adjacent slots for ACL, input verifier, and gateway
+contracts. The encrypted mempool reuses this same precompile; no
+new address is required.
+
+% ================================================================
+\section{GPU-Native Pipeline}
+% ================================================================
+
+The cost driver in this protocol is the TFHE bootstrap operation
+performed inside the precompile during step P4. On modern hardware
+this is the difference between an unbuildable system (CPU TFHE
+bootstrap at $\sim$10~ms/gate) and a buildable one (H100/H200 GPU
+TFHE bootstrap at $\sim$10--50~\textmu s/gate, batched).
+
+\subsection{Client-side encryption}
+
+The client SDK exposes a single entry point,
+\texttt{encryptIntent(\{symbol, side, qty, limit\})}, returning
+$(\text{ciphertext}, \text{NIZK\_proof})$. Implementation chooses
+the backend at runtime via capability detection:
+
+\begin{longtable}{p{3.4cm}p{5.0cm}p{6.2cm}}
+\toprule
+\textbf{Tier} & \textbf{Backend} & \textbf{Audience} \\
+\midrule
+Native &
+  \texttt{luxfi/lattice/v7/gpu} CUDA on NVIDIA, Metal on Apple &
+  Market maker bots, institutional traders, validators \\
+Browser GPU &
+  WebGPU compute shaders against the same kernels &
+  Retail web users on modern browsers \\
+Edge CPU fallback &
+  Native Go fall-through &
+  Old browsers, last-resort path \\
+\bottomrule
+\end{longtable}
+
+The NIZK proof keeps mempool admission cheap: validators verify the
+proof against the precompile without ever decrypting. Malformed
+ciphertexts cannot reach block construction.
+
+\subsection{Validator pipeline}
+
+Per-validator architecture:
+
+\begin{itemize}[nosep]
+\item \textbf{Mempool extension}: admit on signature + fee + NIZK
+  + bootstrap-budget bid, no decryption. Per-account FIFO inside
+  each partition.
+\item \textbf{Block proposer hook} (every 2~s): proposer collects
+  $N$ encrypted intents into a batch.
+\item \textbf{Threshold partial-decrypt service}: a GPU sidecar
+  running the \texttt{luxfi/fhe} threshold partial-decrypt
+  surface, exposed via gRPC. Holds one share of the network FHE
+  secret key. Computes its partial decryption of the batch in
+  one bootstrapped pass.
+\item \textbf{Cross-validator combine}: proposer collects
+  $M$-of-$N$ partial decryptions from peer sidecars over the
+  intra-cluster mesh. Combine is fast linear algebra on the
+  proposer's GPU.
+\item \textbf{Plaintext feed}: handed to the DEX matching engine
+  for execution.
+\end{itemize}
+
+\subsection{Why threshold TFHE on GPU}
+
+\begin{longtable}{p{3.8cm}p{4.2cm}p{2.4cm}p{4.4cm}}
+\toprule
+\textbf{Option} & \textbf{Security} & \textbf{GPU fit} & \textbf{Verdict} \\
+\midrule
+Single-key TFHE &
+  One holder of FHE secret key &
+  Trivial GPU port &
+  Single point of compromise. \textbf{Reject.} \\
+TEE-only &
+  TEE-attested boundary &
+  Existing \texttt{0x7201} precompile &
+  Strong but trusts hardware vendor. \\
+Threshold TFHE on GPU &
+  $M$-of-$N$ secret-sharing of FHE key &
+  \texttt{luxfi/lattice/v7/gpu} + thin partial-decrypt &
+  No single point of compromise. Throughput matches block
+  time. \textbf{Recommended.} \\
+Hybrid: Threshold + TEE &
+  TEE attests each share's correct use &
+  Same GPU; defense-in-depth &
+  Marginal incremental win. \textbf{Add later.} \\
+\bottomrule
+\end{longtable}
+
+\subsection{Block-level bootstrap budget}
+
+Each block carries a TFHE bootstrap meter,
+$\texttt{tfhe\_ops\_used} / \texttt{tfhe\_ops\_max}$, analogous to
+EVM gas. This prevents one large encrypted order from starving the
+block by forcing an unbounded bootstrap chain. The meter is enforced
+inside the precompile dispatch and surfaced as a transaction-level
+fee bid: a higher bid lets a transaction consume more bootstrap
+budget within its slot.
+
+% ================================================================
+\section{Security}
+% ================================================================
+
+\begin{theorem}[No sandwich on the encrypted mempool]
+\label{thm:sandwich}
+Under the protocol of \S3 with a correctly-generated threshold
+TFHE key, an honest majority of $M$-of-$N$ share holders, and
+TFHE-CCA1 security under Ring-LWE hardness, an attacker cannot
+execute a sandwich attack against a target intent.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+A sandwich requires the attacker to (a)~identify the victim intent
+in the mempool, (b)~determine its direction and size, and (c)~place
+front-running and back-running intents that bracket it. Steps (a)
+and (b) require distinguishing or recovering plaintext from
+ciphertexts under the threshold key; under TFHE semantic security
+this is computationally infeasible. Step (c) requires the
+attacker's intents to land immediately before and after the
+victim's; mempool ordering is FIFO and the validator does not
+learn which ciphertext is the victim until the block is built. The
+attacker has no targeting primitive. \qed
+\end{proof}
+
+\begin{theorem}[Negative expected value of blind front-running]
+\label{thm:blind-frontrun}
+An attacker who submits speculative orders without information
+about pending intents has expected P\&L
+\[
+\mathbb{E}[\textit{P\&L}_{\textit{blind}}] = -f_{\textit{taker}}
+\cdot V_{\textit{blind}}
+\]
+where $f_{\textit{taker}}$ is the taker fee and
+$V_{\textit{blind}}$ is the speculative-order notional.
+\end{theorem}
+
+\begin{proof}
+With no information advantage the directional bet is a zero-mean
+random variable. The attacker pays taker fees on every speculative
+intent. Expected P\&L is strictly negative. \qed
+\end{proof}
+
+\begin{theorem}[Quorum failure preserves liveness]
+\label{thm:quorum-fail}
+If $M$-of-$N$ partial decryptions are unavailable at block
+construction --- e.g., a partition isolates a validator subset or
+$N-M+1$ sidecars are simultaneously down --- the proposer falls
+back to plaintext FIFO without dropping the block.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+The proposer hook of \S3.4 has a configurable budget
+($\Delta t_{\max}$, default 500~ms). If the threshold-decrypt
+service does not complete in $\Delta t_{\max}$, the proposer
+discards the partial decryptions received and falls back to plain
+FIFO. Liveness is preserved at the cost of one block of MEV
+exposure on the encrypted-mempool path. Subsequent blocks return
+to the protected path as soon as the quorum is restored. \qed
+\end{proof}
+
+% ================================================================
+\section{Upstream Module Map}
+\label{sec:upstream-map}
+% ================================================================
+
+\begin{longtable}{p{3.0cm}p{6.0cm}p{2.0cm}p{4.0cm}}
+\toprule
+\textbf{Module} & \textbf{Role} & \textbf{Status} & \textbf{Reference issue} \\
+\midrule
+\texttt{luxfi/precompile/fhe} &
+  FHE precompile at \texttt{0x0700\dots} &
+  \done & --- \\
+\texttt{luxfi/fhe} &
+  TFHE library (native Go, Ring-LWE, GPU NTT) &
+  \done (CPU + GPU NTT) &
+  Bootstrap-on-GPU follow-on: \texttt{luxfi/fhe\#4} \\
+\texttt{luxfi/threshold} &
+  Threshold protocols (CGGMP21, FROST, TFHE keygen) &
+  \indev (TFHE distributed decrypt stubbed) &
+  Critical path: \texttt{luxfi/threshold\#20} \\
+\texttt{luxfi/lattice/v7} &
+  Ring-LWE, NTT, sampling &
+  \done & --- \\
+\texttt{luxfi/node} &
+  Encrypted-payload mempool admission &
+  \todesign &
+  \texttt{luxfi/node\#115} \\
+\texttt{luxfi/consensus} &
+  Block-proposer hook for deferred decryption &
+  \todesign &
+  \texttt{luxfi/consensus\#9} \\
+\texttt{luxfi/vm} &
+  Per-account FIFO mempool primitive &
+  \todesign &
+  \texttt{luxfi/vm\#6} \\
+\texttt{luxfi/dex} &
+  Decrypted-batch ingress + ordering &
+  \todesign &
+  \texttt{luxfi/dex\#7} \\
+\texttt{luxfi/bridge} &
+  FHE payload wrapping for destination-chain ingress &
+  \todesign &
+  \texttt{luxfi/bridge\#403} \\
+\bottomrule
+\end{longtable}
+
+\noindent The honest summary: the FHE precompile, the TFHE library
+(CPU + GPU NTT), the Ring-LWE primitives, and the threshold
+keygen path are all production today. What is missing is the
+end-to-end glue: real distributed TFHE decryption, the
+encrypted-payload mempool extension, the block-proposer hook, and
+the DEX / bridge integrations. Each missing piece has a tracking
+issue against the relevant module.
+
+% ================================================================
+\section{Build Punch List}
+% ================================================================
+
+The build is tracked as discrete tickets across modules. Intended
+ordering respects dependencies: real distributed decryption
+(\texttt{luxfi/threshold\#20}) and GPU bootstrap
+(\texttt{luxfi/fhe\#4}) unblock the rest; the mempool extension
+(\texttt{luxfi/node\#115}) and the proposer hook
+(\texttt{luxfi/consensus\#9}) unblock DEX integration
+(\texttt{luxfi/dex\#7}); bridge wrapping
+(\texttt{luxfi/bridge\#403}) is a follow-on once the destination
+chain is encrypted-mempool capable.
+
+\begin{enumerate}[label=\textbf{E\arabic*}]
+\item \texttt{luxfi/threshold}: replace the fake-threshold TFHE
+  stub with real Shamir-split-secret partial-decrypt and
+  Lagrange-interpolated combine. Use the existing LSSS framework
+  in \texttt{luxfi/fhe/pkg/threshold}.
+\item \texttt{luxfi/fhe}: extend GPU dispatch beyond NTT to
+  blind rotation, key switching, and bootstrap. Maintain
+  byte-equality probe against CPU.
+\item \texttt{luxfi/node}: encrypted-payload tx type; admission
+  policy on signature + NIZK + bootstrap-budget bid; per-account
+  FIFO partition; integration with the FHE precompile for NIZK
+  verify.
+\item \texttt{luxfi/consensus}: optional
+  \texttt{IntentDecryptor} callback in ChainVM init; receives the
+  ordered batch and returns a transformed plaintext batch within
+  a configurable time budget; falls back to plaintext FIFO on
+  quorum failure.
+\item \texttt{luxfi/vm}: expose
+  \texttt{Mempool.GetPerAccountFIFO(owner)} on the mempool
+  interface; default linked.Hashmap implementation; per-account
+  capacity caps.
+\item \texttt{luxfi/dex}: add \texttt{BatchMetadata} (origin,
+  intra-batch order) to the order ingress wire format; engine
+  respects \texttt{intra\_batch\_order} for encrypted-origin
+  batches.
+\item \texttt{luxfi/bridge}: optional \texttt{PayloadWrapper}
+  callback between signature and broadcast; resolves destination
+  chain's threshold TFHE public key; encrypts under it; cancel
+  path on destination decryption failure.
+\end{enumerate}
+
+% ================================================================
+\section{Use Cases}
+% ================================================================
+
+The encrypted-mempool primitive is venue-neutral and substrate-level.
+Downstream chains and applications consume it without modification
+to the protocol described here.
+
+\begin{itemize}[nosep]
+\item \textbf{Regulated digital-securities venues} consume the
+  encrypted mempool to provide best-execution guarantees to
+  retail and institutional traders without an opt-in flow. The
+  same defence applies uniformly to every intent.
+\item \textbf{Dark pools and confidential market making} reuse
+  the FHE precompile and threshold-key infrastructure to keep
+  individual maker quotes private until block construction.
+\item \textbf{Permissioned consortium chains} use the encrypted
+  mempool to remove front-running risk on inter-bank settlement,
+  even when the validator set is a small known group.
+\item \textbf{Cross-chain bridges} use the bridge payload
+  wrapping (\texttt{luxfi/bridge\#403}) to protect source-side
+  observability of large deposits, closing the source-chain
+  sandwich vector that has historically cost institutional users.
+\end{itemize}
+
+White-label applications that ship downstream of Lux import the
+upstream modules and inherit the protocol without modification. The
+Lux philosophy is that the primitive lives once, in the substrate,
+and every consumer benefits.
+
+% ================================================================
+\section{Open Questions}
+% ================================================================
+
+\begin{enumerate}[label=\arabic*.]
+\item \textbf{Throughput at peak orderbook load.} The bootstrap
+  budget is the enforcement primitive; the right \emph{values}
+  for per-block ops cap and per-tx bid require benchmarking at
+  realistic intent volumes once the GPU-bootstrap path
+  (\texttt{luxfi/fhe\#4}) lands.
+\item \textbf{Threshold-key ceremony.} The threshold TFHE secret
+  key is generated once across $N$ validators. Failure modes
+  (partial output, share corruption, observer-in-the-middle)
+  must be designed and documented before mainnet rollout.
+\item \textbf{Encrypted-bridge atomicity.} An encrypted bridge
+  message whose decryption fails on destination leaves a gap.
+  The bridge protocol needs a retry-and-cancel path that does
+  not leak content during the gap.
+\item \textbf{Validator ordering attestations.} Signed
+  $(\text{ciphertext-hash}, \text{arrival-time})$ tuples per
+  block would let third parties audit mempool ordering without
+  decryption. Design + operational cost is open.
+\item \textbf{Formal mechanisation.}
+  Theorems~\ref{thm:sandwich}, \ref{thm:blind-frontrun}, and
+  \ref{thm:quorum-fail} are paper-form. A Lean4 or Coq
+  mechanisation is planned alongside the existing
+  \texttt{luxfi/proofs/} corpus.
+\end{enumerate}
+
+% ================================================================
+\section{Conclusion}
+% ================================================================
+
+The Lux substrate today ships an FHE precompile, a TFHE library
+with GPU NTT, a threshold-protocol framework, and a permissioned
+validator option. What remains to deliver an end-to-end encrypted
+mempool is precisely a glue layer: real distributed TFHE
+decryption, an encrypted-payload mempool admission policy, a
+proposer hook for deferred decryption, and DEX / bridge
+integrations. Each piece is tracked against the relevant upstream
+module. Once it lands, every consumer of the Lux stack inherits
+sandwich-and-flash-loan immunity on the protected surface, with no
+opt-in, no separate relay, and no per-trade configuration.
+
+The primitive lives once. Every chain in the family, and every
+white-label application downstream, gets it for free.
+
+\end{document}
