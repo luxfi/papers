@@ -16,35 +16,44 @@ This section maps the per-validator standalone construction of
 
 \begin{table}[H]
 \centering
-\caption{Magnetar v0.5.2 per-validator standalone primary path
-file layout. The threshold forms (\texttt{thbs/} subpackage and
-\texttt{combine.go}, \texttt{dkg.go}, \texttt{threshold.go}) are
-documented in Appendix~\ref{app:thbs} and Appendix~\ref{app:reveal}.}
+\caption{Magnetar v1.0.0 file layout. The per-validator standalone
+primary path lives in \texttt{standalone.go}; the THBS-SE
+permissionless threshold companion lives in \texttt{thbsse.go} and
+\texttt{thbsse\_field.go} and is documented in \S\ref{sec:thbsse}.}
 \label{tab:magnetar-files-standalone}
 \begin{tabular}{lp{8cm}}
 \toprule
 File & Role \\
 \midrule
-\multicolumn{2}{l}{\emph{Standalone primary path}} \\
+\multicolumn{2}{l}{\emph{Shared core}} \\
 \midrule
-\texttt{doc.go}            & Package doc + invariant summary \\
+\texttt{doc.go}            & Package doc + v1.0 dual-primitive summary \\
 \texttt{params.go}         & FIPS 205 parameter table; Mode dispatch \\
-\texttt{types.go}          & Wire types ($\mathsf{NodeID}$, \texttt{Signature}, \texttt{PublicKey}, \texttt{PrivateKey}, \texttt{AbortEvidence}) \\
+\texttt{types.go}          & Wire types ($\mathsf{NodeID}$, \texttt{Signature}, \texttt{PublicKey}, \texttt{PrivateKey}) \\
 \texttt{keygen.go}         & Single-party FIPS 205 KeyGen / DeriveKey passthrough \\
 \texttt{sign.go}           & Single-party FIPS 205 SignDeterministic / SignRandomized dispatch \\
 \texttt{verify.go}         & FIPS 205 Verify passthrough (no Magnetar envelope) \\
-\texttt{standalone.go}     & \texttt{PerValidatorKeypair}, \texttt{ValidatorSign}, \texttt{ValidatorBatchVerify}, \texttt{ValidatorAggregateCert}, \texttt{BuildAggregateCert}, \texttt{VerifyAggregateCert} \\
-\texttt{aggregate.go}      & SDK-friendly \texttt{SignedBundle} / \texttt{AggregatedSignature} shape (byte-equivalent to \texttt{ValidatorAggregateCert}) \\
 \texttt{wire.go}           & Canonical MAGS / MAGG envelope codec; stateless \texttt{VerifyBytes} dispatcher \\
-\texttt{transcript.go}     & cSHAKE256 helpers; constant-time byte equality \\
+\texttt{transcript.go}     & cSHAKE256 helper; THBS-SE share-deal customisation tag \\
 \texttt{zeroize.go}        & Constant-time wipes for bytes, uint16 slices, PrivateKeys \\
+\texttt{dispatch.go}       & ValidatorBatchTier provenance; ctEqualBytes \\
 \midrule
-\multicolumn{2}{l}{\emph{Standalone primary path tests}} \\
+\multicolumn{2}{l}{\emph{Per-validator standalone primary primitive}} \\
+\midrule
+\texttt{standalone.go}     & \texttt{PerValidatorKeypair}, \texttt{ValidatorSign}, \texttt{ValidatorBatchVerify}, \texttt{ValidatorAggregateCert}, \texttt{BuildAggregateCert}, \texttt{VerifyAggregateCert} \\
+\midrule
+\multicolumn{2}{l}{\emph{THBS-SE permissionless threshold companion}} \\
+\midrule
+\texttt{thbsse.go}         & \texttt{NewThbsSeKey}, \texttt{ThbsSeRound1}, \texttt{Combine}, \texttt{ThbsSeSlotGuard}, equivocation + share-evidence verifiers \\
+\texttt{thbsse\_field.go}  & Internal GF(257) byte-wise Shamir share arithmetic; \texttt{MaxCommittee257}, \texttt{EvalPointFromID} \\
+\midrule
+\multicolumn{2}{l}{\emph{Tests}} \\
 \midrule
 \texttt{standalone\_test.go}      & 7 tests: round-trip, determinism, independence, batch verify, bad-sig-counted-out, unknown-validator rejection, duplicate-dedupe \\
-\texttt{aggregate\_test.go}       & Bundle / aggregate cross-checks \\
+\texttt{thbsse\_test.go}          & 8 gate tests + 2 bonus: \textbf{TestThbsSE\_Wire\_FIPS205Verifiable}, \textbf{TestThbsSE\_RejectSeedReveal}, \textbf{TestThbsSE\_RejectUnselectedFORS}, \textbf{TestThbsSE\_RejectUnselectedWOTS}, \textbf{TestThbsSE\_SlotReuseRejected}, \textbf{TestThbsSE\_OverselectedCommittee}, \textbf{TestThbsSE\_SlotBindingDomainSeparation}, \textbf{BenchmarkThbsSE\_Sign\_5of7} \\
 \texttt{wire\_test.go}            & MAGS / MAGG roundtrip + \textbf{TestMagnetar\_Wire\_FIPS205Verifiable} (load-bearing byte-identity gate) \\
-\texttt{verify.go} / \texttt{sign\_test.go} / \texttt{keygen\_test.go} & Single-party FIPS 205 dispatch tests \\
+\texttt{kat\_test.go}             & KAT replay including \textbf{TestKAT\_ThbsSe} (deterministic $n=7,t=4$ vectors) \\
+\texttt{sign\_test.go} / \texttt{keygen\_test.go} & Single-party FIPS 205 dispatch tests \\
 \texttt{race\_off\_test.go} / \texttt{race\_on\_test.go} & \texttt{raceEnabled} build-tag pattern (FIPS 205 heavy paths skipped under race) \\
 \midrule
 \multicolumn{2}{l}{\emph{KAT generator}} \\
@@ -216,9 +225,11 @@ input slices; there is no shared mutable state.
 \texttt{ValidatorSign} is strictly single-goroutine: the FIPS 205
 signing path is sequential per signature, and a deployment running
 many concurrent signing sessions allocates one signer goroutine per
-session. The threshold forms documented in Appendix~\ref{app:thbs}
-and Appendix~\ref{app:reveal} are also strictly single-goroutine
-per session.
+session. THBS-SE Combine is also strictly single-goroutine per
+session: the FIPS 205 dispatch dominates the runtime and the
+Lagrange interpolation is small enough that there is no
+parallelization win at the round threshold sizes (typically
+$t \le 21$).
 
 \subsection{Lux Polaris integration}
 \label{sec:impl:polaris}
@@ -246,8 +257,10 @@ $\textsc{KeyRotate}$ that signs the old $pk_i$ replacing under
 $sk_i^{\mathrm{old}}$ before installing $(sk_i^{\mathrm{new}},
 pk_i^{\mathrm{new}})$.
 
-For the threshold forms (Appendix~\ref{app:thbs},
-Appendix~\ref{app:reveal}), the LSS lifecycle is committee-wide
-and matches the Pulsar / Corona threshold adapters. Those are
-appropriate for the M-Chain bridge custody and A-Chain
-confidential compute paths.
+For THBS-SE (\S\ref{sec:thbsse}), the LSS lifecycle is
+committee-wide and matches the Pulsar / Corona threshold adapters
+shape: a Polaris generation transition rotates the committee's
+threshold material via a fresh \texttt{NewThbsSeKey} ceremony (or
+the production leaderless PVSS-DKG variant in the sibling
+\texttt{luxfi/threshold} package) and re-publishes the new group
+public key under the next-generation LSS adapter.
