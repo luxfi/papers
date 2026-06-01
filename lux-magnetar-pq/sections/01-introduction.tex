@@ -41,11 +41,16 @@ break the conjunction --- a strictly harder task than breaking any
 single primitive.
 
 Magnetar is the third leg. This paper specifies the construction at
-\texttt{github.com/luxfi/magnetar} v0.5.2 (per-validator standalone
-public-BFT primary primitive; canonical MAGS/MAGG wire codec; stateless
-\texttt{VerifyBytes} dispatcher), the byte-identity argument against
-single-party FIPS 205, and the Polaris-composition discipline that
-binds Magnetar to Pulsar and Corona under a common transcript.
+\texttt{github.com/luxfi/magnetar} v1.0.0 --- the per-validator
+standalone public-BFT primary primitive, the THBS-SE permissionless
+threshold companion, the canonical MAGS/MAGG wire codec, and the
+stateless \texttt{VerifyBytes} dispatcher --- and the
+Polaris-composition discipline that binds Magnetar to Pulsar and
+Corona under a common transcript.\footnote{Operator-controlled MPC
+custody uses TEE-attestation-gated variants in
+\texttt{luxfi/threshold/protocols/\{slhdsa,mldsa,rlwe\}-tee} shipped
+via the \texttt{lux/mpc} sibling tree; those variants are out of
+scope here.}
 
 \subsection{What Magnetar is}
 \label{sec:intro:what}
@@ -66,19 +71,20 @@ threshold templates of FROST \cite{frost,rfc9591}, Pulsar
 \emph{no linear share-aggregation identity}: there is no algebraic
 operation analogous to FROST's $z = \sum_i z_i$ that produces a valid
 SLH-DSA signature from per-party contributions on the same message.
-The literature is uniform on this point. Cozzo-Smart (EUROCRYPT 2019,
-``Sharing the LUOV'') establish that every internal SHAKE/SHA-2
-evaluation in a hash-based signature is a non-linear function of the
-seed, so any genuine $t$-of-$n$ scheme producing a single FIPS
-205-shaped signature requires either (i) reconstructing the seed
-inside a trusted aggregator (the reveal-and-aggregate trust model,
-which puts the aggregator in the TCB), or (ii) running a full MPC
-over the entire SHA-256/SHAKE hash tree (open research, with cost
-proportional to the $\sim 10^4$ hash invocations per
-SLH-DSA-SHAKE-192s signature). Bonte-Smart-Tan (2023, ``Threshold
-SPHINCS+'') confirm the infeasibility analysis. NIST IR 8214
-\cite{nistir8214c} classifies SLH-DSA as ``highest threshold-MPC
-cost'' among FIPS 203/204/205.
+The literature is uniform on this point. Cozzo and Smart
+\cite{cosmin2021} (EUROCRYPT 2019, ``Sharing the LUOV'') establish
+that every internal SHAKE/SHA-2 evaluation in a hash-based signature
+is a non-linear function of the seed, so any genuine $t$-of-$n$
+scheme producing a single FIPS 205-shaped signature requires either
+(i) reconstructing the seed inside some combiner process at sign
+time, or (ii) running a full MPC over the entire SHA-256/SHAKE hash
+tree (open research, with cost proportional to the $\sim 10^4$ hash
+invocations per SLH-DSA-SHAKE-192s signature). Bonte, Smart and Tan
+(2023, ``Threshold SPHINCS+'') confirm the infeasibility analysis.
+THBS-SE (\S\ref{sec:thbsse}) is Magnetar's chosen instantiation of
+(i) with a \emph{public combiner} role: anyone can be the combiner;
+no host is in the TCB at sign time; the seed reconstruction is
+transient and local to the combiner's own substrate.
 
 The architecturally correct primitive for \emph{public-BFT consensus}
 under these constraints is therefore $N$ standalone signatures
@@ -245,17 +251,20 @@ What \texttt{luxfi/magnetar} contributes is the \emph{composition}:
         \texttt{ValidatorAggregateCert} parallel-slices shape is
         designed to feed the Z-Chain Groth16 rollup that compresses
         $N \times |\sigma|$ to a constant-size certificate.
-  \item Honest demotion of the threshold forms. Reveal-and-aggregate
-        seed reconstruction and the THBS construction over selected
-        FORS / WOTS+ elements both ship in the same artefact under
-        \texttt{ref/go/pkg/thbs/} and \texttt{combine.go}, but they
-        are explicitly TEE-required by policy. The deployment
-        runbook directs public-BFT consumers to
-        \texttt{ValidatorSign} as the only public-BFT-safe entry
-        point; the threshold forms are appropriate for M-Chain
-        bridge custody and A-Chain confidential compute, where a
-        TEE-attested host is in the TCB by policy. See
-        Appendix~\ref{app:thbs} and Appendix~\ref{app:reveal}.
+  \item THBS-SE (Threshold Hash-Based Signatures with
+        Selected-Element Reconstruction), the permissionless
+        threshold companion to the per-validator standalone path,
+        specified in \S\ref{sec:thbsse}. THBS-SE is a $t$-of-$n$
+        construction in which the public combiner role is open to
+        any peer (validator, block proposer, RPC node, passive
+        watcher); no host is in the TCB at sign time. The
+        construction enforces the hard invariant ``a revealed value
+        is allowed only if it is also present in the final SLH-DSA
+        signature'' --- party-local share material never includes
+        the SLH-DSA seed, only Shamir leaves over $\mathrm{GF}(257)$
+        --- and produces FIPS 205 wire bytes byte-identical to
+        single-party $\textsc{SignDeterministic}$ on the
+        reconstructed seed.
 \end{enumerate}
 
 \subsection{Trust model summary}
@@ -300,59 +309,65 @@ quantum operations per validator to forge that validator's
 signatures, and would still control only one quorum vote per
 forgery target.
 
-\paragraph{Threshold forms (TEE-only).} The threshold forms shipped
-in the same artefact --- THBS v1 (Appendix~\ref{app:thbs}) and
-reveal-and-aggregate over the SLH-DSA scheme seed
-(Appendix~\ref{app:reveal}) --- carry their own trust models in
-which a dealer or aggregator holds master secret material in
-memory. These forms are explicitly NOT public-BFT-safe and
-require hardware-attested confidential compute (AMD SEV-SNP, Intel
-TDX, or equivalent). They are documented in the appendices as
-companion primitives for M-Chain bridge custody and A-Chain
-confidential compute.
+\paragraph{THBS-SE trust model.} The permissionless threshold
+companion (\S\ref{sec:thbsse}) carries a distinct trust model: a
+public combiner reconstructs the SLH-DSA seed transiently in its
+own memory for the duration of one
+$\textsc{SignDeterministic}$ call (sub-second wall-clock at
+SHAKE-192s) and zeroizes. The combiner role is open to any peer;
+no long-lived secret material exists outside party-local Shamir
+leaves; no host is in the TCB by policy. This is materially
+stronger than a TEE-attested privileged-aggregator model and
+materially weaker than a strict ``no transient seed at any moment''
+invariant. The strict-atom-assembly path (the v1.1 lift tracked in
+\texttt{BLOCKERS.md::MAGNETAR-STRICT-ATOM-V11}) closes the gap by
+reconstructing only the message-selected FORS leaves and WOTS+
+chain bases from per-atom shares, bypassing
+\texttt{slh\_sign\_internal} entirely; that work requires a
+Magnetar-internal reimplementation of FIPS 205 \S\S 5--8 and is
+out of scope for v1.0.
 
 \subsection{What this paper specifies}
 \label{sec:intro:paper}
 
 Section~\ref{sec:preliminaries} reviews FIPS 205 SLH-DSA, the
-threshold-signature syntax used by the appendices, and the security
+threshold-signature syntax used by THBS-SE, and the security
 games. Section~\ref{sec:construction} gives the per-validator
 standalone construction byte-exact in pseudocode, keyed to the Go
 canonical at \texttt{ref/go/pkg/magnetar/standalone.go} and
 \texttt{wire.go} byte-for-byte. Section~\ref{sec:security} states
 the security argument: byte-identity to single-party FIPS 205, the
-$N$-of-$N$ verification semantics, and the existential
-unforgeability inheritance from FIPS 205 UF-CMA per validator.
+$N$-of-$N$ verification semantics, the existential unforgeability
+inheritance from FIPS 205 UF-CMA per validator, and the named
+THBS-SE selected-element-reveal invariant theorem.
+Section~\ref{sec:thbsse} specifies THBS-SE: the slot binding, the
+commit-and-reveal rounds, the public combiner, the slashable
+equivocation and malformed-share evidence shapes, and the
+byte-identity theorem that ties the public-combiner output to
+single-party FIPS 205 $\textsc{SignDeterministic}$.
 Section~\ref{sec:implementation} surveys the reference
 implementation. Section~\ref{sec:evaluation} reports parameter sets
 and per-signature latency from the production test suite.
 Section~\ref{sec:comparison} locates Magnetar alongside Pulsar and
 Corona in the Polaris cert profile.
-Section~\ref{sec:fullmpc} surveys the open research path to a true
-public-DKG threshold HBS that would not require TEE.
-Section~\ref{sec:related} surveys the (sparse) threshold-SLH-DSA
-literature and the broader threshold-hash-based-signature work.
+Section~\ref{sec:related} surveys the threshold-SLH-DSA literature
+and the broader threshold-hash-based-signature work.
 Section~\ref{sec:conclusion} closes.
 
-Appendix~\ref{app:thbs} documents the THBS (true threshold
-hash-based signature) construction per McGrew et al. ePrint 2019/793
-shipped at \texttt{ref/go/pkg/thbs/}, with explicit
-TEE-only-by-policy framing. Appendix~\ref{app:reveal} documents the
-reveal-and-aggregate construction over the SLH-DSA scheme seed
-shipped at \texttt{ref/go/pkg/magnetar/combine.go}, with the same
-TEE-only-by-policy framing.
-
 \medskip\noindent\textbf{Artefact status.} At the time of writing,
-the artefact is \texttt{luxfi/magnetar} v0.5.2 (commit
-\texttt{1c84519}; tagged 2026-05-31). The per-validator standalone
-primary primitive shipped at v0.5.0; the canonical MAGS/MAGG wire
-codec and the stateless \texttt{VerifyBytes} dispatcher shipped at
-v0.5.1; v0.5.2 added the integration entry points for the
-threshold daemon and pinned the byte-identity regression test
-across all three parameter sets under \texttt{-count=1} and
-\texttt{-race}. The Tier-A documentation shape (12-document
-package mirroring Pulsar's structure) is in-tree. Mechanised
-proof artefacts (EasyCrypt theories for FIPS 205 UF-CMA inheritance,
-Lean bridges for the wire-codec byte-identity lemma, Jasmin sources
-for the constant-time hot paths) and external cryptographer audit
-are the remaining gates to full Tier A.
+the artefact is \texttt{luxfi/magnetar} v1.0.0. The per-validator
+standalone primary primitive shipped at v0.5.0 and is unchanged at
+v1.0; THBS-SE is the v1.0 closer of the permissionless-threshold
+story and replaces the v0.x reveal-and-aggregate path. The
+byte-identity regression tests
+$\textsc{TestMagnetar\_Wire\_FIPS205Verifiable}$ and
+$\textsc{TestThbsSE\_Wire\_FIPS205Verifiable}$ pin both primitives
+to unmodified \texttt{cloudflare/circl/sign/slhdsa.Verify} across
+all three SHAKE parameter sets under \texttt{-count=1} and
+\texttt{-race}. The Tier-A documentation shape (10-document package
+mirroring Pulsar's structure, with the v0.x submission scaffolds
+ported forward and the v1.0 normative content in
+\texttt{SPEC.md} + \texttt{THBS-SPEC.md}) is in-tree. Mechanised
+proof artefacts for THBS-SE, the strict-atom-assembly v1.1 lift,
+and external cryptographer audit of the v1.0 surface are the
+remaining gates to full Tier A.
