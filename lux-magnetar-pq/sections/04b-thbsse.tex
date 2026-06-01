@@ -1,0 +1,411 @@
+\section{THBS-SE --- Selected-Element Permissionless Threshold}
+\label{sec:thbsse}
+
+This section specifies \emph{THBS-SE} (Threshold Hash-Based
+Signatures with Selected-Element Reconstruction), the
+permissionless threshold companion to the per-validator standalone
+construction of \S\ref{sec:construction}. THBS-SE produces a
+\emph{single} FIPS 205-shaped signature from a $t$-of-$n$ committee
+on a slot-bound message; the public combiner role is open to any
+peer; no host is in the TCB by policy at sign time. The construction
+sits alongside the standalone primary primitive in
+\texttt{ref/go/pkg/magnetar/thbsse.go} and produces wire bytes that
+unmodified FIPS 205 verifiers (notably
+\texttt{cloudflare/circl/sign/slhdsa.Verify}) accept verbatim.
+
+\subsection{Motivation}
+\label{sec:thbsse:motivation}
+
+The per-validator standalone primitive ships $N$ independent
+FIPS 205 signatures per consensus message and trusts the consensus
+layer's certificate-counting logic to determine quorum. For
+public-BFT consensus this is the right primitive. There are
+deployments, however, where the verifier wants \emph{one} FIPS
+205-shaped signature on a message from a committee: long-term
+storage on a separate ledger, smart-contract verification with
+fixed gas cost regardless of $n$, cross-chain bridging into a
+system that recognises only one signature per message.
+
+Cozzo and Smart \cite{cosmin2021} establish that producing a
+single FIPS 205-shaped signature from $t$ shares requires either
+(i) some combiner process reconstructing the seed at sign time, or
+(ii) full MPC over the hash tree. THBS-SE chooses (i) with a
+\emph{public combiner} role: anyone --- a validator, a block
+proposer, an RPC node, a passive watcher --- can run Combine. The
+combiner role is a PUBLIC role, not a privileged aggregator role;
+the construction has no host in the TCB by policy.
+
+\subsection{Hard invariant}
+\label{sec:thbsse:invariant}
+
+The construction enforces the named theorem
+(Theorem~\ref{thm:thbsse-selected-element-reveal} in
+\S\ref{sec:security:thbsse-reveal}):
+
+\begin{quote}
+\textbf{A revealed value is allowed only if it is also present in
+the final SLH-DSA signature.}
+\end{quote}
+
+The construction-level instantiation:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \textbf{Allowed reveals.} The per-round mask $r_i$, the
+        masked share $s'_i = \mathit{share}_i \oplus r_i$, the
+        Round-1 commit hash $D_i$, the final FIPS 205 signature
+        bytes. The mask plus masked share lets the public combiner
+        recover $\mathit{share}_i$ by byte-wise XOR; the share
+        alone is information-theoretically uniform-random to
+        anyone holding fewer than $t$ leaves.
+  \item \textbf{Forbidden reveals.} $\mathit{SK.seed}$ in any
+        party-local persistent form; $\mathit{SK.prf}$;
+        future-slot share material; in the strict (v1.1) form,
+        WOTS+ chain bases for unused chains and FORS leaves not
+        selected by the message digest.
+\end{itemize}
+
+\subsection{Slot binding and domain separation}
+\label{sec:thbsse:slotbind}
+
+Every signature is bound to a slot tuple
+\begin{equation*}
+  \mathit{bind} = (\mathit{chain\_id}, \mathit{epoch},
+  \mathit{slot}, \mathit{height},
+  \mathit{committee\_id}, \mathit{message\_domain}).
+\end{equation*}
+
+The binding flows into:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item the cSHAKE256 commit transcript $\tau$ (so the same
+        committee cannot reuse the same share material on a
+        different message), and
+  \item the FIPS 205 ctx string at sign time, so any verifier
+        holding $\mathit{bind}$ can derive
+        $\mathit{ctx} = \texttt{lux-magnetar-thbsse-v1} \|
+        \mathit{slot\_id}$ independently and route through
+        unmodified \texttt{slhdsa.Verify}.
+\end{enumerate}
+
+The canonical 32-byte slot identifier is
+$\mathit{slot\_id} = \textsc{cSHAKE256}(\texttt{encode}(\mathit{bind}),
+32, \texttt{"MAGNETAR-THBSSE-SLOT-V1"})$. The encoding is
+big-endian, length-prefixed per field --- the exact format the
+reference implementation persists.
+
+The four THBS-SE cSHAKE customisation tags are:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \texttt{MAGNETAR-THBSSE-SLOT-V1} --- slot ID and message
+        digest derivation;
+  \item \texttt{MAGNETAR-THBSSE-R1-COMMIT-V1} --- Round-1 commit
+        $D_i$;
+  \item \texttt{MAGNETAR-THBSSE-SHARE-DEAL-V1} --- coefficient
+        stream for $\mathrm{GF}(257)$ share dealing and
+        \texttt{EvalPointFromID};
+  \item \texttt{MAGNETAR-THBSSE-SHARE-MAC-V1} --- reserved for
+        share-MAC envelope.
+\end{itemize}
+
+\subsection{Setup}
+\label{sec:thbsse:setup}
+
+The protocol shape calls for the committee to run a leaderless
+PVSS-DKG ceremony in which no party holds a master secret at any
+point. The v1.0 Magnetar reference ships a
+\emph{deterministic-dealer} variant
+(\texttt{NewThbsSeKey}) for KAT determinism and foundation
+single-host bootstrap; production deployments route through the
+sibling \texttt{luxfi/threshold} DKG package and feed the result
+into the same wire-shape share envelope.
+
+The PVSS scheme of choice for the production setup is
+Schoenmakers PVSS (CRYPTO 1999, \cite{schoenmakers1999}) over a
+discrete-log group of prime order, with a cSHAKE256 hash-to-byte
+step that lifts the group output into the byte-wise
+$\mathrm{GF}(257)$ share field. Schoenmakers PVSS is publicly
+verifiable: each share carries a NIZK proof of correctness against
+public commitments, so any peer (the future public combiner
+included) can verify the share envelope without holding any
+secret. We pick Schoenmakers over a more modern hash-based PVSS
+because the security argument over a curve subgroup with the DDH
+assumption is well-understood, the per-share NIZK is compact
+(constant number of group elements per share), and the
+cSHAKE256 hash-to-byte step is FIPS 202-domain-separable into the
+$\mathrm{GF}(257)$ share field cleanly. The DKG round structure
+(complaint phase, qualified-set determination, joint public-key
+derivation) is the standard Pedersen/Schoenmakers shape and lives
+in the sibling \texttt{luxfi/threshold} package.
+
+The deterministic-dealer reference produces:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item Sample SLH-DSA seed $S \in \{0,1\}^{8 \cdot \texttt{SeedSize}}$.
+  \item Derive $(\mathit{PK}, \mathit{SK}) =
+        \texttt{slhdsa.Scheme.DeriveKey}(S)$.
+  \item Byte-wise Shamir-share $S$ across $(n, t)$ over
+        $\mathrm{GF}(257)$ via
+        \texttt{thbsseDealRandom} (\texttt{thbsse\_field.go}).
+        Each byte position is shared independently as the
+        constant term of a degree-$(t-1)$ polynomial; the
+        coefficient stream is drawn from the RNG and stretched
+        via cSHAKE256 if short.
+  \item Publish $\mathit{PK}$, the committee, and $(n, t)$.
+  \item Erase $S$. The dealer is in the TCB FOR SETUP ONLY;
+        once \texttt{NewThbsSeKey} returns, no party including
+        the dealer holds $S$.
+\end{enumerate}
+
+The output is a \texttt{ThbsSeKey} struct carrying
+$(\mathit{PK}, [\mathit{share}_i], \mathit{setup\_transcript},
+\texttt{Threshold}, \texttt{N}, \texttt{Params})$ where
+$\mathit{setup\_transcript}$ is the
+$\textsc{cSHAKE256}(\mathit{PK} \| n \| t \| \mathit{committee},
+32, \texttt{"MAGNETAR-THBSSE-R1-COMMIT-V1"})$ tag --- the audit
+witness that binds the public key to the share set without
+leaking secret material.
+
+\subsection{Sign Round 1 (per-party, in parallel)}
+\label{sec:thbsse:round1}
+
+Party $p_i$ with share $\mathit{share}_i$ and slot binding
+$\mathit{bind}$, message $\mu$, and local slot guard $G$:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item Sample per-round mask $r_i$ uniformly random over
+        $\{0,1\}^{8 \cdot 2 \cdot \texttt{SeedSize}}$ (the
+        Shamir wire width).
+  \item Compute the masked share
+        $s'_i = \mathit{share}_i \oplus r_i$ byte-wise.
+  \item Compute the Round-1 commit
+        \begin{equation*}
+          D_i = \textsc{cSHAKE256}\big(
+            r_i \| s'_i \| \tau,
+            32, \texttt{"MAGNETAR-THBSSE-R1-COMMIT-V1"}\big)
+        \end{equation*}
+        where $\tau = \texttt{encode}(\mathit{bind}) \| \mu \|
+        \mathit{party\_id}_i$.
+  \item Broadcast
+        $(p_i, \mathit{slot\_id}, D_i, \mathit{Available})$.
+  \item Persist $(\mathit{slot\_id}, H(\mathit{slot\_id} \| \mu))$
+        in $G$. If $G$ already records the same
+        $\mathit{slot\_id}$ under a different message digest,
+        emit a
+        $\texttt{ThbsSeEquivocationError}$ carrying the
+        slashable evidence blob (see
+        \S\ref{sec:thbsse:slashing}) and do NOT broadcast.
+\end{enumerate}
+
+\subsection{Sign Round 2 (per-party, after Round-1 quorum
+observable)}
+\label{sec:thbsse:round2}
+
+Party $p_i$ reveals
+\begin{equation*}
+  \texttt{PartialSig}_i = r_i \| s'_i.
+\end{equation*}
+
+The wire layout is canonical: mask first, masked share second,
+each $\texttt{Params.SeedSize} \times 2$ bytes wide. Idempotent
+replay on the same $(\mathit{slot\_id}, \mu)$ returns the
+persisted $(R1_i, R2_i)$. A genuine equivocation attempt is the
+local equivocation case above.
+
+\subsection{Combine (anyone, public)}
+\label{sec:thbsse:combine}
+
+The PUBLIC COMBINER routine $\texttt{Combine}$ takes
+$(\texttt{Key},
+\mathit{bind}, \mu, \{R1_i\}, \{R2_i\})$ and produces a
+$(*\texttt{Signature}, [\texttt{ThbsSeShareEvidence}], \mathit{err})$
+triple. Any peer can invoke it; no committee membership is
+required to combine.
+
+\textbf{Validation order:}
+
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item Every Round-2 reveal must carry the same slot ID as
+        $\mathit{bind}$. Mismatch emits
+        \texttt{ThbsSeShareEvidence} with
+        \texttt{Reason}=\texttt{ThbsSeShareSlotMismatch}.
+  \item The PartialSig must be exactly
+        $2 \cdot \texttt{Params.SeedSize} \cdot 2$ bytes.
+        Wrong-size reveals emit
+        \texttt{ThbsSeShareEvidence} with
+        \texttt{Reason}=\texttt{ThbsSeShareWireSize}.
+  \item The Round-1 commit must re-derive correctly from
+        $(\texttt{PartialSig}, \mathit{bind}, \mu, p_i)$.
+        Mismatch emits
+        \texttt{ThbsSeShareEvidence} with
+        \texttt{Reason}=\texttt{ThbsSeShareCommitMismatch}
+        carrying both the expected and observed commits.
+  \item The party's $\mathit{NodeID}$ must appear in the
+        committee; unknown parties' reveals are dropped silently
+        (the registry binding is a consumer concern).
+  \item After dropping the above, the validated-share set must
+        have size $\ge t$. If not, return
+        \texttt{ErrInsufficientQuor} plus the collected
+        evidence.
+\end{enumerate}
+
+\textbf{Reconstruction:}
+
+\begin{enumerate}[leftmargin=2em,nosep,start=6]
+  \item For each surviving Round-2 reveal, recover
+        $\mathit{share}_i = r_i \oplus s'_i$ byte-wise.
+  \item Select the first $t$ shares by ascending evaluation
+        point (canonical Lagrange basis); call the set $T$.
+  \item Lagrange-interpolate at $x = 0$ over $\mathrm{GF}(257)$
+        per byte position:
+        \begin{equation*}
+          S[b] = \sum_{i \in T}
+            \lambda_i \cdot \mathit{share}_i[b]
+            \pmod{257},
+          \qquad \lambda_i = \prod_{j \in T, j \ne i}
+            \frac{-x_j}{x_i - x_j} \pmod{257}.
+        \end{equation*}
+  \item Derive $\mathit{ctx} = \texttt{ctxFromSlot}(\mathit{bind})$
+        and call
+        $\sigma = \texttt{circl.slhdsa.SignDeterministic}(
+        \mathit{SK} \gets \texttt{DeriveKey}(S), \mu,
+        \mathit{ctx})$.
+  \item Zeroize $S$, $\mathit{SK}$, the byte-sum buffer, and
+        every transient working buffer before return. Return
+        $(\sigma, \mathit{evidences}, \mathit{nil})$.
+\end{enumerate}
+
+Theorems~\ref{thm:thbsse-byte-identity}
+and~\ref{cor:thbsse-determinism} establish that the output
+$\sigma$ is byte-identical to a centralized FIPS 205 call on the
+same $(S, \mu, \mathit{ctx})$, and that any two disjoint
+$t$-sized sub-quora produce the same $\sigma$ byte-for-byte.
+
+\subsection{Verify (anyone, public)}
+\label{sec:thbsse:verify}
+
+Verification is standard FIPS 205:
+\begin{equation*}
+  \texttt{circl.slhdsa.Scheme}(\textsc{Mode}).\texttt{Verify}(
+    \mathit{PK}, \mu, \sigma, \mathit{ctx}).
+\end{equation*}
+
+The Magnetar reference exposes this as
+\texttt{VerifyBytesCtx} for stateless dispatch (the wire bytes
+of the group key, the message, the ctx, the wire bytes of the
+signature in, a bool out). No Magnetar code runs on the
+verifier path; any unmodified FIPS 205 verifier accepts.
+
+\subsection{Slashing evidence}
+\label{sec:thbsse:slashing}
+
+\paragraph{Equivocation evidence
+$(\texttt{ThbsSeEvidence})$.} A party that signs two distinct
+messages at the same slot binding raises a
+$\texttt{ThbsSeEquivocationError}$ carrying
+\begin{equation*}
+  (\mathit{slot\_id}, p_i, D^A, R1^A, R2^A,
+  D^B, R1^B, R2^B).
+\end{equation*}
+Both Round-1 commits are publicly checkable against the
+corresponding Round-2 reveals; both digests are checkable
+against the slot ID; the two digests must differ. The function
+$\texttt{VerifyThbsSeEvidence}$ implements all four checks as a
+pure function with no committee state required. The consensus
+layer's slashing pipeline applies $\texttt{VerifyThbsSeEvidence}$
+to gossiped or on-chain-submitted evidence blobs and slashes the
+party named in $p_i$ on success.
+
+\paragraph{Malformed-share evidence
+$(\texttt{ThbsSeShareEvidence})$.} Combine emits typed
+share-malformation evidence for the three categories enumerated
+above. $\texttt{VerifyThbsSeShareEvidence}$ is the third-party
+pure-function verifier; for the commit-mismatch case it
+recomputes the expected commit from
+$(p_i, \mathit{bind}, \texttt{PartialSig}, \mu)$ and checks it
+matches the named expected hash.
+
+\subsection{Over-selected committee}
+\label{sec:thbsse:overselect}
+
+With $(n, t)$ and $n > t$, up to $n - t$ silent withholders are
+tolerated. The Lagrange basis is determined by any $t$
+evaluation points, so disjoint sub-quora of size $t$ produce
+byte-equal final signatures
+(Corollary~\ref{cor:thbsse-determinism}). The reference
+implementation pins this via
+$\textsc{TestThbsSE\_OverselectedCommittee}$ at
+$(n=7, t=3)$ with 4 honest signers + 3 withholders and
+$\textsc{TestThbsSE\_PublicCombiner\_Determinism}$ over the
+$(n=7, t=3)$ committee comparing two disjoint $t$-subsets.
+
+\subsection{Empirical gates}
+\label{sec:thbsse:gates}
+
+The reference implementation pins the construction's properties
+via eight test gates at
+\texttt{ref/go/pkg/magnetar/thbsse\_test.go}:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item $\textsc{TestThbsSE\_Wire\_FIPS205Verifiable}$ over
+        three SHAKE modes --- the headline byte-identity
+        regression.
+  \item $\textsc{TestThbsSE\_RejectSeedReveal}$ --- a malicious
+        party publishing a forged share that decodes to the
+        seed is rejected at Combine's commit re-derivation.
+  \item $\textsc{TestThbsSE\_RejectUnselectedFORS}$ --- a
+        reveal with extra trailing bytes (the analog of
+        ``reveal an unselected FORS leaf'') is rejected on
+        wire-size grounds.
+  \item $\textsc{TestThbsSE\_RejectUnselectedWOTS}$ --- a
+        single-bit flip in the masked-share portion (the analog
+        of ``reveal an unselected WOTS+ chain base'') is
+        rejected on commit-mismatch grounds and emits
+        verifiable evidence.
+  \item $\textsc{TestThbsSE\_SlotReuseRejected}$ --- the local
+        slot guard refuses a same-slot, distinct-message second
+        signing attempt with a verifiable
+        $\texttt{ThbsSeEquivocationError}$.
+  \item $\textsc{TestThbsSE\_OverselectedCommittee}$ --- the
+        availability claim under $n = 7$, $t = 3$ with 3
+        silent withholders.
+  \item $\textsc{TestThbsSE\_SlotBindingDomainSeparation}$ ---
+        same message under distinct slot bindings produces
+        distinct signatures; cross-binding verify fails.
+  \item $\textsc{BenchmarkThbsSE\_Sign\_5of7}$ --- end-to-end
+        per-signature wall-clock under SHAKE-192f at
+        $< 100$~ms/op on Apple M1 Max.
+\end{enumerate}
+
+A bonus correctness gate
+$\textsc{TestThbsSE\_PublicCombiner\_Determinism}$ pins the
+public-combiner-determinism corollary, and
+$\textsc{TestKAT\_ThbsSe}$ pins deterministic vectors at
+$(n=7, t=4)$ over three SHAKE modes and three messages, regenerated
+by \texttt{ref/go/cmd/genkat}.
+
+\subsection{Bypassing the Cozzo-Smart obstruction}
+\label{sec:thbsse:cosmin-smart}
+
+Cozzo and Smart \cite{cosmin2021} establish that
+threshold-by-seed-sharing for hash-based signatures requires
+either reconstructing the seed at some combiner or running full
+MPC over the hash tree. The literature treats the
+seed-reconstruction route as putting the combiner ``in the TCB''
+because the canonical instantiation has a privileged aggregator
+role bound to a specific host.
+
+THBS-SE bypasses the canonical Cozzo-Smart obstruction by making
+the combiner role \emph{public}: any peer can run Combine on its
+own substrate; no specific host is selected; the combiner does
+not hold long-lived material. The seed reconstruction is
+transient and local to the peer that chose to combine.
+Bonte-Smart-Tan \cite{bonte2023threshold} extends the
+infeasibility analysis to the strict
+``no transient seed at any moment'' regime, which THBS-SE
+v1.0 does NOT close; the strict-atom-assembly v1.1 path
+(\texttt{BLOCKERS.md::MAGNETAR-STRICT-ATOM-V11}) is the planned
+closer. THBS-SE v1.0 sits at the
+``public-combiner-with-transient-seed'' point in the design
+space --- materially stronger than TEE-attested
+privileged-aggregator constructions, materially weaker than the
+strict refinement.
