@@ -7,39 +7,39 @@ the Lux Polaris cert profile. This section makes the comparison
 explicit: what is structurally shared, what is structurally distinct,
 and why all three are necessary.
 
-\subsection{The shared v0.1 trust caveat}
-\label{sec:cmp:caveat}
+\subsection{Different threshold mechanics per primitive}
+\label{sec:cmp:mechanics}
 
-All three primitives ship v0.1 reveal-and-aggregate constructions in
-their first releases. This is not coincidence; it is a deliberate
-sequencing decision documented in the Lux PQ roadmap
-\cite{lp020}. Each v0.1 trades full MPC for a simpler construction
-that:
-\begin{enumerate}[leftmargin=2em,nosep]
-  \item produces byte-identical output to the underlying centralised
-        primitive (the Class-N1 / Class-N1-analog claim), so consuming
-        verifiers need no code change;
-  \item carries an honest aggregator-TCB caveat, documented in the
-        respective \texttt{DEPLOYMENT-RUNBOOK.md} of each repository;
-  \item ships first so the protocol composition (Polaris cert) can be
-        validated end-to-end before the more complex v0.2 MPC
-        constructions land.
-\end{enumerate}
-The trust caveat is uniform: the aggregator process holds the
-reconstructed secret material in memory for the duration of a single
-$\textsc{Combine}$ call, with the same threat surface and the same
-operational mitigations (memory-encrypted VMs, ephemeral processes,
-seccomp-bpf restrictions). Any deployment that runs all three lanes
-must apply the hardening checklist to all three aggregator processes;
-if any single lane's aggregator is compromised, that lane's PQ
-insurance is lost (but the conjunction of the other two lanes still
-provides post-quantum safety under Polaris's composition theorem).
+Pulsar and Corona ship true threshold constructions: their lattice
+algebra admits FROST-style linear share aggregation (Pulsar over
+the module $R_q^{n_{\mathrm{vec}}}$, Corona over the single ring
+$R_q$). At sign time a quorum of $\ge t$ parties exchanges
+two rounds of messages and produces a single aggregate signature
+that verifies under the joint group public key, with no party
+ever reconstructing the master secret. The trust model is
+public-BFT-safe: no dealer, no aggregator-in-TCB.
+
+Magnetar cannot do this. SLH-DSA has no linear share-aggregation
+identity (Cozzo--Smart EUROCRYPT 2019; Bonte--Smart--Tan 2023; NIST
+IR 8214). The canonical hash-based primitive for public-BFT
+consensus is therefore $N$ independent standalone signatures
+collected at the consensus layer. This paper's primary primitive
+is exactly that pattern; the threshold forms in the appendices
+(THBS, reveal-and-aggregate) exist for the TEE-attested custody
+path where a dealer or aggregator is in the TCB by deployment
+policy.
+
+The Polaris cert profile composition accepts this asymmetry: it
+binds three independent per-lane signatures (one Pulsar threshold
+signature, one Corona threshold signature, one Magnetar
+\texttt{ValidatorAggregateCert}) against the same Prism transcript.
+All three must verify for Polaris to advance.
 
 \subsection{Mathematical independence}
 \label{sec:cmp:independence}
 
-The three primitives rest on \emph{algorithmically distinct} security
-assumptions:
+The three primitives rest on \emph{algorithmically distinct}
+security assumptions:
 \begin{itemize}[leftmargin=2em,nosep]
   \item \textbf{Pulsar} (M-LWE): security reduces to Module-LWE
         \cite{mlwe,dilithium} on
@@ -50,10 +50,10 @@ assumptions:
   \item \textbf{Corona} (R-LWE): security reduces to Ring-LWE
         \cite{regev2009,lp104corona} on
         $R_q = \mathbb{Z}_q[X]/(X^N+1)$ with $q$ a 48-bit
-        NTT-friendly prime. Note: Corona has \emph{no} module
-        structure --- it operates on a single ring rather than on a
-        vector of polynomials. A break of Module-LWE that exploits
-        the module structure does not necessarily transfer to Corona.
+        NTT-friendly prime. Corona has \emph{no} module structure
+        --- it operates on a single ring rather than on a vector
+        of polynomials. A break of Module-LWE that exploits the
+        module structure does not necessarily transfer to Corona.
   \item \textbf{Magnetar} (SLH-DSA): security reduces to collision
         resistance and preimage resistance of SHA-3 (Keccak)
         \cite{keccak-keccak}, the WOTS+ one-time signature
@@ -90,30 +90,34 @@ approximate, drawn from their respective evaluation sections
 
 \begin{table}[H]
 \centering
-\caption{Polaris three-lane comparison at the v0.1 construction tier.
-``Per-sig latency'' is end-to-end on commodity Apple Silicon. ``Wire
-bytes'' is the per-party broadcast budget per signing session.}
+\caption{Polaris three-lane comparison.
+``Per-sig latency'' is end-to-end on commodity Apple Silicon.
+``Wire bytes'' is the per-party broadcast budget per signing session;
+for Magnetar this is the full standalone signature
+(each validator broadcasts its own $\sigma_i$).}
 \label{tab:cmp-perf}
 \begin{tabular}{lrrrr}
 \toprule
 Lane & Family & Per-sig latency & Wire bytes/party/sig & Sig size \\
 \midrule
-Pulsar & Module-LWE   & $\sim 250$~ms & $\sim 25$~KB & $\sim 33$~KB \\
-Corona & Ring-LWE     & $\sim 600$~ms & $\sim 18$~KB & $\sim 56$~KB \\
-Magnetar & SLH-DSA  & $\sim 1\,200$~ms & $\sim 0.4$~KB & $\sim 16$~KB \\
+Pulsar & Module-LWE (threshold)  & $\sim 250$~ms & $\sim 25$~KB & $\sim 33$~KB \\
+Corona & Ring-LWE (threshold)    & $\sim 600$~ms & $\sim 18$~KB & $\sim 56$~KB \\
+Magnetar & SLH-DSA (standalone) & $\sim 1\,200$~ms & $\sim 16$~KB & $\sim 16$~KB \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 Magnetar's per-signature latency is the slowest of the three; this
-is FIPS 205's intrinsic cost. But Magnetar's per-party wire bytes
-are by far the smallest --- the threshold layer transmits only a
-32-byte commit and a $\sim 400$-byte masked share, because the
-SLH-DSA signature itself is computed locally at the aggregator (not
-constructed from per-party contributions).
+is FIPS 205's intrinsic cost. The wire-bytes-per-party at Magnetar
+is the full $|\sigma_i|$ because each validator broadcasts its own
+signature in the standalone primitive (versus Pulsar / Corona
+which transmit only round-1 commits and round-2 reveals during
+the threshold protocol). Magnetar's mitigation for the aggregate
+size is the Z-Chain Groth16 rollup which compresses $K \times
+|\sigma|$ to a constant $\sim 192$~B.
 
 The signature size at $\sim 16$~KB (SHAKE-192s) is competitive: only
-$\sim 2\times$ larger than Pulsar's M-LWE signature and
+$\sim 2\times$ smaller than Pulsar's M-LWE signature and
 substantially smaller than Corona's R-LWE signature. SHAKE-192f
 trades a $\sim 3\times$ larger signature ($35$~KB) for $\sim 10\times$
 faster signing, which may be the right trade-off for higher-rate
@@ -123,82 +127,87 @@ deployments; this is a per-deployment configuration choice.
 \label{sec:cmp:lifecycle}
 
 All three lanes plug into the same LSS \cite{luxlssmpc} lifecycle
-adapter:
+adapter at the public-BFT path, with the Magnetar adapter
+specialised to the per-validator standalone shape:
 \begin{itemize}[leftmargin=2em,nosep]
   \item \texttt{lss/protocols/lss\_pulsar.go} adapts Pulsar's
         $\textsc{Reshare}$ and $\textsc{Refresh}$ to the LSS
-        generation-aware orchestration.
+        generation-aware orchestration. Committee-wide shared
+        secret refresh.
   \item \texttt{lss/protocols/lss\_corona.go} adapts Corona's
-        R-LWE resharing.
-  \item \texttt{lss/protocols/lss\_magnetar.go} (v0.3 target)
-        will adapt Magnetar. The Magnetar adapter contract is
-        \emph{simpler} than the lattice adapters because the
-        Shamir-over-GF(257) sharing is inherently shape-preserving:
-        a $\textsc{Reshare}$ from old set $V$ to new set $V'$
-        re-Shamir-shares the master byte-sum across $V'$ with the
-        same $(t, n)$ structure, and the cSHAKE256 mix
-        produces the same master seed when the committee changes.
+        R-LWE resharing. Same shape as Pulsar.
+  \item \texttt{lss/protocols/lss\_magnetar.go} adapts the
+        per-validator standalone primitive. Per-validator
+        $\textsc{KeyRotate}$ (no committee-wide ceremony), with
+        the validator-set registry update serving as the
+        generation transition.
 \end{itemize}
 
 The activation cert composition: a Polaris generation transition
-requires three activation certs in lockstep, one per lane. Each
-activation cert verifies under the unchanged group public key of
-its respective lane (cf. Pulsar Theorem 5.2,
-\cite{lp073pulsarpaper}~\S5.2). All three must accept for the
-Polaris cert profile to advance.
+requires three independent per-lane operations in lockstep.
+For Pulsar and Corona this is committee-wide threshold resharing;
+for Magnetar it is per-validator key rotation broadcasts. All
+three must complete before the Polaris cert profile advances.
 
-\subsection{Trust caveat: what differs across lanes}
+\subsection{Trust posture: what differs across lanes}
 \label{sec:cmp:caveat-differ}
 
-The aggregator-TCB caveat applies uniformly. The \emph{secret material}
-that lives in the aggregator's memory during $\textsc{Combine}$
-differs:
+The trust posture at the public-BFT path differs sharply between
+lanes:
 \begin{itemize}[leftmargin=2em,nosep]
-  \item \textbf{Pulsar}: the reconstructed master secret
-        $\mathbf{s} \in R_q^{n_{\mathrm{vec}}}$ (a 7-element vector
-        of polynomials over $\mathbb{Z}_q$, $q \approx 2^{48}$,
-        degree 256). $\sim 11$~KB of secret material.
-  \item \textbf{Corona}: the reconstructed R-LWE secret
-        $s \in R_q$ (a single polynomial over the cyclotomic ring).
-        $\sim 1.5$~KB of secret material.
-  \item \textbf{Magnetar}: the reconstructed SLH-DSA scheme seed
-        $S$ (96 or 128 bytes) plus the recovered SLH-DSA secret
-        key (96 or 128 bytes). $\sim 200$~B of secret material.
+  \item \textbf{Pulsar} (threshold): no dealer, no aggregator-in-TCB.
+        The threshold protocol's $\textsc{Combine}$ phase is a pure
+        public-input function over the round-1 / round-2 transcript;
+        no party reconstructs the master secret at sign time.
+  \item \textbf{Corona} (threshold): same trust posture as Pulsar.
+        $\textsc{Combine}$ is a pure public-input function.
+  \item \textbf{Magnetar} (standalone): no shared secret at all.
+        Each validator's $sk_i$ lives only on validator $i$'s own
+        host. Compromising one validator yields one quorum vote,
+        not a master-secret reconstruction.
 \end{itemize}
 
-Magnetar's TCB exposure is the \emph{smallest} of the three lanes in
-absolute byte terms: the secret material is two short buffers
-totalling $\sim 200$ bytes (for SHAKE-192s) versus Pulsar's
-$\sim 11$~KB. This is a modest practical advantage --- a smaller
-secret is easier to zeroize reliably and easier to keep in CPU
-registers --- but does not change the qualitative caveat.
+All three are public-BFT-safe. Magnetar's standalone TCB is
+strictly per-validator (one $sk_i$ per validator); Pulsar's and
+Corona's threshold TCBs are committee-wide shared-secret
+distributions where the privacy guarantee is information-
+theoretic against any $t-1$-subset.
+
+For TEE-only paths (M-Chain bridge custody, A-Chain confidential
+compute), Magnetar's threshold forms (Appendix~\ref{app:thbs},
+Appendix~\ref{app:reveal}) carry an aggregator-in-TCB or dealer-
+in-TCB caveat that is appropriate only when the host is
+hardware-attested. Pulsar and Corona do not need TEE-only forms
+because their public-BFT-safe threshold mechanics extend directly
+to the custody path.
 
 \subsection{Where each lane is the right answer}
 \label{sec:cmp:fit}
 
 For deployments that adopt only a single PQ lane (rather than the
-full Polaris three-lane composition), the trade-off:
+full Polaris three-lane composition):
 \begin{itemize}[leftmargin=2em,nosep]
   \item \textbf{Pulsar} is the right answer when sub-second
         signing latency is the dominant constraint and the lattice
         assumption is acceptable. Pulsar's per-party wire bandwidth
-        is high, but its hot-path latency is the lowest.
+        is high during the threshold protocol, but its hot-path
+        latency is the lowest.
   \item \textbf{Corona} is the right answer when validator
-        committees scale beyond $K \sim 100$ and the R-LWE single-ring
-        structure is preferred to Pulsar's M-LWE module structure
-        (some deployments may prefer the simpler ring for audit
-        clarity).
+        committees scale beyond $K \sim 100$ and the R-LWE single-
+        ring structure is preferred to Pulsar's M-LWE module
+        structure (some deployments may prefer the simpler ring
+        for audit clarity).
   \item \textbf{Magnetar} is the right answer when the
         threat model includes ``the lattice family might be broken
         algorithmically'' (a long-tail risk) or when the deployment
         needs a primitive whose security can be argued from
-        hash-function assumptions alone. Magnetar's per-party wire
-        bandwidth is by far the smallest, which makes it the
-        right answer for bandwidth-constrained deployments
-        (cellular / IoT / regulated-traffic environments).
+        hash-function assumptions alone. Magnetar's per-validator
+        independence is the right posture for permissionless
+        validator sets where coordinating a committee-wide DKG /
+        threshold protocol is impractical.
 \end{itemize}
 
 For \textbf{maximum assurance} (the Lux Polaris production
 deployment), all three lanes run in parallel. The triple-redundancy
-is the correct response to the long-tail cryptographic risks of the
-PQ transition era.
+is the correct response to the long-tail cryptographic risks of
+the PQ transition era.

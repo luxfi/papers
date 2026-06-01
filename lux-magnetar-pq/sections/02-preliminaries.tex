@@ -7,40 +7,36 @@
 \begin{itemize}[nosep,leftmargin=2em]
   \item $\lambda$ --- security parameter (set to $192$ for SHAKE-192s,
         $256$ for SHAKE-256s).
-  \item $n$ --- committee size, $1 \le n \le 256$.
-  \item $t$ --- reconstruction threshold, $1 \le t \le n$.
-  \item $\mathrm{GF}(p)$ --- finite field of order $p$; throughout
-        this paper, $p = 257$ is the smallest prime greater than
-        $255$.
-  \item $\textsc{seed\_size}$ --- byte-length of the SLH-DSA scheme
-        seed: $96$ bytes for SHAKE-192s and SHAKE-192f; $128$ bytes
-        for SHAKE-256s. This is the secret input to FIPS 205
-        $\textsc{DeriveKey}$.
-  \item $P_i$ --- party $i$, $1 \le i \le n$. Each party is identified
-        by a 32-byte $\mathsf{NodeID}$.
-  \item $x_i \in [1, 256]$ --- party $P_i$'s Shamir evaluation point,
-        distinct per party.
-  \item $c_i \in \{0,1\}^{8 \cdot \textsc{seed\_size}}$ --- party
-        $P_i$'s DKG contribution.
-  \item $S \in \{0,1\}^{8 \cdot \textsc{seed\_size}}$ --- joint master
-        SLH-DSA seed.
-  \item $\mathit{share}_i \in [0, 257)^{\textsc{seed\_size}}$ ---
-        party $P_i$'s Shamir share of the master byte-sum (per byte
-        position, modulo $p = 257$).
-  \item $(pk, sk)$ --- the FIPS 205 SLH-DSA public/private keypair
-        derived from $S$ via FIPS 205 $\textsc{KeyGen}$.
-  \item $\sigma$ --- a FIPS 205 SLH-DSA signature (the wire bytes).
+  \item $N$ --- validator-set size at the consensus layer (the
+        primary primitive of this paper is $N$-of-$N$ collection;
+        a quorum policy of size $K \le N$ filters the count at the
+        consumer).
+  \item $P_i$ --- validator $i$, $1 \le i \le N$. Each validator is
+        identified by a 32-byte $\mathsf{NodeID}$.
+  \item $(sk_i, pk_i)$ --- validator $i$'s FIPS 205 SLH-DSA keypair.
+        Each validator's keypair is independent of every other
+        validator's; there is no shared seed, no DKG, and no
+        dealer.
+  \item $\sigma_i$ --- validator $i$'s FIPS 205 SLH-DSA signature
+        (the wire bytes) on the consensus message.
   \item $\mu$ --- the message being signed; $\mathit{ctx}$ --- the
         FIPS 205 context string ($0$--$255$ bytes).
-  \item $\mathit{sid} \in \{0,1\}^{128}$ --- a session identifier
-        binding one threshold-sign attempt across the network.
-  \item $\kappa \in \mathbb{N}$ --- session attempt counter (for
-        replay isolation between retries).
-  \item $\textsc{cSHAKE256}$ --- the cSHAKE256 customisable hash from
-        NIST SP 800-185 \cite{sp800185}, with function-name string
-        ``Magnetar'' and per-context customisation tags.
+  \item $\mathit{registry}: \mathsf{NodeID} \to \{0,1\}^{|pk|}$ ---
+        the consensus layer's authoritative validator-set
+        registry, binding $\mathsf{NodeID}_i$ to $pk_i$.
+  \item $\textsc{cSHAKE256}$ --- the cSHAKE256 customisable hash
+        from NIST SP 800-185 \cite{sp800185}, with function-name
+        string ``Magnetar'' and per-context customisation tags.
   \item $\Vert$ --- byte concatenation; $\oplus$ --- bitwise XOR.
 \end{itemize}
+
+\paragraph{Appendix notation.} The appendices on threshold forms
+introduce additional symbols: $n$ for committee size, $t$ for
+reconstruction threshold, $\mathrm{GF}(p)$ for the Shamir field with
+$p = 257$, $S$ for the shared SLH-DSA scheme seed, and
+$\mathit{share}_i$ for party $i$'s share. Those symbols are local to
+the appendices and do not appear in the main per-validator
+standalone construction.
 
 \subsection{FIPS 205 SLH-DSA review}
 \label{sec:prelim:slhdsa}
@@ -50,8 +46,8 @@ stateless hash-based signature standard. The Magnetar reference
 implementation targets the FIPS 205 SHAKE parameter sets:
 \begin{table}[H]
 \centering
-\caption{FIPS 205 SHAKE parameter sets exposed by Magnetar v0.1. Values
-from FIPS 205 \cite{fips205} \S10.1 Table~2.}
+\caption{FIPS 205 SHAKE parameter sets exposed by Magnetar v0.5.
+Values from FIPS 205 \cite{fips205} \S10.1 Table~2.}
 \label{tab:fips205-params}
 \begin{tabular}{lrrrrrr}
 \toprule
@@ -98,19 +94,18 @@ $128$ for $n=32$ (256s).
 \mathit{ctx})$ \cite{fips205}~\S9.2 computes a randomiser
 $R \gets \mathrm{PRF}_{\mathit{SK.prf}}(\mathit{ctx} \Vert \mu)$ and
 proceeds deterministically. The output is byte-identical across calls
-with the same $(sk, \mu, \mathit{ctx})$. This determinism is the
-property that makes the Magnetar Class-N1-analog claim trivially
-provable: if two parties reconstruct the same $sk$ and call
-$\textsc{Sign}_{\mathrm{det}}$ on the same $(\mu, \mathit{ctx})$, they
-obtain byte-identical signatures.
+with the same $(sk, \mu, \mathit{ctx})$. The Magnetar per-validator
+standalone primitive uses this variant; the byte-identity claim
+against \texttt{cloudflare/circl/sign/slhdsa.Verify} pins to this
+determinism.
 
 \paragraph{Randomised signing.} $\textsc{Sign}_{\mathrm{rand}}(sk,
 \mathit{rng}, \mu, \mathit{ctx})$ \cite{fips205}~\S9.2 samples a fresh
-$n$-byte randomiser from $\mathit{rng}$. Magnetar's threshold-sign path
-uses the deterministic variant by default (so the byte-equality claim
-holds); a $\mathit{randomized}$ flag exposes the randomised variant
-for callers that want hedge against fault-injection on the
-$\mathit{PRF}$ derivation.
+$n$-byte randomiser from $\mathit{rng}$. The Magnetar
+\texttt{ValidatorSign} entry point routes to the deterministic
+variant by default (\texttt{rng=nil}); passing a non-nil reader
+selects the randomised variant for callers who specifically want
+hedging against fault injection on the $\mathit{PRF}$ derivation.
 
 \paragraph{Verification.} $\textsc{Verify}(pk, \mu, \sigma,
 \mathit{ctx})$ \cite{fips205}~\S9.3 walks the XMSS-HT root, recomputes
@@ -118,14 +113,107 @@ $\mathit{PK.root}$ from the FORS and XMSS authentication paths in
 $\sigma$, and accepts iff it matches the $\mathit{PK.root}$ embedded
 in $pk$. The verifier consumes no secret material; \emph{any
 unmodified FIPS 205 verifier accepts a Magnetar signature with no
-code change.}
+code change}.
 
-\subsection{Shamir secret sharing over $\mathrm{GF}(257)$}
+\subsection{Per-validator standalone signature syntax}
+\label{sec:prelim:standalone-syntax}
+
+The primary primitive of this paper is a per-validator standalone
+SLH-DSA construction. The syntax is the single-party FIPS 205 syntax,
+replicated independently $N$ times, plus an aggregate-certificate
+shape at the consensus layer.
+
+\begin{definition}[Per-validator standalone signature scheme]
+\label{def:standalone-syntax}
+$\Pi_{\mathrm{Magnetar}}^{\mathrm{std}}$ is a tuple of probabilistic
+polynomial-time algorithms
+$(\textsc{KeyGen}, \textsc{Sign}, \textsc{BatchVerify},
+\textsc{BuildCert}, \textsc{VerifyCert})$:
+\begin{itemize}[nosep,leftmargin=2em]
+  \item $\textsc{KeyGen}(1^\lambda)$: each validator $i$ runs this
+        independently on its own host. Outputs an SLH-DSA keypair
+        $(sk_i, pk_i)$. No interaction.
+  \item $\textsc{Sign}(sk_i, \mu, \mathit{ctx})$: validator $i$'s
+        signing primitive. Returns
+        $\sigma_i = \textsc{slhdsa.SignDeterministic}(sk_i, \mu,
+        \mathit{ctx})$. Deterministic.
+  \item $\textsc{BatchVerify}(\{pk_i\}, \mu, \{\sigma_i\}) \to
+        \mathit{bitmap}$: returns a Boolean bitmap indicating
+        per-signer FIPS 205 verifier acceptance. Pure function of
+        public inputs.
+  \item $\textsc{BuildCert}(\mathit{Mode},
+        \{\mathsf{NodeID}_i, pk_i, \sigma_i\}_{i \in S})$: assembles
+        the on-wire $\mathit{ValidatorAggregateCert}$ carrying the
+        parallel-slices triple $(\mathit{Signers},
+        \mathit{PubKeys}, \mathit{Sigs})$ for the contributing
+        set $S$.
+  \item $\textsc{VerifyCert}(\mathit{cert}, \mu, \mathit{registry})
+        \to \mathit{count}$: enforces registry binding (drops
+        unknown signers and pubkey mismatches), dedupes
+        repeated signers, calls
+        $\textsc{BatchVerify}$ on the verifiable subset, and
+        returns the count of valid signers. The quorum decision
+        ``$\mathit{count} \ge K$?'' lives at the consumer.
+\end{itemize}
+\end{definition}
+
+The deliberate choice that $\textsc{Sign}$ is the unmodified FIPS 205
+$\textsc{SignDeterministic}$ --- not a Magnetar-specific envelope ---
+is the load-bearing operational property: any deployment shipping a
+Magnetar signer needs to add no new verification code on the
+consuming side. Every SLH-DSA verifier in the wild
+(\texttt{cloudflare/circl/sign/slhdsa} \cite{circl}, the FIPS 205
+reference, openssl-pq, libsignal-pq) accepts Magnetar signatures
+unmodified after the wire envelope is stripped.
+
+\subsection{Threshold signature syntax (appendix forms)}
+\label{sec:prelim:thresh-syntax}
+
+The threshold forms documented in the appendices use the standard
+threshold-signature syntax of Canetti \cite{canetti2001uc} and
+Boneh--Shoup \cite{boneh-shoup-textbook} as specialised to SLH-DSA.
+
+\begin{definition}[Threshold SLH-DSA scheme (appendix forms)]
+\label{def:thresh-syntax}
+$\Pi_{\mathrm{Magnetar}}^{\mathrm{thr}}$ is a tuple
+$(\textsc{Setup}, \textsc{SignShare}, \textsc{Combine},
+\textsc{Verify})$:
+\begin{itemize}[nosep,leftmargin=2em]
+  \item $\textsc{Setup}$: produces the joint group public key $pk$
+        and per-party secret shares. For
+        Appendix~\ref{app:thbs} this is
+        \texttt{thbs.DealerDKG} (dealer-backed v1; PVSS skeleton
+        for v2 at \texttt{thbs/dkg2/}). For
+        Appendix~\ref{app:reveal} this is the three-round
+        Magnetar DKG over the SLH-DSA scheme seed.
+  \item $\textsc{SignShare}$: per-party contribution. For THBS
+        this is the selected-element share release; for
+        reveal-and-aggregate this is the two-round commit-and-
+        reveal of the local Shamir share.
+  \item $\textsc{Combine}$: deterministic aggregator function.
+        For THBS this Lagrange-reconstructs the selected WOTS+
+        chain heads and FORS leaves; for reveal-and-aggregate
+        this Lagrange-reconstructs the scheme seed.
+  \item $\textsc{Verify}$: \emph{the unmodified FIPS 205
+        verifier} of \cite{fips205}~\S9.3.
+\end{itemize}
+\end{definition}
+
+The threshold forms preserve the FIPS 205 output shape ---
+$\textsc{Combine}$ output is byte-identical to single-party
+$\textsc{SignDeterministic}$ on the implicit
+$(\mathit{seed}, \mu, \mathit{ctx})$ tuple --- so a relying party
+sees no difference between a standalone $\sigma_i$ and a threshold
+$\sigma$ once both are unwrapped from the consensus envelope.
+
+\subsection{Shamir secret sharing over $\mathrm{GF}(257)$ (appendix forms)}
 \label{sec:prelim:shamir}
 
 We instantiate Shamir secret sharing \cite{shamir1979} byte-wise over
-$\mathrm{GF}(p)$ with $p = 257$. The choice of $p = 257$ is dictated by
-two constraints:
+$\mathrm{GF}(p)$ with $p = 257$ for the threshold forms in
+Appendix~\ref{app:reveal} and (with an additional cSHAKE256 mix on
+the output) Appendix~\ref{app:thbs}. The choice of $p = 257$ is
+dictated by two constraints:
 \begin{enumerate}[leftmargin=2em,nosep]
   \item $p > 255$, so every byte value $0,\ldots,255$ is a distinct
         field element.
@@ -134,9 +222,9 @@ two constraints:
 \end{enumerate}
 The trade-off: $p = 257$ admits at most $p - 1 = 256$ distinct non-zero
 evaluation points, capping the committee size at $256$ (constant
-\texttt{MaxCommittee257} in \texttt{params.go}). For the Lux validator
-committees this is comfortably above the production thresholds (Quasar
-operates at $K \le 21$ \cite{lp020}).
+\texttt{MaxCommittee257} in \texttt{params.go}). For the Lux
+validator committees this is comfortably above the production
+thresholds (Quasar operates at $K \le 21$ \cite{lp020}).
 
 \paragraph{Sharing.} To share a $\textsc{seed\_size}$-byte secret
 $\mathbf{s} \in [0,256]^{\textsc{seed\_size}}$ across $n$ parties at
@@ -178,17 +266,16 @@ over $[0,257)^{|Q| \cdot \textsc{seed\_size}}$ \emph{independent} of
 $\mathbf{s}$. This is the standard Shamir privacy property
 \cite{shamir1979,katzlindell}: every $t-1$-subset of shares reveals
 zero information about the secret, as a matter of information theory
-(not computational complexity). This property is the load-bearing
-secrecy guarantee of Magnetar v0.1 \emph{against the committee} ---
-a coalition of $t-1$ or fewer committee members has no useful
-information about $S$.
+(not computational complexity). This is the load-bearing secrecy
+guarantee of the appendix threshold forms against a coalition of
+$t-1$ or fewer committee members.
 
 \paragraph{The $\mathrm{GF}(257)$/byte-domain mismatch.} The Lagrange
 reconstruction \eqref{eq:shamir-lagrange} produces a value in
 $[0, 257)$; the SLH-DSA scheme seed is byte-valued in $[0, 256)$. The
-single value $256$ has no byte representation. Magnetar handles this
-\emph{constructively}: the Shamir reconstruction is fed into a
-cSHAKE256 mix
+single value $256$ has no byte representation. The appendix forms
+handle this \emph{constructively}: the Shamir reconstruction is fed
+into a cSHAKE256 mix
 \begin{equation}
   S = \textsc{cSHAKE256}\bigl(
     \mathrm{byteSum}_\mathit{BE} \,\Vert\, \mathit{committee\_root},
@@ -199,101 +286,60 @@ cSHAKE256 mix
 \end{equation}
 which absorbs the $\mathrm{GF}(257)$-valued $\mathrm{byteSum}$ as a
 $2 \cdot \textsc{seed\_size}$-byte big-endian buffer and emits a
-$\textsc{seed\_size}$-byte $S$. The cSHAKE256 mix domain-separates the
-seed from raw Shamir output and gives a constant-length seed regardless
-of the value distribution of $\mathrm{byteSum}$.
-
-\subsection{Threshold signature syntax}
-\label{sec:prelim:syntax}
-
-We use the standard threshold-signature syntax of Canetti
-\cite{canetti2001uc} and Boneh--Shoup \cite{boneh-shoup-textbook} as
-specialised to SLH-DSA.
-
-\begin{definition}[Magnetar threshold signature scheme]
-\label{def:magnetar-syntax}
-$\Pi_{\mathrm{Magnetar}}$ is a tuple of probabilistic polynomial-time
-algorithms $(\textsc{DKG}, \textsc{Sign}, \textsc{Combine},
-\textsc{Verify})$:
-\begin{itemize}[nosep,leftmargin=2em]
-  \item $\textsc{DKG}(1^\lambda, n, t, \mathrm{Committee})$: a
-        three-round interactive protocol among committee parties.
-        Outputs the joint group public key $pk$, per-party key shares
-        $\{(\mathit{NodeID}_i, x_i, \mathit{share}_i)\}_{i=1}^n$, and
-        a transcript hash $\tau_{\mathrm{DKG}}$.
-  \item $\textsc{Sign}_i(\mathit{share}_i, \mathit{sid}, \kappa,
-        \mathrm{Quorum}, \mu)$: an interactive 2-round subprotocol
-        executed by party $P_i$ in $\mathrm{Quorum}$. Outputs a
-        Round-1 commit message and a Round-2 reveal message.
-  \item $\textsc{Combine}(pk, \mu, \mathit{ctx},
-        \mathit{sid}, \kappa, \mathrm{Quorum}, t,
-        \{\textsc{R1}_i, \textsc{R2}_i\}_{i \in \mathrm{Quorum}},
-        \{\mathit{share}_j\}_{j=1}^n)$: a deterministic function
-        executed by the aggregator. Outputs a FIPS 205 SLH-DSA
-        signature $\sigma$ or $\bot$.
-  \item $\textsc{Verify}(pk, \mu, \sigma, \mathit{ctx})$: \emph{the
-        unmodified FIPS 205 verifier of \cite{fips205}~\S9.3}.
-\end{itemize}
-\end{definition}
-
-The deliberate choice that $\textsc{Verify}$ is the unmodified FIPS 205
-verifier --- not a Magnetar-specific envelope --- is the load-bearing
-operational property: deployment shipping a Magnetar threshold signer
-needs to add no new verification code on the consuming side. Every
-SLH-DSA verifier in the wild (the FIPS 205 reference, openssl,
-cloudflare/circl, libsignal) accepts Magnetar signatures with no
-change.
+$\textsc{seed\_size}$-byte $S$. The cSHAKE256 mix domain-separates
+the seed from raw Shamir output and gives a constant-length seed
+regardless of the value distribution of $\mathrm{byteSum}$.
 
 \subsection{Security games}
 \label{sec:prelim:games}
 
-We adopt the standard threshold unforgeability game (cf. Pulsar
-\cite{lp073pulsarpaper}~\S5).
+The per-validator standalone primitive's security game is the
+single-party SLH-DSA UF-CMA game replicated $N$ times in parallel.
+We state the formal definition.
 
-\begin{definition}[Threshold EUF-CMA]
-\label{def:teuf-cma}
-$\mathsf{Game}^{\mathrm{tEUF-CMA}}_{\Pi}(\mathcal{A}, \lambda)$:
+\begin{definition}[Multi-validator EUF-CMA]
+\label{def:multivalidator-eufcma}
+$\mathsf{Game}^{\mathrm{multi\text{-}EUF\text{-}CMA}}_{
+\Pi^{\mathrm{std}}_{\mathrm{Magnetar}}}(\mathcal{A}, \lambda, N)$:
 \begin{enumerate}[nosep,leftmargin=2em]
-  \item \textbf{Setup.} The challenger runs $\textsc{DKG}$ with the
-        adversary $\mathcal{A}$ playing the corrupt parties.
-        $\mathcal{A}$ commits to a corrupt set $F$ with $|F| < t$ at
-        the outset (static corruption model). The challenger gives
-        $\mathcal{A}$ the joint $pk$ and $\{\mathit{share}_i : i \in F\}$.
-  \item \textbf{Queries.} $\mathcal{A}$ adaptively requests signatures
-        on messages $\mu_1, \ldots, \mu_{Q_S}$. The challenger runs
-        the honest threshold sign protocol and returns each
-        $\sigma_i$. $\mathcal{A}$ may invoke the random oracle
-        $\mathcal{O}_H$ up to $Q_H$ times.
+  \item \textbf{Setup.} The challenger runs $\textsc{KeyGen}$
+        independently $N$ times to obtain $(sk_i, pk_i)$ for
+        $i = 1, \ldots, N$. The adversary $\mathcal{A}$ commits
+        to a corrupt set $F \subset [N]$ with $|F| < K$ at the
+        outset, where $K$ is the quorum threshold; the
+        challenger gives $\mathcal{A}$
+        $\{(pk_i)\}_{i=1}^N \cup \{sk_i : i \in F\}$.
+  \item \textbf{Queries.} $\mathcal{A}$ adaptively requests
+        signatures from honest validators on messages $\mu_1,
+        \ldots, \mu_{Q_S}$. For each query
+        $(i, \mu)$ with $i \notin F$, the challenger returns
+        $\sigma_i = \textsc{Sign}(sk_i, \mu, \mathit{ctx})$.
+        $\mathcal{A}$ may invoke the random oracle $\mathcal{O}_H$
+        up to $Q_H$ times.
   \item \textbf{Forgery.} $\mathcal{A}$ outputs $(\mu^\star,
-        \sigma^\star)$ with $\mu^\star \notin \{\mu_i\}$, and
-        \emph{wins} iff
-        $\textsc{Verify}(pk, \mu^\star, \sigma^\star, \mathit{ctx}) = 1$.
+        \mathit{cert}^\star)$ and \emph{wins} iff
+        $\textsc{VerifyCert}(\mathit{cert}^\star, \mu^\star,
+        \mathit{registry}) \ge K$ and there exist $K - |F|$
+        signers $i \notin F$ whose signatures in $\mathit{cert}^\star$
+        are valid forgeries on $\mu^\star \notin \{\mu_j : (i, \mu_j)
+        \in \mathit{queries}\}$.
 \end{enumerate}
 The advantage is
-$\mathsf{Adv}^{\mathrm{tEUF-CMA}}_{\Pi, \mathcal{A}}(\lambda)
+$\mathsf{Adv}^{\mathrm{multi\text{-}EUF\text{-}CMA}}_{
+\Pi^{\mathrm{std}}_{\mathrm{Magnetar}}, \mathcal{A}}(\lambda, N)
 = \Pr[\mathcal{A} \text{ wins}]$.
-$\Pi$ is $(Q_S, Q_H, T, \epsilon)$-tEUF-CMA secure if for every
-$\mathcal{A}$ within $(Q_S, Q_H, T)$,
-$\mathsf{Adv} \le \epsilon$.
 \end{definition}
 
-The \emph{aggregator-honest} variant of this game (Magnetar's v0.1
-security target) restricts $\mathcal{A}$ from compromising the
-aggregator: the aggregator is assumed to execute $\textsc{Combine}$
-honestly and zeroize secret material as specified.
+The multi-validator forgery condition reduces to single-party SLH-DSA
+UF-CMA via a standard hybrid argument: each honest validator's
+keypair is independent, so any forgery on validator $i$'s signature
+yields a single-party SLH-DSA UF-CMA forgery on $(pk_i, sk_i)$. The
+reduction has a factor $N$ loss for the hybrid (the standard hybrid
+argument over independent keypairs); the SLH-DSA UF-CMA bound at the
+SHAKE-192s parameter set ($\le 2^{-192}$ classical, $\le 2^{-128}$
+quantum) absorbs this factor comfortably for any $N \le 2^{60}$.
 
-\begin{definition}[Aggregator-honest tEUF-CMA]
-\label{def:agg-honest-teuf-cma}
-The aggregator-honest variant $\mathsf{Game}^{\mathrm{tEUF-CMA-AH}}_{\Pi}
-(\mathcal{A}, \lambda)$ is identical to Definition~\ref{def:teuf-cma}
-except that the corrupt set $F$ is constrained to exclude the
-aggregator process and the adversary has no access to the master seed
-$S$ or the reconstructed $sk$ during their in-memory lifetime.
-\end{definition}
-
-The v0.1 security claim (Theorem~\ref{thm:magnetar-aggregator-honest}
-below) is stated in the aggregator-honest model. The honest disclosure
-is that any deployment must operationally enforce
-\emph{aggregator-honest} via the mitigations of
-\S\ref{sec:intro:trust} or accept the residual risk of an aggregator
-compromise. v0.2 (\S\ref{sec:fullmpc}) drops this assumption.
+The threshold-form security games used in the appendices are the
+standard threshold EUF-CMA game in the aggregator-honest model
+(reveal-and-aggregate) or the slot-bound McGrew threshold-HBS game
+(THBS); we defer their formal statement to the appendices.
