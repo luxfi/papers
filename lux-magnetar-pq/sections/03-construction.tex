@@ -1,423 +1,386 @@
 \section{Construction}
 \label{sec:construction}
 
-This section specifies the Magnetar v0.1 reveal-and-aggregate
-construction byte-for-byte. The pseudocode is keyed to the Go canonical
-at \texttt{ref/go/pkg/magnetar/} \cite{magnetargo}; line references are
-to commit \texttt{db6c252} (Tier B graduation).
+This section specifies the per-validator standalone construction
+byte-for-byte. The pseudocode is keyed to the Go canonical at
+\texttt{ref/go/pkg/magnetar/standalone.go} and
+\texttt{ref/go/pkg/magnetar/wire.go} at commit \texttt{1c84519}
+(v0.5.2). The threshold forms (THBS, reveal-and-aggregate) are
+specified in Appendix~\ref{app:thbs} and Appendix~\ref{app:reveal}.
 
 \subsection{Hash-domain separation}
 \label{sec:construction:domains}
 
 Every cryptographic hash invocation in Magnetar is cSHAKE256
 \cite{sp800185} with function-name string \texttt{"Magnetar"} and a
-per-purpose customisation string. The seven canonical tags are listed
-in Table~\ref{tab:magnetar-tags}.
+per-purpose customisation string. The per-validator standalone path
+uses only the wire-codec canonical magic constants; the threshold
+forms use additional per-purpose tags listed in
+Table~\ref{tab:magnetar-tags}.
 
 \begin{table}[H]
 \centering
-\caption{Magnetar v0.1 cSHAKE256 domain separation. Every secret-bearing
-hash invocation is bound to exactly one tag; cross-tag replay reduces
-to cSHAKE256 collision resistance.}
+\caption{Magnetar v0.5 cSHAKE256 domain separation. Every
+secret-bearing hash invocation is bound to exactly one tag;
+cross-tag replay reduces to cSHAKE256 collision resistance.
+Tags marked \emph{(thresh)} appear only in the threshold-form
+appendices.}
 \label{tab:magnetar-tags}
 \begin{tabular}{lp{8.5cm}}
 \toprule
 Tag & Purpose \\
 \midrule
-\texttt{MAGNETAR-DKG-COMMIT-V1} & committee-root digest (sorted committee binding) \\
-\texttt{MAGNETAR-DKG-TRANSCRIPT-V1} & DKG transcript digest (Round-2 equivocation check) \\
-\texttt{MAGNETAR-SIGN-R1-V1} & threshold-sign Round-1 commit $D_i$ \\
-\texttt{MAGNETAR-SIGN-R1-MAC-V1} & (reserved for v0.2 per-pair MAC layer) \\
-\texttt{MAGNETAR-SIGN-MASK-V1} & per-attempt mask $r_i$ derivation \\
-\texttt{MAGNETAR-SEED-SHARE-V1} & Shamir coefficient stream + final seed mix \\
+\texttt{MAGS} (magic 0x4D414753) & MAGS wire envelope for FIPS 205 signature payload (standalone primary) \\
+\texttt{MAGG} (magic 0x4D414747) & MAGG wire envelope for FIPS 205 public-key payload (standalone primary) \\
+\texttt{MAGNETAR-DKG-COMMIT-V1} & committee-root digest (sorted committee binding) \emph{(thresh)} \\
+\texttt{MAGNETAR-DKG-TRANSCRIPT-V1} & DKG transcript digest (Round-2 equivocation check) \emph{(thresh)} \\
+\texttt{MAGNETAR-SIGN-R1-V1} & threshold-sign Round-1 commit $D_i$ \emph{(thresh)} \\
+\texttt{MAGNETAR-SIGN-MASK-V1} & per-attempt mask $r_i$ derivation \emph{(thresh)} \\
+\texttt{MAGNETAR-SEED-SHARE-V1} & Shamir coefficient stream + final seed mix \emph{(thresh)} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 The protocol-wide domain separation context is the byte string
-\texttt{"lux-magnetar-v0.1"} (\texttt{tagDomainSep}). It is prepended to
-the DKG transcript binding so that a separate Magnetar version (or a
+\texttt{"lux-magnetar-v0.5"} (\texttt{tagDomainSep}). It is bound
+into the wire-codec magic constants and into every threshold-form
+transcript binding so that a separate Magnetar version (or a
 different Lux PQ primitive that happened to reuse the same hash
 function) cannot collide.
 
-\subsection{DKG protocol}
-\label{sec:construction:dkg}
+\subsection{Per-validator keypair generation}
+\label{sec:construction:keygen}
 
-The DKG is a three-round broadcast-channel protocol over the canonical
-sorted committee. Round 1 distributes Shamir-shared dealer
-contributions; Round 2 commits each party to its local view of the
-ordered envelope set; Round 3 detects equivocation and produces the
-final key shares.
+Each validator $i$ runs \texttt{PerValidatorKeypair} once at
+validator-set onboarding, persists $(sk_i, pk_i)$ to local
+HSM-backed storage, and registers $pk_i$ in the consensus layer's
+validator-set commitment.
 
-\paragraph{Round 1 (dealer $P_i$, \texttt{dkg.go:137}).}
-\begin{enumerate}[nosep,leftmargin=2em]
-  \item Sample $c_i \overset{\$}{\gets} \{0,1\}^{8 \cdot
-        \textsc{seed\_size}}$ from $\mathit{rng}$.
-  \item Sample $2(t-1) \cdot \textsc{seed\_size}$ bytes of
-        coefficient material from $\mathit{rng}$. If short, stretch
-        via $\textsc{cSHAKE256}(\cdot, \mathrm{S} =
-        \text{``MAGNETAR-SEED-SHARE-V1''})$.
-  \item For each byte position $b \in [0, \textsc{seed\_size})$,
-        define the polynomial
-        $f_{b,i}(x) = c_i[b] + \sum_{j=1}^{t-1}
-        a_{b,j,i} \cdot x^j \pmod{257}$
-        with the $a_{b,j,i}$ unpacked from the coefficient stream
-        ($2$~bytes per coefficient, taken modulo $257$).
-  \item For each recipient $P_k$ (committee order, $k = 1, \ldots, n$),
-        compute $\mathit{share}_{i \to k}[b] = f_{b,i}(x_k) \bmod 257$
-        for every $b$ via Horner's method (\texttt{shamir.go:111}).
-  \item Construct the envelope
-        $\mathrm{Env}_{i \to k} = (\mathit{share}_{i \to k}, c_i)$
-        for every $k$. Note: the dealer's full $c_i$ is duplicated
-        into every envelope --- this is the v0.1 reveal-and-aggregate
-        compromise (every committee member learns every other
-        dealer's contribution). v0.2 closes this by wrapping each
-        envelope under $\textsc{ML-KEM-768}$ keyed to the recipient's
-        long-term identity public key (BLOCKERS.md CR-8).
-  \item Broadcast $\textsc{DKGRound1Msg}_i = (\mathit{NodeID}_i,
-        \{\mathrm{Env}_{i \to k}\}_{k=1}^n)$.
+\paragraph{Algorithm (\texttt{standalone.go:197-199},
+\texttt{keygen.go}).}
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item Pull \texttt{params} for the target \texttt{Mode}
+        (SHAKE-192s, SHAKE-192f, or SHAKE-256s).
+  \item Source $4n$ bytes of entropy from \texttt{rng} (where $n$ is
+        the FIPS 205 ``$n$'' parameter: 24 for 192, 32 for 256).
+        If \texttt{rng=nil}, source from \texttt{crypto/rand}.
+  \item Pass the entropy buffer to
+        \texttt{circl.slhdsa.Scheme(params.ID).DeriveKey}.
+  \item Output $(sk_i, pk_i)$ in the FIPS 205 wire form: $sk_i =
+        (\mathit{SK.seed}, \mathit{SK.prf}, \mathit{PK.seed},
+        \mathit{PK.root})$ of length $4n$; $pk_i = (\mathit{PK.seed},
+        \mathit{PK.root})$ of length $2n$.
 \end{enumerate}
 
-\paragraph{Round 2 (party $P_i$, \texttt{dkg.go:185}).}
-\begin{enumerate}[nosep,leftmargin=2em]
-  \item Validate every received $\textsc{DKGRound1Msg}_j$
-        contains an envelope for every committee member (no
-        omissions), with the expected wire sizes for every share and
-        every contribution. Reject malformed messages with
-        $\textsc{ErrDKGMissingEnvelope}$,
-        $\textsc{ErrDKGShareSize}$, or
-        $\textsc{ErrDKGContribSize}$.
-  \item Compute the transcript digest:
-        \begin{align*}
-          \tau_{\mathrm{DKG}} \;=\; & \texttt{"lux-magnetar-v0.1"} \,\Vert\,
-            \mathrm{Mode} \,\Vert\, t_{\mathrm{LE}} \,\Vert\, n_{\mathrm{LE}}
-            \,\Vert\,
-            \mathit{NodeID}_1 \,\Vert\, \cdots \,\Vert\,
-            \mathit{NodeID}_n \\
-          D \;=\; & \textsc{cSHAKE256}\bigl(
-            \tau_{\mathrm{DKG}} \,\Vert\,
-            \mathrm{for\_each\_dealer}_j(\mathrm{for\_each\_recipient}_k(
-            \mathrm{share}_{j \to k} \,\Vert\, c_j)),
-            \\
-            & \quad
-            \mathrm{N} = \text{``Magnetar''},
-            \mathrm{S} = \text{``MAGNETAR-DKG-TRANSCRIPT-V1''},
-            32\,\mathrm{B}\bigr).
-        \end{align*}
-  \item Broadcast $\textsc{DKGRound2Msg}_i = (\mathit{NodeID}_i, D)$.
-\end{enumerate}
+\paragraph{Determinism.} If \texttt{rng} is a deterministic reader
+(e.g., a \texttt{detReader} seeded by the canonical test fixture),
+the output keypair is byte-identical across calls. This is the
+property KAT regeneration relies on.
 
-\paragraph{Round 3 (party $P_i$, \texttt{dkg.go:278}).}
-\begin{enumerate}[nosep,leftmargin=2em]
-  \item Validate every $\textsc{DKGRound2Msg}_j$.$D = D$ (computed
-        locally). A mismatch is an \emph{identifiable abort} ---
-        $\textsc{AbortEvidence}_{\mathrm{Equivocation}}$ names the
-        offending dealer $P_j$ and carries the conflicting digest
-        pair as on-chain slashing evidence.
-  \item Compute the per-party share of the master byte-sum
-        $\mathit{mySumShare}_i$ by adding the per-byte shares received
-        from every dealer:
-        $\mathit{mySumShare}_i[b] = \sum_{j=1}^n
-        \mathit{share}_{j \to i}[b] \bmod 257$, for $b \in [0,
-        \textsc{seed\_size})$.
-  \item Compute the master byte-sum (also derivable as the sum of
-        every dealer's contribution):
-        $\mathit{masterByteSum}[b] = \sum_{j=1}^n c_j[b] \bmod 257$,
-        for $b \in [0, \textsc{seed\_size})$.
-  \item Compute the committee root:
-        \[
-          \mathit{committee\_root}
-          = \textsc{cSHAKE256}\bigl(
-            \text{``MAGNETAR-COMMITTEE-V1''} \,\Vert\,
-            \mathrm{sorted\_committee},
-            \mathrm{N} = \text{``Magnetar''},
-            \mathrm{S} = \text{``MAGNETAR-DKG-COMMIT-V1''},
-            32\,\mathrm{B}\bigr).
-        \]
-        The committee is canonically sorted ascending by
-        $\mathit{NodeID}$ (\texttt{dkg.go:423}).
-  \item Mix to the master seed via equation~\eqref{eq:seed-mix}:
-        $S = \textsc{cSHAKE256}(
-        \mathit{masterByteSum}_\mathit{BE} \,\Vert\,
-        \mathit{committee\_root},
-        \mathrm{N} = \text{``Magnetar''},
-        \mathrm{S} = \text{``MAGNETAR-SEED-SHARE-V1''},
-        \textsc{seed\_size}\,\mathrm{B})$.
-  \item Derive the SLH-DSA secret key:
-        $(sk, pk) \gets \textsc{circl.slhdsa.Scheme}(\mathit{ID}).
-        \textsc{DeriveKey}(S)$.
-        Verify the resulting public key matches what every other
-        honest party would compute (this is automatic: every party
-        has identical $\mathit{masterByteSum}$ and
-        $\mathit{committee\_root}$ inputs).
-        \emph{Discard} $sk$; publish $pk$ as the joint group public
-        key.
-  \item Compute the chain-pinned transcript hash binding
-        $(\mathit{committee\_root}, pk, t)$:
-        $\tau_{\mathrm{out}} = \textsc{transcriptHash}(
-        \text{``MAGNETAR-DKG-TRANSCRIPT-V1''},
-        \text{``lux-magnetar-v0.1''},
-        \mathit{committee\_root},
-        pk_\mathrm{bytes},
-        t_{\mathrm{LE}})$.
-  \item Output:
-        $\textsc{KeyShare}_i = (\mathit{NodeID}_i, x_i = i,
-        \mathit{Share} =
-        \mathit{mySumShare}_{i,\mathit{BE}},
-        \mathit{Pub} = pk,
-        \mathrm{Mode})$
-        and $\tau_{\mathrm{out}}$.
-  \item Zeroize all intermediate buffers: $S$, the recovered $sk$,
-        $\mathit{mySumShare}_i$ wire-form, $\mathit{masterByteSum}$,
-        the mix input, $c_i$, and every per-byte share $f_{b,i}(x_k)$
-        ($\textsc{zeroizeBytes}$ / $\textsc{zeroizeU16Slice}$ /
-        $\textsc{zeroizePrivateKey}$).
-\end{enumerate}
+\paragraph{Independence.} No shared state. No correlation between
+$(sk_i, pk_i)$ and $(sk_j, pk_j)$ for $i \ne j$. Each keypair is
+generated on its own host with its own RNG.
 
-\paragraph{DKG correctness.} For any quorum $Q \subseteq [n]$ with
-$|Q| \ge t$, Lagrange interpolation of
-$\{(x_i, \mathit{mySumShare}_i)\}_{i \in Q}$ at $x = 0$ recovers
-$\mathit{masterByteSum}$:
-\begin{equation}
-  \sum_{i \in Q} \lambda_i^Q(0) \cdot \mathit{mySumShare}_i[b]
-  \;=\;
-  \sum_{i \in Q} \lambda_i^Q(0) \cdot
-    \sum_{j=1}^n f_{b,j}(x_i)
-  \;=\;
-  \sum_{j=1}^n \underbrace{\sum_{i \in Q} \lambda_i^Q(0) \cdot
-    f_{b,j}(x_i)}_{= c_j[b]}
-  \;=\;
-  \mathit{masterByteSum}[b],
-  \label{eq:dkg-correctness}
-\end{equation}
-where the inner Lagrange sum recovers $f_{b,j}(0) = c_j[b]$ by the
-standard Shamir reconstruction property. The cSHAKE256 mix
-\eqref{eq:seed-mix} is deterministic, so the reconstructed master seed
-is identical to the master seed computed at DKG Round 3. \qed
-
-\subsection{Threshold sign protocol}
+\subsection{Per-validator signing primitive}
 \label{sec:construction:sign}
 
-The sign protocol is a two-round commit-and-reveal between a quorum
-$T \subseteq [n]$ of size $t$.
+\texttt{ValidatorSign} is the canonical signing primitive for the
+public-BFT path. It is a thin wrapper over the FIPS 205 reference,
+exposed with a public-BFT-explicit signature.
 
-\paragraph{Round 1 (signer $P_i$ for $i \in T$,
-\texttt{threshold.go:150}).}
-\begin{enumerate}[nosep,leftmargin=2em]
-  \item Sample raw entropy
-        $\mathit{rngBytes} \overset{\$}{\gets} \{0,1\}^{16 \cdot
-        \textsc{seed\_size}}$ from $\mathit{rng}$.
-  \item Derive per-attempt mask via cSHAKE256:
-        \[
-          r_i = \textsc{cSHAKE256}\bigl(
-            \mathit{rngBytes} \,\Vert\,
-            \mathit{sid} \,\Vert\,
-            \kappa_\mathit{BE} \,\Vert\,
-            \mathit{NodeID}_i,
-            \mathrm{N} = \text{``Magnetar''},
-            \mathrm{S} = \text{``MAGNETAR-SIGN-MASK-V1''},
-            2 \cdot \textsc{seed\_size}\,\mathrm{B}\bigr).
-        \]
-        The mask-mix construction ensures that even a deterministic
-        $\mathit{rng}$ that emits the same bytes across two attempts
-        produces distinct masks per attempt (the $\kappa_\mathit{BE}$
-        field rules out cross-attempt collision).
-  \item Compute the byte-wise XOR-masked share
-        $\mathit{masked}_i[b] = \mathit{share}_i[b] \oplus r_i[b]$
-        for $b \in [0, 2 \cdot \textsc{seed\_size})$.
-  \item Build the Round-1 transcript $\tau_1$ binding
-        $(\mathit{sid}, \kappa, \mathrm{Quorum}, \mathit{NodeID}_i,
-        pk, \mu)$ in NIST SP 800-185 encoded form
-        (\texttt{threshold.go:230}):
-        \[
-          \tau_1 =
-            \textsc{leftEncode}(|\mathrm{parts}|) \,\Vert\,
-            \textsc{encodeString}(\mathit{sid}) \,\Vert\,
-            \textsc{encodeString}(\kappa) \,\Vert\,
-            \cdots \,\Vert\,
-            \textsc{encodeString}(\mu).
-        \]
-  \item Compute the commit:
-        \[
-          D_i = \textsc{cSHAKE256}\bigl(
-            r_i \,\Vert\, \mathit{masked}_i \,\Vert\, \tau_1,
-            \mathrm{N} = \text{``Magnetar''},
-            \mathrm{S} = \text{``MAGNETAR-SIGN-R1-V1''},
-            32\,\mathrm{B}\bigr).
-        \]
-  \item Broadcast $\textsc{Round1Message}_i = (\mathit{NodeID}_i,
-        \mathit{sid}, \kappa, D_i)$.
-  \item \emph{Retain} $r_i, \mathit{masked}_i, \tau_1$ locally for
-        Round 2 reveal. Wipe $\mathit{rngBytes}$ and the mask-mix
-        input.
+\paragraph{Algorithm (\texttt{standalone.go:231-244}, \texttt{sign.go}).}
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item Verify $sk_i$ is non-nil and the embedded mode matches an
+        installed \texttt{Params}.
+  \item Pull the \texttt{slhdsa.Scheme} for the embedded mode.
+  \item If \texttt{rng=nil}, invoke
+        \texttt{Scheme.SignDeterministic(sk\_i, msg, ctx=nil)}.
+        Otherwise invoke
+        \texttt{Scheme.SignRandomized(sk\_i, rng, msg, ctx=nil)}.
+  \item Return the raw FIPS 205 signature bytes
+        (\texttt{params.SignatureSize}: $16{,}224$, $35{,}664$, or
+        $29{,}792$ depending on mode).
 \end{enumerate}
 
-\paragraph{Round 2 (signer $P_i$, \texttt{threshold.go:198}).}
-\begin{enumerate}[nosep,leftmargin=2em]
-  \item Validate received Round-1 messages: every
-        $\textsc{Round1Message}_j$ must carry the same
-        $(\mathit{sid}, \kappa)$ as the local state. Reject
-        cross-session messages with $\textsc{ErrSessionMismatch}$,
-        cross-attempt with $\textsc{ErrAttemptMismatch}$.
-  \item Construct the reveal
-        $\textsc{PartialSig}_i = r_i \,\Vert\, \mathit{masked}_i$
-        ($4 \cdot \textsc{seed\_size}$ bytes).
-  \item Broadcast $\textsc{Round2Message}_i = (\mathit{NodeID}_i,
-        \mathit{sid}, \kappa, \textsc{PartialSig}_i)$.
+\paragraph{Context binding.} The \texttt{ctx} parameter is
+intentionally omitted at the \texttt{ValidatorSign} surface: the
+consensus layer binds chain-id / block-height / epoch into the
+message $\mu$ upstream (the QuasarCert transcript-hash pattern).
+The \texttt{Sign} entry point in \texttt{sign.go} retains the
+\texttt{ctx} parameter for callers that need explicit context
+binding; the \texttt{ValidatorSign} wrapper passes
+\texttt{ctx=nil}.
+
+\paragraph{Determinism.} With \texttt{rng=nil}, $\sigma_i$ is byte-
+identical to what a single-party FIPS 205 signer would emit on
+$(sk_i, \mu, \mathit{ctx}=\varepsilon)$. This is the load-bearing
+property pinned by
+$\textsc{TestMagnetar\_Wire\_FIPS205Verifiable}$ at
+\texttt{wire\_test.go:166-220} (cf. \S\ref{sec:security:byte-equality}).
+
+\subsection{Aggregate certificate construction}
+\label{sec:construction:cert}
+
+The consensus layer collects validator signatures into a
+\texttt{ValidatorAggregateCert} for transport over the wire. The
+cert is intentionally a parallel-slices shape (not a nested per-
+signer record list) because it maps directly to the Z-Chain Groth16
+rollup witness layout.
+
+\paragraph{Wire layout
+(\texttt{standalone.go:415-432}, \texttt{wire.go}).}
+\begin{align*}
+  \mathit{ValidatorAggregateCert} \;=\; &
+    \mathit{Mode}_1 \,\Vert\, N_{\mathit{BE},4} \,\Vert\,
+    \mathit{Signers}[0]_{32} \,\Vert\, \cdots \,\Vert\,
+    \mathit{Signers}[N-1]_{32} \\
+  & \,\Vert\, \mathit{PubKeys}[0]_{|pk|} \,\Vert\, \cdots \,\Vert\,
+    \mathit{PubKeys}[N-1]_{|pk|} \\
+  & \,\Vert\, \mathit{Sigs}[0]_{|\sigma|} \,\Vert\, \cdots \,\Vert\,
+    \mathit{Sigs}[N-1]_{|\sigma|}.
+\end{align*}
+
+\paragraph{Algorithm \texttt{BuildAggregateCert}
+(\texttt{standalone.go:443-478}).}
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item Validate \texttt{params} matches one of the canonical
+        parameter tables.
+  \item Validate the three parallel slices
+        $(\mathit{signers}, \mathit{pubKeys}, \mathit{sigs})$ have
+        the same length $N \ge 1$.
+  \item For each $i \in [0, N)$, validate $|pubKeys[i]| =
+        params.PublicKeySize$ and $|sigs[i]| = params.SignatureSize$.
+  \item Defensively copy each $pubKeys[i]$ and $sigs[i]$ (the
+        caller's slices may be aliased; the cert is wire-stable and
+        must not move under the caller).
+  \item Return the \texttt{ValidatorAggregateCert} record.
 \end{enumerate}
 
-\subsection{Combine (aggregator)}
-\label{sec:construction:combine}
+\paragraph{Independent verifiability.} Each $\sigma_i$ in the cert
+verifies independently against $pk_i$; there is no cross-signer
+algebraic coupling. A relying party can verify any subset of the
+cert (e.g., for incremental quorum-detection) without sharing any
+secret state with other relying parties.
 
-$\textsc{Combine}$ is a deterministic pure function executed by the
-aggregator (any party in the quorum, or an external aggregator with
-read access to the share directory). \texttt{combine.go:47}.
+\subsection{Aggregate certificate verification}
+\label{sec:construction:verifycert}
 
-\paragraph{Inputs:} $(pk, \mu, \mathit{ctx}, \mathit{randomized},
-\mathit{sid}, \kappa, \mathrm{Quorum}, t,
-\{\textsc{R1}_i\}, \{\textsc{R2}_i\},
-\{\textsc{KeyShare}_j\}_{j=1}^n)$.
+\texttt{VerifyAggregateCert} is the consumer-facing verification
+primitive. It enforces registry binding (dropping unknown signers
+and pubkey mismatches), dedupes repeated signers, runs the parallel
+batch verify, and returns the count of valid signers. The quorum
+decision lives at the consumer.
 
-\paragraph{Steps:}
-\begin{enumerate}[nosep,leftmargin=2em]
-  \item Index $\{\textsc{R1}_i\}$ by sender $\mathit{NodeID}_i$.
-        Reject cross-session messages.
-  \item For each $\textsc{R2}_i$ in the quorum:
-        \begin{enumerate}[nosep,leftmargin=2em]
-          \item Parse $r_i \Vert \mathit{masked}_i =
-                \textsc{PartialSig}_i$.
-          \item Re-derive $D_i' = \textsc{cSHAKE256}(
-                r_i \,\Vert\, \mathit{masked}_i \,\Vert\, \tau_{1,i},
-                \mathrm{N} = \text{``Magnetar''},
-                \mathrm{S} = \text{``MAGNETAR-SIGN-R1-V1''},
-                32\,\mathrm{B})$ with $\tau_{1,i}$ reconstructed from
-                public inputs.
-          \item Compare $D_i'$ against $\textsc{R1}_i.D_i$ in
-                constant time (\texttt{ctEqual32}). On mismatch:
-                reject with $\textsc{ErrRound2CommitBad}$.
-          \item Recover $\mathit{share}_i = \mathit{masked}_i \oplus
-                r_i$.
-        \end{enumerate}
-  \item Pair each recovered share with the matching $\textsc{KeyShare}$
-        entry's $x_i$ (the aggregator gets the directory of
-        $\{\textsc{KeyShare}_j\}_{j=1}^n$ so it can recover
-        evaluation points).
-  \item Run Lagrange reconstruction over $\mathrm{GF}(257)$ at $x = 0$
-        per equation~\eqref{eq:shamir-lagrange} on the first $t$
-        recovered shares, yielding $\mathit{reconstructedByteSum}
-        \in [0, 257)^{\textsc{seed\_size}}$.
-  \item Compute $\mathit{committee\_root}$ from the
-        full directory of $\{\textsc{KeyShare}_j\}_{j=1}^n$ (the same
-        definition as DKG Round 3 step 4).
-  \item Reconstruct the master seed via equation~\eqref{eq:seed-mix}:
-        $S = \textsc{cSHAKE256}(
-        \mathit{reconstructedByteSum}_\mathit{BE} \,\Vert\,
-        \mathit{committee\_root},
-        \mathrm{N} = \text{``Magnetar''},
-        \mathrm{S} = \text{``MAGNETAR-SEED-SHARE-V1''},
-        \textsc{seed\_size}\,\mathrm{B})$.
-  \item Derive the centralized FIPS 205 secret key:
-        $(sk_{\mathrm{rec}}, pk_{\mathrm{rec}}) \gets
-        \textsc{circl.slhdsa.Scheme}(\mathit{ID}).
-        \textsc{DeriveKey}(S)$.
-  \item Verify $pk_{\mathrm{rec}} = pk$. On mismatch: zeroize secret
-        material and return $\textsc{ErrPubkeyMismatch}$.
-  \item Compute the FIPS 205 signature:
-        $\sigma = \begin{cases}
-          \textsc{slhdsa.SignDeterministic}(sk_{\mathrm{rec}}, \mu,
-            \mathit{ctx}) & \text{if } \mathit{randomized} = \mathit{false},\\
-          \textsc{slhdsa.SignRandomized}(sk_{\mathrm{rec}}, \mathit{rng},
-            \mu, \mathit{ctx}) & \text{if } \mathit{randomized} = \mathit{true}.
-        \end{cases}$
-  \item Zeroize $S$, $sk_{\mathrm{rec}}$, the mix input,
-        $\mathit{reconstructedByteSum}$, and the recovered
-        $\{\mathit{share}_i\}$. Return $\sigma$.
+\paragraph{Algorithm (\texttt{standalone.go:519-613}).}
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item Validate \texttt{cert} is non-nil and the embedded
+        \texttt{Mode} matches a canonical parameter set.
+  \item Validate $N \ge 1$ and the parallel slices have matching
+        lengths.
+  \item For each $i \in [0, N)$, validate $|cert.PubKeys[i]| =
+        params.PublicKeySize$ and $|cert.Sigs[i]| =
+        params.SignatureSize$.
+  \item \emph{Phase 1 (entry classification).} For each $i$, dedupe
+        against \texttt{seen}, look up
+        $registered = knownValidators[cert.Signers[i]]$; mark the
+        entry verifiable only if (a) the lookup succeeds, (b)
+        $|registered| = params.PublicKeySize$, and (c)
+        $\textsc{ctEqualBytes}(cert.PubKeys[i], registered)$. Both
+        cases (a)/(b)/(c) failing are counted as INVALID, not
+        fatal.
+  \item \emph{Phase 2 (parallel batch verify).} Collect the
+        verifiable entries into flat slices and invoke
+        \texttt{ValidatorBatchVerify}, which dispatches serial or
+        goroutine-parallel based on the
+        \texttt{verifyAggregatedConcurrentThreshold} constant
+        (currently $\sim 16$).
+  \item \emph{Phase 3 (tally).} Count verifiable + valid entries.
+        Return the count.
 \end{enumerate}
 
-\paragraph{Determinism and byte equality.} With $\mathit{randomized} =
-\mathit{false}$ (the default), the FIPS 205
-$\textsc{SignDeterministic}$ output is a deterministic function of
-$(sk_{\mathrm{rec}}, \mu, \mathit{ctx})$. Since
-$sk_{\mathrm{rec}}$ is itself a deterministic function of $S$, and $S$
-is a deterministic function of the share set (independent of which
-quorum of size $\ge t$ is used), every quorum produces the same
-$\sigma$. This is the empirical content of
-$\textsc{TestN1\_ByteEquality\_DifferentQuorumsSameSignature}$
-(\S\ref{sec:evaluation:tests}).
+\paragraph{Defense-in-depth choices.}
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item \textbf{Unknown signers counted as INVALID, not fatal.} A
+        cert carrying a signature from a stale or unknown validator
+        does not crash the verifier; the verifier reports the
+        count, and the quorum policy at the consumer decides
+        whether to accept. This is the right discipline when certs
+        may be Z-Chain Groth16-rolled-up over a stale validator
+        registry: the verifier must not abort the entire batch on
+        one stale entry.
+  \item \textbf{Pubkey mismatches counted as INVALID, not fatal.}
+        Same rationale. An attacker who slips a SignedBundle from
+        an unknown validator into the cert does not gain a count
+        but does not crash the verifier.
+  \item \textbf{Duplicate signers deduped first-wins.} The first
+        occurrence wins; subsequent occurrences are silently
+        dropped (not counted twice, not counted as invalid). The
+        consensus layer can collect proof of double-signing
+        separately via per-signer \texttt{Sigs} comparison.
+  \item \textbf{Constant-time pubkey comparison.}
+        \texttt{ctEqualBytes} short-circuits at the wire-length
+        validation and otherwise runs a constant-time
+        byte-by-byte XOR-then-OR reduction. No secret-dependent
+        timing.
+\end{enumerate}
+
+\subsection{Canonical wire codec (MAGS / MAGG)}
+\label{sec:construction:wire}
+
+The wire codec at \texttt{wire.go} provides byte-stable framing for
+individual signatures (MAGS) and group keys (MAGG), with a stateless
+verifier dispatcher (\texttt{VerifyBytes}) for consensus-layer
+consumption.
+
+\paragraph{MAGS signature envelope.}
+\begin{align*}
+  \mathit{MAGS\_frame} \;=\; & \mathtt{0x4D4147} \,\Vert\,
+    \mathtt{0x53} \,\Vert\, \mathit{version}_{\mathit{BE},2} \,\Vert\,
+    \mathit{mode}_1 \,\Vert\, \mathit{payloadLen}_{\mathit{BE},4} \\
+  & \,\Vert\, \mathit{sigPayload}_{params.SignatureSize}.
+\end{align*}
+Total length: $11 + params.SignatureSize$ bytes. The 11-byte fixed
+header carries the magic ASCII string ``MAGS'', the version
+(currently 1), the FIPS 205 mode byte, and the big-endian payload
+length. The payload is the raw FIPS 205 signature bytes verbatim.
+
+\paragraph{MAGG group-key envelope.}
+\begin{align*}
+  \mathit{MAGG\_frame} \;=\; & \mathtt{0x4D4147} \,\Vert\,
+    \mathtt{0x47} \,\Vert\, \mathit{version}_{\mathit{BE},2} \,\Vert\,
+    \mathit{mode}_1 \,\Vert\, \mathit{payloadLen}_{\mathit{BE},4} \\
+  & \,\Vert\, \mathit{pkPayload}_{params.PublicKeySize}.
+\end{align*}
+Total length: $11 + params.PublicKeySize$ bytes. Same structure as
+MAGS with a distinct magic suffix byte (``G'' vs ``S'').
+
+\paragraph{Stateless \texttt{VerifyBytes} dispatcher.}
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item Validate $len(groupKeyWire) \ge 11$ and the magic matches
+        \texttt{MAGG}.
+  \item Validate $len(sigWire) \ge 11$ and the magic matches
+        \texttt{MAGS}.
+  \item Decode the version, mode, and declared payload length from
+        each frame. Validate
+        $len(groupKeyWire) = 11 + declared_{gk}$ and
+        $len(sigWire) = 11 + declared_{sig}$.
+  \item Validate both frames target the same mode.
+  \item Strip the 11-byte header from each, recovering the raw
+        FIPS 205 $pk_{raw}$ and $\sigma_{raw}$ payloads.
+  \item Dispatch to
+        \texttt{circl.slhdsa.Scheme(mode).PublicKey.UnmarshalBinary(
+        $pk_{raw}$)} and then
+        \texttt{Scheme.Verify($pk$, msg, $\sigma_{raw}$, ctx=nil)}.
+  \item Return the Boolean from the FIPS 205 verifier.
+\end{enumerate}
+
+\paragraph{Byte-identity to FIPS 205.} The wire codec is purely
+additive (an envelope prefix); the payload bytes are the raw FIPS
+205 signature or public-key bytes verbatim. Stripping the 11-byte
+header recovers exactly what \texttt{cloudflare/circl/sign/slhdsa}
+emits on the same $(sk, \mu, \mathit{ctx})$ tuple. The
+$\textsc{TestMagnetar\_Wire\_FIPS205Verifiable}$ regression pins
+this property across all three SHAKE parameter sets.
 
 \subsection{Verify (FIPS 205 passthrough)}
 \label{sec:construction:verify}
 
-$\textsc{Verify}$ \texttt{verify.go:32} is a single dispatch to
-$\textsc{circl.slhdsa.PublicKey.UnmarshalBinary}(pk.\mathit{Bytes})$
-followed by
-$\textsc{slhdsa.Verify}(\mathit{pk}, \textsc{NewMessage}(\mu), \sigma,
-\mathit{ctx})$. \emph{No Magnetar-specific envelope or wrapper}. This
-is the Class-N1-analog property: the produced signatures live in the
-exact FIPS 205 signature space and any FIPS 205 verifier accepts them
-unmodified.
+The per-signature \texttt{Verify} entry point at \texttt{verify.go}
+is a thin dispatch to
+\texttt{circl.slhdsa.PublicKey.UnmarshalBinary($pk.Bytes$)} followed
+by
+\texttt{slhdsa.Verify($pk$, NewMessage($\mu$), $\sigma$, ctx)}. No
+Magnetar-specific envelope or wrapper. This is the FIPS 205-byte-
+identity property: the produced signatures live in the exact FIPS
+205 signature space, and any FIPS 205 verifier accepts them
+unmodified after the wire-codec envelope (if present) is stripped.
 
-\subsection{Identifiable abort}
+\subsection{Constant-time discipline}
+\label{sec:construction:ct}
+
+The per-validator standalone primitive's hot paths are:
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \texttt{ValidatorSign} $\to$ \texttt{Sign} $\to$
+        \texttt{circl.slhdsa.SignDeterministic} (constant-time per
+        circl design).
+  \item \texttt{ValidatorBatchVerify} $\to$
+        \texttt{circl.slhdsa.Verify} (constant-time per circl
+        design; verifier accepts only public inputs).
+  \item \texttt{VerifyAggregateCert} pubkey-equality comparison
+        via \texttt{ctEqualBytes} (constant-time XOR-then-OR
+        reduction).
+  \item Wire-codec header validation via fixed-length big-endian
+        decode and constant-time magic comparison.
+\end{itemize}
+None of the standalone-path operations branch on secret material:
+$sk_i$ is consumed only by \texttt{circl.slhdsa.SignDeterministic}
+which is constant-time by construction. There are no Shamir
+operations, no Lagrange interpolation, and no aggregator-held
+secrets in the standalone path. The threshold forms in
+Appendix~\ref{app:thbs} and Appendix~\ref{app:reveal} carry
+additional constant-time obligations that the appendices document.
+
+\subsection{Identifiable abort (consensus layer)}
 \label{sec:construction:abort}
 
-The v0.1 protocol commits to identifiable abort: every detected
-misbehaviour produces verifiable on-chain evidence suitable for
-slashing.
+The per-validator standalone primitive has a clean abort posture:
+each $\sigma_i$ is a single-party FIPS 205 signature, and
+\texttt{VerifyAggregateCert} reports the per-signer outcome via
+the bitmap from \texttt{ValidatorBatchVerify}. The consensus layer
+collects evidence of misbehaviour:
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \textbf{Invalid signature.} The verifier bitmap reports
+        $\mathit{false}$ for the offending signer. The
+        $(\mathsf{NodeID}_i, pk_i, \sigma_i, \mu)$ quad is
+        sufficient on-chain evidence for slashing.
+  \item \textbf{Double-signing.} Two valid signatures from the
+        same $\mathsf{NodeID}_i$ on distinct messages on the same
+        slot constitute evidence; the consensus layer collects
+        $(\mathsf{NodeID}_i, pk_i, \sigma_{i,A}, \sigma_{i,B},
+        \mu_A, \mu_B)$ as the slashing record.
+  \item \textbf{Unregistered signer.} An entry whose
+        $\mathsf{NodeID}_i$ does not appear in
+        \texttt{knownValidators} is counted as INVALID; the
+        consensus layer may treat repeated unregistered-signer
+        entries as a peer misbehaviour signal at the gossip layer.
+  \item \textbf{Pubkey-registry mismatch.} An entry whose embedded
+        $pk_i$ does not byte-equal the registered pubkey for that
+        $\mathsf{NodeID}_i$ is counted as INVALID; same handling
+        as unregistered signer.
+\end{itemize}
+The identifiable-abort taxonomy of the threshold forms (DKG
+equivocation, Round-2 commit-bind failure, pubkey mismatch) is
+documented in Appendix~\ref{app:reveal} and Appendix~\ref{app:thbs}.
+
+\subsection{Wire sizes}
+\label{sec:construction:wire-sizes}
 
 \begin{table}[H]
 \centering
-\caption{Identifiable abort taxonomy in Magnetar v0.1.}
-\label{tab:abort}
-\begin{tabular}{lll}
-\toprule
-Complaint & Detected at & Evidence \\
-\midrule
-$\textsc{ComplaintEquivocation}$ & DKG Round 3 & $(\mathit{digest}_{\mathrm{honest}},
-\mathit{digest}_{\mathrm{accused}})$ \\
-$\textsc{ComplaintBadDelivery}$ & DKG Round 2 & malformed envelope (parsed bytes) \\
-$\textsc{ErrRound2CommitBad}$ & $\textsc{Combine}$ step 2c & $(\textsc{R1}_i, \textsc{R2}_i)$ pair \\
-$\textsc{ErrPubkeyMismatch}$ & $\textsc{Combine}$ step 8 & quorum + share set \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-The v0.1 protocol \emph{omits} the per-pair MAC layer that Pulsar uses
-to authenticate Round 1 against tampering by a network attacker
-(BLOCKERS.md CR-7). The omission is documented; v0.2 adds the MAC
-layer once the trust model tightens to include passive-network-observer
-secrecy of envelopes.
-
-\subsection{Wire format}
-\label{sec:construction:wire}
-
-The wire formats are byte-exact specifications that gate
-cross-implementation interoperability. Magnetar's wire bytes are
-defined by the Go canonical's serialisation in \texttt{types.go} and
-must match across any future port (C++, Rust, hardware).
-
-\begin{table}[H]
-\centering
-\caption{Magnetar v0.1 wire-format sizes. ``Conceptual size'' is the
-serialised payload; the actual envelope adds an SP 800-185 leftEncode
-length prefix per field.}
+\caption{Magnetar v0.5 per-validator standalone wire sizes.}
 \label{tab:wire-sizes}
 \begin{tabular}{lr}
 \toprule
 Object & Size (bytes) \\
 \midrule
-$\textsc{Round1Message}$ commit $D_i$ & 32 \\
-$\textsc{Round2Message}$ partial sig $r_i \Vert \mathit{masked}_i$ &
-$4 \cdot \textsc{seed\_size}$ (e.g., 384 for SHAKE-192s) \\
-$\textsc{KeyShare}$ share buffer & $2 \cdot \textsc{seed\_size}$ \\
-$\textsc{DKGShareEnvelope}$ $(\mathit{share}, c)$ &
-$3 \cdot \textsc{seed\_size}$ \\
-$\textsc{Signature.Bytes}$ (SHAKE-192s) & 16\,224 \\
-$\textsc{Signature.Bytes}$ (SHAKE-192f) & 35\,664 \\
-$\textsc{Signature.Bytes}$ (SHAKE-256s) & 29\,792 \\
+$\sigma_i$ FIPS 205 payload (SHAKE-192s) & 16\,224 \\
+$\sigma_i$ FIPS 205 payload (SHAKE-192f) & 35\,664 \\
+$\sigma_i$ FIPS 205 payload (SHAKE-256s) & 29\,792 \\
+$pk_i$ FIPS 205 payload (SHAKE-192s / 192f) & 48 \\
+$pk_i$ FIPS 205 payload (SHAKE-256s) & 64 \\
+MAGS envelope header (fixed) & 11 \\
+MAGG envelope header (fixed) & 11 \\
+$\mathsf{NodeID}_i$ in cert & 32 \\
+\midrule
+\texttt{ValidatorAggregateCert} (SHAKE-192s, $K=21$) & $\sim 332$ KiB \\
+\texttt{ValidatorAggregateCert} (SHAKE-192s, $K=21$) post Z-Chain Groth16 rollup & $\sim 192$ B \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 The signature wire format is \emph{exactly} the FIPS 205 wire format
-(per FIPS 205 \S9.4); there is no Magnetar prefix, suffix, or
-envelope.
+plus the 11-byte MAGS envelope; there is no Magnetar-specific
+suffix, no per-signer ZK proof, and no out-of-band binding. The
+Z-Chain Groth16 rollup that compresses $N \times |\sigma|$ to a
+constant-size certificate is specified separately at the lux-zchain
+layer and consumes the parallel-slices cert shape verbatim.

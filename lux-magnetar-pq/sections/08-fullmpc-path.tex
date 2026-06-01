@@ -1,15 +1,20 @@
-\section{Path to full MPC threshold (v0.2 research direction)}
+\section{Path to public-DKG threshold HBS (open research)}
 \label{sec:fullmpc}
 
-This section sketches the research path from the v0.1
-reveal-and-aggregate construction to a v0.2 construction that drops
-the aggregator-TCB caveat by performing a true per-signature MPC over
-the SLH-DSA hash tree. We are deliberate about scope: this section
-\emph{does not} specify v0.2. It surveys the design space, identifies
-the load-bearing technical obstacles, and rules out the obvious
-candidate construction (Komlo-style two-round threshold).
+The per-validator standalone construction of \S\ref{sec:construction}
+is the architecturally correct public-BFT primitive for hash-based
+post-quantum consensus today. There is, however, an open research
+question worth specifying: \emph{is there a true threshold HBS
+construction that does not require TEE attestation or a dealer in
+the TCB?}
 
-\subsection{Why Komlo-style two-round threshold does not apply}
+This section surveys the open path. We are deliberate about scope:
+this section \emph{does not} specify a new construction. It
+identifies the load-bearing technical obstacles, surveys the
+candidate sub-protocols, and frames the open research the artefact's
+\texttt{ref/go/pkg/thbs/dkg2/} skeleton scaffolds.
+
+\subsection{Why FROST-style threshold does not apply}
 \label{sec:fullmpc:no-komlo}
 
 FROST \cite{frost,rfc9591} is the canonical two-round threshold
@@ -49,106 +54,153 @@ Concretely:
 \end{itemize}
 
 A direct port of FROST/Pulsar's linear-aggregation pattern is
-\emph{ruled out by the SLH-DSA construction}. This is a load-bearing
-algorithmic obstacle: no choice of parameters, hash function family,
-or per-party masking can paper over the fact that SLH-DSA is not a
-linear scheme.
+\emph{ruled out by the SLH-DSA construction}. This is a load-
+bearing algorithmic obstacle: no choice of parameters, hash
+function family, or per-party masking can paper over the fact that
+SLH-DSA is not a linear scheme. The literature (Cozzo-Smart 2019,
+Bonte-Smart-Tan 2023, NIST IR 8214) is uniform on this point.
 
-\subsection{Candidate MPC topologies}
+\subsection{Candidate sub-protocols for public-DKG THBS}
 \label{sec:fullmpc:topology}
 
-The v0.2 design space splits into three topologies, each with its
-own trade-off.
+A public-DKG instantiation of the McGrew threshold-HBS pattern
+(\cite{mcgrew2019}; Appendix~\ref{app:thbs}) requires two layers
+to be built without a dealer in the TCB. We survey the candidates.
 
-\paragraph{Topology A: Distributed FORS evaluation.} The FORS few-time
-signature is the leaf of the SLH-DSA hypertree; it is evaluated once
-per signature. A v0.2 construction could perform a distributed
-evaluation of the FORS leaves under threshold (each party reveals
-its share of the FORS leaf nodes selected by the message hash; the
-aggregator XOR-combines them into the public leaf bytes). Trade-off:
-this halves the TCB exposure (only the FORS evaluation enters the
-MPC; the XMSS-HT path is precomputed at DKG time) but still requires
-the WOTS+ chains and Merkle path to be in plaintext on the
-aggregator.
+\paragraph{Layer (A): PVSS distribution of per-element entropy.}
+The standard Pedersen / Feldman / Schoenmakers PVSS
+\cite{schoenmakers1999} framework distributes a secret $x =
+\sum_j r_j \bmod p$ across parties without any party learning
+$x$. For McGrew threshold HBS, the per-element secrets are the
+individual WOTS+ chain heads $\mathbf{w}_{\mathit{layer},
+\mathit{tree}, \mathit{leaf}, c}$ and FORS secret leaves
+$\mathbf{f}_{\mathit{tree}, k, i}$; each needs its own PVSS
+distribution, which is feasible but introduces a large
+per-distribution overhead (a single SLH-DSA-SHAKE-192s key has
+on the order of $2^{16}$ secret elements).
 
-\paragraph{Topology B: Full hash-tree MPC.} The most thorough
-construction performs every hash invocation under MPC. Each
-$\mathbf{F}(\textsc{seed}, \textsc{ADRS}, m)$ call inside SLH-DSA
-becomes a secure two-party (or $t$-of-$n$) hash computation. This
-gives ideal threshold security: the aggregator never sees any secret
-material. Trade-off: SHAKE256 has on the order of $10^4$ invocations
-per SLH-DSA-SHAKE-192s signature, and a generic MPC for a SHAKE256
-permutation is at best 100--1000x slower than a plaintext
-evaluation. End-to-end signing latency would balloon to minutes per
-signature.
+The PVSS layer ships as a research-grade SKELETON at
+\texttt{ref/go/pkg/thbs/dkg2/}:
+\texttt{Deal}, \texttt{Verify}, \texttt{Complaint},
+\texttt{Defense}, and \texttt{Run} are wire-shape defined, with
+sentinel errors \texttt{ErrSkeletonOnly} and
+\texttt{ErrMPCRootNotImpl} preventing production consumption.
 
-\paragraph{Topology C: Hardware enclaves.} The pragmatic alternative
-is to keep the v0.1 reveal-and-aggregate construction but run the
-aggregator inside a hardware-attested enclave (AMD SEV-SNP with
-remote attestation, or Intel TDX, or future MPC-friendly hardware
-like RISC-V Keystone). This eliminates the in-process memory threat
-vector at the cost of adding hardware-vendor TCB. The end-to-end
-trust is shifted from ``aggregator software is honest'' to
-``aggregator hardware is honest'' --- a different posture, not
-necessarily a stronger one.
-
-\subsection{Suggested v0.2 direction}
-\label{sec:fullmpc:direction}
-
-The Magnetar v0.2 research target should be \emph{Topology A}
-(distributed FORS evaluation) augmented with \emph{Topology C}
-(hardware enclaves for the WOTS+ chains and XMSS-HT path). Topology A
-gives the cryptographic upgrade for the per-signature critical
-component (FORS, which is signed with the actual key material);
-Topology C gives the operational upgrade for the precomputed
-components.
-
-\paragraph{Why this hybrid.} The FORS leaves are the only SLH-DSA
-component derived from the per-signature randomiser $R$. The WOTS+
-chains and the XMSS-HT tree are derived solely from $(\mathit{SK.seed},
-\mathit{PK.seed})$, which can be \emph{precomputed at DKG} and stored
-in the aggregator enclave once. This precomputation amortises the
-hardware cost across a large number of signing sessions: the same
-WOTS+ chains and XMSS-HT path are reused (in different addressed
-positions) for every signature under the same key.
-
-\paragraph{The remaining MPC cost.} FORS has $k \cdot \log_2(t)$
-leaf nodes per signature (e.g., $k = 17$, $t = 2^{15}$ for
-SHAKE-192s), so the v0.2 MPC needs to perform $\sim 17 \cdot 15
-= 255$ hash invocations under threshold per signature. This is
-two orders of magnitude smaller than the full SLH-DSA $\sim 10^4$
-hash count, making Topology A practically tractable: at
-$\sim 10$~ms per MPC hash invocation, a single threshold signature
-would take $\sim 2.5$~s, comparable to the v0.1 latency at
-$(7, 4)$.
-
-\subsection{What v0.2 will \emph{not} solve}
-\label{sec:fullmpc:limits}
-
-Even a successful Topology-A+C v0.2 carries residual trust
-assumptions:
+\paragraph{Layer (B): MPC over the SHA-256 / SHAKE hash tree.}
+Once layer (A) distributes the secret leaves without any party
+holding them in the clear, the Merkle root of the WOTS+ public
+keys must be computed from those shared leaves without
+revealing them. This requires MPC over the hash function:
 \begin{itemize}[leftmargin=2em,nosep]
-  \item \textbf{The hardware vendor.} Topology C's WOTS+/XMSS-HT
-        precomputation lives inside the enclave; the hardware vendor
-        is in the TCB for the persistent state. A vendor backdoor
-        or a side-channel break on the enclave (e.g., the
-        SEV-SNP attestation chain or the TDX measurement quote)
-        would compromise the persistent state.
-  \item \textbf{The FORS-MPC implementation.} A misimplemented
-        FORS-MPC that leaks any bit of the FORS secret to the
-        aggregator is no better than v0.1's reveal-and-aggregate.
-        Tier A for v0.2 requires a mechanised proof of the
-        FORS-MPC's privacy (EasyCrypt or equivalent).
+  \item \textbf{SPDZ-style preprocessed MPC}
+        (Damg{\aa}rd-Pastro-Smart-Zakarias 2012,
+        Damg{\aa}rd-Keller-Larraia-Pastro-Scholl-Smart 2013).
+        Generic but expensive: per-AND-gate cost is several
+        orders of magnitude higher than plaintext.
+  \item \textbf{Garbled-circuit MPC} (Yao;
+        Wang-Ranellucci-Katz 2017 ``Global-Scale Secure
+        Multi-party Computation''). Communication-heavy at
+        SHAKE256 ($\sim 1600$ permutation rounds per leaf hash).
+  \item \textbf{Function Secret Sharing} (Boyle-Gilboa-Ishai
+        2015). Promising for specific hash function families
+        but no concrete construction for SHAKE256 yet.
 \end{itemize}
 
-We do not promise that v0.2 will be available in any specific
-release window. The research is open, and the path is not a
-straight-line extension of v0.1. The current Tier B status of
-Magnetar v0.2.0 is the operationally relevant fact: a deployment
-running Polaris today should treat Magnetar as one of three
-independent lanes with the v0.1 trust caveat documented in
-\texttt{DEPLOYMENT-RUNBOOK.md}, and should track the v0.2
-research progress separately.
+The MPC-root layer is open research tracked at
+\texttt{BLOCKERS.md::MAGNETAR-PUBLIC-DKG-1}. Preliminary cost
+estimates put a single SHAKE-192s key's MPC-root computation at
+multi-second per leaf, multi-megabyte communication per leaf,
+which is operationally tractable for one-time DKG setup but is
+the load-bearing complexity.
+
+\paragraph{Layer (C, alternative): MPC at sign time over selected
+elements only.} The McGrew threshold-HBS construction releases
+shares only of the selected (per-message-randomiser) WOTS+ chain
+heads and FORS leaves. If the per-element secrets are PVSS-
+distributed via layer (A), then the sign-time MPC only needs to
+operate on the selected subset --- typically a few hundred
+elements per signature, not the full $\sim 2^{16}$. This is a
+much smaller workload than computing the full Merkle root under
+MPC.
+
+Layer (C) is the natural follow-on to layer (A): if PVSS-
+distributed secrets are available, the sign-time aggregation can
+recover only the selected elements via Lagrange interpolation
+under MPC, which is a linear computation over the prime field
+and admits standard SPDZ techniques. The cost is dominated by
+the number of selected elements rather than the full tree size.
+
+\subsection{Suggested public-DKG THBS direction}
+\label{sec:fullmpc:direction}
+
+A future public-DKG threshold HBS construction would combine:
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item Layer (A) PVSS distribution of per-element secrets ---
+        skeleton at \texttt{thbs/dkg2/}; production deployment
+        requires complaint / defense rounds and verifiable
+        dealer protocols.
+  \item Layer (B) MPC root computation at DKG time, run once per
+        key generation. Multi-second per leaf, parallelizable
+        across leaves, tractable as a one-time setup cost.
+  \item Layer (C) selected-element Lagrange under MPC at sign
+        time. Per-signature cost dominated by the FORS leaf
+        count ($\sim 17 \cdot 15 = 255$ leaves at SHAKE-192s)
+        rather than the full tree.
+\end{enumerate}
+
+This is a multi-month research direction. The \texttt{thbs/dkg2/}
+skeleton scaffolds the API surface so that future production code
+slots in cleanly; every public function returns a sentinel
+\texttt{ErrSkeletonOnly} or \texttt{ErrMPCRootNotImpl} that
+prevents accidental consumption today.
+
+\subsection{What public-DKG THBS would and would not solve}
+\label{sec:fullmpc:limits}
+
+\paragraph{What it would solve.} A working public-DKG THBS would
+admit a $t$-of-$n$ threshold SLH-DSA construction with the same
+public-BFT-safe trust posture as Pulsar / Corona threshold
+schemes: no dealer, no aggregator-in-TCB, no TEE required. The
+sign-time output is a single FIPS 205-shaped signature that
+verifies under any unmodified verifier.
+
+\paragraph{What it would not solve.} Even a successful
+public-DKG THBS carries residual concerns:
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \textbf{One-time keys remain one-time.} The FORS / WOTS+
+        per-element structure is intrinsically one-time per
+        slot; same-slot reuse extracts the secret regardless of
+        the DKG mechanism. Slot management (the consensus
+        layer's $(\kappa, \mathit{slot})$ binding) remains a
+        critical operational invariant.
+  \item \textbf{MPC implementation correctness.} A
+        misimplemented MPC that leaks even one bit of a secret
+        element to one party defeats the security goal. Tier A
+        for a public-DKG THBS would require a mechanised proof
+        of the MPC's privacy (EasyCrypt or equivalent).
+  \item \textbf{Per-DKG cost.} Layer (B) MPC-root computation
+        at DKG time is a multi-second per leaf, multi-megabyte
+        per leaf operation. Refreshing the DKG (resharing to a
+        new validator set) is a heavy ceremony.
+\end{itemize}
+
+\paragraph{Operational implications of \emph{not} solving it.}
+For public-BFT consensus, the per-validator standalone primitive
+of \S\ref{sec:construction} is sufficient: each validator signs
+independently and the consensus layer collects the signatures.
+There is no operational pressure to deploy a public-DKG THBS
+construction in the public-BFT path. The pressure is from the
+TEE-only custody path (M-Chain bridge, A-Chain confidential
+compute), where a public-DKG THBS would eliminate the TEE
+requirement and admit a cleaner trust posture.
+
+We do not promise that a public-DKG THBS will be available in
+any specific release window. The research is open, and the path
+is not a straight-line extension of the per-validator standalone
+primitive. The current production posture is: public-BFT runs
+the standalone primitive of this paper, and custody runs the
+TEE-attested threshold forms of Appendix~\ref{app:thbs} and
+Appendix~\ref{app:reveal}.
 
 \subsection{Adjacent literature}
 \label{sec:fullmpc:litreview}
@@ -161,16 +213,23 @@ The earliest dedicated treatment of threshold SLH-DSA (then
 ``Threshold SPHINCS+''). The construction is a single-party
 SPHINCS+ where the WOTS+ secret is shared via Shamir over the
 hash function's output domain. The aggregator reconstructs the
-secret at sign time --- structurally identical to Magnetar v0.1's
-reveal-and-aggregate. Their analysis is in the random-oracle
-model with the same aggregator-honest caveat we make explicit in
-\S\ref{sec:security:tcb}.
+secret at sign time --- structurally identical to the
+reveal-and-aggregate of Appendix~\ref{app:reveal}. Their analysis
+is in the random-oracle model with the aggregator-honest caveat.
+
+\paragraph{McGrew et al. (IACR ePrint 2019/793) \cite{mcgrew2019}.}
+The earliest treatment of true threshold HBS with selected-
+element reconstruction (the THBS pattern of
+Appendix~\ref{app:thbs}). The construction shares individual
+WOTS+ chain heads and FORS leaves rather than the master seed.
+The v1 setup is dealer-backed; the public-DKG variant is the
+open research direction of this section.
 
 \paragraph{Komlo--Stebila--Sullivan (2025 forthcoming, MPTC).}
-A draft NIST MPTC project on threshold SLH-DSA via a
-distributed FORS evaluation; preliminary results suggest the
-Topology A approach is tractable. We track this work as a
-direct candidate for the Magnetar v0.2 reference.
+A draft NIST MPTC project on distributed FORS evaluation for
+threshold SLH-DSA. Preliminary results align with the layer-(C)
+sign-time MPC approach. Magnetar tracks this work as a direct
+candidate for a future public-DKG construction.
 
 \paragraph{Threshold MAYO and Threshold UOV.} The
 multivariate-quadratic family (MAYO \cite{mayo}, UOV) has
@@ -184,9 +243,9 @@ FROST-style constructions.
 \paragraph{Generic-MPC threshold signatures.} A fully-generic
 secure-multiparty-computation framework (BGW \cite{bgw1988},
 GMW \cite{gmw1987}) could in principle compute any function ---
-including FIPS 205 SLH-DSA --- under threshold. The constant-factor
-overhead is the obstacle: per-gate costs in generic MPC are
-several orders of magnitude higher than per-gate costs in
-plaintext computation, and the SHAKE256 permutation has $\sim 10^5$
-gate operations per call. Generic MPC for full SLH-DSA is not
-operationally viable at present.
+including FIPS 205 SLH-DSA --- under threshold. The constant-
+factor overhead is the obstacle: per-gate costs in generic MPC
+are several orders of magnitude higher than per-gate costs in
+plaintext computation, and the SHAKE256 permutation has
+$\sim 10^5$ gate operations per call. Generic MPC for full
+SLH-DSA is not operationally viable at present.
