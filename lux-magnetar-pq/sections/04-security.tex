@@ -210,13 +210,15 @@ state from any other. The construction therefore inherits FIPS
 205's post-quantum security argument verbatim, replicated
 $N$ times.
 
-\paragraph{Comparison to threshold-form TCBs.} The threshold
-forms (Appendix~\ref{app:thbs}, Appendix~\ref{app:reveal}) put
-either a dealer (THBS v1) or an aggregator
-(reveal-and-aggregate) inside the TCB by deployment policy.
-Public-BFT deployments use the standalone primitive of this
-section, which has neither role and therefore neither TCB
-exposure.
+\paragraph{Comparison to THBS-SE.} The permissionless threshold
+companion of \S\ref{sec:thbsse} carries a distinct TCB shape: a
+public combiner reconstructs the SLH-DSA seed transiently in
+its own memory for the duration of one
+$\textsc{SignDeterministic}$ call. The combiner role is open to
+any peer; no host is in the TCB by policy. See
+Theorem~\ref{thm:thbsse-selected-element-reveal} and
+\S\ref{sec:security:thbsse-tcb} for the THBS-SE-specific
+analysis.
 
 \subsection{Constant-time posture}
 \label{sec:security:ct}
@@ -252,10 +254,11 @@ The standalone-path constant-time posture is the union of:
 The standalone path has no secret-dependent control flow outside
 the \texttt{circl} \texttt{slhdsa} dispatch; the constant-time
 properties of the wrapped backend dominate the side-channel
-analysis. The threshold forms in the appendices carry
-additional constant-time obligations (Shamir Lagrange,
-commit-bind comparison, zeroization) that the appendices
-document.
+analysis. The THBS-SE path (\S\ref{sec:thbsse}) carries
+additional constant-time obligations on the Shamir Lagrange
+reconstruct, commit-bind comparison, and combiner-side
+zeroization paths; those obligations are documented in
+\S\ref{sec:security:thbsse-tcb}.
 
 \subsection{Composition with Polaris}
 \label{sec:security:polaris}
@@ -313,13 +316,226 @@ ships.
 path has no constant-time hot paths outside the
 \texttt{circl}-delegated \texttt{slhdsa.SignDeterministic} and
 \texttt{slhdsa.Verify}. The Jasmin \cite{jasmin} obligation
-applies to the threshold-form hot paths
-(Appendix~\ref{app:thbs:where}, Appendix~\ref{app:reveal})
-where Magnetar code holds secret material directly.
+applies to the THBS-SE hot paths
+(\S\ref{sec:thbsse:combine}) where Magnetar code holds
+secret-derived material directly --- the byte-wise Lagrange
+interpolation and the commit re-derivation.
 
-\paragraph{Independent cryptographer review.} BLOCKERS.md
-GATE-4: an independent cryptographer sign-off is the
-human-checked Tier A gate. The review scope is the security
-argument (\S\ref{sec:security}), the FIPS 205 conformance
-trace (\texttt{FIPS-TRACEABILITY.md}), the wire codec, and
-the appendix threshold forms' TEE-only framing.
+\paragraph{Independent cryptographer review.}
+\texttt{BLOCKERS.md::MAGNETAR-EXTERNAL-AUDIT-V11}: an
+independent cryptographer sign-off is the human-checked Tier A
+gate. The review scope is the security argument
+(\S\ref{sec:security}), the THBS-SE construction
+(\S\ref{sec:thbsse}), the FIPS 205 conformance trace
+(\texttt{FIPS-TRACEABILITY.md}), the wire codec, and the
+v1.0 honest open item on transient seed reconstruction at the
+public combiner.
+
+\subsection{THBS-SE: selected-element-reveal invariant}
+\label{sec:security:thbsse-reveal}
+
+The THBS-SE construction (\S\ref{sec:thbsse}) enforces a hard
+invariant on what each party is permitted to reveal. We state
+this invariant verbatim, as a named theorem, because it is the
+load-bearing security claim of the threshold companion: every
+side-channel and protocol-level argument for THBS-SE reduces to
+this property holding.
+
+\begin{theorem}[Selected-element-reveal invariant]
+\label{thm:thbsse-selected-element-reveal}
+A revealed value is allowed only if it is also present in the
+final SLH-DSA signature.
+\end{theorem}
+
+Formally: let $\mathcal{R}_{\textit{round}}(p_i, \mathit{slot}, \mu)$
+denote the set of byte-strings party $p_i$ broadcasts during the
+two-round THBS-SE signing protocol for slot
+$\mathit{slot}$ and message $\mu$. Let
+$\sigma = \texttt{Combine}(\dots)$ be the resulting FIPS 205
+signature, and let
+$\mathcal{P}(\sigma) \subseteq \{0,1\}^*$ denote the set of
+byte-substrings appearing in $\sigma$. Then the construction
+guarantees
+\begin{equation}
+  \bigcup_{p_i \in \mathit{committee}}
+    \mathcal{R}_{\textit{round}}(p_i, \mathit{slot}, \mu)
+  \;\setminus\;
+  \{0, 1\}^*_{\textit{transcript}}
+  \;\subseteq\;
+  \mathcal{P}(\sigma)
+  \;\cup\;
+  \mathcal{U},
+\label{eq:thbsse-invariant}
+\end{equation}
+where $\{0,1\}^*_{\textit{transcript}}$ is the set of public
+transcript bytes (slot binding, party IDs, commit hashes, masks)
+and $\mathcal{U}$ is the information-theoretically uniform-random
+single-party-share class of values that, considered alone, leak
+no information about $\mathit{SK.seed}$ to anyone holding fewer
+than $t$ leaves (Shamir's information-theoretic property over
+$\mathrm{GF}(257)$).
+
+\begin{proof}[Proof sketch]
+By inspection of the THBS-SE round-message and Combine code
+paths (\texttt{ref/go/pkg/magnetar/thbsse.go}). The Round-2
+$\texttt{PartialSig}$ payload is the pair
+$(r_i, s'_i = \mathit{share}_i \oplus r_i)$. Both $r_i$ and
+$s'_i$ are uniformly random in the recipient's view (Shamir
+share property + uniform mask). The Round-1 $\texttt{Commit}$
+is a cSHAKE256 output and is by construction public. The
+Round-2 reveal of a slot-tampered, wire-size-tampered, or
+commit-mismatched partial-sig is rejected by Combine and emits
+typed evidence; the malformed reveal does not enter the final
+signature input set. The honest reveal pair recovers
+$\mathit{share}_i$ via byte-wise XOR, contributes one
+$\mathrm{GF}(257)$ evaluation to the Lagrange interpolation,
+and is then zeroized in the combiner's transient memory. The
+final $\sigma$ is FIPS 205 SignDeterministic on the
+reconstructed seed; the seed itself is in $\mathcal{P}(\sigma)$
+only in the sense that $\sigma$ deterministically determines it
+under the FIPS 205 backward map (which requires breaking the
+SLH-DSA security to extract). The strict ``not even transient
+seed in combiner memory'' refinement requires the v1.1
+strict-atom-assembly path tracked at
+\texttt{BLOCKERS.md::MAGNETAR-STRICT-ATOM-V11}; v1.0 ships the
+$\mathcal{R}_{\textit{round}} \subseteq \mathcal{P}(\sigma)
+\cup \mathcal{U}$ relaxation.
+\end{proof}
+
+\paragraph{Forbidden reveals.} The invariant's contrapositive is
+the operational statement: no party may publish
+$\mathit{SK.seed}$, $\mathit{SK.prf}$, any future-slot share
+material, WOTS+ chain bases for unused chains, or FORS leaves
+not selected by the message digest. The slot guard refuses any
+same-slot re-emission and the share envelope is per-slot, which
+mechanically enforces the future-slot exclusion. The
+v1.1 strict-atom-assembly path extends the exclusion to the
+WOTS+/FORS atom level; v1.0 leans on the FIPS 205 SLH-DSA
+backward-map opacity for that subset.
+
+\subsection{THBS-SE: byte identity to single-party FIPS 205}
+\label{sec:security:thbsse-byte-identity}
+
+\begin{theorem}[THBS-SE byte identity]
+\label{thm:thbsse-byte-identity}
+Fix a parameter set $\textsc{Mode}$, a committee
+$(P_1, \ldots, P_n)$ over GF(257) evaluation points
+$(x_1, \ldots, x_n)$, a threshold $t \le n$, a setup transcript
+$\mathit{setup}$, and a slot binding $\mathit{bind}$ with
+$\mathit{ctx} = \texttt{ctxFromSlot}(\mathit{bind})$. Let
+$(\mathit{PK}, \mathit{SK})$ be the master keypair generated at
+setup with seed $S$. For any message $\mu$, any
+$T \subseteq \{1, \ldots, n\}$ with $|T| = t$, and any honest
+Round-1/Round-2 broadcasts $\{(R1_i, R2_i)\}_{i \in T}$, the
+output
+$\sigma = \texttt{Combine}(\{(R1_i, R2_i)\}_{i \in T},
+\mathit{bind}, \mu, \mathit{PK})$ is byte-identical to
+$\texttt{circl.slhdsa.SignDeterministic}(\mathit{SK}, \mu,
+\mathit{ctx})$.
+\end{theorem}
+
+\begin{proof}
+Combine's Lagrange reconstruction at $x = 0$ over
+$\mathrm{GF}(257)$ is the left inverse of the byte-wise Shamir
+share deal at setup
+(\texttt{thbsse\_field.go::thbsseDealRandom},
+\texttt{thbsseReconstructGF}). For any $t$-sized
+$T$ and any honest $\{\mathit{share}_i\}_{i \in T}$,
+$\sum_{i \in T} \lambda_i \mathit{share}_i \equiv S \pmod{257}$
+where $\lambda_i$ are the Lagrange basis coefficients at $x=0$;
+the relation holds independently per byte position. Combine
+then calls
+$\texttt{circl.slhdsa.SignDeterministic}$ on the reconstructed
+seed with the slot-bound $\mathit{ctx}$, which is by FIPS 205
+\S 9.2 a pure deterministic function of $(\mathit{SK}, \mu,
+\mathit{ctx})$. The output is byte-identical to a centralized
+FIPS 205 call on the same triple.
+\end{proof}
+
+\begin{corollary}[Public-combiner determinism]
+\label{cor:thbsse-determinism}
+For any two distinct $t$-sized
+$T_A, T_B \subseteq \{1, \ldots, n\}$ and any honest
+broadcasts $\{(R1_i, R2_i)\}$,
+$\texttt{Combine}(T_A, \dots) = \texttt{Combine}(T_B, \dots)$
+byte-for-byte.
+\end{corollary}
+
+\begin{proof}
+Both sides reconstruct $S$ by
+Theorem~\ref{thm:thbsse-byte-identity} and feed it through
+deterministic $\textsc{SignDeterministic}$.
+\end{proof}
+
+\paragraph{Empirical pin.}
+$\textsc{TestThbsSE\_Wire\_FIPS205Verifiable}$,
+$\textsc{TestThbsSE\_PublicCombiner\_Determinism}$, and
+$\textsc{TestKAT\_ThbsSe}$ at
+\texttt{ref/go/pkg/magnetar/thbsse\_test.go} and
+\texttt{kat\_test.go} pin Theorems
+\ref{thm:thbsse-byte-identity}--\ref{cor:thbsse-determinism}
+across all three SHAKE modes and the deterministic vector
+$(n=7, t=4)$ KAT.
+
+\subsection{THBS-SE: TCB and v1.0 honest open item}
+\label{sec:security:thbsse-tcb}
+
+\paragraph{Setup TCB.} The deterministic-dealer setup is in the
+TCB FOR SETUP ONLY. Once $\texttt{NewThbsSeKey}$ returns, the
+master seed has been zeroized inside the function and no party
+(including the dealer) holds it. Production deployments needing
+the leaderless PVSS-DKG variant route through the sibling
+\texttt{luxfi/threshold} DKG package; the share envelope is
+wire-equivalent (see
+\texttt{BLOCKERS.md::MAGNETAR-PVSS-DKG-V11}).
+
+\paragraph{Sign-time TCB (v1.0 honest open item).} THBS-SE
+v1.0 routes the final FIPS 205 byte production via a PUBLIC
+COMBINER that reconstructs the SLH-DSA seed transiently in its
+own memory. The seed is present in the combiner's address space
+for the duration of one
+$\textsc{circl.slhdsa.SignDeterministic}$ call (sub-second
+wall-clock at SHAKE-192s) and zeroized before return. The
+combiner role is open to any peer; no host is in the TCB by
+policy.
+
+This is materially stronger than a TEE-attested
+privileged-aggregator model (no host in TCB; combiner is a pure
+function any peer can run) and materially weaker than the strict
+``no transient seed at any moment'' refinement. A peer-local
+memory-disclosure adversary at exactly the combine moment could
+observe the seed; mitigations include the standard process-
+hardening discipline (\texttt{mlock}, ptrace-off, swap
+disabled).
+
+The strict refinement (v1.1) requires a Magnetar-internal
+re-implementation of FIPS 205 \S\S 5--8 that bypasses
+\texttt{slh\_sign\_internal} and assembles the signature
+directly from per-atom share reconstructions of the
+message-selected FORS leaves and WOTS+ chain bases. The
+construction is tracked at
+\texttt{BLOCKERS.md::MAGNETAR-STRICT-ATOM-V11}; the wire format,
+share format, slot-guard state, and protocol round structure
+are all forward-compatible with the lift.
+
+\paragraph{Constant-time obligations on the THBS-SE path.}
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \textbf{Byte-wise Lagrange reconstruction}
+        (\texttt{thbsse\_field.go::thbsseReconstructGF}).
+        Straight-line $\mathrm{GF}(257)$ modular arithmetic over
+        public evaluation points; the per-byte share VALUES are
+        secret but flow only into a fixed sequence of u32 mul +
+        reduction operations with no secret-dependent branches.
+  \item \textbf{Modular inverse}
+        (\texttt{thbsseModInvSmall} via Fermat: $a^{p-2}
+        \bmod p$). The exponent $p - 2 = 255$ is PUBLIC; the
+        square-and-multiply iterates over the public exponent
+        bits, not over the secret base.
+  \item \textbf{Commit re-derivation in Combine}
+        (\texttt{deriveThbsSeCommit}). One cSHAKE256 absorb;
+        constant-time by the upstream
+        \texttt{golang.org/x/crypto/sha3} implementation.
+  \item \textbf{Public-key match check}
+        (\texttt{ctEqualBytes}). Constant-time XOR-then-OR
+        reduction; mirrors the standalone path.
+\end{itemize}
