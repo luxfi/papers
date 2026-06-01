@@ -1,0 +1,665 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
+
+\geometry{margin=1in}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{property}{Property}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue},
+    commentstyle=\color{gray},
+    stringstyle=\color{red},
+    breaklines=true,
+    frame=single
+}
+
+\title{BLS Signature Precompile for Aggregation:\\Efficient Multi-Signature Verification in EVM}
+
+\author{Zach Kelling\\
+\textit{Hanzo Industries}\\
+\textit{Lux Industries}\\
+\textit{Zoo Labs Foundation}\\
+\texttt{zach@hanzo.ai}}
+
+\date{2024}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We present a comprehensive precompiled contract specification for BLS (Boneh-Lynn-Shacham) signatures over the BLS12-381 curve. BLS signatures enable efficient aggregation, where $n$ signatures on $n$ messages by $n$ signers compress to a single signature verifiable with a single pairing check. This property is fundamental for blockchain consensus, cross-chain bridges, and distributed key generation. This paper specifies precompiles for BLS operations at addresses \texttt{0x12-0x16}, covering key aggregation, signature aggregation, single verification, aggregate verification, and hash-to-curve operations per the IETF standard.
+\end{abstract}
+
+\section{Introduction}
+
+Modern proof-of-stake blockchains require efficient verification of thousands of validator signatures per block. Traditional ECDSA signatures scale linearly: verifying $n$ signatures costs $O(n)$ time and space. BLS signatures offer a compelling alternative with $O(1)$ aggregate verification.
+
+\subsection{Motivation}
+
+\begin{enumerate}
+    \item \textbf{Consensus efficiency}: Ethereum 2.0 aggregates 512 committee signatures into one
+    \item \textbf{Cross-chain bridges}: Light clients verify multi-validator signatures cheaply
+    \item \textbf{Threshold signatures}: $(t, n)$ threshold schemes with non-interactive aggregation
+    \item \textbf{Batch verification}: Amortized verification across multiple aggregate signatures
+\end{enumerate}
+
+\subsection{BLS12-381 Curve}
+
+BLS signatures require pairing-friendly curves. BLS12-381 provides:
+\begin{itemize}
+    \item 128-bit security level
+    \item Efficient pairing computation
+    \item Standardized parameters (IETF, Ethereum 2.0, Zcash)
+\end{itemize}
+
+\subsection{Contributions}
+
+\begin{itemize}
+    \item Complete BLS precompile suite at addresses \texttt{0x12-0x16}
+    \item Support for basic scheme, message augmentation, and proof of possession
+    \item Gas models for all operations
+    \item Integration patterns for consensus and bridges
+\end{itemize}
+
+\section{Preliminaries}
+
+\subsection{Bilinear Pairings}
+
+\begin{definition}[Bilinear Pairing]
+Let $\mathbb{G}_1$, $\mathbb{G}_2$, $\mathbb{G}_T$ be groups of prime order $r$. A pairing is a map:
+\[
+e: \mathbb{G}_1 \times \mathbb{G}_2 \to \mathbb{G}_T
+\]
+satisfying:
+\begin{enumerate}
+    \item \textbf{Bilinearity}: $e(aP, bQ) = e(P, Q)^{ab}$ for all $a, b \in \mathbb{Z}_r$
+    \item \textbf{Non-degeneracy}: $e(G_1, G_2) \neq 1_{\mathbb{G}_T}$ for generators $G_1, G_2$
+    \item \textbf{Computability}: $e$ is efficiently computable
+\end{enumerate}
+\end{definition}
+
+\subsection{BLS12-381 Parameters}
+
+\begin{align}
+p &= \text{0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab} \\
+r &= \text{0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001} \\
+\mathbb{G}_1 &\subset E(\mathbb{F}_p): y^2 = x^3 + 4 \\
+\mathbb{G}_2 &\subset E'(\mathbb{F}_{p^2}): y^2 = x^3 + 4(1 + i)
+\end{align}
+
+Group sizes:
+\begin{itemize}
+    \item $\mathbb{G}_1$ points: 48 bytes (compressed)
+    \item $\mathbb{G}_2$ points: 96 bytes (compressed)
+    \item Scalar: 32 bytes
+\end{itemize}
+
+\subsection{BLS Signature Scheme}
+
+\begin{definition}[BLS Signatures]
+\begin{itemize}
+    \item \textbf{KeyGen}: $sk \leftarrow \mathbb{Z}_r$, $pk = sk \cdot G_2$
+    \item \textbf{Sign}: $\sigma = sk \cdot H(m)$ where $H: \{0,1\}^* \to \mathbb{G}_1$
+    \item \textbf{Verify}: Check $e(\sigma, G_2) = e(H(m), pk)$
+\end{itemize}
+\end{definition}
+
+\subsection{Signature Aggregation}
+
+\begin{property}[Aggregation]
+Given signatures $\{\sigma_i\}_{i=1}^n$ on messages $\{m_i\}_{i=1}^n$ by public keys $\{pk_i\}_{i=1}^n$:
+\[
+\sigma_{\text{agg}} = \sum_{i=1}^n \sigma_i
+\]
+Verification:
+\[
+e(\sigma_{\text{agg}}, G_2) = \prod_{i=1}^n e(H(m_i), pk_i)
+\]
+\end{property}
+
+\section{Precompile Specifications}
+
+\subsection{Address Allocation}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llc}
+\toprule
+\textbf{Address} & \textbf{Operation} & \textbf{Description} \\
+\midrule
+\texttt{0x12} & \texttt{BLS\_G1\_ADD} & $\mathbb{G}_1$ point addition \\
+\texttt{0x13} & \texttt{BLS\_G1\_MUL} & $\mathbb{G}_1$ scalar multiplication \\
+\texttt{0x14} & \texttt{BLS\_G2\_ADD} & $\mathbb{G}_2$ point addition \\
+\texttt{0x15} & \texttt{BLS\_G2\_MUL} & $\mathbb{G}_2$ scalar multiplication \\
+\texttt{0x16} & \texttt{BLS\_PAIRING} & Pairing check \\
+\texttt{0x17} & \texttt{BLS\_MAP\_G1} & Hash to $\mathbb{G}_1$ \\
+\texttt{0x18} & \texttt{BLS\_MAP\_G2} & Hash to $\mathbb{G}_2$ \\
+\bottomrule
+\end{tabular}
+\caption{BLS precompile addresses}
+\label{tab:addresses}
+\end{table}
+
+\subsection{Point Encoding}
+
+Points use compressed encoding per ZCash/IETF standards:
+
+\begin{itemize}
+    \item \textbf{$\mathbb{G}_1$}: 48 bytes, MSB indicates $y$ sign
+    \item \textbf{$\mathbb{G}_2$}: 96 bytes, coefficients in $\mathbb{F}_{p^2} = \mathbb{F}_p[i]/(i^2 + 1)$
+\end{itemize}
+
+Special encodings:
+\begin{itemize}
+    \item Point at infinity: All zeros with infinity flag set
+    \item Invalid point: Precompile reverts
+\end{itemize}
+
+\subsection{BLS\_G1\_ADD (0x12)}
+
+\textbf{Input}: Two $\mathbb{G}_1$ points (96 bytes total)
+
+\textbf{Output}: Sum point (48 bytes)
+
+\begin{algorithm}
+\caption{G1 Point Addition}
+\begin{algorithmic}[1]
+\Require Points $P_1, P_2 \in \mathbb{G}_1$ (compressed)
+\Ensure $P_1 + P_2$ (compressed)
+\State $P_1' \gets \text{Decompress}(P_1)$
+\State $P_2' \gets \text{Decompress}(P_2)$
+\If{$P_1' = \mathcal{O}$} \Return $P_2$
+\ElsIf{$P_2' = \mathcal{O}$} \Return $P_1$
+\ElsIf{$P_1' = -P_2'$} \Return $\mathcal{O}$
+\Else
+    \State $P_3 \gets P_1' + P_2'$ \Comment{Elliptic curve addition}
+    \Return $\text{Compress}(P_3)$
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Gas}: 500
+
+\subsection{BLS\_G1\_MUL (0x13)}
+
+\textbf{Input}: $\mathbb{G}_1$ point (48 bytes) + scalar (32 bytes)
+
+\textbf{Output}: Scalar multiple (48 bytes)
+
+\begin{algorithm}
+\caption{G1 Scalar Multiplication}
+\begin{algorithmic}[1]
+\Require Point $P \in \mathbb{G}_1$, scalar $k \in \mathbb{Z}_r$
+\Ensure $k \cdot P$
+\State $P' \gets \text{Decompress}(P)$
+\State $k' \gets k \mod r$
+\If{$k' = 0$ or $P' = \mathcal{O}$} \Return $\mathcal{O}$
+\EndIf
+\State $Q \gets \text{ScalarMul}(P', k')$ \Comment{Double-and-add}
+\Return $\text{Compress}(Q)$
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Gas}: 12,000
+
+\subsection{BLS\_G2\_ADD (0x14)}
+
+\textbf{Input}: Two $\mathbb{G}_2$ points (192 bytes total)
+
+\textbf{Output}: Sum point (96 bytes)
+
+\textbf{Gas}: 800
+
+\subsection{BLS\_G2\_MUL (0x15)}
+
+\textbf{Input}: $\mathbb{G}_2$ point (96 bytes) + scalar (32 bytes)
+
+\textbf{Output}: Scalar multiple (96 bytes)
+
+\textbf{Gas}: 45,000
+
+\subsection{BLS\_PAIRING (0x16)}
+
+\textbf{Input}: Pairs of $(\mathbb{G}_1, \mathbb{G}_2)$ points
+
+\textbf{Output}: 32 bytes (1 if product of pairings equals 1, else 0)
+
+\begin{algorithm}
+\caption{Pairing Check}
+\begin{algorithmic}[1]
+\Require Pairs $\{(P_i, Q_i)\}_{i=1}^n$ where $P_i \in \mathbb{G}_1$, $Q_i \in \mathbb{G}_2$
+\Ensure Boolean: $\prod_i e(P_i, Q_i) = 1_{\mathbb{G}_T}$
+\State $\text{acc} \gets 1_{\mathbb{G}_T}$
+\For{$i = 1$ to $n$}
+    \State $P_i' \gets \text{Decompress}_{\mathbb{G}_1}(P_i)$
+    \State $Q_i' \gets \text{Decompress}_{\mathbb{G}_2}(Q_i)$
+    \If{$P_i' = \mathcal{O}$ or $Q_i' = \mathcal{O}$}
+        \State \textbf{continue} \Comment{Skip identity}
+    \EndIf
+    \State $\text{acc} \gets \text{acc} \cdot e(P_i', Q_i')$
+\EndFor
+\If{$\text{acc} = 1_{\mathbb{G}_T}$}
+    \Return $1$
+\Else
+    \Return $0$
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Gas}: $43,000 \cdot n + 65,000$ for $n$ pairs
+
+\subsection{BLS\_MAP\_G1 (0x17)}
+
+\textbf{Input}: Field element (64 bytes, big-endian, reduced mod $p$)
+
+\textbf{Output}: $\mathbb{G}_1$ point (48 bytes)
+
+Implements IETF hash\_to\_curve for BLS12-381 G1:
+\begin{enumerate}
+    \item Map field element to curve point via SSWU
+    \item Clear cofactor
+    \item Compress output
+\end{enumerate}
+
+\textbf{Gas}: 5,500
+
+\subsection{BLS\_MAP\_G2 (0x18)}
+
+\textbf{Input}: $\mathbb{F}_{p^2}$ element (128 bytes)
+
+\textbf{Output}: $\mathbb{G}_2$ point (96 bytes)
+
+\textbf{Gas}: 110,000
+
+\section{Hash-to-Curve}
+
+\subsection{IETF Standard}
+
+Per RFC 9380, the hash-to-curve process:
+
+\begin{algorithm}
+\caption{Hash to G1}
+\begin{algorithmic}[1]
+\Require Message $m$, domain separation tag $\text{DST}$
+\Ensure Point $P \in \mathbb{G}_1$
+\State $u_0, u_1 \gets \text{hash\_to\_field}(m, \text{DST}, 2)$
+\State $Q_0 \gets \text{map\_to\_curve}(u_0)$ \Comment{SSWU}
+\State $Q_1 \gets \text{map\_to\_curve}(u_1)$
+\State $R \gets Q_0 + Q_1$
+\State $P \gets \text{clear\_cofactor}(R)$
+\Return $P$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Domain Separation}
+
+Standard DST values:
+\begin{itemize}
+    \item Basic: \texttt{BLS\_SIG\_BLS12381G1\_XMD:SHA-256\_SSWU\_RO\_NUL\_}
+    \item Augmented: \texttt{BLS\_SIG\_BLS12381G1\_XMD:SHA-256\_SSWU\_RO\_AUG\_}
+    \item PoP: \texttt{BLS\_SIG\_BLS12381G1\_XMD:SHA-256\_SSWU\_RO\_POP\_}
+\end{itemize}
+
+\section{Gas Cost Model}
+
+\subsection{Operation Costs}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Operation} & \textbf{Gas} & \textbf{Equivalent ecrecover} \\
+\midrule
+G1 Add & 500 & 0.17$\times$ \\
+G1 Mul & 12,000 & 4$\times$ \\
+G2 Add & 800 & 0.27$\times$ \\
+G2 Mul & 45,000 & 15$\times$ \\
+Pairing (1 pair) & 108,000 & 36$\times$ \\
+Pairing (2 pairs) & 151,000 & 50$\times$ \\
+Map to G1 & 5,500 & 1.8$\times$ \\
+Map to G2 & 110,000 & 37$\times$ \\
+\bottomrule
+\end{tabular}
+\caption{BLS operation gas costs}
+\label{tab:gas}
+\end{table}
+
+\subsection{Signature Verification Cost}
+
+Single signature verification:
+\begin{align}
+\text{gas} &= \text{MapG1} + \text{Pairing}(2) \\
+&= 5,500 + 151,000 = 156,500
+\end{align}
+
+$n$-of-$n$ aggregate verification:
+\begin{align}
+\text{gas} &= n \cdot \text{MapG1} + n \cdot \text{G1Add} + \text{Pairing}(2) \\
+&= n \cdot 5,500 + n \cdot 500 + 151,000 \\
+&= 6,000n + 151,000
+\end{align}
+
+\subsection{Scaling Comparison}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Signers} & \textbf{ECDSA} & \textbf{BLS Aggregate} & \textbf{Savings} \\
+\midrule
+1 & 3,000 & 156,500 & -52$\times$ \\
+10 & 30,000 & 211,000 & -7$\times$ \\
+100 & 300,000 & 751,000 & -2.5$\times$ \\
+1000 & 3,000,000 & 6,151,000 & -2$\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Verification gas: ECDSA vs BLS (same message)}
+\label{tab:scaling}
+\end{table}
+
+For same-message aggregation with different signers:
+\begin{align}
+\text{gas} &= n \cdot \text{G2Add} + \text{MapG1} + \text{Pairing}(2) \\
+&= 800n + 5,500 + 151,000
+\end{align}
+
+\section{Security Analysis}
+
+\subsection{Rogue Key Attack}
+
+\begin{definition}[Rogue Key Attack]
+An adversary registers $pk^* = pk_{\text{victim}}^{-1} \cdot pk_{\text{attacker}}$, enabling forgery on aggregate signatures.
+\end{definition}
+
+\textbf{Mitigations}:
+\begin{enumerate}
+    \item \textbf{Message augmentation}: Include $pk$ in message
+    \item \textbf{Proof of possession}: Require signature on $pk$ at registration
+\end{enumerate}
+
+\subsection{Subgroup Checks}
+
+Points must be validated as elements of the prime-order subgroup:
+
+\begin{algorithm}
+\caption{Subgroup Check}
+\begin{algorithmic}[1]
+\Require Point $P$
+\Ensure $P \in \mathbb{G}$ (prime order subgroup)
+\State \textbf{assert} $P$ is on curve
+\State \textbf{assert} $r \cdot P = \mathcal{O}$ \Comment{Cofactor clear}
+\end{algorithmic}
+\end{algorithm}
+
+The precompile performs subgroup checks automatically.
+
+\subsection{Hash Function Security}
+
+BLS security requires the hash function to behave as a random oracle. The hash-to-curve construction satisfies this under standard assumptions.
+
+\section{Integration Patterns}
+
+\subsection{Consensus Aggregation}
+
+\begin{lstlisting}[language=Solidity]
+contract ConsensusVerifier {
+    address constant BLS_PAIRING = address(0x16);
+    address constant BLS_MAP_G1 = address(0x17);
+    address constant BLS_G2_ADD = address(0x14);
+
+    bytes public aggregatePublicKey; // Cached committee key
+
+    function verifyConsensusSignature(
+        bytes32 blockHash,
+        bytes calldata aggregateSignature,
+        uint256 signerBitmap
+    ) external view returns (bool) {
+        // Hash message to G1
+        bytes memory msgPoint = hashToG1(abi.encodePacked(
+            "CONSENSUS",
+            blockHash
+        ));
+
+        // Aggregate participating public keys
+        bytes memory aggPk = aggregatePublicKeys(signerBitmap);
+
+        // Pairing check: e(sig, G2) = e(H(m), aggPk)
+        // Equivalently: e(sig, G2) * e(-H(m), aggPk) = 1
+        bytes memory input = abi.encodePacked(
+            aggregateSignature,  // G1: 48 bytes
+            G2_GENERATOR,        // G2: 96 bytes
+            negateG1(msgPoint),  // G1: 48 bytes (negated)
+            aggPk                // G2: 96 bytes
+        );
+
+        (bool success, bytes memory result) = BLS_PAIRING.staticcall(input);
+        require(success, "Pairing failed");
+
+        return uint256(bytes32(result)) == 1;
+    }
+
+    function hashToG1(
+        bytes memory message
+    ) internal view returns (bytes memory) {
+        // Expand message to field element
+        bytes32 h = keccak256(message);
+        bytes memory fieldElem = abi.encodePacked(bytes32(0), h);
+
+        (bool success, bytes memory point) = BLS_MAP_G1.staticcall(fieldElem);
+        require(success, "Map failed");
+        return point;
+    }
+}
+\end{lstlisting}
+
+\subsection{Cross-Chain Bridge}
+
+\begin{lstlisting}[language=Solidity]
+contract BridgeVerifier {
+    struct ValidatorSet {
+        bytes aggregatePublicKey;
+        uint256 threshold;
+        uint256 totalStake;
+    }
+
+    ValidatorSet public currentValidators;
+
+    function verifyBridgeMessage(
+        bytes32 messageHash,
+        bytes calldata signature,
+        uint256[] calldata signerIndices,
+        bytes[] calldata publicKeys
+    ) external view returns (bool) {
+        // Check threshold
+        uint256 signedStake = computeSignedStake(signerIndices);
+        require(
+            signedStake >= currentValidators.threshold,
+            "Insufficient signatures"
+        );
+
+        // Aggregate public keys of signers
+        bytes memory aggPk = aggregateKeys(publicKeys);
+
+        // Verify aggregate signature
+        return verifyAggregateSignature(
+            messageHash,
+            signature,
+            aggPk
+        );
+    }
+
+    function updateValidatorSet(
+        ValidatorSet calldata newSet,
+        bytes calldata proof
+    ) external {
+        // Verify old validators signed the update
+        require(
+            verifyBridgeMessage(
+                keccak256(abi.encode(newSet)),
+                proof,
+                // ... signers
+            ),
+            "Invalid update proof"
+        );
+
+        currentValidators = newSet;
+    }
+}
+\end{lstlisting}
+
+\subsection{Threshold Signatures}
+
+\begin{lstlisting}[language=Solidity]
+contract ThresholdWallet {
+    uint256 public threshold;
+    bytes[] public publicKeyShares;
+
+    function executeWithThresholdSig(
+        bytes32 txHash,
+        bytes calldata aggregateSignature,
+        uint256[] calldata signerIndices
+    ) external {
+        require(signerIndices.length >= threshold, "Below threshold");
+
+        // Lagrange interpolation coefficients
+        uint256[] memory coeffs = computeLagrangeCoeffs(signerIndices);
+
+        // Weighted public key aggregation
+        bytes memory weightedPk = aggregateWithWeights(
+            signerIndices,
+            coeffs
+        );
+
+        // Verify signature
+        require(
+            verifySignature(txHash, aggregateSignature, weightedPk),
+            "Invalid threshold signature"
+        );
+
+        // Execute transaction...
+    }
+
+    function computeLagrangeCoeffs(
+        uint256[] calldata indices
+    ) internal pure returns (uint256[] memory) {
+        uint256 n = indices.length;
+        uint256[] memory coeffs = new uint256[](n);
+
+        for (uint256 i = 0; i < n; i++) {
+            uint256 num = 1;
+            uint256 den = 1;
+            for (uint256 j = 0; j < n; j++) {
+                if (i != j) {
+                    num = mulmod(num, indices[j], BLS_R);
+                    den = mulmod(
+                        den,
+                        addmod(indices[j], BLS_R - indices[i], BLS_R),
+                        BLS_R
+                    );
+                }
+            }
+            coeffs[i] = mulmod(num, modInverse(den, BLS_R), BLS_R);
+        }
+
+        return coeffs;
+    }
+}
+\end{lstlisting}
+
+\section{Optimization Techniques}
+
+\subsection{Batch Verification}
+
+For multiple independent aggregate signatures:
+
+\begin{equation}
+\prod_{j=1}^{m} e(\sigma_j, G_2) = \prod_{j=1}^{m} \prod_{i=1}^{n_j} e(H(m_{j,i}), pk_{j,i})
+\end{equation}
+
+Randomized batching with scalars $\{r_j\}$:
+\begin{equation}
+e\left(\sum_j r_j \sigma_j, G_2\right) = \prod_j \prod_i e(r_j \cdot H(m_{j,i}), pk_{j,i})
+\end{equation}
+
+\subsection{Precomputed Tables}
+
+For fixed validator sets, precompute public key aggregates for common subsets.
+
+\section{Related Work}
+
+\subsection{EIP-2537}
+
+EIP-2537 proposed BLS12-381 precompiles for Ethereum mainnet. This specification extends EIP-2537 with:
+\begin{itemize}
+    \item Hash-to-curve operations
+    \item Optimized aggregate verification patterns
+    \item Domain separation support
+\end{itemize}
+
+\subsection{Ethereum 2.0}
+
+Ethereum consensus layer uses BLS signatures with:
+\begin{itemize}
+    \item Public keys in $\mathbb{G}_1$, signatures in $\mathbb{G}_2$
+    \item Proof of possession scheme
+    \item Committee-based aggregation
+\end{itemize}
+
+\section{Conclusion}
+
+The BLS precompile suite enables efficient signature aggregation within the EVM, reducing verification costs from $O(n)$ to $O(1)$ for same-message signatures. This capability is essential for proof-of-stake consensus verification, cross-chain bridges requiring multi-validator attestations, and threshold cryptography. The specified gas costs balance computational expense with practical usability for blockchain applications.
+
+\section*{Acknowledgments}
+
+We thank the Ethereum research team, Zcash cryptographers, and IETF CFRG for their work on BLS standardization.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+
+\bibitem{bls}
+Boneh, D., Lynn, B., Shacham, H.,
+\textit{Short Signatures from the Weil Pairing},
+ASIACRYPT 2001.
+
+\bibitem{eip2537}
+Vlasov, A., Khovratovich, D.,
+\textit{EIP-2537: BLS12-381 Curve Operations},
+Ethereum Improvement Proposals, 2020.
+
+\bibitem{rfc9380}
+IETF,
+\textit{RFC 9380: Hashing to Elliptic Curves},
+2023.
+
+\bibitem{eth2}
+Ethereum Foundation,
+\textit{Ethereum 2.0 Specifications},
+2020.
+
+\bibitem{bls12}
+Barreto, P., Lynn, B., Scott, M.,
+\textit{Constructing Elliptic Curves with Prescribed Embedding Degrees},
+SCN 2002.
+
+\end{thebibliography}
+
+\end{document}
