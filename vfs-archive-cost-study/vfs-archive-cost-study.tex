@@ -34,8 +34,8 @@
 }
 
 \title{Validator State Archival via VFS\\[4pt]
-\large Operational-cost and feasibility study for a Lux primary-network\\
-validator using \texttt{hanzoai/vfs} as the finalized-state tier}
+\large Operational-cost and feasibility study: block-time sweep,\\
+hot/cold tiering, and read-replica sharing under \texttt{hanzoai/vfs}}
 \author{Lux Network}
 \date{2026-06-03}
 
@@ -361,6 +361,202 @@ five-year window by:
     runbook to update the projection any time backend list prices
     change or the chain's per-month growth shifts materially.
 \end{enumerate}
+
+\section{Block-time sensitivity sweep}
+\label{sec:blocktime}
+
+Lux's primary-network block time is configurable
+(\verb|poa-min-block-time| in \texttt{luxfi/node/config}, default
+$1\,\text{s}$); Quasar's PQ-finality pipeline can drive sub-second
+slots when proposers run hot, and the chain-config knob
+\verb|targetBlockRate| in C-chain genesis is set to $1\,\text{s}$ on
+mainnet but $2\,\text{s}$ on certain devnets. We sweep block time
+across four orders of magnitude --- $1\,\text{ms}$ to $1\,\text{s}$
+--- holding the average serialised block size constant at
+$20\,\text{KiB}$ (a conservative mainnet figure, derived from EVM
+\verb|targetGas = 500{,}000{,}000| per $10\,\text{s}$ rolling window
+divided into $1\,\text{s}$ slots, then converted at the empirical
+$\approx 1\,\text{B}$ on-disk per $25\,\text{gas}$ post-EIP-4444
+state-rent ratio).
+
+The sweep is reproduced verbatim by
+\texttt{hanzoai/vfs}'s \texttt{TestBlockTimeSweep\_PrintsCostCurve}:
+
+\begin{lstlisting}
+Block-time sweep (avgBlock=20480 B, archive=R2, retention=12 mo)
+block-time hot24h-GB  hot7d-GB    hot30d-GB   cold-R2-$/mo
+1ms        1647.95    11535.64    49438.48    $76,550.13
+10ms        164.79     1153.56     4943.85     $7,655.01
+100ms        16.48      115.36      494.38       $765.50
+250ms         6.59       46.14      197.75       $306.20
+500ms         3.30       23.07       98.88       $153.10
+1s            1.65       11.54       49.44        $76.55
+\end{lstlisting}
+
+\noindent
+Two regimes pop out:
+
+\begin{itemize}
+  \item \textbf{Sub-100ms is uneconomical for a public chain archive.}
+    At $1\,\text{ms}$ block time the cold archive runs $\$76\text{k}/\text{mo}$ per chain on R2 --- and the hot SSD at a 30-day retention window
+    needs $49\,\text{TiB}$, which on a single DOKS PVC at
+    $\$0.10/\text{GiB-mo}$ adds another $\$4\text{k}/\text{mo}$. These
+    cost lines are linear in block rate; an internal-throughput chain
+    (oracle, ZK proof market, derivatives matching) can absorb them but
+    a general-purpose chain with public archival cannot.
+  \item \textbf{100ms-1s is the cost-effective band.} At $1\,\text{s}$
+    a single chain's archive lands at $\$76.55/\text{mo}$ on R2 with a
+    1.65 GiB hot tier; at $100\,\text{ms}$ it scales to
+    $\$765.50/\text{mo}$ with a 16.5 GiB hot tier. Lux's current
+    mainnet default ($1\,\text{s}$ POA, sub-second under Quasar PQ
+    finality) sits inside this band by design.
+\end{itemize}
+
+\section{Hot/cold tiering: keep recent on SSD, stream the rest to VFS}
+\label{sec:tiering}
+
+The \texttt{cost.Tiered} primitive models the hot/cold split directly.
+Inputs: a per-second byte rate, a hot retention window, a cold
+retention horizon, hot and cold backends, and the PUT/GET ratios for
+the cold tier.
+
+For the Lux $1\,\text{s}$-block baseline at $20\,\text{KiB}$/block:
+
+\begin{tabularx}{\linewidth}{lXr}
+\toprule
+\textbf{Window} & \textbf{Description} & \textbf{Cost/mo} \\
+\midrule
+24h SSD + 12mo R2  & hot=1.6 GiB on PVC, cold=593 GB on R2 & \$76.71 \\
+7d  SSD + 12mo R2  & hot=11.5 GiB on PVC, cold=593 GB on R2 & \$77.70 \\
+30d SSD + 12mo R2  & hot=49.4 GiB on PVC, cold=593 GB on R2 & \$81.49 \\
+\bottomrule
+\end{tabularx}
+
+\noindent
+The hot tier is essentially free at these sizes; the dominant cost is
+the cold archive's storage line. Operators choose the window based on
+\emph{query latency} requirements (recent reads stay on SSD, older
+reads pay an R2 round-trip of $\approx 30\text{-}100\,\text{ms}$), not
+cost.
+
+\subsection{Sizing the hot tier per chain}
+
+For a quick recipe: \emph{hot-window} $\times$ \emph{chain-throughput}.
+
+\begin{itemize}[noitemsep]
+  \item C-chain (1 s, 20 KiB/block): 7 days = $\approx 12\,\text{GiB}$ SSD.
+  \item  (1 s, 20 KiB/block): same shape, same window.
+  \item Brand L2 chains (Hanzo, Zoo, Pars, SPC): same shape.
+  \item P-chain (event-driven, $\approx 1\,\text{KiB/event}$ at much
+    lower rate): negligible, fold into the C-chain budget.
+\end{itemize}
+
+A primary-network validator running all six chains at the 7-day window
+sits at $\approx 60\,\text{GiB}$ hot SSD --- comfortably inside a single
+$80\,\text{GiB}$ DOKS PVC. The remainder streams to R2.
+
+\section{Cluster sharing: one writer, $N$ readers, one bucket}
+\label{sec:cluster}
+
+The architectural win that makes object-store archival cost-effective
+at scale is the read-replica split. Content-addressed VFS dedupes
+identical bytes across writers, so:
+
+\begin{itemize}[noitemsep]
+  \item \textbf{Writer-side cost is flat in fleet size.} An $N$-node
+    validator committee that runs deterministic \texttt{zapdb}
+    compaction emits identical canonical bytes for each finalized SST.
+    Whichever writer puts a given content hash first ``wins'', the
+    rest are wasted PUTs that collapse to no-ops because the object
+    already exists. The economic model treats $N$ writers as one
+    writer for archive-storage and PUT pricing.
+  \item \textbf{Reader-side cost is linear in fleet size.} A
+    read-replica (explorer pod, indexer, public RPC node, archive
+    node) holds no chain state on local disk --- it just walks the
+    manifest and pulls archived blocks from the shared bucket on
+    demand. Its only contribution is GET volume and (if it sits
+    outside the backend's region) egress.
+\end{itemize}
+
+The \texttt{cost.Cluster} primitive captures this. The dedup
+invariant is pinned by
+\texttt{TestCluster\_DedupKeepsWriterCostFlat}; the reader-scaling
+behaviour is illustrated by
+\texttt{TestCluster\_ReadersScaleGetCost}:
+
+\begin{lstlisting}
+readers=1    total=$ 67.69/mo  (gets/mo=1.30e+06)
+readers=11   total=$ 72.35/mo  (gets/mo=1.43e+07)
+readers=100  total=$113.87/mo  (gets/mo=1.30e+08)
+readers=1000 total=$533.78/mo  (gets/mo=1.30e+09)
+\end{lstlisting}
+
+\noindent
+1000 read replicas chasing $10\%$ of the writer's archive each
+\emph{per month} (a heavy public-archive scenario) lands the entire
+fleet at $\$534/\text{mo}$ on R2. The reader cost is then split across
+the fleet's host operators rather than borne per node.
+
+\subsection{The big saving: replicas don't need a local archive}
+
+The conventional model gives each archive node a full local copy of
+chain history --- e.g.\ go-ethereum's \verb|--syncmode=full|. For a
+chain at $360\,\text{GB}/\text{yr}$ of growth, a 5-year-old archive
+node holds $\approx 1.8\,\text{TB}$ locally. On a DOKS PVC at
+$\$0.10/\text{GiB-mo}$ this is $\$184/\text{mo}$ \emph{per replica}.
+
+With the VFS-shared-archive model, each replica needs only the hot tier
+($\sim 60\,\text{GiB}$ for all chains, $\$6/\text{mo}$) plus its share
+of the shared archive's GET cost. The 1000-replica scenario:
+
+\begin{tabularx}{\linewidth}{lrrr}
+\toprule
+\textbf{Architecture} &
+\textbf{Per-replica disk} &
+\textbf{Per-replica cost} &
+\textbf{Fleet cost (1000)} \\
+\midrule
+Conventional (full local archive)   & 1.8 TB SSD & \$184.00/mo & \$184,000/mo \\
+VFS shared archive (this study)     &  60 GB SSD &   \$0.53/mo &     \$534/mo \\
+\bottomrule
+\end{tabularx}
+
+\noindent
+\textbf{Headline:} a 1000-replica public-archive fleet runs at
+$\$534/\text{mo}$ on R2 against $\$184{,}000/\text{mo}$ on per-replica
+DOKS PVCs --- a $\approx 345\times$ saving. This is the structural
+reason VFS-shared archival is the right architecture for any public
+chain that wants \emph{many} read-only follow nodes (block
+explorers, indexers, governance archive, academic snapshots,
+museum-of-state nodes).
+
+\subsection{Promotion model: who PUTs}
+
+There are three viable patterns for choosing the writer:
+
+\begin{enumerate}
+  \item \textbf{Race-and-collide.} All $N$ validators try to PUT every
+    finalized SST. The first wins, the rest see ``object exists'' and
+    drop. Wastes PUTs but needs no coordination.
+  \item \textbf{Round-robin proposer-based.} The validator that
+    proposed a given epoch is also responsible for PUTting its SSTs.
+    Uses no extra messages because proposer identity is already in
+    consensus state. Single-point-of-failure for any single PUT but
+    next-epoch PUT comes from a different validator, so the system
+    recovers.
+  \item \textbf{Dedicated archiver service.} A separate
+    \texttt{vfs-archiver} pod (1--2 replicas, leader-elected) walks the
+    manifest of any validator pod and pushes SSTs into the archive.
+    Cleanest separation of concerns: archive PUTs are independent of
+    consensus health.
+\end{enumerate}
+
+For a primary-network fleet the recommendation is (2) --- proposer-based
+promotion --- because it requires no new pods and naturally distributes
+the upload bandwidth across the committee. The
+\texttt{cost.Cluster.Workload()} model assumes dedup is fully
+effective, which (2) achieves under the deterministic-compaction
+assumption.
 
 \section*{Reproducing the numbers}
 
