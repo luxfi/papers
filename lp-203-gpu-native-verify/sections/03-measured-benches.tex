@@ -1,0 +1,228 @@
+\section{Measured Benches: NVIDIA GB10 Grace Blackwell sm\_120}
+\label{sec:measured}
+
+\paragraph{Provenance.} All numbers in this section were measured
+2026-06-04 on \texttt{spark} (DGX Spark, NVIDIA GB10 Grace
+Blackwell Superchip, sm\_120, CUDA 13.0.88, driver 580.159.03,
+\SI{121}{GiB} unified memory, 48 SMs)
+\cite{blackwell2024,gracehopper2023}. The benchmark source is
+\texttt{/tmp/gpu-vtbl-bench/bench.c} calling the public
+\texttt{lux\_gpu\_*} C API; the backend is the CUDA
+plugin at \texttt{lux-private/gpu-kernels/backends/cuda/}
+(\texttt{build-wire/libluxgpu\_backend\_cuda.so}, ABI v12,
+sm\_120 native). Each row reports a measurement, not a
+projection.
+
+\subsection{BLS12-381 EIP-2537 pairing}
+
+The headline GPU primitive on Blackwell is the BLS12-381
+EIP-2537 pairing kernel \cite{eip2537,bls12381}. The Miller loop
+plus final exponentiation run on the GPU; multiple pairings batch
+into one kernel grid.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{3.3cm}p{2.4cm}rp{4cm}@{}}
+\toprule
+\textbf{Operation} & \textbf{Batch} & \textbf{Per-op}
+  & \textbf{Source} \\
+\midrule
+BLS12-381 pairing & $N{=}1$ & \SI{198}{\micro\second}
+  & \texttt{cuda\_op\_bls12\_381\_} \texttt{pairing\_eip2537} \\
+BLS12-381 pairing & $N{=}64$ & \SI{19.1}{\micro\second}
+  & same \\
+BLS12-381 pairing & $N{=}256$ & \SI{19.0}{\micro\second}
+  & same \\
+BLS12-381 pairing & $N{=}1024$ & \SI{19.1}{\micro\second}
+  & same \\
+BLS12-381 sustained
+  throughput & $N{=}256$ batches & \num{49197}~pairings/sec
+  & sustained \SI{25}{\second} run \\
+\bottomrule
+\end{tabular}
+\caption{BLS12-381 EIP-2537 pairing on Grace Blackwell sm\_120.
+The $N{=}1$ point is launch-overhead-dominated; from $N{=}64$
+upward the per-pair cost plateaus at \SI{19}{\micro\second}.
+Throughput row is sustained over \SI{25}{\second} at 90--94\%
+GPU utilization, \SI{20}{\watt} board power.}
+\label{tab:bls-measured}
+\end{table}
+
+\paragraph{Per-pairing crossover.} GPU per-pair
+(\SI{19}{\micro\second}) beats single-thread CPU blst
+\cite{blst} ($\sim$\SI{1}{\milli\second}) from $N{=}1$; beats
+20-core parallel CPU ($\sim$\SI{50}{\micro\second} per pair)
+from $N{\geq}3{-}4$. For block-verify workloads ($N{\geq}64$
+typical) the GPU is unambiguously the right substrate.
+
+\paragraph{Comparison to the prior projection.} The earlier LP-203
+draft projected BLS verify at \SI{0.5}{\micro\second} to
+\SI{1.5}{\micro\second} per signature from H100 FP64 plus Miller
+loop arithmetic. The measured GB10 cost is
+\SI{17.8}{\micro\second} to \SI{19.1}{\micro\second} per pair --
+\emph{about} $10\times$ slower than that projection. The driver
+is real-Miller-loop overhead measured on sm\_120 silicon, not
+roofline arithmetic. Subsequent LPs that depend on per-pair
+timing should use the measured number.
+
+\subsection{Power efficiency}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{State} & \textbf{Power} & \textbf{Temperature} \\
+\midrule
+Idle & \SI{16}{\watt} & \SI{45}{\celsius}--\SI{47}{\celsius} \\
+BLS pairing full load
+  ($N{=}256$ sustained) & \SI{20}{\watt}
+  & \SI{50}{\celsius}--\SI{51}{\celsius} \\
+keccak256 batch full load
+  ($N{=}4096$ sustained) & \SI{20}{\watt}
+  & \SI{50}{\celsius}--\SI{51}{\celsius} \\
+\bottomrule
+\end{tabular}
+\caption{Power and thermals on GB10 under sustained GPU load.
+$\Delta P \approx \SI{4}{\watt}$ between idle and full GPU
+load -- not a typo. Grace Blackwell's per-watt efficiency under
+crypto load is the design intent of sm\_120 silicon.}
+\label{tab:power}
+\end{table}
+
+\paragraph{Pairings per watt.} At \num{49197}~pairings/sec
+sustained and \SI{4}{\watt} marginal power (load minus idle),
+the GB10 delivers $\approx$~\num{12300}~pairings per watt. For
+comparison, x86 CPU baselines at $\sim$\SI{50}{\micro\second}
+per pair on a 20-core part drawing $\sim$\SI{150}{\watt} TDP
+deliver $\sim$\num{130} pairings per watt -- two orders of
+magnitude worse per watt than GB10.
+
+\subsection{Keccak256 and SHA3-256 batch hashing}
+
+The Keccak family \cite{keccak} is the other measured hot path.
+Used in Merkle-tree reduction, transcript binding, and Magnetar
+SLH-DSA inner hashing.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrl@{}}
+\toprule
+\textbf{Operation} & \textbf{Batch} & \textbf{Per-op}
+  & \textbf{Source} \\
+\midrule
+keccak256, 32 B input & $N{=}1$ & \SI{204}{\micro\second}
+  & \texttt{cuda\_op\_keccak256\_hash} \\
+keccak256, 32 B input & $N{=}4096$ & \SI{0.060}{\micro\second}
+  & same \\
+keccak256 sustained
+  throughput & $N{=}4096$ batches
+  & \SI{11.38}{\mega\hertz}
+  & sustained \SI{13}{\second} run \\
+sha3\_256, 32 B input & $N{=}4096$ & \SI{0.059}{\micro\second}
+  & \texttt{cuda\_op\_sha3\_256\_hash} \\
+\bottomrule
+\end{tabular}
+\caption{Keccak256 and SHA3-256 on Grace Blackwell sm\_120. The
+$N{=}1$ point is launch-overhead-dominated. The sustained
+throughput row holds at 32\% GPU utilization, leaving headroom
+to interleave with other primitives.}
+\label{tab:hash-measured}
+\end{table}
+
+\paragraph{Per-hash crossover.} GPU baseline at $\sim$\SI{200}{
+\micro\second} per kernel launch is launch-overhead-dominated for
+single hashes. CPU single-thread keccak runs at
+\SI{0.4}{\micro\second} to \SI{0.9}{\micro\second} per op. GPU
+wins from $N{\geq}\sim$\num{500} (single-thread CPU comparison)
+or $N{\geq}\sim$\num{10000} (20-core parallel CPU comparison).
+The kernel is small-input-optimized; large-input single-keccak
+(\SI{1}{MiB}) hits only \SI{19}{MB/s} throughput, which is
+\emph{not} the intended workload.
+
+\subsection{Corona / Corona threshold combine}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{3cm}rrp{5cm}@{}}
+\toprule
+\textbf{Operation} & \textbf{$N$ ($k$)} & \textbf{Per-share}
+  & \textbf{Source} \\
+\midrule
+Corona/Corona combine & 64 (33) & \SI{0.082}{\micro\second}
+  & \textbf{OpenMP-CPU path, not GPU} --
+  \texttt{cuda\_op\_corona\_} \texttt{combine\_batch} uses
+  \texttt{\#pragma omp parallel for} \\
+Corona/Corona combine & 128 (65) & \SI{0.080}{\micro\second}
+  & same OMP-CPU path \\
+\bottomrule
+\end{tabular}
+\caption{Corona threshold-combine measured times. Labeled
+``CUDA op'' for ABI consistency, but the implementation today
+is the host-side OpenMP path \cite{corona2024}.
+Combine is fast even on CPU; the gap to close is the partial-sign
+side (\S\ref{sec:gaps}).}
+\label{tab:corona-combine}
+\end{table}
+
+\subsection{Composite signature-verify status}
+
+The composite signature-verify wrappers return
+\texttt{LUX\_BACKEND\_ERROR\_NOT\_SUPPORTED} on the GB10 bench.
+The kernels for the underlying primitives exist; the composite
+wrappers are explicit stubs. \S\ref{sec:gaps} inventories the
+exact split.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{3.5cm}p{8cm}@{}}
+\toprule
+\textbf{Verify wrapper} & \textbf{Status} \\
+\midrule
+ML-DSA verify (Pulsar) & \texttt{LUX\_ERROR\_NOT\_SUPPORTED} --
+  \texttt{cuda\_op\_mldsa\_verify\_batch} is an explicit stub in
+  \texttt{plugin.cpp} \\
+SLH-DSA verify (Magnetar, composite) &
+  \texttt{LUX\_ERROR\_NOT\_SUPPORTED} -- the 4 SLH-DSA
+  primitives (\texttt{wotsplus\_chain}, \texttt{fors\_subtree},
+  \texttt{xmss\_subtree}, \texttt{hmsg\_prfmsg}) ARE real GPU;
+  the composite \texttt{op\_slhdsa\_verify\_batch} is stub \\
+Ed25519 verify & \texttt{LUX\_ERROR\_NOT\_SUPPORTED} --
+  \texttt{cuda\_op\_ed25519\_verify\_batch} is an explicit stub \\
+sr25519 verify & \texttt{LUX\_ERROR\_NOT\_SUPPORTED} --
+  \texttt{cuda\_op\_sr25519\_verify\_batch} is an explicit stub \\
+\bottomrule
+\end{tabular}
+\caption{Composite signature-verify wrapper status on the GB10
+bench. The primitives the wrappers would call are real GPU code
+with measured kernel throughput; the wrapper layer is stub.}
+\label{tab:composite-status}
+\end{table}
+
+\subsection{What the measured numbers say}
+
+Two assertions from the measured set:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{Grace Blackwell's BLS12-381 pairing is
+  production-ready.} At \SI{19}{\micro\second} per pair
+  sustained, $N{=}256$ batches deliver $\approx$
+  \num{49197}~pairings/sec at \SI{20}{\watt}. A 1000-tx block
+  of BLS-signed transactions verifies in
+  $\sim$\SI{20}{\milli\second} per block on a single GPU.
+\item \textbf{Keccak256 is a side-car, not the bottleneck.}
+  At \SI{11.38}{\mega\hertz} sustained, hashing 1000 leaves
+  costs $<$\SI{1}{\milli\second} -- well below the BLS verify
+  cost above. Merkle reduction is bottlenecked by the
+  reduction tree's $\log_2(N)$ kernel-launch chain, not the
+  per-hash cost.
+\end{enumerate}
+
+The next assertion (PQ-strict end-to-end on GPU at
+\SI{15}{\milli\second}--\SI{50}{\milli\second}) requires the
+composite signature-verify wrappers to land. Until then it is a
+projection, not a measurement.

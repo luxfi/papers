@@ -1,0 +1,153 @@
+\section{Introduction}
+\label{sec:introduction}
+
+A post-quantum smart-contract platform must verify two different
+cryptographic objects on-chain:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{Signatures} (threshold or single-party) that
+  authenticate \emph{who} authored some commitment. Under Quasar
+  this is the LP-218~\cite{lp218} P3Q family at slot
+  \texttt{0x012205}: kind-byte dispatch over Pulsar (FIPS-204
+  ML-DSA-65 threshold)~\cite{fips204}, Corona (Ring-LWE threshold),
+  Magnetar (FIPS-205 SLH-DSA threshold)~\cite{fips205}.
+\item \textbf{SNARK proofs} that authenticate \emph{what} was
+  executed -- the correctness of an arbitrary off-chain computation
+  with respect to a public-input vector. Under Quasar, this is
+  LP-221: a STARK-FRI verifier at slot \texttt{0x012220}.
+\end{enumerate}
+
+These are disjoint primitives. A Pulsar signature does not assert
+``the rollup batch executed correctly''; it asserts ``the entity
+holding the threshold key co-signed this batch.'' A STARK proof
+does not assert ``the sequencer was authorized''; it asserts
+``starting from \texttt{prev\_root}, executing the batch yields
+\texttt{new\_root}, and the public-input \texttt{batch\_hash}
+commits to the right calldata.'' Both checks are required for a
+sound ZK-rollup -- and they belong at separate precompile slots
+because they verify separate statements with separate parameter
+schedules, separate gas profiles, and separate audit boundaries.
+
+\subsection{Slot \texttt{0x012220}}
+
+LP-221 specifies a dedicated EVM precompile at slot:
+
+\begin{lstlisting}[language={}]
+0x0000000000000000000000000000000000012220
+\end{lstlisting}
+
+The slot is registered normatively in LP-300 master schema
+registry~\cite{lp300}. LP-221 carries the slot informatively
+for self-containment.
+
+\subsection{Distinction from LP-218 P3Q}
+
+The naming history is instructive. The Plonky3-fork STARK / FRI
+verifier originally registered at slot \texttt{0x012205} under the
+package name \texttt{p3q}, and the magic-header tag \texttt{"P3Q1"}
+was threaded through every proof artifact (EasyCrypt theory, Lean
+theorem, Jasmin source, dudect harness). Per Hanzo Crypto Suite
+\S~5.2~\cite{hanzocrypto}, \textbf{P3Q canonically means
+``Post-Quantum Pulsar Proof''} -- the on-chain unified PQ
+\emph{threshold-signature} verifier dispatch (Pulsar~/ Corona~/
+Magnetar). The STARK / FRI dispatch occupying slot
+\texttt{0x012205} under that name was an \emph{aliasing error}.
+
+The 2026-06-03 decomplection (Section~\ref{sec:architectural-decision})
+relocates the STARK-FRI verifier to its own dedicated slot at
+\texttt{0x012220} and leaves \texttt{0x012205} to LP-218 / LP-220 as
+the canonical P3Q signature dispatch~\cite{lp220}.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Slot} & \textbf{LP} & \textbf{Verifier surface} \\
+\midrule
+\texttt{0x012205} & LP-218~/ LP-220 & PQ threshold \textbf{signatures} (Pulsar, Corona, Magnetar) \\
+\texttt{0x012220} & \textbf{LP-221 (this LP)} & STARK \textbf{proofs} (Plonky3-fork FRI~/ cSHAKE256~/ Goldilocks) \\
+\bottomrule
+\end{tabular}
+\caption{The two slots serve disjoint use cases. A ZK-rollup
+typically calls \emph{both} (signature at \texttt{0x012205}, proof
+at \texttt{0x012220}) per batch; an optimistic rollup or a custody
+attestation calls only one.}
+\label{tab:p3q-vs-starkfri}
+\end{table}
+
+\subsection{Why STARK-FRI for ZK rollups}
+
+The Quasar / Lux primary network needs an on-chain SNARK verifier
+for two reasons:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{ZK-rollup batch verification.} A Tier-3 ZK rollup
+  (per LP-204~\cite{lp204}) commits to Z-Chain by submitting a
+  \texttt{RollupBatchTx} that carries both a Pulsar signature and a
+  STARK proof. The Pulsar signature authenticates the \emph{who}
+  (sequencer or threshold-group identity); the STARK proof
+  authenticates the \emph{what} (correct execution of the batch
+  under the rollup-VM's transition relation). Without an on-chain
+  SNARK verifier, Z-Chain can only run optimistic rollups with
+  fraud-proof challenge windows. With LP-221, Z-Chain accepts
+  ZK-rollup batches at the cost of one precompile call per batch.
+\item \textbf{PQ-safe SNARK substrate.} Most production SNARK
+  verifiers (Groth16, PLONK over BN254~/ BLS12-381) are
+  pairing-based and break under a sufficiently large quantum
+  adversary because pairing verification reduces to discrete log on
+  a pairing-friendly elliptic curve. STARK proofs over a small
+  prime field with collision-resistant hash commitments have
+  \emph{no algebraic structure for Shor}; their post-quantum
+  security reduces to collision resistance of the underlying hash
+  (here, cSHAKE256, modeled as a random oracle).
+\end{enumerate}
+
+LP-221 therefore complements LP-218 (signatures) as the strict-PQ
+SNARK leg of the Quasar cryptographic suite. There is no
+classical-curve assumption anywhere in the LP-221 verifier.
+
+\subsection{Why FRI, cSHAKE256, Goldilocks}
+
+The three choices are deliberate:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{FRI}~\cite{frieprint,starkeprint} is the canonical
+  low-degree test for STARKs. Soundness reduces to a Reed-Solomon
+  decoding bound; no trusted setup.
+\item \textbf{cSHAKE256}~\cite{fips202,sp800185} is the FIPS-202
+  / SP-800-185 customizable extendable-output function.
+  Domain-separated Merkle commitments use cSHAKE256 rather than a
+  Merkle-tree hash baked from a non-standard sponge. The
+  standardization gates conformance and audit.
+\item \textbf{Goldilocks} ($p = 2^{64} - 2^{32} + 1$) is a 64-bit
+  prime field~\cite{goldilocks} with fast modular arithmetic on
+  AArch64~/ x86\_64, native register width, and a smooth
+  multiplicative subgroup of order $2^{32}$. Plonky3~\cite{plonky3}
+  and RISC Zero converged on Goldilocks for the same reasons.
+\end{itemize}
+
+Combined: a verifier with $\sim$\SI{30}{\kilo\byte} proof size
+(measured for typical Plonky3-fork batches),
+$\sim$\SIrange{5}{10}{\milli\second} CPU verify on a modern x86\_64
+core, and PQ security under the random-oracle model for cSHAKE256.
+Throughput on Blackwell sm\_120 is projected at $\sim$\SI{50}{\micro\second}
+per verify (LP-203~\cite{lp203} GPU verify dispatch; not yet
+measured at LP-221 publish time).
+
+\subsection{Document roadmap}
+
+Section~\ref{sec:architectural-decision} documents the 2026-06-03
+slot relocation from \texttt{0x012205} to \texttt{0x012220} and
+the Plonky3 fork rationale. Section~\ref{sec:specification} pins
+the wire format, gas schedule, and ABI.
+Section~\ref{sec:verifier} catalogues the Go reference, the
+EasyCrypt theory, and the Jasmin status-code table.
+Section~\ref{sec:cryptographic-properties} states the security
+assumptions (soundness, knowledge soundness, completeness,
+PQ-safety). Section~\ref{sec:constant-time} describes the
+three-layer CT discipline (Jasmin static checker, Go inheritance,
+dudect empirical).
+Section~\ref{sec:composition} composes LP-221 with LP-218 (sibling
+PQ verifier), LP-0120 / LP-300 (slot pin), LP-203 (GPU dispatch),
+and LP-217 (cert profile modes).

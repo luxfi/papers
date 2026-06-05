@@ -1,0 +1,156 @@
+\section{Constant-Time Discipline}
+\label{sec:constant-time}
+
+\subsection{Three layers}
+
+LP-221 maintains constant-time guarantees through three orthogonal
+layers, ordered by decreasing strength:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{Jasmin static checker.} The Jasmin reference at
+  \texttt{lux/precompile/starkfri/jasmin/verify.jazz}
+  (\SI{14.2}{\kilo\byte}) is annotated with a CT type:
+  \texttt{\#[ct = "public * public * public * public -> public"]}.
+  The annotation is statically checkable via
+  \texttt{jasminc -checkCT verify.jazz}. The CT check is part of
+  \texttt{scripts/check-high-assurance.sh} and runs on every push.
+  The Jasmin file covers the structural pre-dispatch gate only
+  (length checks, version byte, magic-header equality via the
+  XOR-accumulator \texttt{ct\_check\_magic}); the FRI verify inner
+  loop is delegated to the Rust verifier crate.
+\item \textbf{Go EVM precompile inheritance.} The Go body in
+  \texttt{contract.go} is shaped to be CT-friendly: no
+  secret-dependent branches; \texttt{Run()} conditions on
+  \emph{public} calldata lengths and the \emph{public} version
+  byte only; the magic-header comparison is a byte-string
+  equality on \emph{public} wire bytes. The Go layer is NOT
+  formally CT-verified (Go lacks a libjade-style CT checker) but
+  inherits the same byte-layout discipline as the Jasmin reference.
+  \textbf{LP-221 does not claim the Go layer itself is
+  constant-time as a primitive}; it claims only the byte-flow
+  shape matches the CT-checkable Jasmin reference.
+\item \textbf{Empirical CT via dudect.} The harness lives at
+  \texttt{lux/crypto/p3q/ct/dudect/} (per the sign-off; relocation
+  to \texttt{lux/crypto/starkfri/ct/dudect/} is pending the
+  cross-tree rename). Builds clean on arm64 + x86\_64; the
+  submission-grade $10^9$-sample run is gated under GATE-3 of the
+  sign-off and has not yet been published.
+\end{enumerate}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lp{4cm}p{5cm}@{}}
+\toprule
+\textbf{Layer} & \textbf{Strength} & \textbf{Status} \\
+\midrule
+1. Jasmin \texttt{-checkCT} & Static, formal & Closed (GATE-2) \\
+2. Go inheritance & Inherited byte-shape & Asserted; not formal \\
+3. dudect empirical & Empirical, weak-vs-strong by sample size & Open (GATE-3); $10^9$-sample run pending \\
+\bottomrule
+\end{tabular}
+\caption{Three-layer constant-time discipline. Layer~1 is the
+strongest claim; layer~3 is the empirical confirmation; layer~2
+is the inheritance bridge between them.}
+\label{tab:ct-layers}
+\end{table}
+
+\subsection{GATE-3 dudect requirement}
+
+The dudect harness's README explicitly documents that per-push
+smoke runs ($\sim$$10^4$~samples) are a \textbf{weak assertion, not
+a measurement}. LP-221 makes no production-grade CT claim until
+GATE-3 closes. The closure criterion is:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item Sample count: $\ge 10^9$ per stage (short-input, wrong-version,
+  wrong-magic, valid-pass-through).
+\item Hardware: representative validator-class CPU (current
+  validator deployment standard is AMD EPYC 7763 or Intel Xeon
+  Platinum 8480+; ARM validators run Ampere Altra or Apple M-series
+  with their respective hard-CT properties).
+\item Result tag: $t$-statistic across all stages remains
+  $\le 4.5$ (dudect's default conservative threshold) for the
+  full sample budget.
+\item Published artifact: a signed CSV plus an EasyCrypt-checkable
+  assertion that the measured timing distribution is statistically
+  indistinguishable across the four stages.
+\end{itemize}
+
+GATE-3 is open and scheduled. LP-221 ships with the harness
+plumbed but the empirical measurement pending. The architectural
+decision to claim CT at the precompile boundary is independent of
+GATE-3 closure: GATE-3 \emph{confirms} the static CT claim under
+realistic compiler output, but the soundness argument does not
+depend on it.
+
+\subsection{Why CT matters for a public proof}
+
+STARK proofs and their public inputs are \emph{non-secret by
+construction}; side-channel leakage of ``the proof verifies'' vs
+``the proof doesn't verify'' is not a confidentiality violation.
+However, CT is required for \textbf{soundness}: a timing oracle
+over the four failure modes (magic-mismatch, length-mismatch,
+wrong-version, no-verifier-registered) lets an adversarial caller
+probe the chain's structural pre-filter and craft calldata that
+exploits the boundary between gas billing and structural
+rejection.
+
+The Jasmin reference and the Go shape both ensure that pre-filter
+outcomes are not data-dependent on values an adversary can
+manipulate per call. Specifically:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item Length checks use unsigned comparison on \emph{public}
+  lengths (the calldata-length field is observable on-chain; no
+  secret is involved).
+\item Version-byte check is equality on a single \emph{public}
+  byte against a compile-time constant.
+\item Magic-header check uses an XOR-accumulator
+  \texttt{ct\_check\_magic} that processes all four bytes in
+  fixed time independently of which byte (if any) differs from
+  the expected \texttt{"P3Q1"} tag.
+\item No-verifier-registered check is an atomic-load of a function
+  pointer plus a non-secret nil-check.
+\end{itemize}
+
+None of these introduces a timing channel that an adversary can
+amplify into a soundness break. The dudect run under GATE-3 is the
+empirical confirmation that the Go compiler's output (which is the
+production-deployed binary, not the Jasmin reference) preserves
+this property under realistic optimization passes.
+
+\subsection{Backend CT discharge}
+
+The cgo handoff to the Rust verifier crate is the external CT
+obligation. The EasyCrypt theory's \texttt{lemmas/P3Q\_CT.ec}
+reduces the precompile-level CT obligation to a backend axiom
+\texttt{backend\_ct}. That axiom is discharged by:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item the Jasmin file's \texttt{\#[ct = ...]} annotation
+  (statically checkable with \texttt{jasminc -checkCT}), and
+\item the audited Rust verifier crate
+  (\texttt{\#![forbid(unsafe\_code)]}, panic-free by contract),
+  pending the external review under GATE-4.
+\end{itemize}
+
+\subsection{Compiler output preservation}
+
+A subtlety worth flagging: the Go compiler may perform branch
+prediction, dead-code elimination, or instruction reordering that
+preserves the byte-shape claim but alters the timing distribution.
+The dudect run under GATE-3 measures the production binary, not the
+Go source, and is the authoritative confirmation that the compiler's
+output preserves CT.
+
+The Jasmin reference is \emph{source-level} CT-verified; the
+empirical layer measures \emph{binary-level} CT. The two together
+bracket the assurance: if the Jasmin source is CT and the
+production binary's dudect distribution is statistically
+indistinguishable across failure modes, then either the Go
+compiler preserved CT or the dudect harness has insufficient power
+to detect the violation. Either way, an adversary's exploitation
+budget against the timing channel is bounded above by the dudect
+power (sample count $\cdot$ measurement precision), which the
+$10^9$-sample budget pushes well below cryptographic significance.

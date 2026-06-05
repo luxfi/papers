@@ -1,0 +1,69 @@
+\section{Introduction}
+
+This paper expands on LP-205
+(\texttt{lps/LP-205-pipelined-quasar.md}) with detail on stage
+independence, the leader-rotation-independence bound, the
+failure-mode unwind contract via LP-202 primitives, and the
+wall-clock throughput model parameterized by the operator's LP-217
+cert mode.
+
+\subsection{What was wrong before}
+
+Quasar in its round-blocking form (LP-017, LP-020) requires round
+$N$ to finalize before round $N{+}1$ starts. The proposer cannot
+begin selecting candidate transactions for $N{+}1$ until $N$'s
+QuasarCert has aggregated. For a PQ-fast-mode chain on the
+2026-06-04 measured CPU-only configuration (Spark, $N{=}64$,
+\SI{585}{\milli\second} cert wall-clock per
+\texttt{/tmp/quasar-results-spark.txt}), single-leader throughput
+is capped at \SI{1.7}{\,blocks\per\second} regardless of how fast
+the underlying stages run. The same measurement on PQ-heavy yields
+\SI{1326}{\milli\second}, capping single-leader throughput at
+\SI{0.75}{\,blocks\per\second}. Pipelining lifts the cap toward
+$\max(\textrm{stages})$; GPU offload (LP-203) drives the
+cert-stage value itself toward $\sim$\SI{5}{\milli\second} per
+the projected GB10 Pulsar/Corona wrapper.
+
+Three concrete consequences:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{Per-block latency dominates throughput.} A
+  Polaris-mode chain at $\sim$\SI{400}{\milli\second} is
+  throughput-capped at \SI{2.5}{\,blocks\per\second}. If each block
+  holds $1000$ transactions, that is $2{,}500$ tps single-leader
+  regardless of how fast the matching engine, the Block-STM
+  executor, or the GPU verify pipeline is.
+\item \textbf{Stage utilization is poor.} During the Sign stage of
+  block $N$, the mempool, the Block-STM speculator, and the ZAP
+  encoder all sit idle. The cert-leg threshold signing is not
+  bottlenecked on those subsystems. Round-blocking wastes
+  $\sim 80\%$ of single-validator wall clock.
+\item \textbf{Leader-rotation cost is paid per block.} Each round
+  switches leader; round-blocking pays the switch cost $N$ times
+  for $N$ blocks. Pipelining amortizes it.
+\end{enumerate}
+
+\subsection{What this LP solves}
+
+Pipelined Quasar runs three blocks in flight at all times. Block $N$
+is in the Sign stage; block $N{+}1$ is in the Build stage; block
+$N{+}2$ is in the Select stage. The three stages touch orthogonal
+subsystems and execute in parallel without cross-stage locks. Per-block
+wall-clock collapses from $\sum(\textrm{stages})$ to
+$\max(\textrm{stages})$.
+
+The depth bound is set by network RTT and consensus-round
+independence: depth $D$ requires $D$ consecutive different leaders.
+Depth~3 is the reference and matches the LP-202 block-production
+stage list exactly.
+
+\subsection{Cert wire format unchanged}
+
+This is not a new consensus protocol. The QuasarCert wire format
+(LP-182) is unchanged per block; the cert mode (LP-217) is unchanged
+per chain; the round-digest binding (LP-077) is unchanged per height.
+Pipelined Quasar is a protocol-orchestration change: it specifies
+\emph{when} a stage runs relative to other in-flight blocks, not
+\emph{what} the stage produces. A relying party reading a single cert
+cannot tell whether the producing chain was running round-blocking
+or pipelined; the cert is the same struct.

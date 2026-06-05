@@ -1,0 +1,122 @@
+\section{Composition With Sibling LPs}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lp{9cm}@{}}
+\toprule
+\textbf{LP} & \textbf{Composition} \\
+\midrule
+LP-010 & Block-STM 3.0 / QuasarSTM (GPU lane-aware variant; LP-210 is the CPU floor) \\
+LP-022 & ZAP wire protocol (tx ZAP frame format read by LP-210) \\
+LP-200 & ZAP Stack umbrella; LP-210 instantiates the layer-7 executor \\
+LP-202 & MVCC primitives, atomic commit, speculative execution contract \\
+LP-203 & GPU-native verify (the LP-209 wave LP-210 consumes inherits cert-tier wall-clock from LP-203's GB10 sm\_120 measurements) \\
+LP-204 & Per-L1 LP-210 instantiation per chain-VM \\
+LP-208 & DAG mempool / header DAG (substrate that produces the txs) \\
+LP-209 & Mysticeti-style total-order on DAG (the wave commit contract LP-210 executes) \\
+LP-211 & Cross-shard atomic Polaris cert (cross-shard Phase-4 staging) \\
+\bottomrule
+\end{tabular}
+\caption{Composition of LP-210 with sibling LPs.}
+\label{tab:composition}
+\end{table}
+
+\subsection{With LP-202}
+
+LP-210's speculative execute IS LP-202's speculative execution
+pattern applied at the per-tx granularity instead of per-block. The
+MVCC snapshot is the same primitive; the unwind on conflict is the
+same \texttt{txn.Discard()}; the atomic commit at end-of-wave is the
+same overlay commit. LP-210 is one specific use of LP-202's
+primitives -- the canonical execution-layer use.
+
+\subsection{With LP-209}
+
+LP-209 commits a wave; LP-210 executes the wave's txs. The contract:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{6.5cm}p{6.5cm}@{}}
+\toprule
+\textbf{LP-209 produces} & \textbf{LP-210 consumes} \\
+\midrule
+Totally ordered tx list with \texttt{tx\_index} per tx & the execution order tiebreak for re-execution in Phase~3 \\
+Wave's prior-root ZapDB pointer & the snapshot from which all goroutines start \\
+Wave's tx count $N$ & the goroutine pool size $=$ \texttt{min(GOMAXPROCS, $N$)} \\
+\bottomrule
+\end{tabular}
+\caption{LP-209 / LP-210 contract.}
+\label{tab:lp209-210}
+\end{table}
+
+LP-209 produces a wave; LP-210 produces a new ZapDB root + a per-tx
+verdict slice. The cert at LP-217 covers the new root, NOT the
+verdict slice -- the verdicts are reproducible from the wave bytes +
+prior root by any conformant LP-210 implementation, so they are not
+part of the cert payload.
+
+\subsection{With LP-211 (cross-shard)}
+
+When a wave contains cross-shard tx groups (LP-211), LP-210 executes
+the per-shard portions independently up through Phase~4 (atomic
+commit). At Phase~4, instead of committing immediately, the
+cross-shard portions \textbf{stage} their overlays and emit
+prepare-acks per LP-211. The actual commit happens when the
+parent-L1 cross-shard cert at LP-211 finalizes; if any sibling shard
+refuses, all participating shards' overlays are unwound via LP-202.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{2.5cm}p{4cm}p{5cm}@{}}
+\toprule
+\textbf{Phase 4 mode} & \textbf{Trigger} & \textbf{Action} \\
+\midrule
+Local-commit & wave contains no cross-shard txs & apply overlay to ZapDB immediately \\
+Staged-prepare & wave contains 1+ cross-shard txs & stage overlay; emit \texttt{CrossShardPrepareAck} per cross-shard tx; intra-shard txs in the same wave still local-commit \\
+\bottomrule
+\end{tabular}
+\caption{Phase-4 modes.}
+\label{tab:phase4}
+\end{table}
+
+The same wave can contain a mix of intra-shard and cross-shard txs.
+The intra-shard txs commit immediately under local-commit; the
+cross-shard portions stage and wait. This is the canonical
+Block-STM $\times$ 2PC composition -- no special tx-type at the
+LP-210 layer beyond the \texttt{cross\_shard} envelope kind.
+
+\section{Failure Modes}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{3cm}p{3cm}p{4cm}p{3.5cm}@{}}
+\toprule
+\textbf{Failure} & \textbf{Trigger} & \textbf{Effect} & \textbf{Recovery} \\
+\midrule
+Tx execution traps & tx logic (out-of-gas, opcode error) & write\_set empty; marked invalid; no commit & tx dropped; no state change \\
+Tx signature invalid & LP-208 normally catches; LP-210 re-checks & marked invalid & dropped \\
+Goroutine panics during execute & bug in VM opcode handler & per-goroutine recover; tx marked invalid & dropped; bug filed; chain continues \\
+All txs conflict (worst-case contention) & adversarial; one hot key & Phase~3 serializes wave & commits at single-threaded rate \\
+ZapDB commit fails (disk full, I/O) & infrastructure & LP-202 atomic unwind; ZapDB root unchanged & node halts at last committed wave; bootstrap recovery \\
+Wave is cross-shard, sibling rolls back & LP-211 refuses commit & per-shard rollback; LP-210 per-tx writes unwound & cross-shard group dropped; per-shard waves move forward \\
+\bottomrule
+\end{tabular}
+\caption{Failure modes.}
+\label{tab:failures}
+\end{table}
+
+\section{Activation Marker}
+
+\begin{verbatim}
+activates:      2025-12-25T16:20:00-08:00
+activates-unix: 1766708400
+\end{verbatim}
+
+\section{Backwards Compatibility}
+
+None. Applies to wave execution from the genesis block of the new
+final Lux network onward.

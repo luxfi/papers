@@ -1,0 +1,186 @@
+\section{Composition With Sibling LPs}
+\label{sec:composition}
+
+\subsection{LP-217 cert profile modes and the P3Q kinds}
+
+The LP-217 cert-profile-mode ladder is the operator-facing
+naming for cross-family PQ posture. Each mode declares a
+required leg set; the P3Q kinds supply the on-chain machinery
+that makes each mode's leg set callable from a rollup contract:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lp{4.5cm}rl@{}}
+\toprule
+\textbf{Mode} & \textbf{Required legs (P3Q calls)} & \textbf{Per-batch gas} & \textbf{Use case} \\
+\midrule
+\texttt{PQ-off} & BLS only (no P3Q) & $\sim$\SI{5000}{} & non-financial; gaming \\
+\texttt{PQ-fast} & BLS + P3Q($0x01$) & $\sim$\SI{55000}{} & payments, DEX, gaming \\
+\texttt{PQ-strict} & BLS + P3Q($0x01$) + P3Q($0x02$) & $\sim$\SI{5055000}{} & custody, treasury, securities \\
+\textbf{\texttt{PQ-heavy}} & BLS + P3Q($0x01$) + P3Q($0x02$) + P3Q($0x03$) & $\sim$\SI{5085000}{} & sovereign anchors, bridges \\
+\bottomrule
+\end{tabular}
+\caption{LP-217 modes mapped to P3Q kind calls. The four cert
+profile modes correspond to subsets of the P3Q kind set; PQ-heavy
+calls all three. The $\sim$\SI{5}{M}-gas cost cliff between
+PQ-fast and PQ-strict is the price of cross-family Ring-LWE
+insurance via the Corona kind.}
+\label{tab:cert-modes-p3q}
+\end{table}
+
+The composition is \textbf{additive}: a PQ-heavy rollup contract
+calls the BLS precompile and three \texttt{P3Q.verify(kind, ...)}
+calls at slot \texttt{0x012205} in sequence inside its
+\texttt{validateBatch} function. If any of the four returns
+\texttt{false}, the batch is rejected.
+
+\subsubsection{Sample rollup-contract composition (Solidity)}
+
+\begin{lstlisting}[language={}]
+function validateBatch(
+    bytes32 prevRoot,
+    bytes32 newRoot,
+    bytes32 batchHash,
+    bytes calldata blsSig,
+    bytes calldata pulsarSig,
+    bytes calldata coronaSig,    // omit for PQ-strict
+    bytes calldata magnetarSig,  // omit for PQ-strict/fast
+    bytes calldata groupPk
+) external returns (bool) {
+    bytes32 h = sha256(abi.encodePacked(prevRoot, newRoot, batchHash));
+
+    // Classical leg
+    if (!BLS.verify(blsSig, h, blsGroupPk)) return false;
+
+    // P3Q Pulsar leg (PQ-fast and above)
+    if (!P3Q.verify(0x01, pulsarSig, h, groupPk)) return false;
+
+    if (mode >= PQ_STRICT) {
+        // P3Q Corona leg (Ring-LWE family independence)
+        if (!P3Q.verify(0x02, coronaSig, h, groupPk)) return false;
+    }
+
+    if (mode == PQ_HEAVY) {
+        // P3Q Magnetar leg (hash-based family independence)
+        if (!P3Q.verify(0x03, magnetarSig, h, groupPk)) return false;
+    }
+
+    return true;
+}
+\end{lstlisting}
+
+The same precompile address (\texttt{0x012205}) is called
+three times with three different kind bytes. The rollup
+contract's mode field is set at rollup-genesis time via
+\texttt{CertModeFloor} (LP-218); the contract enforces it on
+every batch.
+
+\subsection{LP-218 rollup-batch pattern}
+
+LP-218 specifies the rollup-batch envelope and the
+sequencer$\to$Z-Chain submission pattern; LP-220 specifies the
+per-kind verifier mechanics. The two LPs share the same slot
+(\texttt{0x012205}), the same ABI shape
+(\texttt{P3Q.verify(kind, sig, h, pk)}), and the same
+\texttt{abiFalse}-on-cryptographic-failure contract.
+
+LP-218 \S~``Precompile wire format'' documents the structural
+format; LP-220 sections~\ref{sec:pulsar-kind}--\ref{sec:magnetar-kind}
+document the per-kind specifics on top of that uniform skeleton.
+The intent is clean cross-reference rather than duplication: a
+reader who wants the rollup-batch pattern reads LP-218; a reader
+who wants per-kind verifier mechanics reads LP-220; a reader who
+wants both reads both.
+
+\subsection{LP-300 schema registry}
+
+The P3Q family lives at one slot, but the wire envelopes -- the
+sequencer$\to$Z-Chain \texttt{RollupBatchTx} payload, the
+inner-batch Pulsar/Corona/Magnetar signature blobs -- are
+schema-versioned per LP-300. The registry entry for the P3Q
+family is:
+
+\begin{verbatim}
+slot:    0x012205
+kinds:   { 0x01: pulsar, 0x02: corona, 0x03: magnetar }
+domain:  lux-evm-precompile-p3q-v1   (FIPS 204 ctx)
+abi:     P3Q.verify(uint8, bytes, bytes32, bytes) -> bool
+\end{verbatim}
+
+Schema bumps within a kind (e.g.\ a future Corona parameter set
+revision) advance the mode byte without changing the slot or
+the kind byte. Schema bumps across the family (a fourth kind,
+say) advance the kind byte without changing the slot.
+
+\subsection{Cross-references}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lp{9cm}@{}}
+\toprule
+\textbf{LP} & \textbf{Relationship} \\
+\midrule
+LP-073 & Pulsar threshold signature -- P3Q kind $0x01$ verifies \\
+LP-181 & Magnetar threshold SLH-DSA -- P3Q kind $0x03$ verifies \\
+LP-182 & QuasarCert -- the cert legs whose verify kinds LP-220 supplies \\
+LP-200 & ZAP Stack umbrella -- the ``one and only one way'' principle the unified slot honors \\
+LP-202 & Cert tier degradation -- the per-kind verify path participates in the tier ladder \\
+LP-203 & GPU-native verify -- batched Corona / Magnetar kernels (projected) \\
+LP-217 & Cert profile modes -- the operator-facing names that determine which P3Q kinds a rollup contract calls \\
+LP-218 & ZAP-native PQ rollups -- specifies the unified slot and kind $0x01$ Pulsar; LP-220 specifies kinds $0x02$ Corona and $0x03$ Magnetar on the same slot \\
+LP-219 & Rollup-to-rollup atomic -- cross-rollup batches verify via the P3Q family at each participating rollup's chosen kind set \\
+LP-0120 & Quasar mainnet defaults -- owns slots \texttt{0x012204},
+  \texttt{0x012206}, \texttt{0x012207} for raw-primitive verifiers
+  (the non-rollup-batch use case); LP-218/LP-220 P3Q family
+  lives exclusively at \texttt{0x012205} \\
+LP-300 & Schema registry -- entry for the P3Q family kind set \\
+FIPS 204 & ML-DSA standard -- Pulsar-kind verifier conformant \\
+FIPS 205 & SLH-DSA standard -- Magnetar-kind verifier conformant \\
+Corona eprint 2024/1113 & Ring-LWE threshold reference -- Corona-kind verifier conformant \\
+\bottomrule
+\end{tabular}
+\caption{LP-220 composition references.}
+\label{tab:composition-refs}
+\end{table}
+
+\subsection{Backwards compatibility}
+
+None. The pre-Quasar Edition Lux network had no P3Q precompile
+family and is a separate network out of scope. The genesis state
+of the new final Lux network (activation
+\texttt{2025-12-25T16:20:00-08:00}) ships the unified-slot
+kind-byte-dispatch ABI as the only ABI; no shim exists for the
+sibling-slots draft.
+
+\subsection{Future work}
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Corona/Magnetar verifier wiring.} The reference
+  \texttt{p3q.Run} returns \texttt{abiFalse} for kinds $0x02$
+  and $0x03$ today. The follow-up is to wire
+  \texttt{luxfi/corona/sign.Verify} and
+  \texttt{luxfi/magnetar/verify} into the dispatch table. The
+  ABI and the wire format are stable across this transition;
+  only verify behavior changes from \texttt{false} to the
+  cryptographic outcome.
+\item \textbf{GPU dispatch boundary closure.} Install
+  \texttt{lux-lattice.pc} on Spark and expose
+  \texttt{lux\_slhdsa\_*} / \texttt{lux\_corona\_*} entry
+  points in \texttt{lux/accel/c\_api.h}. Once both close, the
+  Blackwell verify projections (sections~\ref{sec:corona-kind}
+  and~\ref{sec:magnetar-kind}) become measurements.
+\item \textbf{Fourth PQ family.} If a code-based signature
+  scheme (HQC-Sig variants, McEliece-Sig) becomes
+  operationally relevant, it lands as one new
+  \texttt{P3QVerifier} impl and one new \texttt{kind} byte
+  (provisionally $0x04$) in the dispatch table. No new
+  precompile slot allocation, no new Solidity function shape.
+\item \textbf{Blackwell-discounted Corona gas.} Operators with
+  all-Blackwell validator sets may petition for a discounted
+  Corona gas charge reflecting GPU-class verify cost rather
+  than CPU-class; LP-220 does not codify this. A future
+  amendment would tie the discount to a validator-hardware
+  attestation surface.
+\end{itemize}

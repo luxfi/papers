@@ -1,0 +1,104 @@
+\section{Latency}
+
+LAN, PQ-strict mode at every layer, 40-validator parent L1 with
+4-shard fan-out. Two columns: the projected GPU-accelerated path
+and the 2026-06-04 quasar-matrix-bench measured CPU-only path.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{5.5cm}rrp{3.6cm}@{}}
+\toprule
+\textbf{Event} & \textbf{GPU proj.} & \textbf{CPU meas.} & \textbf{Source} \\
+\midrule
+Cross-shard tx submitted to coordinator & \SI{0}{\milli\second} & \SI{0}{\milli\second} & client \\
+Coordinator dispatches to shards via DHT & $\sim$\SI{10}{\milli\second} & $\sim$\SI{10}{\milli\second} & LP-201 DHT \\
+Per-shard mempool admit & $\sim$\SI{25}{\milli\second} & $\sim$\SI{25}{\milli\second} & LP-208 tx receive \\
+Per-shard wave commits $T_j$ with prepare-staged & $\sim$\SI{120}{\milli\second} & $\sim$\SI{711}{\milli\second} & LP-209 PQ-strict latency \\
+Prepare-acks arrive at coordinator & $\sim$\SI{130}{\milli\second} & $\sim$\SI{721}{\milli\second} & + \SI{10}{\milli\second} gossip \\
+Coordinator submits CrossShardCommit & $\sim$\SI{131}{\milli\second} & $\sim$\SI{722}{\milli\second} & one mempool insert \\
+Parent L1 wave commits CrossShardCommit & $\sim$\SI{251}{\milli\second} & $\sim$\SI{1317}{\milli\second} & + LP-209 wave PQ-strict \\
+Shards observe commit-notify and apply staged overlay & $\sim$\SI{260}{\milli\second} & $\sim$\SI{1326}{\milli\second} & + \SI{10}{\milli\second} gossip + LP-202 $O(1)$ \\
+\bottomrule
+\end{tabular}
+\caption{End-to-end cross-shard finality at PQ-strict LAN. GPU
+column is projected (LP-209 latency assuming the projected
+$\sim$\SI{5}{\milli\second} GPU-accelerated cert from LP-203 GB10
+sm\_120 pairing rates measured 2026-06-04). CPU column is
+grounded in the matrix-bench-measured cert wall-clock at
+Spark $N{=}64$ PQ-strict \SI{595}{\milli\second}
+(\texttt{/tmp/quasar-results-spark.txt}); LP-209 LAN wave
+$\approx$ \SI{116}{\milli\second} pre-cert + \SI{595}{\milli\second}
+cert $\approx$ \SI{711}{\milli\second}.}
+\label{tab:latency-lan}
+\end{table}
+
+\paragraph{End-to-end.} \textbf{Projected GPU path:}
+$\sim$\SI{260}{\milli\second} at PQ-strict LAN. WAN, PQ-strict mode:
+$\sim$\SI{600}{\milli\second}--\SI{800}{\milli\second}
+(RTT-dominated; LP-209 latency triples under WAN). PQ-heavy mode
+under projected GPU: add $\sim$\SI{150}{\milli\second} to each cert
+step; total $\sim$\SI{400}{\milli\second} LAN,
+$\sim$\SI{1000}{\milli\second} WAN.
+
+\textbf{Measured CPU path (matrix bench Spark $N{=}64$,
+\texttt{/tmp/quasar-results-spark.txt}):}
+$\sim$\SI{1326}{\milli\second} cross-shard finality at PQ-strict
+LAN. PQ-heavy CPU cert wall-clock \SI{1326}{\milli\second} (matrix
+bench) pushes per-shard wave to $\sim$\SI{1442}{\milli\second};
+parent L1 adds another $\sim$\SI{1442}{\milli\second}; total
+cross-shard PQ-heavy LAN $\sim$\SI{2900}{\milli\second}. The
+CPU-only path is the floor until LP-203 GPU wrappers
+(Magnetar/Pulsar/Corona verify) ship; the GB10 kernels themselves
+are operational (BLS pairing 49\,197/s at 19\,$\mu$s/pair, keccak256
+\SI{11.38}{\mega ops/s}).
+
+The dominant cost is the \textbf{two sequential LP-209 wave commits}
+-- per-shard prepare wave plus parent-L1 commit wave.
+Optimizations:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Speculative commit at PQ-fast.} If the shard cert is
+  PQ-fast and the parent-L1 cert is also PQ-fast under the
+  \emph{projected} GPU-accelerated path, both certs land within
+  $\sim$\SI{5}{\milli\second} LAN; total cross-shard latency drops
+  to $\sim$\SI{150}{\milli\second}. On the measured CPU-only path
+  PQ-fast cert wall-clock is \SI{585}{\milli\second} (matrix bench
+  Spark $N{=}64$), so this optimization is GPU-gated.
+\item \textbf{Pipelined cross-shard groups.} Multiple in-flight
+  cross-shard groups overlap their wave commits via LP-205
+  pipelining; aggregate cross-shard throughput remains at the
+  parent-L1 wave rate. Under projected GPU: $\sim 10$ waves/sec
+  $\times$ $\sim 100$ cross-shard txs/wave = \SI{1000}{cross-shard tx/s}
+  floor. Under measured CPU: $\sim 1.7$ waves/sec (matrix bench
+  PQ-strict $N{=}64$) $\times$ $\sim 100$ = \SI{170}{cross-shard tx/s}
+  floor.
+\end{itemize}
+
+\subsection{Pipelined cross-shard groups (worked example)}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lp{2.5cm}p{2.5cm}p{2.5cm}@{}}
+\toprule
+\textbf{Parent-L1 wave} & \textbf{$t{=}T$} & \textbf{$t{=}T{+}$\SI{100}{\milli\second}} & \textbf{$t{=}T{+}$\SI{200}{\milli\second}} \\
+\midrule
+$W_k$ -- contains CrossShardCommit($T_A$) & committed & settled & settled \\
+$W_{k{+}1}$ -- contains CrossShardCommit($T_B$) & preparing & committed & settled \\
+$W_{k{+}2}$ -- contains CrossShardCommit($T_C$) & still collecting prepare-acks & preparing & committed \\
+\bottomrule
+\end{tabular}
+\caption{Three cross-shard tx groups, three overlapping parent-L1
+wave commits.}
+\label{tab:pipeline-xshard}
+\end{table}
+
+Aggregate cross-shard throughput at LAN scale $\approx$ parent-L1
+wave rate $\times$ (parent-L1 wave capacity / \texttt{CrossShardCommit}
+tx size). Under projected GPU-accelerated cert (LP-203):
+$\sim 1000$ cross-shard groups/sec at PQ-strict, $\sim 500$ at
+PQ-heavy. Under measured CPU-only cert (2026-06-04 matrix bench
+Spark $N{=}64$): $\sim 170$ cross-shard groups/sec at PQ-strict
+(\SI{595}{\milli\second} cert wall-clock), $\sim 75$ at PQ-heavy
+(\SI{1326}{\milli\second} cert wall-clock).

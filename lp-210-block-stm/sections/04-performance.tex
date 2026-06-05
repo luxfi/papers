@@ -1,0 +1,86 @@
+\section{Performance}
+
+Reference numbers from a 16-core box (Apple M4 Max,
+\texttt{GOMAXPROCS}{=}$16$), $40$k-tx wave (per LP-209 throughput
+floor numbers), realistic Liquidity-style workload mix.
+
+\subsection{Per-phase timing (projected, not measured)}
+
+The four-phase budget below is a design-time projection built from
+LP-202 MVCC primitive costs and the per-opcode VM cost model. LP-210
+end-to-end execution has not been measured on a real wave at the
+$40$k-tx scale; the planned measurement run will land in the LP-210
+bench addendum once the production Liquidity validator profile ships.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrp{6cm}@{}}
+\toprule
+\textbf{Phase} & \textbf{Time} & \textbf{Notes} \\
+\midrule
+1 (speculative execute) & $\sim$\SI{8}{\milli\second} & $40$k txs / 16 goroutines = $2.5$k txs per goroutine; $\sim$\SI{3}{\micro\second}/tx avg \\
+2 (commit-phase conflict detection) & $\sim$\SI{1}{\milli\second} & linear in total reads ($\sim 200$k cell reads at 5 reads/tx avg); hashmap probe per read \\
+3 (re-execute conflicted) & $\sim$\SI{0.5}{\milli\second} & $\sim 2$k conflicted txs at $\sim$\SI{250}{\nano\second}/tx serial re-exec \\
+4 (atomic commit to ZapDB) & $\sim$\SI{0.3}{\milli\second} & LP-202 $O(1)$ overlay commit \\
+\midrule
+\textbf{Total per wave} & $\sim$\SI{10}{\milli\second} & projected floor at 16-core hardware \\
+\bottomrule
+\end{tabular}
+\caption{Per-phase timing on the reference workload.
+\textbf{Projected, not measured.} Wall-clock will be verified
+against the LP-210 implementation tag once production traffic is
+available.}
+\label{tab:perphase}
+\end{table}
+
+Compare against the projected single-threaded baseline: same workload, serial
+executor, no STM machinery: $\sim$\SI{120}{\milli\second} per wave.
+Projected Block-STM speedup: $\sim 12\times$ on 16 cores at $\sim 75\%$
+efficiency.
+
+\subsection{Scale-up projection}
+
+On a 64-core box (production Liquidity validator): expected
+$\sim 50\times$ over single-threaded (LP-208 reference rack
+profile). Combined with LP-209 wave throughput
+($40$k txs / \SI{10}{\milli\second} $=$ \SI{4}{\mega tx/s} on a
+64-core box) and LP-205 3-deep pipelining
+(\SI{12}{\mega tx/s} aggregate), this is the billion-user
+throughput envelope.
+
+\subsection{Honest reading of the projections}
+
+The 16-core Phase-1 through Phase-4 numbers are \textbf{projected
+design-time estimates}, not measured wall-clock. They derive from
+LP-202 MVCC primitive cost characterizations (snapshot $O(1)$,
+hashmap probe per read $O(\log\,n)$ amortized, overlay commit $O(1)$)
+plus per-opcode VM cost averages. No end-to-end Block-STM wave
+execution measurement was on the 2026-06-04 bench cluster (the
+quasar-matrix-bench run exercised the cert ceremony, not LP-210).
+The 64-core projection is linear extrapolation of the Phase-1 cost
+(the only phase that scales with core count) at $75\%$ efficiency;
+the other phases are core-count-insensitive (Phase-2 is linear in
+total reads; Phase-3 is serial by design; Phase-4 is $O(1)$).
+Measured Block-STM throughput will land in the LP-210 bench
+addendum once the production Liquidity validator profile ships.
+
+\subsection{Worst-case contention}
+
+When all transactions in a wave conflict on a single hot key,
+Phase~3 serializes the entire wave: throughput collapses to the
+single-threaded executor rate. The LP-210 throughput floor is the
+serial-executor throughput. Mitigations:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Hot-key sharding at the application layer.} A DEX
+  order-book contract is typically split per trading pair; the hot
+  key contention is per-pair, not chain-wide.
+\item \textbf{Account-disjoint mempool prioritization.} The LP-208
+  mempool can be configured to prefer account-disjoint transactions
+  when emitting headers; this maximizes Phase-1 parallelism at the
+  cost of slightly lower mempool admit fairness.
+\end{itemize}
+
+Neither mitigation is required for correctness -- they are
+performance tunings.

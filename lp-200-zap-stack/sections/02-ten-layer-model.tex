@@ -1,0 +1,61 @@
+\section{The Ten-Layer Model}
+\label{sec:tenlayer}
+
+Each row is one job. Each row consumes the layer below as a byte slice
+and produces its successor as a byte slice. No layer reaches across.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}rlll@{}}
+\toprule
+\textbf{\#} & \textbf{Layer} & \textbf{One job} & \textbf{Implementation} \\
+\midrule
+0 & ZAP frame & wire envelope (magic+version+object) & \texttt{luxfi/zap} (LP-022) \\
+1 & ZapDB & LSM KV consuming ZAP bytes; age-encrypted snapshot stream & \texttt{luxfi/zapdb} (\texttt{!grpc} build) \\
+2 & Schemas & TypeKind + offset map per type & per-repo \texttt{pkg/wire/zap/schemas.go} \\
+3 & Identity & \texttt{sha256.Sum256(buf)} for stable IDs & call-sites, no central impl \\
+4 & Transcript & TupleHash256 / cSHAKE256 with SP 800-185 framing & \texttt{round\_digest.go}, \texttt{qblock.go} \\
+5 & Signature & \texttt{wire.SignSecp256k1(unsigned, signers)} & \texttt{luxfi/utxo/wire/sign.go} \\
+6 & Validator & per-schema \texttt{Verify()} reads offset-indexed fields & per-type validators in each VM \\
+7 & Executor & dispatch on TxKind byte (first byte of envelope) & per-chain executor with kind-byte registry \\
+8 & Block & block bytes are a ZAP frame containing tx ZAP frames & per-chain block schema \\
+9 & Consensus & QuasarCert composes BLS+Pulsar+Corona+Magnetar legs as opaque ZAP byte strings & \texttt{consensus/protocol/quasar/} \\
+10 & P2P transport & QUIC streams carrying ZAP frames; mDNS LAN, Kademlia DHT WAN & LP-201 (sibling) \\
+\bottomrule
+\end{tabular}
+\caption{The ten layers of the Lux ZAP Stack.}
+\label{tab:tenlayer}
+\end{table}
+
+The numbering goes 0--10 (eleven slots) because layer~0 is the byte
+frame itself -- a property of bytes, not a layer of work. Layers 1--10
+are the work.
+
+\paragraph{Layer 0 (ZAP frame).} A ZAP frame is magic byte
+\texttt{0x5A}, version byte, an 8-byte length prefix, and the object
+bytes. That is the wire envelope and the storage envelope. There is
+no second envelope at any other layer.
+
+\paragraph{Layer 1 (ZapDB).} ZapDB is a Badger fork with the
+\texttt{!grpc} build tag and native ZAP-typed encoders in
+\texttt{pb\_zap.go}. The LSM consumes ZAP buffers directly; it does
+not re-encode for storage.
+
+\paragraph{Layer 4 (Transcript).} The cryptographic transcript is a
+function from buffer to digest. It uses TupleHash256 with NIST SP
+800-185 framing for unambiguous serialization of typed offsets. The
+transcript and the identity hash are independent functions of the same
+buffer -- changing one does not touch the other.
+
+\paragraph{Layer 7 (Executor).} The first byte of the unsigned tx
+envelope is \texttt{TxKind}. The executor is a
+\texttt{map[TxKind]Handler}. There is no Visit pattern, no interface
+polymorphism, no generated visitor. Adding a tx kind is one entry in
+the registry; removing one is one deletion.
+
+\paragraph{Layer 9 (Consensus).} The QuasarCert (LP-182) composes four
+legs -- BLS, Pulsar, Corona, Magnetar -- as opaque ZAP byte strings.
+Verify is per-leg dispatch with a leg verifier per leg type; no leg
+verifier knows about another leg. The operator-facing mode names
+(LP-217) describe which legs are required for a given posture.

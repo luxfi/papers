@@ -1,0 +1,73 @@
+\section{Introduction}
+
+This paper expands on LP-208 (\texttt{lps/LP-208-dag-mempool.md})
+with detail on the wire format for the two new ZAP schemas
+(\texttt{0xF0}~DAGHeader, \texttt{0xF1}~DAGBody), the parent-linking
+discipline, the throughput model, the garbage collection contract,
+and the composition with sibling LPs.
+
+\subsection{What was wrong before}
+
+Today's Lux mempool model: each validator maintains its own ranked
+heap of pending transactions; a leader at each round picks from its
+local mempool when proposing a block. Aggregate throughput is
+bounded by the slowest validator -- if one validator's mempool can
+admit \SI{50000}{tx/s}, that is the aggregate ceiling no matter how
+many validators participate.
+
+Three concrete failures:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{Throughput is min-bounded.} Aggregate admission rate at
+  a chain is $\min(\textrm{per-validator-admission})$. For a 64-validator
+  chain with one validator on consumer hardware
+  (\SI{10000}{tx/s}) and 63 on Blackwell (\SI{200000}{tx/s}),
+  aggregate is \SI{10000}{tx/s} -- $99.2\%$ of the validator-set
+  capacity is wasted.
+\item \textbf{Tx loss on leader byzantine.} A leader at round $R$
+  picks from its local mempool. If the leader is byzantine and
+  withholds its block, all txs in its local mempool are stuck until
+  the next round; honest validators' versions of those txs may have
+  already expired.
+\item \textbf{Latency is leader-rotation-dependent.} A tx admitted
+  to validator $V$'s mempool at time $T$ does not propagate into a
+  block until $V$ is the leader at some future round. The gap is
+  bounded by leader-rotation period; for round-robin with $N$
+  validators and block period $P$, the worst-case tx-to-block
+  latency is $N \times P$.
+\end{enumerate}
+
+\subsection{What this LP solves}
+
+The DAG mempool inverts the model. Every validator continuously
+broadcasts a stream of ZAP headers; each header carries a list of
+tx hashes, parent pointers to the most recent headers from peer
+validators, and a leader-signed digest. The actual tx bytes live in
+the Kademlia DHT (LP-201 layer~C), content-addressed by hash. The
+aggregate structure is a directed acyclic graph: every header has
+parents from peers, so the graph captures the partial order of tx
+admission across the validator set.
+
+Throughput becomes $\sum(\textrm{validators})$. If each validator
+emits \SI{50000}{tx-hashes/s}, a 64-validator set admits
+\SI{3.2}{\mega tx-hashes/s} into the DAG. The bottleneck moves from
+mempool admission to DHT throughput and signature-verification rate
+per validator -- both linearly scalable.
+
+\subsection{Scope of this LP}
+
+DAG total-ordering -- the step that picks a single canonical
+sequence from the DAG for execution -- is deferred to LP-209
+(Mysticeti, \cite{mysticeti2024}). This LP defines only the
+construction surface: the wire format for headers and bodies, the
+parent-linking discipline, the DHT-storage contract for bodies, the
+garbage-collection rule for old headers, and the per-validator
+emission rate.
+
+This separation is deliberate. Multiple ordering algorithms can
+consume the same DAG: Mysticeti (committee-based ordering with
+sub-second finality); Bullshark \cite{bullshark2022} (round-robin
+anchored ordering with FIFO fairness); Tusk (asynchronous ordering
+with worst-case finality). Each algorithm has a different
+latency/throughput/fairness tradeoff. The DAG construction is
+invariant across these choices.

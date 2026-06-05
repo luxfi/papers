@@ -1,0 +1,191 @@
+\section{Verifier Interface and Dispatch}
+\label{sec:verifier-interface}
+
+\subsection{The \texttt{P3QVerifier} Go interface}
+
+The unification of the three kinds onto one slot is mediated by
+a Go-side interface at
+\texttt{lux/standard/precompiles/p3q\_family/}. The interface is
+the single audit boundary for adding a kind: implement the four
+methods, register at \texttt{init()}, done.
+
+\begin{lstlisting}[language={}]
+// P3QVerifier is the per-kind verifier abstraction.
+//
+// Each P3QVerifier implementation is registered at process boot
+// into a kind-byte keyed dispatch table loaded by the single
+// P3Q precompile at slot 0x012205.
+type P3QVerifier interface {
+    // Verify returns true iff sig is a valid threshold signature
+    // from groupPubKey on messageHash. The implementation must
+    // be constant-time over secret inputs (there are none; both
+    // sig and pk are PUBLIC calldata) and must not panic on
+    // malformed input -- malformed inputs return false.
+    Verify(sig []byte, messageHash [32]byte, groupPubKey []byte) bool
+
+    // GasCost returns the per-call precompile gas charge for
+    // this kind. The P3Q dispatcher charges this amount BEFORE
+    // calling Verify, so an out-of-gas caller never observes the
+    // verifier's behavior on its specific input.
+    GasCost() uint64
+
+    // Kind returns the calldata discriminator byte:
+    //   0x01 = Pulsar     (Module-LWE)
+    //   0x02 = Corona     (Ring-LWE)
+    //   0x03 = Magnetar   (hash-based)
+    Kind() byte
+
+    // PrimitiveName returns "pulsar", "corona", or "magnetar".
+    // Used for metric labels, log lines, and audit trails.
+    PrimitiveName() string
+}
+\end{lstlisting}
+
+The interface is minimal by design: four methods, three of which
+are constant-returning getters. The verifier core lives in the
+\texttt{Verify} method; the gas calibration lives in
+\texttt{GasCost}; the dispatch discriminator lives in
+\texttt{Kind}. There is no shared base class, no inheritance, no
+mutable verifier state -- each verifier is value-typed and
+independently complete (composition over inheritance per
+LP-200).
+
+\subsection{Dispatch flow}
+
+When the \texttt{0x012205} precompile is called:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item Read the leading \texttt{kind} byte from calldata
+  (offset~0).
+\item Look up the registered \texttt{P3QVerifier} for that kind
+  in the kind-keyed dispatch table.
+\item Charge \texttt{Verifier.GasCost()} (per-kind, returned by
+  the impl). The uniform per-byte adder is added separately by
+  the precompile's \texttt{RequiredGas}.
+\item Parse the wire format down to
+  \texttt{(sig, messageHash, groupPubKey)} using the layout
+  appropriate to the kind (the per-kind size constants are
+  baked into the implementation; the framing -- BE32 length
+  fields, trailing 32-byte messageHash -- is uniform).
+\item Call \texttt{Verifier.Verify(sig, messageHash, pk)}.
+\item Return the boolean result encoded as a 32-byte EVM-ABI
+  \texttt{bool} (\texttt{abiTrue} or \texttt{abiFalse}).
+\end{enumerate}
+
+This is the single point of truth for the family. Three verifier
+implementations, one slot, one dispatch path, one ABI shape, one
+audit surface. Adding a fourth PQ-family kind (a hypothetical
+code-based threshold via HQC-Sig variants, for example) is one
+new \texttt{P3QVerifier} impl and one new \texttt{kind} byte
+registered in the same dispatch table; no new precompile slot,
+no new Solidity function shape, no new audit boundary at the
+EVM-side.
+
+\subsection{Per-kind gas table}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{kind} & \textbf{Name} & \textbf{Gas charge} & \textbf{Verify CPU} \\
+\midrule
+$0x01$ & Pulsar   & \SI{50000}{}    & $\sim$\SI{80}{\micro\second} \\
+$0x02$ & Corona   & \SI{5000000}{}  & $\sim$\SI{1.6}{\milli\second} \\
+$0x03$ & Magnetar & \SI{30000}{}    & $\sim$\SI{1.92}{\milli\second} \\
+\bottomrule
+\end{tabular}
+\caption{Per-kind gas table. Corona's \SI{5}{M} charge is the
+$\sim$$100\times$ multiplier over Pulsar reflecting the CPU
+verify-cost ratio; Magnetar's \SI{30000}{} reflects the fact
+that the SLH-DSA hash-tree walk is memory-bandwidth-bound and
+parallelizes harder on modern CPUs than the lattice NTT
+inverse.}
+\label{tab:gas-per-kind}
+\end{table}
+
+The asymmetry between Corona's \SI{5}{M} and Magnetar's
+\SI{30000}{} -- despite comparable CPU verify times -- reflects
+two distinct calibrations:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item Corona's verify dominates a single core because the NTT
+  inverse + polynomial multiplication mod $q$ over the larger
+  Ring-LWE coefficients is a tight cache-resident loop with
+  limited ILP. \SI{1.6}{\milli\second} on a single core is
+  $\sim$$141\times$ the Pulsar verify; the gas charge rounds
+  to $\sim$$100\times$.
+\item Magnetar's verify is a hash-tree walk: hash function
+  evaluation is highly parallelizable, well-vectorized by
+  modern CPUs, and memory-bandwidth-bound. \SI{1.92}{\milli\second}
+  wall-clock is dominated by sequential dependencies in the
+  WOTS+ structure but the per-operation cost is lower than the
+  lattice multiplication. The gas charge reflects the modest
+  per-call CPU cost.
+\end{itemize}
+
+This is the same calibration discipline LP-218 uses for Pulsar:
+gas reflects CPU-class verifier cost, not GPU-class. Operators
+with all-Blackwell validator sets may petition for discounted
+gas in a future amendment; LP-220 does not codify it.
+
+\subsection{Validator registration}
+
+Each P3Q-conformant validator MUST register a
+\texttt{P3QVerifier} for every kind it will accept on-chain.
+Misconfiguration -- a validator missing the Corona verifier
+when Z-Chain receives a rollup-batch tx that calls
+\texttt{P3Q.verify(0x02, ...)} -- is a configuration error, not
+a soundness error: the validator's EVM cannot validate the
+block, and consensus excludes that validator's vote on the
+block. LP-202 tier-degradation handles the recovery (the
+validator votes \texttt{nil} on the block; consensus continues
+with the remaining validators).
+
+The reference \texttt{p3q.Run} ships KindPulsar wired and
+KindCorona / KindMagnetar reserved-but-not-wired; this is the
+genesis state. As the Corona and Magnetar verifier libraries
+land in subsequent versions of \texttt{luxfi/corona} and
+\texttt{luxfi/magnetar}, their P3Q dispatch entries are wired
+in, and the wired-state advances. The wire format and the
+Solidity ABI are stable across the wired/not-wired transition;
+only the verify behavior changes (from \texttt{false} to the
+actual cryptographic outcome).
+
+\subsection{Failure modes}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{4.8cm}p{4cm}p{4.5cm}@{}}
+\toprule
+\textbf{Failure} & \textbf{Trigger} & \textbf{Effect} \\
+\midrule
+Unknown \texttt{kind} byte & caller passes
+  \texttt{kind} not in $\{0x01, 0x02, 0x03\}$ &
+  precompile returns \texttt{abiFalse}; caller observes \texttt{false} \\
+Reserved-but-not-wired kind & caller passes \texttt{kind=0x02}
+  or \texttt{kind=0x03} before verifier lands &
+  precompile returns \texttt{abiFalse}; caller observes \texttt{false} \\
+Malformed wire layout & caller passes truncated/oversized
+  fields & precompile returns \texttt{abiFalse} \\
+Sig-length mismatch (Pulsar) & \texttt{sigLen} $\neq$ FIPS-204
+  expected size for the mode byte & precompile returns
+  \texttt{abiFalse} \\
+FIPS verifier reject & sig genuinely does not verify under the
+  group pubkey & precompile returns \texttt{abiFalse} \\
+Out-of-gas & caller supplies
+  \texttt{gas} $<$ \texttt{RequiredGas(input)} & precompile
+  returns \texttt{contract.ErrOutOfGas}; caller transaction reverts \\
+Group pubkey rotation skew & sequencer rotated keys without
+  updating the on-chain group pubkey & precompile returns
+  \texttt{abiFalse} until rotation tx lands \\
+\bottomrule
+\end{tabular}
+\caption{Failure modes. Every cryptographic failure is
+\texttt{abiFalse}; only out-of-gas reverts. This is the LP-218
+``no revert on cryptographic failure'' contract -- the
+Solidity caller decides whether \texttt{false} is fatal to its
+batch.}
+\label{tab:failures}
+\end{table}

@@ -1,0 +1,109 @@
+\section{Algorithm}
+\label{sec:algorithm}
+
+\subsection{Round structure}
+
+Rounds in the DAG advance at a fixed cadence -- every header
+references $K$ parents from the prior round (LP-208 round
+structure). Waves are anchored at even rounds ($2, 4, 6, \ldots$);
+leader election runs every $2$ rounds.
+
+\subsection{Leader election}
+
+At even round $2k$, the leader is selected via VRF over the round
+digest:
+
+\begin{equation}
+\textrm{leader}(2k) = \arg\max_{v \in \textrm{validators}}
+\textrm{VRF}(v.\textrm{staking\_key}, \textrm{round\_digest}(2k))
+\end{equation}
+
+where
+$\textrm{round\_digest}(r) = \textrm{sha256}(\textrm{chain\_id} \| r \| k_{\textrm{prev\_round\_root}})$.
+
+The VRF is BLS-based (LP-075 BLS leg) for the classical case; under
+PQ-heavy the VRF falls back to a Pulsar threshold-derived
+randomness beacon (LP-176). Round-robin is the deterministic
+fallback when no validator publishes a VRF proof within the round
+timeout: $\textrm{leader}(2k) = \textrm{validators}[(2k/2) \bmod N]$.
+
+\subsection{Wave anchoring}
+
+At the end of round $2k{+}1$, every validator examines the DAG and
+decides: \emph{did the leader's round-$2k$ vertex receive
+$\geq 2f{+}1$ references in the round-$2k{+}1$ layer?}
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Yes} $\to$ the leader vertex is the wave anchor. The
+  wave commits.
+\item \textbf{No} $\to$ the wave skips. The leader of round $2k{+}2$
+  anchors a larger wave covering rounds $2k..2k{+}2$.
+\end{itemize}
+
+The $\geq 2f{+}1$ references condition is the Mysticeti fast-path
+quorum under $<33\%$ byzantine. Under $<50\%$ byzantine (recovery
+path), 3-RTT vote counting on round $2k{+}2$ votes for round-$2k{+}1$
+votes for round-$2k$ anchors the wave at the cost of one extra
+round.
+
+\subsection{Causal commit set}
+
+Once the anchor is decided, the wave's commit set is the causal
+closure of the anchor in the DAG:
+
+\begin{equation}
+W(\textrm{anchor}) = \bigl\{ v \in \textrm{DAG} : v \in
+\textrm{causalAncestors}(\textrm{anchor}) \bigr\}
+\cup \{\textrm{anchor}\}
+\setminus \bigcup_{j<k} W(\textrm{prior\_anchor}_j)
+\end{equation}
+
+Subtract prior anchors' commit sets -- a vertex is committed
+exactly once, by the earliest wave whose anchor causally dominates
+it.
+
+\subsection{Total order within wave}
+
+The wave's vertices are totally ordered by:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{Round number ascending} (vertices in lower rounds
+  order first).
+\item Within a round, \textbf{lexicographic on
+  \texttt{(NodeID, headerHash)} ascending}.
+\end{enumerate}
+
+This is the canonical sort. Every validator independently computes
+the same order from the same DAG -- no coordination needed. The
+order is deterministic and content-addressable.
+
+\subsection{Cert ceremony}
+
+Once the wave is ordered, the LP-217 cert ceremony runs on the
+wave's ordered byte payload (concatenation of header bytes in
+order). One QuasarCert per wave, signed by $\geq 2f{+}1$ validators
+per LP-182. The cert's leg composition is per the chain's
+configured \texttt{quasar.cert\_mode} (LP-217); the cert's
+\texttt{blockID} field is $\textrm{sha256}(\textrm{wave\_ordered\_bytes})$.
+
+\subsection{Stack composition}
+
+\begin{verbatim}
+LP-208 DAG mempool produces headers (continuous)
+    |
+    v
+LP-209 wave commit (every 2 rounds; leader-anchored)
+    |
+    v
+LP-210 Block-STM execution (parallel; per-tx MVCC)
+    |
+    v
+LP-217 cert ceremony (one cert per wave)
+    |
+    v
+ZapDB MVCC commit (LP-202 atomic unwind)
+\end{verbatim}
+
+LP-209 never re-orders within a header -- the tx order inside one
+header is the header author's choice, sealed at LP-208 publish
+time. LP-209 only orders \emph{across} headers, by the rule above.

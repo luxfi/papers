@@ -1,0 +1,74 @@
+\section{Why DAG Mempool Beats Traditional Mempool}
+
+Four operational properties, each backed by a specific mechanism.
+
+\subsection{Throughput is sum-bounded}
+
+A traditional mempool has admission rate
+$\min(\textrm{validator\_admit\_rate})$; aggregate is the slowest
+validator.
+
+The DAG mempool has emission rate
+$\sum(\textrm{validator\_emit\_rate})$. Each validator emits its own
+headers; the DAG-wide rate is the sum. The slowest validator
+contributes its share; it does not gate the fastest.
+
+Reference numbers (LP-203 GPU verify + LP-202 pipeline depth):
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item Per-validator emission: $1$ header $/$
+  \SI{50}{\milli\second} $\times 1000$ tx-hashes/header
+  $=$ \SI{20000}{tx-hashes/s}
+\item $64$-validator chain: \SI{1.28}{\mega tx-hashes/s} aggregate
+\item $256$-validator chain: \SI{5.12}{\mega tx-hashes/s} aggregate
+\end{itemize}
+
+Headers contain only hashes; bodies are fetched separately via DHT,
+so per-validator bandwidth is $\textrm{tx\_count} \times 32$ bytes
+per emission period $\approx \SI{640}{\kilo\byte/\second}$ per
+validator at the reference rate. Trivial network overhead.
+
+\subsection{No tx loss on byzantine leader}
+
+In a single-mempool model, a tx admitted to a byzantine leader's
+mempool may be withheld from blocks indefinitely; honest validators
+do not see it until the next leader proposes.
+
+In the DAG mempool, every validator emits its own admitted txs
+independently. A tx admitted at any honest validator appears in at
+least one honest validator's header within $K$ milliseconds, and the
+body is replicated to the DHT under its content-hash. The leader at
+the consumer layer reads from the DAG, not from its own mempool, so
+byzantine-leader-withholds-tx is mechanically impossible.
+
+The cert-profile (LP-217 mode) is unaffected: the consumer
+LP-205/LP-209 reads the DAG and orders it; the cert is computed over
+the ordered output, not the DAG itself.
+
+\subsection{Content-addressed, no re-encoding}
+
+Each header references its body via \texttt{body\_hash}. The body is
+the tx bytes verbatim. There is no re-encoding step -- the bytes
+that the validator admitted are the bytes that go in the DHT and
+that the consumer reads. This is the LP-200 ZAP stack guarantee
+(immutable buffer, content-addressed, no codec re-marshal) applied
+at the mempool layer.
+
+A traditional mempool re-encodes txs on insertion (for storage
+layout) and on emission (for wire format). The DAG mempool does
+neither; the LP-022 wire format IS the storage format.
+
+\subsection{Latency is leader-independent}
+
+In a single-mempool model, tx-to-block latency is
+$\textrm{leader\_rotation\_period} \times \textrm{position\_in\_rotation}$.
+The worst case for a tx that just missed the current leader is one
+full rotation.
+
+In the DAG mempool, tx-to-DAG latency is bounded by the validator's
+emission period $K$ (default \SI{50}{\milli\second}). The tx is in
+the DAG as soon as the validator that admitted it emits its next
+header. The consumer's ordering (LP-209) picks the tx for execution
+at the next ordering pass; for a typical chain with cert wall-clock
+\SI{5}{\milli\second}--\SI{15}{\milli\second}, the tx-to-block
+latency is dominated by $K$.

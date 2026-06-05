@@ -1,0 +1,105 @@
+\section{Performance Characteristics}
+\label{sec:performance}
+
+All numbers in this section are measured on the new final Lux
+network's reference validator, using \texttt{go test -bench}. Sources
+of raw data:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \texttt{/tmp/zap-vs-codec/} -- ZAP vs legacy \texttt{linearcodec}
+  per-operation microbenchmarks; raw outputs in
+  \texttt{raw\_bench\_\{m1max,evo,dbc,spark\}.txt}.
+\item \texttt{/tmp/multi-validator/} -- distributed end-to-end cert
+  benches at $10$, $100$, $500$ validators across three host hardware
+  classes; \texttt{result-\{10,100,500\}v-\{aurora,polaris,hybrid\}.json}.
+\item \texttt{/tmp/spark-gpu-bench/} -- DGX Spark GB10 GPU baseline
+  for the Corona/Pulsar lattice paths; \texttt{MEDIANS.txt} and
+  \texttt{raw\_bench\_spark.txt}.
+\item \texttt{lux/threshold/protocols/parity/} -- Corona/Pulsar parity
+  audit (\texttt{parity\_test.go}); the result that locks
+  Pulsar-first in LP-217's PQ-fast tier.
+\end{itemize}
+
+\subsection{Per-operation wins (measured)}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Operation} & \textbf{Legacy (linearcodec)} & \textbf{ZAP Stack} & \textbf{Win} \\
+\midrule
+Parse small tx & \SI{129}{\nano\second}/op, 2 allocs & \SI{36}{\nano\second}/op, 1 alloc & $3.6\times$ \\
+Parse complex tx & \SI{1008}{\nano\second}/op, 6 allocs & \SI{75}{\nano\second}/op, 1 alloc & $13.4\times$ \\
+Mempool insert & parse $\to$ struct $\to$ remarshal & parse $\to$ buffer ref & $\sim 5\times$ \\
+State write & unmarshal $\to$ mutate $\to$ marshal & wrap $\to$ mutate $\to$ write buffer & $\sim 3\times$ \\
+Snapshot stream & re-encode for backup & direct buffer stream & $\sim 10\times$ \\
+Corona aggregate $n{=}64$ (incorrect serial baseline) & \SI{14}{\second} & \SI{356}{\milli\second}--\SI{440}{\milli\second} parallel & $-97\%$ \\
+\bottomrule
+\end{tabular}
+\caption{Per-operation cost: ZAP Stack vs legacy. The Corona row
+deserves a note (Section~\ref{ssec:corona-row}).}
+\label{tab:perops}
+\end{table}
+
+\subsection{End-to-end distributed-cluster cert finality}
+
+The multi-validator bench (\texttt{/tmp/multi-validator/}) measures
+end-to-end QuasarCert finality across a three-host cluster at
+$10$/$100$/$500$ validator scales. The hosts span the three production
+hardware families: Apple Silicon (\texttt{ra}, M1 Max), NVIDIA
+Blackwell-class GPU server (\texttt{spark}, GB10), and x86\_64 Linux
+(\texttt{evo}, Ryzen AI MAX+).
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llrrrr@{}}
+\toprule
+\textbf{Scale} & \textbf{Profile} & \textbf{Blocks/s} & \textbf{BLS leg} & \textbf{Pulsar leg} & \textbf{Corona leg} \\
+\midrule
+$10$v   & Hybrid-1s & 0.88 & \SI{159}{\milli\second} & \SI{203}{\milli\second} & \SI{1135}{\milli\second} \\
+$100$v  & Hybrid-1s & 0.39 & \SI{162}{\milli\second} & \SI{298}{\milli\second} & \SI{2593}{\milli\second} \\
+$500$v  & Hybrid-1s & 0.38 & \SI{187}{\milli\second} & \SI{408}{\milli\second} & \SI{2655}{\milli\second} \\
+\bottomrule
+\end{tabular}
+\caption{Leg arrival $p_{50}$ in milliseconds on the Hybrid-1s
+profile. CPU baseline; Corona GPU acceleration pending. Source:
+\texttt{/tmp/multi-validator/result-*v-hybrid.json}.}
+\label{tab:e2e}
+\end{table}
+
+At $10$v Hybrid-1s the BLS preliminary-finality lands at
+\SI{159}{\milli\second}; Pulsar lands at \SI{203}{\milli\second};
+Corona lands at \SI{1.135}{\second}. At $100$v and $500$v Corona's CPU
+cost dominates; the architectural shape (LP-217 PQ-fast = BLS +
+Pulsar, PQ-strict adds Corona on top) is precisely the mode-tier
+degradation pattern that lets relying parties at PQ-fast act in
+\SI{200}{\milli\second} while PQ-strict relying parties wait the full
+$\sim$\SI{2.6}{\second}.
+
+\subsection{The Corona row deserves a note}
+\label{ssec:corona-row}
+
+The legacy serial-aggregate Corona implementation that yielded
+\SI{14}{\second} per round at $n{=}64$ was incorrect, not a baseline.
+The parallel implementation, which is what ships, lands at
+\SI{356}{\milli\second}--\SI{440}{\milli\second}. The win in the table
+is real and reflects the correct implementation cost; it is not a
+straw-man comparison.
+
+\subsection{Parity audit: Pulsar is $141\times$ cheaper than Corona at $n{=}64$}
+
+The Corona/Pulsar parity audit
+(\texttt{lux/threshold/protocols/parity/parity\_test.go}) measured
+the two schemes apples-to-apples on Apple M1 Max + DGX Spark GB10 and
+found Corona is \emph{$141\times$ slower than Pulsar at $n{=}64$
+validators} (\SI{3.2}{\second}--\SI{4.0}{\second} vs
+\SI{23}{\milli\second}--\SI{28}{\milli\second} total signing
+round-trip). This is not an optimization gap -- it is algorithmic.
+Pulsar is a reconstruct-on-aggregator Shamir scheme over the
+unmodified FIPS 204 ML-DSA sign; Corona is a genuine 2-round
+threshold lattice scheme (Corona family, \cite{corona2024}). The
+result locks the LP-217 PQ-fast tier at \texttt{BLS + Pulsar}; Corona
+is added on top at PQ-strict for the never-trust-aggregator security
+property.

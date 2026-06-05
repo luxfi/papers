@@ -1,0 +1,139 @@
+\section{Two Rollup Modes and Inherited Cert Mode}
+
+\subsection{Optimistic vs ZK}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{2cm}p{3cm}p{1.8cm}p{1.5cm}p{2cm}p{2.5cm}@{}}
+\toprule
+\textbf{Mode} & \textbf{Integrity model} & \textbf{Challenge tx} & \textbf{ZK proof} & \textbf{Withdrawal latency} & \textbf{Use case} \\
+\midrule
+\textbf{Optimistic} & Sequencer asserts; anyone may challenge during window & Required & Absent & $\geq$ challenge window ($\sim 7$ days) & High-throughput general-purpose rollups; gaming; social \\
+\textbf{ZK} & Each batch carries STARK / Groth16 proof of correct execution & Absent & Required & Immediate ($\sim$ one parent L1 block) & Custody-grade rollups; payment finality; cross-rollup composition \\
+\bottomrule
+\end{tabular}
+\caption{The two rollup modes share the same envelopes and same P3Q
+precompile verification path. The difference is the integrity
+witness.}
+\label{tab:rollup-modes}
+\end{table}
+
+Both modes share the same envelopes and the same P3Q precompile
+verification path. The difference is whether the integrity of the
+state transition is established by:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item (a) sequencer Pulsar-signed attestation plus
+  optimistic-challenge window, OR
+\item (b) sequencer Pulsar-signed attestation plus STARK /
+  Groth16 proof of correct execution.
+\end{itemize}
+
+The Pulsar-sig $+$ P3Q path is identical; the integrity witness
+differs.
+
+\subsection{Authenticity vs correctness}
+
+Sequencer-side Pulsar signing is REQUIRED; ZK proof is OPTIONAL.
+Every \texttt{RollupBatchTx} MUST carry a valid Pulsar threshold
+signature verified by P3Q. There is no path where a rollup batch
+skips P3Q verification.
+
+The ZK proof field is optional. If present, Z-Chain verifies it
+inline (Groth16 verify $\approx$ \SI{200000}{gas}, STARK verify
+$\approx$ \SI{500000}{gas} on a generic verifier). If absent, the
+batch is optimistic and subject to challenge.
+
+Rationale: the Pulsar signature is the \textbf{authenticity}
+witness (the sequencer attests to the batch). The ZK proof is the
+\textbf{correctness} witness (the batch was applied correctly).
+Authenticity is always required; correctness can be optimistic.
+
+\subsection{Inherited cert mode}
+
+Each rollup pins one field of the LP-217 \texttt{CertPolicy} struct
+at genesis: \texttt{CertPolicy.Mode}. Historically this LP referred
+to this field as \texttt{CertModeFloor}; semantically they are the
+same -- the minimum cert mode the parent L1 must be operating at
+for the rollup batch to be considered final. The other three
+\texttt{CertPolicy} fields (\texttt{Variant}, \texttt{TimeoutMs},
+\texttt{Fallback}) are inherited from the parent L1 by reference;
+Tier-3 is the only tier where a partial-\texttt{CertPolicy}
+declaration is valid (see LP-204 \S``Tier-3 -- L3 rollups on
+Z-Chain'').
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llp{6cm}@{}}
+\toprule
+\textbf{CertModeFloor} & \textbf{Mode} & \textbf{Required parent-L1 legs} \\
+\midrule
+\texttt{0x00} & PQ-off & BLS \\
+\texttt{0x01} & PQ-fast & BLS + Pulsar \\
+\texttt{0x02} & PQ-strict & BLS + Pulsar + Corona \\
+\texttt{0x03} & PQ-heavy & BLS + Corona + Pulsar + Magnetar \\
+\texttt{0x10} & strict-PQ-fast & Pulsar \\
+\texttt{0x11} & strict-PQ-strict & Pulsar + Corona \\
+\texttt{0x12} & strict-PQ-heavy & Corona + Pulsar + Magnetar \\
+\bottomrule
+\end{tabular}
+\caption{Per-rollup \texttt{CertModeFloor}.}
+\label{tab:cert-mode-floor}
+\end{table}
+
+A rollup cannot ENFORCE a stronger cert mode than its parent L1
+operates at. If parent L1 is at PQ-fast, the rollup cannot
+synthesize PQ-strict finality -- it would have to wait for legs
+the parent L1 never produces. A rollup that requires PQ-strict
+MUST deploy on a parent L1 operating at PQ-strict or higher.
+
+The rollup MAY pin its floor lower than the parent L1's mode and
+finalize earlier in the LP-202 tier-degradation timeline. A rollup
+with \texttt{CertModeFloor = PQ-fast} running on a PQ-strict
+parent L1 finalizes at the parent L1's PQ-fast preliminary tier
+($\sim$\SI{5}{\milli\second}), not the PQ-strict final tier
+($\sim$\SI{15}{\milli\second}).
+
+\subsection{Rollups SHOULD NOT run at PQ-off for value-bearing state}
+
+The protocol allows \texttt{CertModeFloor = PQ-off} (BLS only).
+This is the right choice for ephemeral or non-financial rollups:
+gaming session state, social-graph mutations, real-time bidding,
+telemetry.
+
+For \textbf{value-bearing state} -- money, securities, identity,
+custody -- the recommended floor is \textbf{PQ-strict} (BLS + Pulsar +
+Corona). This matches the floor recommended by LP-217 for
+``custody, treasury, regulated securities, store-of-value.''
+
+This LP does not introduce a protocol-level requirement that
+rollups hit PQ-strict. The parent L1's cert mode is the security
+ceiling; the rollup pins its floor anywhere up to that ceiling.
+Codifying a ``must be PQ-strict for tokens $> \$X$'' rule belongs
+in operator-policy, not in this LP.
+
+\subsection{Inheritance from parent L1}
+
+Per LP-204 ``Tier-3 rollups have NO own validator set,'' a rollup's
+security model IS the parent L1's security model.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{4cm}p{8cm}@{}}
+\toprule
+\textbf{Property} & \textbf{Source} \\
+\midrule
+Block finality cryptographic strength & Parent L1 QuasarCert under its LP-217 cert mode \\
+Sequencer payment gas token & Parent L1 native gas (Z-Chain settlement gas) \\
+Rollup state commit & Embedded in a parent L1 block (Z-Chain block on Lux primary) \\
+Tier degradation behavior & Parent L1 LP-202 tier degradation applies; rollup users see parent L1's degraded tier with no separate degradation \\
+Liveness & Bounded by parent L1 liveness; if Z-Chain stops, rollup stops; if rollup sequencer fails, parent L1 continues, rollup pauses \\
+Slashing & Sequencer slashable on \texttt{RollupChallengeTx} (optimistic) or on invalid Pulsar sig; slashing settles on parent L1 \\
+\bottomrule
+\end{tabular}
+\caption{Properties inherited from the parent L1.}
+\label{tab:inheritance}
+\end{table}
