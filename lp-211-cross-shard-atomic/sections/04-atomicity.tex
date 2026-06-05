@@ -1,0 +1,101 @@
+\section{Atomicity Proof Sketch}
+
+The atomicity claim: for any cross-shard tx group $T$, after the
+parent-L1 cert decisively covers either
+\texttt{CrossShardCommit}$(T.\textrm{id})$ or
+\texttt{CrossShardAbort}$(T.\textrm{id})$, every shard
+$s_j \in T$'s shards has either committed $T_j$ or unwound $T_j$,
+and these outcomes match.
+
+\subsection{Argument}
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item Each shard's LP-210 Phase~4 staging is local -- the staged
+  overlay exists only in the shard's runtime, content-addressed by
+  the per-shard wave cert.
+
+\item The shard's wave cert (Step 2 ack) commits the shard to
+  executing $T_j$ at the shard's per-wave finality. If the shard
+  later refuses to apply the staged overlay on Step 4
+  commit-notify, the shard is byzantine and slashable on the parent
+  L1 (Step 4 commit-notify is the cryptographic instruction;
+  refusal contradicts the shard's own wave cert).
+
+\item The parent-L1 cert is either commit or abort, never both --
+  wave ordering at the parent L1 is total (LP-209), so the
+  \texttt{CrossShardCommit}$(T.\textrm{id})$ or
+  \texttt{CrossShardAbort}$(T.\textrm{id})$ tx commits at exactly
+  one parent-L1 wave height with a single cert.
+
+\item Therefore: the parent-L1 cert is the unique decision oracle.
+  Every shard's local outcome is a deterministic function of the
+  parent-L1 cert (commit $\to$ apply staged overlay; abort $\to$
+  LP-202 unwind). A shard that diverges is byzantine and
+  slashable.
+\end{enumerate}
+
+\subsection{Eventually-cryptographic atomicity}
+
+The atomicity is \emph{eventually-cryptographic}: there is a
+transient window between Step 2 prepare and Step 4 commit during
+which a shard's staged overlay exists but is not yet committed.
+During that window, the shard's external API MUST NOT expose the
+staged state -- queries return pre-$T_j$ state. This is the
+standard 2PC invisibility property; LP-210's Phase-4 staging
+guarantees it by construction.
+
+\subsection{Monotonic cert-tier upgrade across shards}
+
+LP-202's ``Cert leg degradation tiers'' allows a QuasarCert to be
+observable at a lower mode than the chain's configured target, when
+slower legs fail to aggregate within the timeout. The cert is
+monotone: once a leg arrives, the cert is observable at the higher
+tier; legs never retract.
+
+\paragraph{Cross-shard interaction.} The parent-L1 cross-shard
+commit cert is observable at progressively higher modes as its legs
+arrive. A relying party (a shard executor watching for
+commit-notify) applies its \emph{own} cert-mode policy against the
+parent-L1 cert. The shard does not need to wait for the parent L1
+to reach the parent L1's configured target mode; it only needs to
+wait for its own configured mode.
+
+Worked example: parent L1 configured PQ-heavy, shards $A$ and $B$
+configured PQ-strict.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}rp{4cm}p{2.5cm}p{2cm}p{2cm}@{}}
+\toprule
+\textbf{$t$ (ms)} & \textbf{Event} & \textbf{Parent-L1 cert observable at} & \textbf{Shard $A$ acts?} & \textbf{Shard $B$ acts?} \\
+\midrule
+$0$ & Commit tx in parent-L1 wave & n/a & no & no \\
+$100$ & Parent-L1 BLS leg aggregates & PQ-off & no ($A$ wants $\geq$ PQ-strict) & no \\
+$105$ & Parent-L1 Corona leg aggregates & PQ-fast & no & no \\
+$110$ & Parent-L1 Pulsar leg aggregates & PQ-strict & \textbf{yes -- $A$ commits} & \textbf{yes -- $B$ commits} \\
+$155$ & Parent-L1 Magnetar leg aggregates & PQ-heavy & (already committed) & (already committed) \\
+\bottomrule
+\end{tabular}
+\caption{Monotonic cert-tier observability across shards.}
+\label{tab:mono}
+\end{table}
+
+The shards commit at PQ-strict observability (their configured
+mode), not at the parent L1's target PQ-heavy. The parent L1 still
+waits for Magnetar before finalizing at its target -- but the
+shards do not.
+
+\paragraph{Architectural decision.} Shards may commit early at
+their individual mode without waiting for the parent L1's target
+mode. This follows from LP-202's monotonic-upgrade invariant -- the
+parent-L1 cert is the same struct at every observation point; only
+the leg-set membership grows. A shard acting on an early
+observation cannot be wrong, because the cert at the lower mode is
+a strict subset of the cert at the higher mode.
+
+\textbf{The cross-shard 2PC commit point is the
+minimum-mode-observability of the parent-L1 cert across all
+participating shards}, not the parent L1's configured target.
+Latency is bounded by the slowest-configured shard, not by the
+parent L1's configured target.

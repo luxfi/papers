@@ -1,0 +1,184 @@
+\section{Architectural Decision: Dedicated Slot for STARK-FRI}
+\label{sec:architectural-decision}
+
+\subsection{The 2026-06-03 slot relocation}
+
+Pre-rename state: the Plonky3-fork STARK / FRI verifier lived at
+slot \texttt{0x012205} under the package name \texttt{p3q}. The
+package contained the line \emph{``P3Q strict-PQ STARK verifier''}
+and the magic-header tag \texttt{"P3Q1"} was threaded through every
+proof artifact (EasyCrypt, Lean, Jasmin, dudect).
+
+Per Hanzo Crypto Suite \S~5.2~\cite{hanzocrypto} and the roadmap
+\S~B.11, \textbf{P3Q canonically means ``Post-Quantum Pulsar
+Proof''}: the on-chain unified PQ \emph{threshold-signature}
+verifier dispatch (Pulsar~/ Corona~/ Magnetar). The STARK / FRI
+dispatch occupying slot \texttt{0x012205} under the same name was
+an aliasing error: STARK proof verification and PQ signature
+verification are two different primitives serving disjoint use
+cases.
+
+The 2026-06-03 decomplection makes this explicit by moving each
+concern to its own slot:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Surface} & \textbf{Pre-rename} & \textbf{Post-rename} & \textbf{Reason} \\
+\midrule
+Source path & \texttt{lux/precompile/p3q/} & \texttt{lux/precompile/starkfri/} & primitive name \\
+Slot & \texttt{0x012205} & \texttt{0x012220} & disjoint surface \\
+Go package & \texttt{package p3q} & \texttt{package starkfri} & value-typed naming \\
+Address symbol & \texttt{ContractP3QVerifyAddress} & \texttt{ContractStarkFRIVerifyAddress} & matches package \\
+Singleton type & \texttt{P3QVerifyPrecompile} & \texttt{StarkFRIVerifyPrecompile} & matches package \\
+Config key & \texttt{p3qVerify} & \texttt{starkfriVerify} & matches package \\
+Wire-bytes magic & \texttt{"P3Q1"} & \texttt{"P3Q1"} (preserved) & proof-artifact stability \\
+\bottomrule
+\end{tabular}
+\caption{Surfaces touched in the 2026-06-03 rename. Slot moves;
+package and symbol names follow the package; the wire-bytes magic
+header is preserved verbatim because every proof artifact references
+it.}
+\label{tab:rename-surfaces}
+\end{table}
+
+After the rename:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \texttt{0x012205} is LP-218's unified PQ \emph{signature}
+  verifier (P3Q-Pulsar~/ P3Q-Corona~/ P3Q-Magnetar -- kind-byte
+  dispatched per LP-220).
+\item \texttt{0x012220} is LP-221's STARK-FRI \emph{proof}
+  verifier (this LP).
+\end{itemize}
+
+The two slots are orthogonal. There is no aliasing, no overlap, no
+shared dispatch table. Both can be called from a single ZK-rollup
+batch validator and the two costs sum cleanly:
+$\sim$\num{50000} gas for Pulsar verify $+$ $\sim$\num{500000}
+gas for STARK verify $\approx$ \num{550000} gas per ZK-rollup
+batch at typical parameters.
+
+\subsection{Why \texttt{"P3Q1"} survives the rename}
+
+The 4-byte tag \texttt{"P3Q1"} is a \emph{wire-format byte string},
+not a name claim. Renaming it would invalidate the byte-identical
+proof artifacts (EasyCrypt theories at admit-budget $0\,/\,0$, Lean
+theorems, Jasmin source, dudect harness) that reference the header
+verbatim. A future v2 wire format MAY rename the magic to
+\texttt{"SFR1"} (STARK-FRI Rev~1) once the proof artifacts and the
+artifact-budget tracker (\texttt{scripts/checks/ec-admits.sh}) are
+refreshed in lockstep. Today, breaking proof-artifact byte equality
+for a cosmetic rename has no upside.
+
+This is the \emph{values, not places} discipline: the magic header
+is the value at the wire, not a label about which file it lives in;
+renaming the file does not rename the wire-bytes value, and the
+proof artifacts that reference the wire-bytes value stay byte-stable.
+
+\subsection{Lockstep updates across the codebase}
+
+The rename touched five downstream surfaces in the same atomic
+landing. These are recorded for self-containment; the normative
+surface remains the precompile package itself.
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \texttt{lux/geth/core/vm/lux\_precompiles.go} -- EVM wiring,
+  registry entry updated to
+  \texttt{starkfri.StarkFRIVerifyPrecompile} at \texttt{0x012220}.
+\item \texttt{lux/chains/evm/main.go} -- chain import shim.
+\item \texttt{lux/evm/precompile/registry/registry.go} --
+  precompile registry.
+\item \texttt{lux/crypto/p3q/ct/dudect/verify\_ct.go} -- dudect
+  harness; cross-tree rename to
+  \texttt{lux/crypto/starkfri/ct/dudect/} pending (see
+  \S~\ref{sec:constant-time}).
+\item LP-218~\S``Verifier reference'' -- inline reference to the
+  STARK-FRI precompile now points at \texttt{0x012220} rather than
+  the old \texttt{0x012205} co-location.
+\end{itemize}
+
+\subsection{Why a Plonky3 fork}
+
+The reference backend at \texttt{lux/p3q/crates/p3q-verifier} is a
+Plonky3~\cite{plonky3} fork. The fork strips:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item KZG polynomial commitments (require pairings, classical-only).
+\item BN254 / BLS12-381 elliptic-curve backends.
+\item All non-strict-PQ FRI configurations (e.g.\ small-field
+  Reed-Solomon parameter choices that don't meet the soundness
+  target of $\le 2^{-100}$ under the chosen blowup factor and query
+  count).
+\end{itemize}
+
+Plonky3 upstream is dual-tracked: a strict-PQ profile (cSHAKE256~/
+Goldilocks~/ FRI only) and a classical profile (KZG~/ Poseidon~/
+BN254). LP-221's fork pins the strict-PQ profile and removes the
+classical surface entirely. The two reasons:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{Audit surface.} An EVM precompile is a permanent
+  reservation in block validation. Every line of code reachable
+  from the precompile entry point is in the audit boundary. A
+  dual-tracked upstream with both classical and PQ surfaces
+  doubles the audit boundary without doubling the security
+  guarantee -- only the strict-PQ surface is reachable in
+  production.
+\item \textbf{Misuse resistance.} A future caller cannot
+  accidentally instantiate the classical surface by passing the
+  wrong configuration bytes; the classical surface does not exist
+  in the binary. The wire-format version byte
+  (\texttt{VersionV1=0x01}) selects \emph{which strict-PQ profile}
+  the verifier expects; it does not select between classical and
+  PQ.
+\end{enumerate}
+
+Tracking the Plonky3 upstream beyond this point is a
+\emph{rebase-and-re-strip} discipline: each upstream release the
+fork rebases, re-applies the strip patches, re-runs the EasyCrypt
+admit budget check, and re-tests against the proof corpus. The fork
+maintainer is one person on the cryptography team; the rebase is
+not a routine release-engineering concern.
+
+\subsection{What this is not}
+
+It is worth being explicit about two design decisions LP-221 does
+\emph{not} make:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{It is not a kind-byte-dispatched family.} Unlike
+  LP-218~/ LP-220 at slot \texttt{0x012205} where a single precompile
+  dispatches over $\{0x01, 0x02, 0x03\}$ to three signature
+  verifiers, LP-221 is a single-primitive precompile. The
+  \texttt{VersionV1=0x01} version byte exists so a future LP can
+  graft a v2 wire format (post-Plonky3-upstream-rotation or a
+  recursive variant) without re-allocating the slot, but the
+  version is not a primitive-family discriminator. The slot is
+  reserved for STARK-FRI; if a fundamentally different SNARK family
+  enters the Lux stack (a recursive HyperPlonk variant, say) it
+  lands at its own slot inside the reserved range
+  \texttt{0x012220..0x01222F}.
+\item \textbf{It is not a backwards-compatible upgrade of a prior
+  STARK precompile.} There is no pre-LP-221 STARK verifier
+  deployment in the wild. LP-0120's historical row at
+  \texttt{0x012205} for ``Plonky3 PQ-only STARK'' was a
+  pre-genesis placeholder that never reached any network. The
+  activation marker \texttt{2025-12-25T16:20:00-08:00} places the
+  LP-221 ABI at network genesis of the new final Lux network. The
+  pre-Quasar Edition Lux network (2020--2025) had no STARK-FRI
+  precompile; there is nothing to migrate, no shim, no replay
+  window.
+\end{enumerate}
+
+\subsection{Activation marker}
+
+\begin{verbatim}
+activates:      2025-12-25T16:20:00-08:00
+activates-unix: 1766708400
+\end{verbatim}
+
+The STARK-FRI precompile at slot \texttt{0x012220} is callable from
+the genesis block of the new final Lux network.

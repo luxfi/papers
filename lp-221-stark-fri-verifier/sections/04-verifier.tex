@@ -1,0 +1,182 @@
+\section{Verifier: Go Reference, Jasmin Table, EasyCrypt Budget}
+\label{sec:verifier}
+
+\subsection{The Go reference implementation}
+
+The reference implementation is single-source-of-truth at
+\texttt{lux/precompile/starkfri/}~\cite{starkfrirepo}.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{4.5cm}p{2cm}p{6.5cm}@{}}
+\toprule
+\textbf{Artifact} & \textbf{LOC} & \textbf{Purpose} \\
+\midrule
+\texttt{contract.go}         & 244 & \texttt{StarkFRIVerifyPrecompile} struct; \texttt{Run()} does parse, structural pre-filter, dispatch \\
+\texttt{module.go}           & 57  & \texttt{init()} registers \texttt{starkfriVerify} config key + slot \texttt{0x012220} \\
+\texttt{contract\_test.go}   & 156 & 8 unit tests (address pin, gas formula, structural rejection, version, registered verifier round trip, missing-verifier surfaces typed error, wrong-version, backend-rejection surfaces typed error) \\
+\texttt{contract\_e2e\_test.go} & $\sim$440 & 14 tests covering 64 round-trip dispatches, structural rejection before backend, backend-failure surfacing, gas monotonicity, gas uniformity, OOG short-circuit, round-trip parser; 5 Go fuzz targets + native \texttt{FuzzStarkFRI\_Dispatch} \\
+\bottomrule
+\end{tabular}
+\caption{Reference artifact inventory. Total Go source under
+\texttt{lux/precompile/starkfri/} is $\sim$\SI{900}{LOC}.}
+\label{tab:go-artifacts}
+\end{table}
+
+\subsubsection{Measured test result}
+
+\begin{lstlisting}[language={}]
+$ go test -race -count=1 -v ./...
+...
+PASS
+ok  github.com/luxfi/precompile/starkfri  1.376s
+\end{lstlisting}
+
+\textbf{22 tests pass under \texttt{go test -race -count=1 -v ./...}}
+at HEAD on \texttt{main} of \texttt{github.com/luxfi/precompile}.
+Measured 2026-06-04 on darwin/arm64; total wallclock
+\SI{1.376}{\second} including race detector. The race detector
+catches no data race; the structural-parsing path and the
+registered-verifier atomic load are concurrency-safe by construction.
+
+\subsubsection{Backend dispatch boundary}
+
+The Go layer is intentionally thin: $\sim$\SI{70}{LOC} of
+\texttt{Run()} body is structural parsing and pre-filter; the heavy
+lifting (FRI verify, cSHAKE256 Merkle openings, Goldilocks
+arithmetic) happens in the audited Rust verifier crate at
+\texttt{lux/p3q/crates/p3q-verifier}, reached through
+\texttt{RegisterVerifier} at node startup. The cgo bridge is out of
+scope of LP-221 (it is a node-build detail) and is gated by an
+external audit per the sign-off's GATE-4.
+
+The atomic-load pattern on the verifier function pointer means a
+node operator can hot-swap the backend without restarting the
+precompile (e.g., to roll out a verifier patch in a coordinated
+upgrade window); concurrent calls observe either the pre-swap or
+post-swap function value, never a torn read.
+
+\subsection{Jasmin reference and status-code table}
+
+The Jasmin reference at \texttt{lux/precompile/starkfri/jasmin/verify.jazz}
+(\SI{14.2}{\kilo\byte}) covers the structural pre-dispatch gate
+only: length checks, version byte, magic-header equality via the
+XOR-accumulator \texttt{ct\_check\_magic}. The FRI verify inner
+loop is delegated to the Rust verifier crate; Jasmin owns the
+boundary that EasyCrypt reasons about.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llp{6cm}@{}}
+\toprule
+\textbf{Status code} & \textbf{Symbol} & \textbf{Meaning} \\
+\midrule
+$0$  & \texttt{STARKFRI\_OK} & Structural gate passed; dispatch to backend \\
+$1$  & \texttt{STARKFRI\_ERR\_LENGTH}  & \texttt{len(input) < MinInputLength}, or internal length fields overrun \\
+$2$  & \texttt{STARKFRI\_ERR\_VERSION} & \texttt{version != 0x01} \\
+$3$  & \texttt{STARKFRI\_ERR\_MAGIC}   & \texttt{proof[0:4] != "P3Q1"} (XOR-accumulator zero check) \\
+$4$  & \texttt{STARKFRI\_ERR\_NO\_VERIFIER} & no backend registered at call time \\
+\bottomrule
+\end{tabular}
+\caption{Jasmin status codes returned by the structural gate. The
+Go layer maps these into Go error sentinels per
+Table~\ref{tab:return-contract} in
+Section~\ref{sec:specification}.}
+\label{tab:jasmin-status}
+\end{table}
+
+\subsubsection{CT annotation}
+
+The CT annotation in the Jasmin source is:
+
+\begin{lstlisting}[language={}]
+#[ct = "public * public * public * public -> public"]
+\end{lstlisting}
+
+All four arguments and the return value are tagged \texttt{public}.
+This is consistent with the threat model: STARK proofs and their
+public inputs are non-secret by construction. The CT annotation is
+load-bearing for soundness rather than confidentiality (see
+Section~\ref{sec:constant-time}).
+
+\subsection{EasyCrypt admit budget: 0~/~0}
+
+The EasyCrypt theory under
+\texttt{lux/precompile/starkfri/proofs/easycrypt/} comprises four
+files and is pinned at admit budget $0\,/\,0$:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llrr@{}}
+\toprule
+\textbf{File} & \textbf{Subject} & \textbf{Admits used} & \textbf{Admits budgeted} \\
+\midrule
+\texttt{P3Q\_Verifier.ec}     & accept-iff-backend-accept bridge & 0 & 0 \\
+\texttt{P3Q\_Gas\_Model.ec}   & \texttt{oog\_dominates} lemma     & 0 & 0 \\
+\texttt{P3Q\_CT.ec}           & CT obligation $\Rightarrow$ \texttt{backend\_ct} axiom & 0 & 0 \\
+\texttt{P3Q\_Magic\_Header.ec} & magic-header equality reduces to byte-string equality & 0 & 0 \\
+\midrule
+\textbf{Total} & & \textbf{0} & \textbf{0} \\
+\bottomrule
+\end{tabular}
+\caption{EasyCrypt admit budget. Pinned at
+\texttt{scripts/checks/ec-admits.sh} which counts the literal token
+\texttt{admit} across all theory files and fails CI on any
+non-zero result.}
+\label{tab:ec-admits}
+\end{table}
+
+The budget is enforced by a per-push CI check; any new \texttt{admit}
+token in any of the four files breaks the build. The
+zero-admit budget means every theorem in the theory either
+discharges to a Lean / EasyCrypt primitive, to a backend axiom
+explicitly named in the theory, or to a structural-Jasmin
+correspondence claim.
+
+The key theorem is \texttt{accept\_iff\_backend\_accept} in
+\texttt{P3Q\_Verifier.ec}:
+
+\begin{quote}
+\emph{For every input \texttt{calldata}, every gas-in
+\texttt{gas\_in $\ge$ RequiredGas(calldata)}, and every registered
+backend \texttt{B}: the precompile returns
+$(\texttt{output}, \_, \texttt{nil})$ on calldata if and only if the
+backend $B$ accepts $(\texttt{version=0x01}, \texttt{proof}, \texttt{pub})$
+extracted from \texttt{calldata} per the wire-format parse.}
+\end{quote}
+
+The theorem reduces precompile soundness to backend soundness; the
+backend's soundness is the standard STARK / FRI knowledge soundness
+under the random-oracle model.
+
+\subsection{Sign-off gates}
+
+The internal cryptographer sign-off
+(\texttt{CRYPTOGRAPHER-SIGN-OFF.md} in the precompile package)
+verdict is \textbf{APPROVED WITH GATES}. The four gates are:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{GATE-1.} EasyCrypt admit budget pinned at $0\,/\,0$ in
+  CI (\textbf{closed}; \texttt{scripts/checks/ec-admits.sh} enforces
+  on every push).
+\item \textbf{GATE-2.} Jasmin file passes \texttt{jasminc -checkCT}
+  on every push (\textbf{closed}; integrated into
+  \texttt{scripts/check-high-assurance.sh}).
+\item \textbf{GATE-3.} Submission-grade dudect run
+  ($10^9$~samples per stage on the structural pre-filter)
+  (\textbf{open}; harness builds clean, smoke runs at
+  $10^4$~samples per push are \emph{weak assertions, not
+  measurements}; the production-grade run is gated on hardware
+  scheduling).
+\item \textbf{GATE-4.} External audit of the Rust verifier crate at
+  \texttt{lux/p3q/crates/p3q-verifier} (\textbf{open}; audit
+  procurement in progress).
+\end{enumerate}
+
+LP-221 ships with GATE-1 and GATE-2 closed. GATE-3 and GATE-4 are
+prerequisites for moving LP-221 from Draft to Final; the slot
+allocation and ABI are stable across the Draft$\to$Final
+transition, only the assurance posture changes.

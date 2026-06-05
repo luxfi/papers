@@ -1,0 +1,192 @@
+\section{Honest Gaps}
+\label{sec:gaps}
+
+GPU-native verify is the LP-203 architecture. The matrix bench on
+2026-06-04 demonstrated that the architecture is not yet
+end-to-end exercised on the production hot path. This section
+inventories exactly what is not measured, why, and what closes
+each gap.
+
+\subsection{The matrix bench's GPU-utilization observation}
+
+The Quasar 4-scheme matrix bench \cite{matrixbench} ran for two
+hours on Spark on 2026-06-04 and captured \num{4595} samples of
+\texttt{nvidia-smi dmon} during the run. The aggregate
+observation: mean \texttt{SM\%} = \SI{11.9}{\percent}.
+
+\textbf{The GPU was not exercised by any path in this bench.}
+Every cert mode (PQ-off, PQ-fast, PQ-strict, PQ-heavy) and every
+$N{=}\{4,8,16,32,64\}$ ran on CPU. The bench's measured
+wall-clock numbers (PQ-strict at \SI{595}{\milli\second}
+$N{=}64$, see LP-217 \cite{lp217}) are CPU numbers. The GPU was
+idle (or running background work) for the entire run.
+
+This is not a benchmarking error. It is an honest reflection of
+where the production code stops dispatching to GPU today.
+
+\subsection{Boundary gap A: \texttt{lux-lattice.pc} missing on Spark}
+
+The first boundary gap is at the cgo / pkg-config layer. The
+CUDA target's dependency chain requires \texttt{lux-lattice.pc}
+to be findable by \texttt{find\_package(MLX REQUIRED)} in the
+CMake build of \texttt{lattice/v7/gpu}. On Spark today,
+\texttt{lux-lattice.pc} is not installed; the
+\texttt{find\_package(MLX REQUIRED)} call fails; the
+\texttt{lattice/v7/gpu} target does not build under
+\texttt{-tags "cgo gpu"}.
+
+\paragraph{Consequence.} Even if a caller-side path tried to
+dispatch lattice ops to the GPU, the CUDA backend's lattice path
+is missing from the binary. The caller falls through to the CPU
+fallback. The mean \texttt{SM\%} of \SI{11.9}{\percent} is the
+direct expected consequence.
+
+\paragraph{Close-out.} Install \texttt{lux-lattice.pc} on Spark
+(packaged from \texttt{lux-private/lattice/v7/pkgconfig}). Once
+the package is present, \texttt{find\_package(MLX REQUIRED)}
+resolves and the lattice GPU target builds. No code change
+required on either side.
+
+\subsection{Boundary gap B: Magnetar \texttt{lux\_slhdsa\_*}
+entry points not exposed}
+
+The second boundary gap is at the C API surface. The Magnetar
+SLH-DSA \cite{lp181,fips205} CUDA kernel exists on Spark and
+passes the FIPS 205 KAT vectors when called directly. But the
+\texttt{lux\_slhdsa\_*} entry points are not exposed in
+\texttt{lux/accel/c\_api.h}. \texttt{luxfi/accel} has no symbol
+to dispatch to; the dispatcher falls back to CPU.
+
+\paragraph{Consequence.} Magnetar verify in the PQ-heavy and
+strict-PQ-heavy modes runs on CPU even when the GPU has a
+working kernel. SLH-DSA-192s per-validator sign on Spark CPU is
+$\sim$\SI{795}{\milli\second}; the GPU kernel would be
+substantially faster if dispatched, but the C API surface
+prevents dispatch.
+
+\paragraph{Close-out.} Add \texttt{lux\_slhdsa\_keygen},
+\texttt{lux\_slhdsa\_sign}, \texttt{lux\_slhdsa\_verify} to
+\texttt{c\_api.h}; wire them into
+\texttt{luxfi/accel/ops\_lattice.go} \cite{accelmod}. The kernels
+on the other side of the ABI are already there.
+
+\subsection{Composite signature-verify wrappers as stubs}
+
+The CUDA plugin in
+\texttt{lux-private/gpu-kernels/backends/cuda/src/plugin.cpp}
+exposes 76 vtbl ops. The honest split:
+
+\paragraph{Real GPU code with measured throughput.}
+\begin{itemize}[leftmargin=2em,nosep]
+\item BLS12-381 EIP-2537: G1 add, G1 MSM, G2 add, G2 MSM,
+  pairing, hash-to-curve
+\item BN254: G1 ops, pairing-check
+\item keccak256, sha3\_256, blake3
+\item modexp
+\item Magnetar SLH-DSA primitives: \texttt{wotsplus\_chain},
+  \texttt{fors\_subtree}, \texttt{xmss\_subtree},
+  \texttt{hmsg\_prfmsg}
+\item Corona partial-sign step
+\end{itemize}
+
+\paragraph{Explicit \texttt{LUX\_BACKEND\_ERROR\_NOT\_SUPPORTED}
+stubs (16 of 76 ops).}
+\begin{itemize}[leftmargin=2em,nosep]
+\item Direct-verify entries for signature schemes: Ed25519,
+  sr25519, ML-DSA, SLH-DSA composite, ML-KEM
+\item Projective-coords BLS / BN254 ops (the EIP-2537 path is
+  the canonical surface; projective coords are absent)
+\end{itemize}
+
+\paragraph{The composite signature-verify wrappers are the gap
+to close before LP-203 numbers turn fully empirical.} The
+primitives (pairings, NTT, hashing, Magnetar 4) are real and
+measured; the wrappers that compose them into a single
+``verify this signature'' call return \texttt{NOT\_SUPPORTED}.
+
+\subsection{What the LP-203 markdown projects vs. what the
+bench measured}
+
+The LP-203 markdown's throughput tables include both
+``measured'' and ``estimated'' columns. The 2026-06-04 bench
+forces a reassessment of one specific number:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{4.4cm}rrp{2.6cm}@{}}
+\toprule
+\textbf{Operation} & \textbf{LP-203 est.}
+  & \textbf{GB10 meas.} & \textbf{Delta} \\
+\midrule
+BLS verify, $N{=}1$, H100 FP64-roofline
+  estimate & \SI{0.5}{\micro\second}
+  & \SI{19}{\micro\second}
+  & $\sim 38\times$ slower than roofline \\
+BLS verify, 1000-sig batch, H100 estimate
+  & \SI{0.5}{\milli\second}
+  & $\sim$\SI{20}{\milli\second}
+  & $\sim 40\times$ slower than roofline \\
+\bottomrule
+\end{tabular}
+\caption{Measured GB10 BLS pairing cost is approximately
+$40\times$ the LP-203 H100 FP64 roofline projection. The
+measurement is the Miller-loop-plus-final-exp cost on real
+sm\_120 silicon, not arithmetic intensity over peak FLOPS. The
+GB10 number is the correct figure for downstream LP
+performance budgets; the H100 roofline projection should be
+re-derived against the measured GB10 number, not used directly.}
+\label{tab:projection-delta}
+\end{table}
+
+\subsection{What is NOT yet measured}
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Pulsar / Magnetar composite verify GPU
+  throughput.} The kernels exist; the composite-verify wrappers
+  are stubs. Until the wrappers ship, the production hot path
+  for ML-DSA and SLH-DSA verify runs on CPU. The matrix bench's
+  mean \texttt{SM\%} of \SI{11.9}{\percent} is the empirical
+  consequence.
+\item \textbf{GPU dispatch on Spark blocked by
+  \texttt{lux-lattice.pc} absence.} Until the package is
+  installed, no lattice GPU code is in the binary; the CPU
+  fallback path is the only path.
+\item \textbf{CXL 3.0 racks.} The LP-203 markdown does not
+  reference CXL 3.0, but a sibling LP-205 will -- the bench
+  cluster does not yet include CXL 3.0 hosts, so cross-socket
+  UMA semantics under CXL are not measured.
+\item \textbf{End-to-end block finality measurements on the
+  full LP-200 stack with GPU dispatch.} The matrix bench
+  measured Quasar at the threshold-cert layer; full pipeline
+  numbers (NIC ingest $\to$ verify $\to$ Merkle $\to$ ZapDB
+  commit) await the wrapper close-out.
+\end{itemize}
+
+\subsection{What this means for downstream LPs}
+
+LP-217 \cite{lp217} (cert profile modes), LP-218 \cite{lp218}
+(P3Q rollups), LP-205 (pipelined Quasar): every paper that
+cites a GPU latency for ML-DSA or SLH-DSA verify is citing a
+\emph{projection}, not a measurement. The papers tag those
+cells ``projected, not measured'' for that reason. LP-217's
+matrix-bench measurements are CPU wall-clock at $N{=}64$ on
+Spark, not GPU. LP-218's P3Q verify cost of
+\SI{50}{\micro\second} on Blackwell is a projection.
+
+This is not a problem with the LPs. The LPs are honest about
+what is measured and what is projected. It is a problem with
+the dispatch surface, which two small CL changes
+(\texttt{lux-lattice.pc} install plus
+\texttt{lux\_slhdsa\_*} C API exposure) close.
+
+\subsection{Pulsar's per-validator sign measurement}
+
+One CPU measurement worth recording, because it sets the
+GPU-target ceiling: Pulsar per-validator sign on Spark CPU is
+\SI{175}{\micro\second} \cite{paritytest}. The GPU target for
+the Pulsar sign kernel (when it lands behind a working
+composite-verify wrapper) should beat that number. Pulsar's
+algorithm \cite{lp073} is Shamir-on-GF($257$) plus one FIPS 204
+sign \cite{fips204} on the aggregator; the FIPS 204 sign is the
+work to GPU-accelerate.

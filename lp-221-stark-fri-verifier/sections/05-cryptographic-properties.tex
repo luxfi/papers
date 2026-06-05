@@ -1,0 +1,192 @@
+\section{Cryptographic Properties}
+\label{sec:cryptographic-properties}
+
+\subsection{Threat model}
+
+The verifier operates in the following threat model:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Adversary capability.} Probabilistic polynomial-time
+  Turing machine. PQ adversary is a polynomial-time quantum Turing
+  machine; the verifier's PQ claim is against this stronger
+  adversary class.
+\item \textbf{Adversary access.} The adversary chooses calldata
+  (proof bytes and public inputs) and submits it to a node's EVM.
+  The adversary observes the precompile's return tuple but not the
+  validator's internal state.
+\item \textbf{Honest verifier.} The validator runs the unmodified
+  precompile + backend; we assume no fault injection on the
+  validator side.
+\item \textbf{Random oracle for cSHAKE256.} cSHAKE256 is modeled as
+  a random oracle in the security reduction. This is the standard
+  assumption for FRI's Fiat-Shamir compilation; the modeled
+  primitive is the cSHAKE256 customizable XOF as standardized in
+  FIPS-202 / SP-800-185.
+\end{itemize}
+
+There are \emph{no secret keys} on the verifier side. STARK proofs
+authenticate public statements; the verifier's secrets-side surface
+is empty. The CT discussion in Section~\ref{sec:constant-time}
+therefore concerns soundness leakage (which validation stage
+rejected) rather than confidentiality leakage (no confidentiality
+to leak).
+
+\subsection{Soundness}
+
+\subsubsection{Knowledge soundness}
+
+Under the random-oracle model for cSHAKE256, FRI is a knowledge-sound
+interactive oracle proof~\cite{frieprint,starkeprint}. Knowledge
+soundness extracts a witness from any prover that convinces the
+verifier with probability above the soundness error.
+
+Concretely, for the strict-PQ Plonky3-fork configuration used by the
+audited backend crate, the knowledge-soundness statement is:
+
+\begin{quote}
+\emph{There exists a polynomial-time extractor $E^{P}$ such that for
+every PPT prover $P$ that wins the FRI knowledge-soundness game with
+probability $\epsilon$, the extractor outputs a witness for the
+underlying R1CS / Plonkish instance with probability
+$\ge \epsilon - 2^{-100}$.}
+\end{quote}
+
+The $2^{-100}$ figure is the \emph{soundness error}, derived from
+the FRI parameter set: query count $q$, blowup factor $\rho$,
+folding factor $f$, and field size $|\mathbb{F}|$. The Plonky3-fork
+parameter set is documented in
+\texttt{lux/p3q/crates/p3q-verifier/src/params.rs}; LP-221 pins
+the verifier-conformance, not the prover parameter schedule (the
+prover may choose stronger parameters but cannot choose weaker
+ones, because the verifier hard-codes its expected schedule).
+
+\subsubsection{Soundness error}
+
+Per the parameter schedule used by the audited backend crate, the
+soundness error is $\le 2^{-100}$ in the random-oracle model. This
+is the conventional STARK target~\cite{starkeprint}: it bounds the
+probability that a cheating prover convinces the verifier of a
+false statement.
+
+\subsubsection{Completeness}
+
+Honest prover, honest verifier: the verifier accepts with
+probability~$1$. There is no statistical-zero-knowledge slack at
+the verify side; the prover may have ZK slack (depending on whether
+the Plonky3-fork hiding mode is enabled), but the verifier's
+acceptance probability on an honestly-generated proof is exactly~$1$.
+
+\subsubsection{Public-coin / Fiat-Shamir}
+
+FRI is public-coin~\cite{frieprint}; the Fiat-Shamir transform
+with cSHAKE256 as the random oracle compiles it to a
+non-interactive argument. The transcript hashing
+domain-separates rounds; cSHAKE256's customization string carries
+the per-round domain tag.
+
+\subsection{Post-quantum assumption}
+
+The single cryptographic assumption is \textbf{collision resistance
+of cSHAKE256}, modeled as a random oracle in the Fiat-Shamir
+reduction. There is no discrete-log, no pairing, no factoring, no
+LWE, no SVP, no SIDH-style isogeny assumption.
+
+cSHAKE256~\cite{fips202,sp800185} inherits the SHA-3 / Keccak-$f[1600]$
+design. The conjectured security strength is:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llr@{}}
+\toprule
+\textbf{Adversary} & \textbf{Best attack} & \textbf{Conjectured cost} \\
+\midrule
+Classical & generic preimage / collision (birthday) & $\ge 2^{256}$ preimage; $\ge 2^{128}$ collision \\
+Quantum   & Grover preimage; BHT collision           & $\ge 2^{128}$ preimage; $\ge 2^{85}$ collision \\
+\bottomrule
+\end{tabular}
+\caption{cSHAKE256 security strength against classical and quantum
+adversaries at the 256-bit output length. Adequate for
+$\le 2^{-100}$ soundness error at the FRI parameter choices the
+backend uses; the soundness reduction is loose by $\sim$$30$~bits
+of margin against the Grover-bounded quantum attacker, which is
+the standard PQ-STARK safety budget.}
+\label{tab:cshake-strength}
+\end{table}
+
+\subsubsection{Why not BLAKE3 or Poseidon}
+
+LP-221 picks cSHAKE256 over alternatives for three reasons:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{Standardization.} cSHAKE256 is FIPS-202~/
+  SP-800-185~\cite{fips202,sp800185}. NIST standardization gates
+  conformance test vectors, third-party crypto-library
+  implementations, and audit checklists. BLAKE3 is widely deployed
+  but not FIPS-standardized; Poseidon is SNARK-friendly but its
+  collision-resistance under standard-model assumptions is the
+  subject of ongoing analysis.
+\item \textbf{Customization string.} cSHAKE256's customization
+  string ($S$ parameter) is purpose-built for domain separation
+  between protocol contexts. The Plonky3-fork uses per-round
+  customization strings to bind Fiat-Shamir transcripts;
+  reusing the same primitive with different $S$ values is
+  cleaner than concatenating tag-prefixes onto a non-customizable
+  hash function.
+\item \textbf{Audit surface uniformity.} The Quasar stack uses
+  Keccak-$f[1600]$ as the hash primitive at multiple layers
+  (cSHAKE256 here, SLH-DSA inside Magnetar~\cite{fips205}, EVM
+  KECCAK256 at the precompile boundary). Co-locating the hash
+  primitive reduces the audit surface and amortizes the
+  side-channel hardening across multiple protocol layers.
+\end{enumerate}
+
+\subsection{Domain separation}
+
+The on-chain wire format carries a fixed leading
+\texttt{MagicHeader = "P3Q1"} that ties the precompile to the
+strict-PQ Plonky3 fork. Within the proof bytes, the Plonky3-fork
+verifier applies its own domain separation via cSHAKE256
+customization strings on each Fiat-Shamir round; that domain
+separation is internal to the backend crate and is out of scope of
+LP-221's wire-format contract.
+
+The two-layer domain separation (wire-bytes magic header at the
+EVM boundary $+$ Fiat-Shamir customization inside the backend) is
+deliberate. The EVM boundary's magic header is a coarse
+type-discriminator: it answers ``is this a STARK-FRI strict-PQ v1
+proof or something else.'' The backend's customization strings are
+fine-grained: they answer ``which round of which proof is this
+hash invocation for.'' Conflating the two is an anti-pattern
+(``omit the magic header because the backend will catch it later'')
+because it shifts a cheap, structural check into an expensive,
+cryptographic one.
+
+\subsection{What is NOT claimed}
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Zero-knowledge.} The Plonky3-fork verifier as deployed
+  does NOT carry a zero-knowledge property at the LP-221 boundary.
+  Public inputs (\texttt{prev\_root}, \texttt{new\_root},
+  \texttt{batch\_hash}) are explicitly public. A future LP can
+  graft a ZK-extension by activating Plonky3's hiding commitment
+  mode and bumping the version byte. Today, LP-221 verifies
+  computational integrity, not zero-knowledge proof-of-knowledge.
+\item \textbf{Universal setup.} Not applicable; FRI is transparent
+  (no trusted setup of any kind). The Plonky3 fork inherits this
+  property; LP-221 does not introduce any setup-requiring
+  component.
+\item \textbf{Recursion.} The Plonky3-fork verifier as exposed at
+  LP-221 does not recurse over itself on-chain; recursion happens
+  off-chain in the prover and surfaces to the EVM as a single
+  STARK proof. A future recursive variant would land at a separate
+  version byte (and likely separate magic header) under the same
+  slot.
+\item \textbf{Quantitative GPU verify performance.} LP-221 does NOT
+  claim measured GPU throughput. The CPU verify cost of
+  \SIrange{5}{10}{\milli\second} on a modern x86\_64 core is the
+  measured number; the projected $\sim$\SI{50}{\micro\second} per
+  verify on Blackwell sm\_120 is a projection from LP-203 kernel
+  micro-benchmarks~\cite{lp203}, not a measurement. The gas
+  schedule is sized to the CPU-class cost.
+\end{itemize}

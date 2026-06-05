@@ -1,0 +1,238 @@
+\section{Composition With Sibling LPs}
+\label{sec:composition}
+
+LP-203 is one of seven LPs in the ZAP-stack umbrella
+(LP-200--LP-218). The composition is orthogonal: each LP solves
+one concern, and they stack at well-defined seams.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lp{9.5cm}@{}}
+\toprule
+\textbf{LP} & \textbf{Composition with LP-203} \\
+\midrule
+LP-022 & ZAP wire protocol. The buffer LP-203's GPU kernels
+  read \cite{lp022}. \\
+LP-077 & Round digest binding. The TupleHash256 transcript
+  that feeds the GPU Merkle compute \cite{lp077}. \\
+LP-132 & Quasar GPU execution adapter. The consensus-side hook
+  this LP wires up \cite{lp132}. \\
+LP-177 & Bridge PQ-only profile. Requires GPU on validators
+  per the strict-PQ architectural decision \cite{lp177}. \\
+LP-181 & Magnetar threshold SLH-DSA. CPU/GPU hybrid verify;
+  this LP specs the crossover threshold \cite{lp181}. \\
+LP-200 & ZAP Stack umbrella; the no-codec wire guarantee the
+  GPU kernels rely on \cite{lp200}. \\
+LP-201 & ZAP P2P / transport selector. DPDK and GPUDirect are
+  ingest mechanisms underneath whichever transport
+  \texttt{Pick()} chose for the peer \cite{lp201}. \\
+LP-202 & ZAP pipelining and atomic unwind. The verify pipeline
+  width LP-203's GPU kernels saturate \cite{lp202}. \\
+LP-205 & Pipelined Quasar. The throughput model parameterized
+  by GPU dispatch and mode \cite{lp205}. \\
+LP-217 & Cert profile modes. Per-leg GPU dispatch lets the
+  four modes share kernels \cite{lp217}. \\
+LP-218 & ZAP P3Q PQ-rollup. P3Q precompile at EVM slot
+  \texttt{0x012205}; runs on the same Pulsar-verify GPU path
+  this LP specifies \cite{lp218,hanzocrypto}. \\
+\bottomrule
+\end{tabular}
+\caption{Composition of LP-203 with sibling LPs.}
+\label{tab:composition}
+\end{table}
+
+\subsection{LP-201 transport selector: orthogonal to LP-203}
+
+LP-201 defines a peer-to-transport selector \cite{lp201}. The
+default is QUIC; LP-207 RDMA-IB is selectable for high-throughput
+racks. LP-203's DPDK and GPUDirect contributions sit
+\emph{underneath} the transport: they change how UDP packets
+reach the process (kernel-bypass plus NIC DMA into UMA), not how
+peers map to transports.
+
+\paragraph{Composition contract.} DPDK and GPUDirect do not
+register against \texttt{Transport.Pick()}. A GPUDirect-capable
+NIC DMAs packets into UMA regardless of which transport
+\texttt{Pick()} chose for the peer. The QUIC transport on a
+DPDK + GPUDirect host gets its UDP packets via the
+DPDK PMD; the LP-207 RDMA-IB transport on the same host gets
+its frames via the GPUDirect MR. Both end up in the same UMA
+buffer that the verify kernel reads.
+
+\subsection{LP-205 pipelined Quasar: GPU dispatch is the
+saturation source}
+
+LP-205 \cite{lp205} parameterizes Quasar's verify pipeline
+width by the underlying kernel throughput. With LP-203's
+measured BLS verify at \SI{49197}~pairings/sec sustained on
+a single GB10, a 4-validator host can run a 4-way pipeline
+where each stage saturates a different GPU primitive:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item Stage 1: NIC ingest (DPDK or GPUDirect) -- bytes land
+  in UMA
+\item Stage 2: BLS pairing verify (GPU) -- the load-bearing
+  measured kernel
+\item Stage 3: Corona/Corona aggregate (GPU; once
+  \texttt{lux-lattice.pc} ships) -- per-validator parallel
+\item Stage 4: Merkle root reduction (GPU sha3-256 chain)
+  -- $\log_2(N)$ kernel-launch chain
+\end{itemize}
+
+The stages share nothing except UMA pointers. Each stage's
+output is a UMA address; the next stage reads from that
+address. No \texttt{cudaMemcpy} between stages.
+
+\subsection{LP-217 cert profile modes: GPU dispatch per leg}
+
+LP-217 \cite{lp217} defines the operator-facing 4-mode
+cert ladder: PQ-off (BLS), PQ-fast (BLS + Pulsar), PQ-strict
+(BLS + Pulsar + Corona), PQ-heavy (BLS + Pulsar + Corona +
+Magnetar). Each leg is verified by an independent GPU dispatch:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item BLS leg: \texttt{cuda\_op\_bls12\_381\_pairing\_eip2537}
+  (\SI{19}{\micro\second} per pair sustained, measured)
+\item Pulsar leg: the FIPS 204 verify wrapper (projected
+  \SI{50}{\micro\second}--\SI{100}{\micro\second} per cert
+  once the composite wrapper lands)
+\item Corona leg: NTT batch on GPU + combine (Corona combine
+  measured at \SI{0.082}{\micro\second} per share)
+\item Magnetar leg: SLH-DSA 192f composite verify (projected
+  $\sim$\SI{2}{\milli\second} at $N{=}64$ once the wrapper
+  lands)
+\end{itemize}
+
+The four legs dispatch in parallel CUDA streams. A final CPU
+step reads four boolean results from UMA and computes the
+QuasarCert verdict. The PQ-strict round budget is set so the
+slowest leg (Corona) determines the wall-clock; the other
+three legs overlap.
+
+\paragraph{Strict-PQ-* requires GPU.} The architectural
+decision from LP-203 stands: strict-PQ-* modes drop the BLS
+leg and the survivable-CPU path \emph{disappears}. Corona
+aggregate over 64 validators takes
+$\sim$\SI{350}{\milli\second} on CPU; the strict-PQ round
+budget is tighter than that. The Lux Operator
+(\texttt{luxfi/operator}) refuses to admit a validator to a
+strict-PQ-enabled chain unless the validator's
+\texttt{gpu.enabled} is true and the boot-time GPU probe
+succeeds.
+
+\subsection{LP-218 P3Q precompile at slot \texttt{0x012205}}
+
+LP-218 \cite{lp218,hanzocrypto} specifies a single EVM
+precompile that verifies a Pulsar threshold signature against a
+group public key. The precompile runs on whichever backend
+\texttt{luxfi/accel} is built against -- on a Blackwell-class
+validator, P3Q dispatches to the Pulsar GPU verify wrapper
+(projected; behind the composite-verify wrapper landing).
+
+\paragraph{Gas cost contract.} P3Q gas cost is dimensioned for
+worst-case CPU verify, not for GPU dispatch. Operators pay the
+same gas whether the validator runs P3Q on CPU or GPU; the
+incentive to deploy GPU validators is that the validator's
+own wall-clock budget tightens. This decoupling preserves the
+gas-cost spec's portability across hardware classes.
+
+\subsection{Composition diagram}
+
+\begin{verbatim}
++-----------------------------+    LP-200 (one byte stream)
+|  ZAP buffer (UMA-backed)    |<-- LP-022 wire format
+|  cudaMallocManaged          |    LP-077 round digest binds
+|  shared across CPU + GPU    |
++-----------------------------+
+            |
+            | DPDK ingress  (LP-201 underneath, not on top of selector)
+            | GPUDirect RDMA (same)
+            v
++-----------------------------+
+|  GPU verify kernels         |<-- LP-132 Quasar hook
+|  (luxfi/accel, ABI v12)     |    LP-181 Magnetar SLH-DSA
+|  - BLS12-381 EIP-2537       |    LP-205 pipelined Quasar
+|  - keccak256 / sha3 / b3    |    LP-217 4-mode dispatch
+|  - Pulsar / Corona NTT      |    LP-218 P3Q precompile
++-----------------------------+
+            |
+            | UMA fence
+            v
++-----------------------------+
+|  Consensus verdict          |
+|  + Merkle root              |
+|  + ZapDB commit             |
++-----------------------------+
+\end{verbatim}
+
+\section{Activation Marker}
+
+\begin{verbatim}
+activates:      2025-12-25T16:20:00-08:00
+activates-unix: 1766708400
+\end{verbatim}
+
+GPU-native verify is the architecture from genesis of the new
+final Lux network. No backwards compatibility with the pre-Quasar
+Edition CPU-only verify path. The pre-Quasar network
+(\num{2020}--\num{2025}) is a separate network out of scope.
+
+\section{Backwards Compatibility}
+
+None. The pre-Quasar Edition Lux network had no GPU-native
+verify path. CPU verify remains as the fallback within
+LP-203's profile (per \texttt{luxfi/accel} dispatcher) for
+hosts without a GPU; in the strict-PQ-* modes, CPU fallback
+is explicitly not survivable.
+
+\section{Security Considerations}
+
+\paragraph{No new cryptographic primitives.} LP-203 specifies
+dispatch and zero-copy wire-up. The cryptographic primitives
+verified (BLS12-381 EIP-2537, Ed25519, secp256k1, ML-DSA,
+SLH-DSA, Corona / Corona) are unchanged from their FIPS or
+EIP specifications \cite{fips203,fips204,fips205,eip2537}.
+
+\paragraph{GPU-side fault model.} GPU kernels run with
+warp-level data parallelism. A faulty kernel implementation
+that returns ``verify OK'' on a bad signature would break the
+verify guarantee. The dispatcher's per-kernel timeout plus
+CPU fallback provides a fault-tolerant degrade path; the
+kernel KAT vectors (FIPS test vectors per scheme) catch
+implementation faults at boot time.
+
+\paragraph{UMA security model.} \texttt{cudaMallocManaged}
+memory is in the same address space as host memory; a kernel
+that exceeds its bounds writes into host pages. The kernels
+do not malloc; they only read from caller-supplied UMA
+pointers. The host-side bounds check is on
+\texttt{accel.BatchVerify*}'s parameter validation.
+
+\paragraph{Side-channel surface.} GPU verify times are
+data-dependent in principle (Miller loop, NTT, SHA). The
+production hot path uses constant-time CPU implementations on
+fallback. GPU implementations follow the same constant-time
+discipline; KAT-vector tests cross-check.
+
+\section{Future Work}
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Composite signature-verify wrappers.} Close the
+  16-of-76 stub gap in \texttt{plugin.cpp}. Once landed, every
+  cell in \S\ref{sec:projections} becomes measurable.
+\item \textbf{\texttt{lux-lattice.pc} install on Spark.}
+  Unblocks lattice GPU dispatch.
+\item \textbf{LP-204 GPU-shared resource scheduling.} One GPU
+  per validator host serving multiple chain-VMs' verify
+  queues fairly.
+\item \textbf{LP-205 FHE GPU runtime.} Wires \texttt{luxfi/fhe}
+  and \texttt{accel/ops\_fhe.go} into the consensus hot path
+  for encrypted votes.
+\item \textbf{LP-206 TEE attestation for GPU verify.}
+  H100 / GB10 SEV-SNP attestation of the GPU verify kernels so
+  GPU-computed Merkle roots and verdicts carry a remote-
+  attestation receipt.
+\item \textbf{CXL 3.0 racks.} Add cross-socket UMA semantics to
+  the bench when CXL 3.0 hosts land in the bench cluster.
+\end{itemize}

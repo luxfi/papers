@@ -1,0 +1,104 @@
+\section{Garbage Collection and Throughput Targets}
+
+The DAG grows continuously. Without GC, validator memory and DHT
+storage would grow without bound.
+
+\subsection{Header GC}
+
+A header at height $H$ is eligible for GC when:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item The consumer (LP-209) has total-ordered the DAG past height
+  $H$, AND
+\item The cert (LP-217 mode) covering all transactions hashed in the
+  header has finalized.
+\end{itemize}
+
+Eligible headers are removed from the active DAG window. Their
+content-hashes remain valid forever (anyone who archives a header
+can still reference it), but live validators no longer hold them in
+memory. Validator local storage of GC'd headers falls to ``cold''
+-- moved to long-term archival storage; no longer indexed for active
+parent-pointer resolution.
+
+\paragraph{Default window.} $2 \times \textrm{cert\_timeout\_ms}$
+worth of headers, plus the maximum LP-209 ordering-delay window.
+Concrete reference: at $K{=}$\SI{50}{\milli\second}, LP-217
+PQ-strict mode (cert $\sim$\SI{15}{\milli\second}), LP-209 Mysticeti
+(ordering delay $\sim 3$ rounds) -- active window is
+$5 \times $\SI{50}{\milli\second} $=$ \SI{250}{\milli\second} of
+headers $=$ $5$ headers per validator $=$ $320$ headers in a
+$64$-validator chain. Trivial memory.
+
+\subsection{Body GC}
+
+Bodies in the DHT (LP-201 layer~C) age out per the LP-201 TTL rule:
+default \SI{24}{\hour} with refresh-on-access. Bodies for headers
+that have been GC'd at all live validators are still served by
+archival nodes until the TTL expires.
+
+Bodies for headers still in the active DAG window are pinned (LP-201
+content-pinning) so they cannot be evicted from the DHT.
+
+\subsection{Restart / catch-up}
+
+A validator that restarts re-fetches the active DAG window from
+peers. Each peer serves its own freshest headers via the
+unidirectional DAGHeader stream; the restarted validator stitches
+the parent-pointers to reconstruct the DAG. Bodies are re-fetched
+from the DHT as needed.
+
+Catch-up latency: bounded by
+$\textrm{active\_window\_size} \times \textrm{network\_RTT}$. For the
+reference $320$-header window over a \SI{100}{\milli\second} RTT,
+catch-up is $\sim 32$ seconds -- fast enough for routine validator
+restart.
+
+\subsection{Throughput targets}
+
+The DAG mempool's per-validator emission rate sets the per-chain
+throughput ceiling at the admission layer. Reference targets:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}rrr@{}}
+\toprule
+\textbf{Per-validator emit rate} & \textbf{64-validator chain} & \textbf{256-validator chain} \\
+\midrule
+\SI{10}{\kilo tx-hashes/s} & \SI{640}{\kilo tx/s} & \SI{2.56}{\mega tx/s} \\
+\SI{50}{\kilo tx-hashes/s} & \SI{3.2}{\mega tx/s} & \SI{12.8}{\mega tx/s} \\
+\SI{100}{\kilo tx-hashes/s} & \SI{6.4}{\mega tx/s} & \SI{25.6}{\mega tx/s} \\
+\SI{1}{\mega tx-hashes/s} & \SI{64}{\mega tx/s} & \SI{256}{\mega tx/s} \\
+\bottomrule
+\end{tabular}
+\caption{Per-validator emission rate $\times$ validator count $=$
+chain-wide admission rate. \textbf{Projected.}}
+\label{tab:throughput}
+\end{table}
+
+The per-validator emit rate is bounded by:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{GPU verify} (LP-203). BLS leg-sig verify on Blackwell
+  at $\sim$\SI{500}{\micro\second} aggregate per $N{=}64$; $\sim 2000$
+  sig verifies/sec at full precision. For tx sig verify (per-tx, not
+  per-header), GPU bench is $\sim$\SI{1}{\mega verifies/s} on
+  Blackwell -- the per-validator emit rate at this hardware class is
+  $\sim$\SI{1}{\mega tx-hashes/s}.
+\item \textbf{DHT body write throughput} (LP-201). Bounded by
+  replication factor $k{=}20$ and network bandwidth. At
+  $\sim$\SI{1}{\kilo\byte} per tx and \SI{1}{\mega tx/s} emit, body
+  throughput is $\sim$\SI{1}{\gibi\byte/\second} into the DHT per
+  validator -- within Blackwell-class NIC bandwidth
+  (\SI{200}{\giga\bit/\second} $\approx$
+  \SI{25}{\gibi\byte/\second}).
+\item \textbf{Mempool admission} (per-validator local). Bounded by
+  tx-sig verify rate on the local GPU and Block-STM speculator
+  throughput. Both scale with GPU class.
+\end{itemize}
+
+\paragraph{Honest reading.} The numbers above are projected from the
+LP-203 measured bench rows extrapolated to the DAG emission model.
+Measured DAG-mempool throughput will land in the LP-203 addendum
+once the implementation tag ships.

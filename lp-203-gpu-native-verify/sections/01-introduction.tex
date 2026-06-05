@@ -1,0 +1,128 @@
+\section{Introduction}
+
+This paper expands on LP-203
+(\texttt{lps/LP-203-gpu-native-verify.md}) with the first round of
+\emph{measured} numbers from NVIDIA GB10 Grace Blackwell sm\_120
+(DGX Spark, 2026-06-04), an architecture description that names
+the on-disk implementations, an honest inventory of the gaps the
+matrix bench exposed, and the composition contract with sibling
+LPs. The activation marker is fixed:
+
+\begin{verbatim}
+activates:      2025-12-25T16:20:00-08:00
+activates-unix: 1766708400
+\end{verbatim}
+
+GPU-native verify is in force from the genesis block of the new
+final Lux network. The pre-Quasar Edition Lux network
+(\num{2020}--\num{2025}) ran CPU-only verify and is a separate
+network out of scope.
+
+\subsection{Why GPU-native, not GPU-accelerated}
+
+The distinction is load-bearing. A GPU-accelerated design treats
+the GPU as an optimization: kernels are bolted onto a CPU-first
+verify path; the wire emits a DTO; the DTO is marshaled into a
+GPU-readable buffer; the kernel runs; the result is copied back.
+Every step is a CPU-side serialization decision. The boundary
+between ``the wire'' and ``the kernel'' is mediated by the CPU.
+
+The Lux ZAP Stack \cite{lp200} rejects that boundary. The ZAP
+buffer is one byte stream from NIC RAM to ZapDB. It is allocated
+in unified memory (CUDA \texttt{cudaMallocManaged}, Metal
+\texttt{MTLBuffer} with \texttt{storageModeShared}) so that both
+CPU and GPU see the same backing memory \cite{cudaumat}. There is
+no DTO between the network buffer and the GPU verify kernel; the
+kernel reads the bytes the NIC delivered.
+
+The implication for throughput is direct: the GPU is on the
+critical path of every verify, not a side car. Eight years of
+``marshal between CPU and GPU'' disappears because there is no
+marshal: there is one buffer in UMA, and both processors share it.
+
+\subsection{What was wrong before}
+
+A CPU-first verify path has three concrete failures on a
+1000-transaction block with mixed signature schemes:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{Serial signature verify dominates the block budget.}
+  At BLS12-381 verify $\sim$\SI{1.2}{\milli\second} per signature
+  on a CPU core, a 1000-tx block of BLS-signed transactions takes
+  \SI{1.2}{\second} serial -- five orders of magnitude longer
+  than the per-tx state-machine application work.
+\item \textbf{CPU/GPU memcpy dominates the GPU verify path.} If
+  GPU acceleration is added \emph{around} a CPU-first wire, every
+  block pays \texttt{cudaMemcpy} round-trips in both directions
+  (host-to-device and device-to-host). On a Grace Blackwell host
+  with PCIe-shared NIC ingest, the copy can cost more than the
+  verify itself.
+\item \textbf{Strict-PQ profile has no survivable CPU path.} The
+  PQ-strict cert mode (LP-217) requires Pulsar plus Corona in
+  the cert. The Corona parity audit \cite{paritytest} measured
+  Corona per-host CPU at \SI{4.0}{\second} for $N{=}64$. The
+  PQ-strict round budget is tighter than that; a validator on
+  CPU fallback on a PQ-strict chain cannot keep up.
+\end{enumerate}
+
+\subsection{What this LP solves}
+
+LP-203 makes GPU verify the default and the wire-up between the
+ZAP buffer and the kernel zero-copy. Three concrete contracts:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{UMA is the verify substrate.} The ZAP buffer is
+  allocated in unified memory; the verify kernel reads it
+  directly. There is no DTO and no copy.
+\item \textbf{Transport selector composes orthogonally.} LP-201's
+  transport selector decides peer-to-transport mapping (QUIC by
+  default; LP-207 RDMA-IB for high-throughput racks). DPDK and
+  GPUDirect are NIC-ingest mechanisms underneath the transport,
+  not transport choices. A GPUDirect-capable NIC DMAs packet
+  bytes into UMA whichever transport the selector picked.
+\item \textbf{Composite verify wrappers gate the production
+  hot path.} The CUDA plugin in
+  \texttt{\textasciitilde/work/lux-private/gpu-kernels} exposes
+  76 vtbl ops. The pairing, hash, Magnetar-primitive, and Corona
+  partial-sign ops are real GPU code with measured throughput
+  (\S\ref{sec:measured}). The \emph{composite} signature-verify
+  wrappers (Ed25519, sr25519, ML-DSA, SLH-DSA composite verify)
+  are explicit \texttt{LUX\_BACKEND\_ERROR\_NOT\_SUPPORTED}
+  stubs. Closing those stubs is the gap to close before LP-203's
+  throughput tables turn fully empirical (\S\ref{sec:gaps}).
+\end{enumerate}
+
+\subsection{What this paper adds beyond the LP markdown}
+
+The LP markdown frames the architecture and the throughput
+targets; this paper does three things on top of it:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{First measured numbers on GB10.}
+  \S\ref{sec:measured} renders the measurements from the
+  2026-06-04 bench run on Spark across three real GPU kernels:
+  BLS12-381 EIP-2537 pairing, keccak256, and sha3\_256.
+  BLS12-381 EIP-2537 pairing sustains \SI{19}{\micro\second} per
+  pair at $N{=}256$ ($\sim$\num{49197}~pairings/sec at
+  \SI{20}{\watt}, $\sim$\num{12300}~pairings/watt). Keccak256
+  sustains \SI{11.38}{\mega\hertz} at $N{=}4096$.
+\item \textbf{Honest gaps.} \S\ref{sec:gaps} names exactly which
+  kernels are real GPU paths and which are stubs. The matrix
+  bench captured \num{4595} samples of \texttt{nvidia-smi dmon}
+  during a 2-hour run on Spark and observed mean SM\% of
+  \SI{11.9}{\percent}: \emph{the GPU was not exercised by any
+  path in that bench}. Two boundary gaps explain why
+  (\texttt{lux-lattice.pc} not installed on Spark; Magnetar
+  \texttt{lux\_slhdsa\_*} entry points not exposed in
+  \texttt{c\_api.h}).
+\item \textbf{Projections separated from measurements.}
+  \S\ref{sec:projections} lists the projected numbers (Pulsar
+  per-sig \SI{50}{\micro\second}, Magnetar composite verify on
+  GPU at $N\geq 32$, PQ-strict end-to-end at \SI{10}{\milli\second})
+  with every cell tagged \emph{projected, not measured}.
+\end{itemize}
+
+The paper closes (\S\ref{sec:composition}) by tying LP-203 into
+LP-201 (transport selector), LP-205 (pipelined Quasar), LP-217
+(cert profile modes), and LP-218 (P3Q precompile at slot
+\texttt{0x012205}).

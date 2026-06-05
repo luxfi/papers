@@ -1,0 +1,76 @@
+\section{Introduction}
+
+This paper expands on LP-211
+(\texttt{lps/LP-211-cross-shard-atomic.md}) with the five new wire
+schemas, the atomicity proof sketch, the load-bearing composition
+with LP-202's monotonic cert-tier upgrade, and the latency
+projections at LAN/WAN $\times$ PQ-strict/PQ-heavy.
+
+\subsection{What was wrong before}
+
+LP-204 organizes state into Tier-2 chain-VMs running on a parent L1.
+Each chain-VM has its own LP-208 mempool, LP-209 wave ordering, and
+LP-210 Block-STM executor. Per-shard finality is independent: each
+shard publishes its own QuasarCert per wave.
+
+For a transaction group whose state touches multiple chain-VMs, this
+shard-independence is a correctness problem. If shard $A$'s wave
+commits but shard $B$'s wave aborts, the cross-shard transaction is
+half-applied: $A$'s state has moved, $B$'s has not. The protocol
+needs cross-shard atomicity.
+
+\subsection{What this LP solves}
+
+Cross-shard 2PC via a parent-L1 QuasarCert. A coordinator (one of
+the parent L1's validators, selected deterministically per cross-shard
+tx group) dispatches per-shard portions to shard executors, collects
+prepare-acks (LP-210 Phase-4 staged-prepare), and when all shards
+have prepared, submits a cross-shard commit transaction to the
+parent L1. The parent L1's next wave (LP-209) includes that commit
+tx; the wave's LP-217 cert is the cross-shard cert. Once the parent
+L1's cert finalizes, every shard's prepared overlay is committed
+atomically.
+
+If any shard refuses to prepare, the coordinator submits a
+cross-shard abort transaction instead; every prepared shard unwinds
+its staged overlay via LP-202 \texttt{txn.Discard()}. ALL shards
+commit OR NONE.
+
+\subsection{Why Polaris cert, not a sidechain mechanism}
+
+A naive cross-shard atomicity mechanism uses a sidechain or a relay
+validator set. LP-211 instead uses the \emph{parent L1's existing
+QuasarCert} as the atomic-commit anchor. The parent L1 already has a
+validator set; LP-204's chain-VMs inherit the parent's security
+automatically. The parent L1's cert at LP-217's chosen mode is the
+strongest cryptographic statement available on the network -- using
+it for cross-shard commit means cross-shard finality is exactly as
+strong as the parent L1's finality at that mode.
+
+No new validator set. No new bridge contract. No new dispute window.
+The cert that the parent L1 already publishes per wave serves as
+the cross-shard commit anchor. The shards prepare; the parent L1
+commits; the cert covers the commit.
+
+This is the canonical pattern from LP-204 ``Cross-VM atomic memory''
+elevated to a wave-scale formal protocol.
+
+\subsection{Latency and throughput dividends}
+
+\paragraph{Latency.} Per-shard waves continue at the LP-209 cadence
+($\sim$\SI{100}{\milli\second} LAN under the projected GPU-accelerated
+cert; $\sim$\SI{711}{\milli\second} on the measured CPU-only cert
+per the 2026-06-04 quasar-matrix-bench Spark $N{=}64$ PQ-strict
+row, \texttt{/tmp/quasar-results-spark.txt}). The cross-shard cert
+adds one parent-L1 wave plus the LP-217 cert mode timing
+($\sim$\SI{5}{\milli\second} at PQ-strict projected GPU;
+$\sim$\SI{595}{\milli\second} measured CPU). Total cross-shard
+latency: $\sim$\SI{260}{\milli\second} (projected GPU) or
+$\sim$\SI{1326}{\milli\second} (measured CPU) at LAN scale at
+PQ-strict.
+
+\paragraph{Throughput.} Each shard's waves run independently except
+for the cross-shard txs, which by construction are a minority of the
+workload (in Liquidity-style traffic: $\sim 5\%$). The $95\%$
+intra-shard waves commit at the LP-210 single-shard rate; the $5\%$
+cross-shard waves pay the 2PC tax.

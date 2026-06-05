@@ -1,0 +1,217 @@
+\section{Specification: Wire Format, Gas, ABI}
+\label{sec:specification}
+
+\subsection{Slot and config key}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Attribute} & \textbf{Value} \\
+\midrule
+EVM precompile address & \texttt{0x0000000000000000000000000000000000012220} \\
+Go address symbol & \texttt{ContractStarkFRIVerifyAddress} \\
+Chain-config key & \texttt{starkfriVerify} \\
+Go package & \texttt{starkfri} \\
+Reference path & \texttt{lux/precompile/starkfri/} \\
+\bottomrule
+\end{tabular}
+\caption{Slot and registration identifiers. The slot pin in
+LP-300~\cite{lp300} is normative; this table is informative.}
+\label{tab:slot-id}
+\end{table}
+
+The chain-config key \texttt{starkfriVerify} is the unique key under
+which the upgrade-config block is keyed in the node's chain
+configuration JSON. The reference implementation registers under
+this key in \texttt{module.go} via the standard precompile
+registration init function.
+
+\subsection{Wire format}
+
+Single-call interface; no Solidity function selector. The wire bytes
+are:
+
+\begin{lstlisting}[language={}]
+[ 1 byte  ] version            -- 0x01 (VersionV1)
+[ 4 bytes ] proof_len           -- big-endian uint32
+[ proof_len bytes ] proof       -- must begin with MagicHeader "P3Q1"
+[ 4 bytes ] pub_len             -- big-endian uint32
+[ pub_len bytes ] public_inputs
+\end{lstlisting}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Field} & \textbf{Size} & \textbf{Encoding} & \textbf{Constraint} \\
+\midrule
+\texttt{version}        & 1 byte  & raw byte       & MUST equal \texttt{0x01} \\
+\texttt{proof\_len}     & 4 bytes & big-endian \texttt{uint32} & MUST equal length of \texttt{proof} \\
+\texttt{proof}          & variable & opaque bytes   & First 4 bytes MUST equal \texttt{"P3Q1"} \\
+\texttt{pub\_len}       & 4 bytes & big-endian \texttt{uint32} & MUST equal length of \texttt{public\_inputs} \\
+\texttt{public\_inputs} & variable & opaque bytes   & format dictated by circuit \\
+\bottomrule
+\end{tabular}
+\caption{Wire-format field table. Big-endian for length fields
+matches Ethereum-mainnet conventions and the LP-218 P3Q ABI.}
+\label{tab:wire-fields}
+\end{table}
+
+\subsubsection{Minimum input length}
+
+\begin{equation*}
+\texttt{MinInputLength} = 1 + 4 + 4 + 4 = 13 \text{ bytes}
+\end{equation*}
+
+The thirteen bytes decompose as: 1 version byte $+$ 4 proof-length
+bytes $+$ 4 magic-header bytes (which live inside the
+\texttt{proof} blob but are structurally required) $+$ 4
+public-input-length bytes. Calls shorter than \SI{13}{\byte} are
+rejected with \texttt{ErrInvalidInputLength}.
+
+The Jasmin reference verifier checks
+\texttt{len(input) >= MinInputLength} as the first gate, before the
+version byte or magic-header check. This ordering is intentional:
+length checks are cheaper than byte-string equality on the magic
+header, and the dudect harness measures the dispatch path under all
+three rejection modes (short, wrong-version, wrong-magic) to
+empirically confirm timing uniformity.
+
+\subsubsection{Magic header}
+
+The 4-byte tag \texttt{MagicHeader = "P3Q1"} is preserved verbatim
+from the pre-rename era so EasyCrypt~/ Lean~/ Jasmin~/ dudect proof
+artifacts remain byte-identical against on-chain calldata. The
+header is a \emph{wire-bytes tag, not a name claim}; renaming would
+invalidate the proof artifacts. A future v2 wire format may rename
+it to \texttt{"SFR1"} once the proof artifacts are refreshed and
+the artifact-budget tracker (\texttt{scripts/checks/ec-admits.sh})
+is updated in lockstep. This is documented at
+\texttt{contract.go:46-52} in the reference implementation.
+
+\subsubsection{Version byte}
+
+Only \texttt{VersionV1 = 0x01} is accepted today. Versions
+\texttt{0x00} or $\ge \texttt{0x02}$ are rejected with
+\texttt{ErrInvalidVersion}. The version byte exists so a future LP
+can graft a v2 wire format (post-Plonky3-upstream-rotation or a
+recursive variant) without re-allocating the slot.
+
+\subsection{Gas schedule}
+
+\begin{equation*}
+\texttt{RequiredGas}(\texttt{input}) = \texttt{BaseVerifyGas} + |\texttt{input}| \cdot \texttt{PerByteGas}
+                                       = 200{,}000 + |\texttt{input}| \cdot 10
+\end{equation*}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Constant} & \textbf{Value} & \textbf{Units} \\
+\midrule
+\texttt{BaseVerifyGas} & \num{200000} & gas \\
+\texttt{PerByteGas}    & \num{10}     & gas / byte \\
+\bottomrule
+\end{tabular}
+\caption{Gas constants per \texttt{contract.go:107-110}.}
+\label{tab:gas-constants}
+\end{table}
+
+The \num{200000} base reflects FRI verify cost being
+\emph{logarithmic in circuit size}: on-chain we only see the
+serialized proof, so we charge a flat base plus per-byte for
+bandwidth and decode. At a typical \SI{30}{\kilo\byte} proof, total
+gas is $200{,}000 + 30{,}000 \cdot 10 = 500{,}000$ gas per verify --
+$\sim$$24$~verifies per \num{12000000}-gas C-Chain block.
+
+\subsubsection{Upfront gas billing}
+
+Gas is charged upfront before any structural validation or backend
+dispatch (\texttt{contract.go:194-198}). The
+\texttt{oog\_dominates} EasyCrypt lemma
+(\texttt{proofs/easycrypt/P3Q\_Gas\_Model.ec}) pins this:
+out-of-gas wins against every other failure mode. The lemma's
+statement is informally ``for every input and every
+\texttt{gas\_in} value, if
+\texttt{gas\_in < RequiredGas(input)} then the precompile's return
+tuple is $(\texttt{nil}, 0, \texttt{ErrOutOfGas})$ regardless of any
+other field's contents.''
+
+This matters for soundness because it forecloses a gas-side channel:
+a caller cannot probe which validation stage rejected the input by
+arranging \texttt{gas\_in} to be just-below the per-stage threshold,
+because there are no per-stage thresholds. There is one threshold,
+charged upfront, and either it is met (in which case validation
+runs) or it is not (in which case the call short-circuits with
+\texttt{ErrOutOfGas} before any byte of the input is parsed).
+
+\subsection{Return contract}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{6.5cm}p{6.5cm}@{}}
+\toprule
+\textbf{Outcome} & \textbf{Return} \\
+\midrule
+Verified & $(\texttt{nil}, \texttt{gasLeft}, \texttt{nil})$ \\
+Insufficient gas & $(\texttt{nil}, 0, \texttt{contract.ErrOutOfGas})$ \\
+Input shorter than \texttt{MinInputLength}, or internal length fields exceed remaining bytes & $(\texttt{nil}, \texttt{gasLeft}, \texttt{ErrInvalidInputLength})$ \\
+\texttt{version != 0x01} & $(\texttt{nil}, \texttt{gasLeft}, \texttt{ErrInvalidVersion})$ \\
+\texttt{proof[0:4] != "P3Q1"} & $(\texttt{nil}, \texttt{gasLeft}, \texttt{ErrInvalidProof})$ \\
+No verifier registered via \texttt{RegisterVerifier} & $(\texttt{nil}, \texttt{gasLeft}, \texttt{ErrVerifierNotRegistered})$ \\
+Backend returned \texttt{(false, nil)} & $(\texttt{nil}, \texttt{gasLeft}, \texttt{ErrInvalidProof})$ \\
+Backend returned \texttt{(\_, err)} for \texttt{err != nil} & $(\texttt{nil}, \texttt{gasLeft}, \texttt{err})$ -- backend internal failure surfaces verbatim \\
+\bottomrule
+\end{tabular}
+\caption{Return-tuple contract by outcome. Per
+\texttt{contract.go:113-118}, error sentinels are exported package
+symbols so Solidity callers (via revert-data decoding) and Go
+callers can pattern-match on them.}
+\label{tab:return-contract}
+\end{table}
+
+This contract differs from the LP-218 \texttt{abiFalse}-on-failure
+convention because LP-221 reports \emph{structural} failures via
+Go error returns. A Solidity caller will see the precompile call
+revert on any structural mismatch (length, version, magic) and on
+backend verification failure; success returns empty output (the
+proof either verifies or it doesn't, and the caller's contract
+treats the absence of revert as success).
+
+The \texttt{ErrInvalidProof} sentinel is overloaded to cover both
+\emph{wire-format} bad-magic and \emph{cryptographic} backend
+rejection. A future LP may split these into two sentinels
+(\texttt{ErrBadMagic} vs \texttt{ErrBackendReject}); today they
+share the same revert-data path because the caller's response is
+identical (reject the batch). Splitting them is a UX improvement,
+not a soundness improvement; it lands behind the version-byte gate
+when the wire format bumps.
+
+\subsection{Cross-reference to the registry}
+
+LP-300~\S``Post-quantum precompile registry'' is the master pin for
+slot \texttt{0x012220}. The pre-LP-221 row in LP-300 read:
+
+\begin{quote}
+\texttt{0x012220 -- LP-218 -- Placeholder for displaced
+Plonky3-fork STARK -- pending dedicated LP allocation.}
+\end{quote}
+
+LP-221 closes the placeholder. LP-300's row should be amended on
+its next revision to:
+
+\begin{quote}
+\texttt{0x012220 -- LP-221 -- STARK-FRI -- Plonky3-fork FRI~/
+cSHAKE256~/ Goldilocks STARK verifier; magic header "P3Q1"
+preserved verbatim for proof-artifact stability -- Draft --
+2026-06-04.}
+\end{quote}
+
+LP-300 is normative; LP-221 is the dedicated LP that LP-300's
+placeholder row was waiting on.

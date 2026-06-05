@@ -39,6 +39,10 @@ Auto-generated catalogue of research papers — regenerated 2026-05-18.
 | `lp-102-encrypted-sqlite-replication` | `lp-102-encrypted-sqlite-replication/lp-102-encrypted-sqlite-replication.tex` | ✓ |
 | `lp-103-omnichain-explorer` | `lp-103-omnichain-explorer/lp-103-omnichain-explorer.tex` | ✓ |
 | `lp-137-gpu-crypto-stack` | `lp-137-gpu-crypto-stack/lp-137-gpu-crypto-stack.tex` | ✓ |
+| `lp-203-gpu-native-verify` | `lp-203-gpu-native-verify/lp-203-gpu-native-verify.tex` | ✓ |
+| `lp-220-p3q-corona-magnetar` | `lp-220-p3q-corona-magnetar/lp-220-p3q-corona-magnetar.tex` | ✓ |
+| `lp-221-stark-fri-verifier` | `lp-221-stark-fri-verifier/lp-221-stark-fri-verifier.tex` | ✓ |
+| `lp-300-schema-registry` | `lp-300-schema-registry/lp-300-schema-registry.tex` | ✓ |
 | `lp-305-quantum-secure-assets` | `lp-305-quantum-secure-assets/lp-305-quantum-secure-assets.tex` | ✓ |
 | `lp-306-lx-social-dex` | `lp-306-lx-social-dex/lp-306-lx-social-dex.tex` | ✓ |
 | `lp-307-quantum-consensus-protocol` | `lp-307-quantum-consensus-protocol/lp-307-quantum-consensus-protocol.tex` | ✓ |

@@ -1,0 +1,185 @@
+\section{Corona Kind ($\textnormal{kind} = 0x02$)}
+\label{sec:corona-kind}
+
+\subsection{Slot and ABI}
+
+\texttt{0x012205} with leading \texttt{kind=0x02}. Same physical
+precompile address as Pulsar (kind $0x01$) and Magnetar
+(kind $0x03$); dispatch resolves to the Corona
+\texttt{P3QVerifier} implementation.
+
+\begin{lstlisting}[language={}]
+// EVM precompile at slot 0x012205, kind = 0x02
+bool ok = P3Q.verify(
+    0x02,                        // Corona kind
+    coronaSig,                   // serialized Corona threshold sig
+    messageHash,                 // H(prev_root || new_root || batch_hash)
+    groupPubKey                  // Corona group public key
+);
+\end{lstlisting}
+
+\subsection{Underlying scheme}
+
+Corona is the Lux deployment of the Corona two-round
+lattice threshold signature scheme~\cite{corona2024}. Hardness
+reduces to Ring-LWE in dimension $n = 1024$, modulus $q
+\approx 2^{40}$, and the standard Corona two-round
+distributed signing protocol.
+
+Corona's signature is \emph{not} byte-equal to any NIST standard.
+ML-DSA (FIPS-204) is the Module-LWE relative; Corona is the
+Ring-LWE relative; they share the broader lattice family but
+sit on different rings with different polynomial commitment
+structures. A Ring-LWE break does not imply a Module-LWE break
+and vice-versa; this is the cross-family-independence property
+the cross-family-maximum posture relies on.
+
+\subsection{Wire format}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}rrl@{}}
+\toprule
+\textbf{Offset} & \textbf{Size} & \textbf{Field} \\
+\midrule
+0 & 1 & \texttt{kind = 0x02} \\
+1 & 1 & \texttt{mode = 0x01} (reserved Corona parameter set) \\
+2 & 4 & \texttt{sigLen} (BE32) \\
+6 & \texttt{sigLen} & \texttt{coronaSig} (\textasciitilde\SI{33052}{B}) \\
+$6{+}\textit{sigLen}$ & 4 & \texttt{pkLen} (BE32) \\
+$10{+}\textit{sigLen}$ & \texttt{pkLen} & \texttt{groupPubKey} \\
+$10{+}\textit{sigLen}{+}\textit{pkLen}$ & 32 & \texttt{messageHash} \\
+\bottomrule
+\end{tabular}
+\caption{Corona-kind wire format. Sig size is the dominant cost
+($\sim\SI{33}{KB}$); the rest mirrors the Pulsar layout to keep
+parsing uniform across kinds.}
+\label{tab:corona-wire}
+\end{table}
+
+The mode byte is reserved at \texttt{0x01}; future Corona
+parameter set additions (a higher-security Ring-LWE variant) get
+new mode bytes without changing the wire-format skeleton.
+
+\subsection{Verifier core}
+
+The Go reference implementation is planned at
+\texttt{lux/standard/precompiles/p3q\_family/corona.go} and
+will wrap \texttt{luxfi/corona/sign.Verify}. The core is bespoke
+-- not FIPS-204 byte-equal -- because Corona is a separate
+Ring-LWE construction, not a NIST standard.
+
+Status as of 2026-06-04: the verifier core is not yet wired into
+the P3Q dispatch table. The reference \texttt{p3q.Run} routes
+\texttt{kind=0x02} to \texttt{abiFalse} via the
+\texttt{ErrKindNotImplemented} path:
+
+\begin{lstlisting}[language={}]
+case KindCorona, KindMagnetar:
+    // Reserved kinds -- verifier not yet wired. Return abiFalse
+    // ...
+    return abiFalse(), remaining, nil
+\end{lstlisting}
+
+Solidity callers MAY emit \texttt{P3Q.verify(0x02, ...)} from
+network genesis; the call charges the per-kind gas (see below)
+and returns \texttt{false} until the verifier lands. This is the
+LP-218 ``no revert on cryptographic failure'' contract:
+\texttt{false} on the return word is the universal signal for
+``not verified for any reason,'' and reserved-but-not-wired
+joins ``malformed input'' and ``FIPS reject'' under that
+umbrella.
+
+\subsection{Gas cost}
+
+\textbf{\SI{5000000}{gas}} -- $\sim$$100\times$ the Pulsar
+kind's \SI{50000}{}. Returned by the Corona
+\texttt{P3QVerifier.GasCost()} entry. Why the disparity?
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{CPU verify cost is heavier.} The Corona verifier
+  requires NTT inverse over the Ring-LWE ring + polynomial
+  multiplication mod $q$ with the larger Ring-LWE coefficients
+  (\textasciitilde\SI{33}{KB} sig vs Pulsar's \SI{3.3}{KB}).
+\item \textbf{Calibration uses the CPU verify cost as the
+  baseline.} LP-218's calibration discipline assumes a
+  CPU-class verifier -- validators are not required to have
+  Blackwell GPUs. Under that assumption, Corona's effective
+  per-validator verify cost is the parity audit's measured
+  $\sim$\SI{1.6}{\milli\second} CPU, which is approximately
+  $141\times$ the Pulsar CPU verify time
+  (\textasciitilde\SI{80}{\micro\second}). The gas charge
+  rounds to $100\times$ Pulsar's for clean accounting:
+  \SI{5}{M} gas.
+\item \textbf{Block-budget headroom.} At \SI{12}{M} block gas
+  and \SI{5}{M} per Corona verify, the limit is $\sim$2 Corona
+  verifies per block -- this is the bottleneck for very high-
+  density PQ-strict rollup throughput. The cost cliff is
+  intentional; the LP-217 mode ladder uses it to price
+  cross-family insurance correctly.
+\end{enumerate}
+
+Operators with all-Blackwell validator sets may petition for a
+\textbf{Blackwell-discounted Corona gas charge} in a future
+amendment; LP-220 does not codify it. The conservative
+CPU-baseline gas charge applies until validator-hardware
+uniformity is established. This is the same calibration
+discipline LP-218 uses for the Pulsar kind.
+
+\subsection{Performance}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrl@{}}
+\toprule
+\textbf{Metric} & \textbf{M1 Max} & \textbf{Spark} & \textbf{Source} \\
+\midrule
+Per-validator Corona sign at $N{=}64$ & $\sim$\SI{30}{\milli\second} & $\sim$\SI{30}{\milli\second} & matrix bench (measured)~\cite{parityaudit} \\
+CPU verify (single sig) & $\sim$\SI{1.6}{\milli\second} & $\sim$\SI{1.6}{\milli\second} & parity audit (measured) \\
+Blackwell sm\_120 verify & --- & $\sim$\SI{15}{\milli\second} & projected (LP-203 kernel)~\cite{lp203} \\
+Blackwell sm\_120 batched ($N{=}64$) & --- & $\sim$\SI{50}{\milli\second} aggregate & projected \\
+\bottomrule
+\end{tabular}
+\caption{Corona kind performance. Sign and CPU-verify times are
+measured per the parity audit; Blackwell verify timings remain
+projections until the GPU dispatch boundary closes (see
+section~\ref{sec:pulsar-perf-note}).}
+\label{tab:corona-perf}
+\end{table}
+
+\subsubsection{Scaling exponent}
+
+The parity audit measured Corona-leg signing cost growing
+super-linearly in $N$. The measured exponent across
+$N \in \{16, 32, 64\}$ is approximately
+$T(N) \approx c \cdot N^{1.5\text{--}1.7}$, depending on the
+host platform. This is not an $O(N)$ scheme and should not be
+described as such in downstream documents; the Ring-LWE
+distributed signing protocol's full-rank check and
+Gaussian-hash PRF carry costs that grow faster than linearly in
+the participant count. The measured exponent is the operative
+number for sequencer capacity planning, not the
+naive-amortization figure.
+
+\subsection{Use case}
+
+A rollup that wants \textbf{Ring-LWE family independence} from
+Module-LWE configures its sequencer to sign each batch with
+both a Pulsar threshold sig AND a Corona threshold sig. The
+rollup contract on Z-Chain calls \texttt{P3Q.verify(0x01, ...)}
+and \texttt{P3Q.verify(0x02, ...)} at the same precompile
+address \texttt{0x012205} in sequence inside its
+\texttt{validateBatch} function; both must return \texttt{true}
+for the batch to be accepted.
+
+A break of Module-LWE that compromises Pulsar does not
+compromise Corona; the rollup remains cryptographically
+anchored. The cost is $\sim$\SI{5050000}{gas} per batch
+(Pulsar \SI{50000}{} + Corona \SI{5000000}{}). Acceptable for
+value-bearing rollups (custody, treasury, regulated securities);
+prohibitive for high-volume rollups (gaming, social).
+
+This is the LP-217 \texttt{PQ-strict} posture made operationally
+callable.

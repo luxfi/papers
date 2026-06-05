@@ -1,0 +1,111 @@
+\section{Algorithm}
+
+\subsection{Step 0 -- coordinator selection}
+
+A cross-shard tx group $T = \{T_1, \ldots, T_K\}$ where each $T_j$
+is the per-shard portion targeting shard $s_j$. The coordinator is
+a parent-L1 validator selected deterministically:
+
+\begin{equation}
+\textrm{coordinator}(T) =
+\textrm{parent\_L1.validators}\bigl[\,\textrm{hash}(T.\textrm{id})
+\bmod N\,\bigr]
+\end{equation}
+
+where
+$T.\textrm{id} = \textrm{sha256}(\textrm{canonical\_bytes}(T))$. The
+selection is a pure function of the tx group; every shard executor
+agrees on the coordinator without coordination.
+
+\subsection{Step 1 -- dispatch}
+
+The coordinator gossips $T$ via the parent L1's LP-201 DHT, schema
+\texttt{0xE3} (\texttt{CrossShardDispatch}). Each shard $s_j$ whose
+NodeID is subscribed to the parent L1 receives $T$ and dispatches
+$T_j$ into its local mempool.
+
+\subsection{Step 2 -- per-shard prepare}
+
+Each shard $s_j$ executes $T_j$ under LP-209/LP-210 normally:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item $T_j$ enters the shard's LP-208 DAG mempool.
+\item The shard's LP-209 wave commits a wave containing $T_j$.
+\item LP-210 Phase~4 detects that $T_j$ is cross-shard
+  (\texttt{T\_j.txEnvelope.kind == cross\_shard}) and stages the
+  overlay instead of committing.
+\item The shard publishes a \emph{prepare-ack}: schema \texttt{0xE4}
+  (\texttt{CrossShardPrepareAck}) containing
+  $(T.\textrm{id}, s_j, T_j.\textrm{state\_diff\_hash},
+  \textrm{shard\_wave\_cert})$.
+\end{enumerate}
+
+The \texttt{shard\_wave\_cert} is the per-shard LP-217 cert at the
+shard's configured mode -- proof that the shard committed to
+executing $T_j$ at the shard's per-wave consensus.
+
+\subsection{Step 3 -- coordinator collect}
+
+The coordinator subscribes to prepare-acks on the parent L1's gossip
+layer. It collects acks until either:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{All $K$ acks arrive} within
+  \texttt{prepare\_timeout\_ms} $\to$ emit cross-shard commit tx
+  (Step 4).
+\item \textbf{Any shard times out or refuses} (returns refuse-ack
+  schema \texttt{0xE5}) $\to$ emit cross-shard abort tx (Step 4').
+\end{itemize}
+
+\texttt{prepare\_timeout\_ms} defaults to $5\times$ the slowest
+shard's wave cadence (typical: \SI{500}{\milli\second} LAN,
+\SI{2000}{\milli\second} WAN). The timeout is conservative -- under
+healthy operation, all acks arrive within $1\times$ wave cadence.
+
+\subsection{Step 4 -- cross-shard commit tx at parent L1}
+
+The coordinator submits to the parent L1's LP-208 mempool:
+
+\begin{verbatim}
+CrossShardCommit {
+    group_id:     [32]byte  T.id
+    shards:       []ShardCommit  // per-shard:
+                                  // (chain_id, state_diff_hash,
+                                  //  wave_cert)
+    coordinator:  NodeID
+    coord_sig:    []byte  // BLS or PQ per parent L1 cert mode
+}
+\end{verbatim}
+
+The parent L1's next LP-209 wave includes this tx. The wave's
+LP-217 cert covers the cross-shard commit. Once the parent L1's
+cert finalizes:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item Each shard observes the parent L1's cert (gossip schema
+  \texttt{0xE6} \texttt{CrossShardCommitNotify}).
+\item Each shard verifies the cert covers $T.\textrm{id}$ and that
+  the cert's leg composition satisfies the shard's cert-mode
+  policy.
+\item Each shard applies its staged overlay via LP-202 atomic
+  commit.
+\end{enumerate}
+
+\subsection{Step 4' -- cross-shard abort tx at parent L1}
+
+If any shard refused or timed out, the coordinator submits:
+
+\begin{verbatim}
+CrossShardAbort {
+    group_id:     [32]byte  T.id
+    reason:       enum {timeout, shard_refused, ...}
+    coordinator:  NodeID
+    coord_sig:    []byte
+}
+\end{verbatim}
+
+The parent L1's next wave includes this tx; the cert covers the
+abort; each shard observes via gossip and unwinds its staged
+overlay via LP-202 \texttt{txn.Discard()}. The cross-shard tx
+group is dropped; per-shard waves move forward independently from
+the next round.

@@ -1,0 +1,136 @@
+\section{Introduction}
+
+A post-quantum rollup architecture has two orthogonal concerns:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{The rollup-batch envelope pattern} -- how a sequencer
+  composes transactions, threshold-signs a state-root tuple, and
+  posts a single \texttt{RollupBatchTx} that the parent L1
+  verifies inside normal block validation. This is the
+  contribution of LP-218: the wire format, the
+  parent-L1-verifies-the-sig pattern, the inherited cert mode,
+  and the first P3Q kind ($0x01$ Pulsar).
+\item \textbf{The per-kind verifier specifications} -- the
+  individual cryptographic primitives that can occupy a P3Q
+  \texttt{kind} slot, their wire layouts, their gas calibrations,
+  their security assumptions, and the operator semantics for
+  composing them into a cross-family-maximum PQ posture. This is
+  the contribution of LP-220.
+\end{enumerate}
+
+LP-218 fixes the pattern and the slot. LP-220 fills in the
+remaining two kinds.
+
+\subsection{Why a single slot}
+
+A naive design would allocate one EVM precompile slot per PQ
+family: \texttt{0x012205} for Pulsar, \texttt{0x012206} for
+Corona, \texttt{0x012207} for Magnetar. The earlier draft of
+LP-220 did exactly that, treating the rollup-batch wrappers as
+sibling primitives. Three slots, three ABIs, three audit
+surfaces, three call-paths in EVM.
+
+The 2026-06-03 decomplection collapses this into one slot with
+kind-byte dispatch. The motivations are not aesthetic:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Solidity callability is a UX surface.} A rollup
+  contract that wants cross-family-maximum verify writes three
+  \texttt{P3Q.verify(kind, ...)} calls at a single address. Three
+  slots would mean three address constants, three ABI imports,
+  three precompile registrations to track in the operator's head.
+  One slot keeps the developer surface coherent.
+\item \textbf{Audit surface compounds.} Three slots with three
+  wrappers means three independent code paths around the
+  threshold-signature verifier core -- the wrappers carry their
+  own structural parsing, length checks, gas billing, and
+  domain-separation contexts. Each is an audit boundary. One
+  slot dispatches into per-kind verifier cores via the
+  \texttt{P3QVerifier} interface and leaves only the dispatch
+  table to audit.
+\item \textbf{Future kinds add a byte, not a slot.} If a fourth
+  PQ family enters the Lux stack (a hypothetical code-based
+  signature with HQC-style structure, say), it lands as one new
+  \texttt{kind} byte in the dispatch table and one new
+  \texttt{P3QVerifier} implementation. No new precompile slot
+  allocation, no new Solidity function shape, no new audit
+  boundary at the EVM-side.
+\item \textbf{One and only one way per LP-200.} The ZAP Stack
+  umbrella codifies the principle: every distinct concern has
+  exactly one canonical entry point. ``Verify a rollup-batch
+  threshold signature on-chain'' is one concern; the kind byte
+  selects which primitive answers the question.
+\end{itemize}
+
+\subsection{The three kinds at a glance}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{kind} & \textbf{Name} & \textbf{PQ family} & \textbf{Underlying scheme} \\
+\midrule
+$0x01$ & Pulsar   & Module-LWE   & FIPS-204 ML-DSA-65 threshold \\
+$0x02$ & Corona   & Ring-LWE     & Corona two-round threshold \\
+$0x03$ & Magnetar & Hash-based   & FIPS-205 SLH-DSA threshold \\
+\bottomrule
+\end{tabular}
+\caption{The three production kinds at slot \texttt{0x012205}.}
+\label{tab:kinds-overview}
+\end{table}
+
+A simultaneous structural break of all three would require
+independent advances in (i) Module-LWE cryptanalysis,
+(ii)~Ring-LWE / ring-structured lattice cryptanalysis, and
+(iii)~collision resistance of the SHA-2 / SHA-3 family. These
+three assumptions are widely understood to be mutually
+independent. The cross-family-maximum posture LP-217 PQ-heavy
+codifies relies on that independence; LP-220 supplies the
+on-chain machinery to actually compose all three kinds inside a
+single rollup contract.
+
+\subsection{Honest measurement state}
+
+Throughout this paper, performance numbers are tagged
+\textbf{measured} or \textbf{projected}.
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Measured} numbers come from the
+  2026-06-04 Quasar 4-scheme matrix bench
+  (\texttt{lux/threshold/protocols/parity/parity\_test.go}) on
+  M1 Max (10-core darwin/arm64) and Spark (NVIDIA GB10 Grace
+  Blackwell, 20-core linux/aarch64). Numbers are wall-clock per
+  per-validator signing round at $N{=}\{16,32,64\}$, mean of 50
+  rounds.
+\item \textbf{Projected} numbers are CPU verify costs scaled by
+  GPU speedup ratios from kernel-level micro-benchmarks. GPU
+  dispatch is not exercised by any path in the matrix bench --
+  \texttt{nvidia-smi dmon} mean \texttt{SM\%} during the 2-hour
+  Spark run was \SI{11.9}{\percent} (idle/background only). Two
+  boundary gaps prevent dispatch: \texttt{lux-lattice.pc} is not
+  installed on Spark (\texttt{find\_package(MLX REQUIRED)}
+  fails), and \texttt{lux\_slhdsa\_*} entry points are not yet
+  exposed in \texttt{lux/accel/c\_api.h}. Until both close, all
+  GPU latency claims in this paper are projections.
+\end{itemize}
+
+The architectural decisions (slot, ABI, dispatch, parameter set
+choice) are not contingent on the GPU dispatch closing. They are
+contingent only on the CPU verifier correctness, which is byte-
+equal to the underlying NIST-standard (Pulsar/Magnetar) or to
+the Corona reference implementation (Corona) and is wired
+already.
+
+\subsection{Roadmap}
+
+Section~\ref{sec:architectural-decision} documents the
+2026-06-03 decomplection in detail: the prior sibling-slots model,
+the unification onto \texttt{0x012205}, and the relationship to
+LP-0120's separate raw-primitive verifier slots.
+Sections~\ref{sec:pulsar-kind}--\ref{sec:magnetar-kind} specify
+each kind in turn. Section~\ref{sec:verifier-interface} defines
+the \texttt{P3QVerifier} Go interface that registers each kind
+into the dispatch table. Section~\ref{sec:composition} ties the
+three kinds back into LP-217 cert profile modes and shows the
+rollup-contract composition pattern for the PQ-heavy posture.
