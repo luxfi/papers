@@ -1,0 +1,133 @@
+\section{Algorithm}
+
+\subsection{Per-tx state}
+
+Every transaction enters LP-210 carrying:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{Source} \\
+\midrule
+\texttt{tx\_bytes} & ZAP buffer (pointer-shared) & LP-208 header payload \\
+\texttt{tx\_index} & uint32 & LP-209 wave ordering position \\
+\texttt{snapshot} & ZapDB MVCC version pointer & LP-202 \texttt{state.NewSnapshot()} \\
+\texttt{read\_set} & sorted slice of \texttt{(key, version)} & populated during execute \\
+\texttt{write\_set} & sorted slice of \texttt{(key, new\_value, prior\_version)} & populated during execute \\
+\texttt{verdict} & enum \{pending, committed, rolled-back, invalid\} & set in commit phase \\
+\bottomrule
+\end{tabular}
+\caption{Per-tx state at LP-210 entry.}
+\label{tab:pertx}
+\end{table}
+
+The snapshot is shared by reference across all goroutines in the
+wave -- it points at the prior-wave ZapDB root. Concurrent reads
+against the same snapshot are lock-free (ZapDB MVCC invariant).
+Writes happen in per-tx-local MVCC overlays.
+
+\subsection{Phase 1 -- speculative execute}
+
+Dispatch $N$ transactions to a worker pool of
+\texttt{min(GOMAXPROCS, $N$)} goroutines. Each goroutine runs:
+
+\begin{verbatim}
+func executeTx(tx Tx, snap *ZapDBSnapshot,
+               rs *ReadSet, ws *WriteSet) {
+    ctx := newTxContext(snap, rs, ws)
+    runVMOpcodes(tx.bytes, ctx)
+    // ctx.rs and ctx.ws now populated
+}
+\end{verbatim}
+
+Every state access through \texttt{ctx} records into \texttt{rs}
+(for reads) or \texttt{ws} (for writes). Read records the
+\texttt{(key, version)} pair from the snapshot; write records
+\texttt{(key, new\_value, prior\_version)} where
+\texttt{prior\_version} is the version observed at write time.
+
+No locks during speculative execute. The ZAP buffer is immutable;
+the ZapDB snapshot is immutable from the goroutine's POV. The only
+mutation is into \texttt{rs} and \texttt{ws}, which are per-goroutine
+state.
+
+\subsection{Phase 2 -- commit-phase conflict detection}
+
+After all $N$ goroutines join, walk the transactions in LP-209 order
+(\texttt{tx\_index} ascending). For each $\textrm{tx}_i$, check:
+
+\begin{equation}
+\textrm{conflict}(\textrm{tx}_i, \textrm{prior\_committed}) \iff
+\exists\,(k, v) \in \textrm{tx}_i.\textrm{read\_set}.\;
+\exists\,\textrm{tx}_j \in \textrm{prior\_committed},\;
+j < i,\; k \in \textrm{tx}_j.\textrm{write\_set}
+\end{equation}
+
+If no conflict: commit $\textrm{tx}_i$'s \texttt{write\_set} to the
+staging MVCC overlay. Mark \texttt{verdict = committed}. If
+conflict: $\textrm{tx}_i$'s \texttt{rs} and \texttt{ws} are stale.
+Mark \texttt{verdict = rolled-back}. $\textrm{tx}_i$ is re-queued
+for phase~3.
+
+The check is $O(|\textrm{tx}_i.\textrm{read\_set}|)$ per tx using a
+hashmap of keys $\to$ most recent committed writer. Total
+commit-phase cost is
+$O(\sum_i |\textrm{tx}_i.\textrm{read\_set}|)$ -- linear in total
+reads across the wave.
+
+\subsection{Phase 3 -- re-execute rolled-back txs in dependency order}
+
+Re-queued transactions are re-executed sequentially in
+\texttt{tx\_index} order. Each re-execution sees the committed
+overlay from Phase~2 (which now includes the writes that caused the
+rollback). Re-execution is serial because the contended set is small
+(in the measured Liquidity workload, $\sim 5\%$ of txs per wave);
+parallelizing re-execution recovers little throughput at significant
+complexity cost.
+
+Re-executed transactions may still fail (a tx that depended on a
+now-overwritten balance may now underflow). Failed re-execution
+marks \texttt{verdict = invalid} and the tx is dropped from the wave
+commit. LP-209's wave ordering is independent of validity -- an
+invalid tx is recorded in the wave but does not contribute to the
+post-wave ZapDB root.
+
+\subsection{Phase 4 -- atomic commit}
+
+The staging MVCC overlay (the union of all committed
+\texttt{write\_set}s) is applied to ZapDB as a single MVCC commit.
+This is the LP-202 atomic commit primitive: either the entire wave's
+writes land or none do.
+
+\begin{verbatim}
+overlay := zapdb.NewOverlay(snap)
+for _, tx := range wave.txs {
+    if tx.verdict == committed {
+        overlay.Apply(tx.write_set)
+    }
+}
+overlay.Commit()  // LP-202 O(1) atomic; new ZapDB root published
+\end{verbatim}
+
+LP-217's cert ceremony (one cert per wave per LP-209) covers the
+new root pointer. LP-211 (cross-shard) interposes here if the wave
+is part of a cross-shard cert.
+
+\subsection{Deterministic output proof}
+
+LP-210 introduces no wire format. Every transaction in the wave is
+already a ZAP frame (LP-022). The STM machinery is purely runtime
+-- MVCC version pointers are ZapDB-internal; read\_set and
+write\_set are runtime in-memory structures, never serialized,
+never gossiped, never content-addressed.
+
+This is a load-bearing property: a validator implementing LP-210 in
+Go and another implementing it in Rust over the same ZAP buffer and
+ZapDB state produce \textbf{byte-identical} post-wave roots. The
+order of re-executions in Phase~3 is determined by tx\_index order
+(LP-209 canonical); the set of committed writes is determined by
+the deterministic conflict-detection rule; the MVCC root is
+therefore a pure function of $(\textrm{wave\_bytes},
+\textrm{prior\_root})$.

@@ -1,0 +1,98 @@
+\section{The Pattern}
+
+\subsection{Six-step framing}
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Collect.} Sequencer collects $N$ transactions; each
+  is a ZAP frame; no re-encode.
+\item \textbf{Apply.} Sequencer applies the batch; computes the new
+  state root over the ZAP-buffer Merkle structure (LP-203 GPU
+  Merkle kernel).
+\item \textbf{Sign.} Sequencer Pulsar threshold-signs the tuple
+  $(\textrm{prev\_root}, \textrm{new\_root}, \textrm{batch\_hash},
+  \textrm{seq\_id})$.
+\item \textbf{Submit.} Sequencer submits
+  \texttt{RollupBatchTx} as a ZAP frame to Z-Chain over QUIC.
+\item \textbf{Verify.} Z-Chain validators call P3Q
+  (\texttt{0x012205}) to verify the Pulsar signature over
+  $H(\textrm{prev\_root} \| \textrm{new\_root} \|
+  \textrm{batch\_hash})$.
+\item \textbf{Finalize.} Z-Chain block finalizes via the parent L1
+  QuasarCert; rollup state inherits parent L1 finality at the
+  configured LP-217 mode.
+\end{enumerate}
+
+\subsection{Five-step framing (user's framing)}
+
+The user's mental model groups steps 1--2 together as ``the
+sequencer constructs the batch'':
+
+\begin{enumerate}[leftmargin=2em]
+\item Sequencer constructs the batch (collect $+$ apply) and
+  computes the new root.
+\item Sequencer Pulsar-signs the root tuple.
+\item Sequencer submits \texttt{RollupBatchTx} to Z-Chain.
+\item Z-Chain validators call P3Q to verify the sig.
+\item Z-Chain block finalizes via parent L1 QuasarCert.
+\end{enumerate}
+
+The two framings are equivalent; the six-step framing breaks the
+``construct'' step into Collect and Apply for stage-cost accounting,
+which is useful when measuring per-stage GPU utilization. Both are
+canonical.
+
+\subsection{Stage-by-stage cost table}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}rp{3cm}p{4cm}p{4cm}@{}}
+\toprule
+\textbf{\#} & \textbf{Stage} & \textbf{Where it runs} & \textbf{Cost target} \\
+\midrule
+1 & Tx collection & Sequencer node(s) & NIC-bound, ZAP frames at LP-201 wire speed \\
+2 & State transition + Merkle root & Sequencer GPU (LP-203 UMA buffer) & $\sim$\SI{100}{\micro\second} per 1k-tx batch \\
+3 & Pulsar threshold sign & Sequencer group (1-of-1 or $t$-of-$n$) & $\sim$\SI{5}{\milli\second} at $N{=}64$ on H100 \\
+4 & RollupBatchTx submission & ZAP frame over QUIC (LP-201) & $\sim$\SI{1}{\milli\second} RTT to nearest Z-Chain validator \\
+5 & P3Q verify on Z-Chain & Z-Chain validator EVM precompile & $\sim$\SI{50}{\micro\second} per verify on Blackwell sm\_120 \\
+6 & Parent L1 finality & Z-Chain QuasarCert & LP-217 cert mode: PQ-fast $\approx$ \SI{5}{\milli\second}, PQ-strict $\approx$ \SI{15}{\milli\second} \\
+\bottomrule
+\end{tabular}
+\caption{Stage-by-stage cost. Source: LP-203 measured benches at
+\texttt{/tmp/spark-gpu-bench/} (stages 2--3 Pulsar GPU) and the
+LP-217 cert table (stage 6).}
+\label{tab:stages}
+\end{table}
+
+End-to-end commit latency from sequencer batch close to parent L1
+finality at PQ-strict: \SI{10}{\milli\second}--\SI{50}{\milli\second}.
+End-to-end at PQ-off (BLS only):
+\SI{1}{\milli\second}--\SI{5}{\milli\second}.
+
+\subsection{Diagram}
+
+\begin{verbatim}
++----------------------------------------------------------+
+| Rollup sequencer (Tier-3, no validator set)              |
++--------------------------+-------------------------------+
+                           |
+   1. Collect N txs (each ZAP frame, no re-encode)
+                           |
+   2. Apply tx batch --> new state root (LP-203 GPU Merkle)
+                           |
+   3. Pulsar threshold-sign (prev_root, new_root,
+                              batch_hash, seq_id)
+                           |
+   4. Submit RollupBatchTx as ZAP frame to Z-Chain
+                           |
+                           v
++----------------------------------------------------------+
+| Z-Chain validators (parent L1 Tier-1)                    |
++--------------------------+-------------------------------+
+                           |
+   5. P3Q (0x012205) verify Pulsar sig
+       over H(prev_root || new_root || batch_hash)
+                           |
+   6. Z-Chain block finalizes via parent L1 QuasarCert
+      --> rollup state inherits parent L1 finality
+\end{verbatim}

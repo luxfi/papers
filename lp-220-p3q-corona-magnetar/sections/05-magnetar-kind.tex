@@ -1,0 +1,201 @@
+\section{Magnetar Kind ($\textnormal{kind} = 0x03$)}
+\label{sec:magnetar-kind}
+
+\subsection{Slot and ABI}
+
+\texttt{0x012205} with leading \texttt{kind=0x03}. Same physical
+precompile address as Pulsar (kind $0x01$) and Corona
+(kind $0x02$); dispatch resolves to the Magnetar
+\texttt{P3QVerifier} implementation.
+
+\begin{lstlisting}[language={}]
+// EVM precompile at slot 0x012205, kind = 0x03
+bool ok = P3Q.verify(
+    0x03,                            // Magnetar kind
+    magnetarSig,                     // FIPS-205 SLH-DSA threshold sig
+    messageHash,                     // H(prev_root || new_root || batch_hash)
+    groupPubKey                      // Magnetar group public key
+);
+\end{lstlisting}
+
+\subsection{Underlying scheme}
+
+Magnetar is the Lux deployment of FIPS-205 SLH-DSA~\cite{fips205}
+under a Lux-defined threshold-aggregation wrapper specified in
+LP-181~\cite{lp181}. The wrapper produces a signature
+byte-identical to a single-party FIPS-205 SLH-DSA signature on
+the same message and group public key; the verifier core is
+therefore the FIPS-205 SLH-DSA verifier with no threshold-
+specific logic.
+
+SLH-DSA is hash-based: hardness reduces to the collision
+resistance of the underlying hash function (SHA-256 or SHA-3
+configurations). This is the only PQ family in P3Q whose
+hardness does not depend on lattice assumptions; Magnetar is
+the cross-family last-line PQ kind.
+
+\subsection{Wire format}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}rrl@{}}
+\toprule
+\textbf{Offset} & \textbf{Size} & \textbf{Field} \\
+\midrule
+0 & 1 & \texttt{kind = 0x03} \\
+1 & 1 & \texttt{mode = 0x01} (reserved Magnetar parameter set) \\
+2 & 4 & \texttt{bitmapLen} (BE32) \\
+6 & \texttt{bitmapLen} & participant bitmap (set bit = participating) \\
+$6{+}\textit{blen}$ & 4 & \texttt{sigLen} (BE32) \\
+$10{+}\textit{blen}$ & \texttt{sigLen} & \texttt{slhSig} (\textasciitilde\SI{35664}{B} for 192f) \\
+$10{+}\textit{blen}{+}\textit{slen}$ & 4 & \texttt{pkLen} (BE32) \\
+$14{+}\textit{blen}{+}\textit{slen}$ & \texttt{pkLen} & \texttt{groupPubKey} \\
+$14{+}\textit{blen}{+}\textit{slen}{+}\textit{pkLen}$ & 32 & \texttt{messageHash} \\
+\bottomrule
+\end{tabular}
+\caption{Magnetar-kind wire format. The participant bitmap is
+specific to the Magnetar kind -- the threshold-aggregation
+wrapper needs to know which signers contributed in order to
+re-derive the aggregated public key for verification. Pulsar
+($0x01$) and Corona ($0x02$) carry that information inside the
+sig structure; Magnetar's hash-tree structure puts it in the
+wire envelope.}
+\label{tab:magnetar-wire}
+\end{table}
+
+\subsection{Verifier core}
+
+The Go reference implementation is planned at
+\texttt{lux/standard/precompiles/p3q\_family/magnetar.go} and
+will wrap \texttt{luxfi/magnetar/verify}. The core is FIPS-205
+SLH-DSA conformant (any conformant FIPS-205 verifier suffices).
+
+Status as of 2026-06-04: same as Corona, the verifier core is
+not yet wired into the P3Q dispatch table; \texttt{p3q.Run}
+routes \texttt{kind=0x03} to \texttt{abiFalse} via the
+\texttt{ErrKindNotImplemented} path. Solidity callers MAY emit
+\texttt{P3Q.verify(0x03, ...)} from network genesis; the call
+charges the per-kind gas and returns \texttt{false} until the
+verifier lands.
+
+\subsection{Parameter set choice: 192f for production
+(locked 2026-06-04)}
+\label{sec:magnetar-192f-lock}
+
+SLH-DSA at the 192-bit security level has two parameter sets;
+the production deployment is locked to the ``fast'' variant
+after the 2026-06-04 measurement.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrrl@{}}
+\toprule
+\textbf{Parameter} & \textbf{Sig size} & \textbf{Sign (Spark)} & \textbf{Sign (M1 Max)} & \textbf{Production fit} \\
+\midrule
+SLH-DSA-192s (small) & $\sim$\SI{16}{KB} & \textbf{\SI{795}{\milli\second}} & \SI{1575}{\milli\second} & breaks \SI{1}{\second} round budget \\
+\textbf{SLH-DSA-192f (fast)} & $\sim$\SI{35}{KB} & \textbf{\SI{36}{\milli\second}} & \SI{71}{\milli\second} & \textbf{fits LP-205 round budget} \\
+\bottomrule
+\end{tabular}
+\caption{SLH-DSA 192s vs 192f per-validator sign times,
+measured in the Quasar 4-scheme matrix bench
+(\texttt{/tmp/quasar-matrix-bench}, 2026-06-04, mean of 50
+rounds at $N{=}64$). 192f is $22\times$ faster than 192s on
+Spark. Source~\cite{parityaudit}.}
+\label{tab:magnetar-192f-lock}
+\end{table}
+
+The matrix bench measured Magnetar-192s as the wall-clock
+bottleneck of every PQ-heavy cell. At $N{=}64$ on Spark,
+PQ-heavy total wall-clock with 192s was \SI{1.33}{\second} --
+blowing past the \SI{1}{\second} sub-second-finality target. The
+bottleneck is the per-validator SLH-DSA sign, not the threshold
+aggregation, not the verifier, not the network -- it is the
+inherent FORS + WOTS+ hash-tree construction cost on the larger
+192s tree.
+
+Switching to 192f drops the per-validator sign from
+\SI{795}{\milli\second} to \SI{36}{\milli\second}
+($22\times$ faster) at the cost of a $\sim$$2.2\times$ larger
+signature ($\sim$\SI{35}{KB} vs $\sim$\SI{16}{KB}). For a
+PQ-heavy rollup posting one Magnetar verify per batch, the
+extra \SI{19}{KB} on the wire is negligible against the
+\SI{0.76}{\second} latency saved.
+
+\subsubsection{Production lock}
+
+LP-220-conformant deployments \textbf{MUST} configure Magnetar
+with SLH-DSA-192f. The threshold-init API at
+\texttt{lux/threshold/protocols/magnetar/} accepts a parameter-
+set argument; PQ-heavy chains pass
+\texttt{magnetar.ParamSetFast192}. Operators choosing 192s for
+the $2.2\times$ smaller signature opt into multi-second finality
+and MUST run \texttt{mode=PQ-strict} (no Magnetar leg) for the
+sub-second tier; 192s is reserved for long-archival anchoring
+use cases that don't require fast finality.
+
+Verification cost is symmetric between the two sets
+($\sim$\SI{1.92}{\milli\second} CPU); the parameter set affects
+only the wall-clock of the per-validator signing ceremony, not
+the on-chain verify cost. The Magnetar kind's gas charge is
+\SI{30000}{gas} regardless of parameter set (signature size on
+the wire varies but the verifier work is bounded by the same
+hash-tree-walk constant).
+
+\subsection{Gas cost}
+
+\textbf{\SI{30000}{gas}} -- comparable to the Pulsar kind's
+\SI{50000}{}. SLH-DSA verify is fast (\textasciitilde\SI{1.92}{\milli\second}
+CPU per the parity audit -- comparable to Corona's
+\textasciitilde\SI{1.6}{\milli\second} CPU but with very
+different gas cost) because the verifier walks a hash tree
+rather than performing lattice NTT inverse.
+
+The gas calibration reflects the modest CPU verify cost
+relative to Corona; Magnetar verify is dominated by memory
+bandwidth on the WOTS+ tree-walk, which is a tight loop on
+SHA-256 / SHA-3 hash function evaluation that modern CPUs
+execute efficiently.
+
+\subsection{Performance}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrl@{}}
+\toprule
+\textbf{Metric} & \textbf{M1 Max} & \textbf{Spark} & \textbf{Source} \\
+\midrule
+Per-validator sign 192f at $N{=}64$ & \SI{71}{\milli\second} & \SI{36}{\milli\second} & matrix bench (measured)~\cite{parityaudit} \\
+Per-validator sign 192s at $N{=}64$ & \SI{1575}{\milli\second} & \SI{795}{\milli\second} & matrix bench (measured) \\
+CPU verify (single sig) & $\sim$\SI{1.92}{\milli\second} & $\sim$\SI{1.92}{\milli\second} & parity audit (measured) \\
+Blackwell sm\_120 verify & --- & $\sim$\SI{50}{\milli\second} & projected (LP-203 kernel)~\cite{lp203} \\
+Blackwell sm\_120 batched ($N{=}64$) & --- & $\sim$\SI{80}{\milli\second} aggregate & projected \\
+\bottomrule
+\end{tabular}
+\caption{Magnetar kind performance. The 192s/192f signing
+delta is the dominant operational consideration; verify cost is
+symmetric between sets. Blackwell verify timings are
+projections.}
+\label{tab:magnetar-perf}
+\end{table}
+
+\subsection{Use case}
+
+A rollup that wants \textbf{hash-based family independence}
+from lattice families configures its sequencer to sign each
+batch with a Magnetar threshold sig in addition to Pulsar (and
+possibly Corona). The rollup contract calls
+\texttt{P3Q.verify(0x01, ...)} then \texttt{P3Q.verify(0x03, ...)}
+at slot \texttt{0x012205}.
+
+SLH-DSA security relies only on the collision resistance of its
+underlying hash function; it is immune to advances in lattice
+cryptanalysis and would survive even a complete break of
+Module-LWE and Ring-LWE. Magnetar is the \textbf{last-line PQ}
+-- the kind of choice for sovereign-archival commitments,
+long-tenor custody attestations, cross-chain bridges, and
+regulator-facing audit trails. The cost (\SI{30000}{gas} per
+verify $+$ $\sim$\SI{35}{KB} signature on the wire) is
+reasonable for low-frequency, high-value batches.

@@ -1,6 +1,7 @@
 \documentclass[11pt,a4paper]{article}
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
+\usepackage{amsmath}
 \usepackage[margin=1in]{geometry}
 \usepackage{longtable}
 \usepackage{booktabs}
@@ -557,6 +558,82 @@ the upload bandwidth across the committee. The
 \texttt{cost.Cluster.Workload()} model assumes dedup is fully
 effective, which (2) achieves under the deterministic-compaction
 assumption.
+
+\section*{Implementation status in \texttt{luxfi/node}}
+
+An audit of the current \texttt{luxfi/node} + \texttt{luxfi/zapdb} tree
+shows the substrate for this architecture is already shipped, but the
+content-addressed dedup layer that produces the headline cluster-cost
+numbers is not yet present. The honest gap matrix:
+
+\begin{center}\small
+\begin{tabular}{p{0.30\linewidth}cp{0.45\linewidth}}
+\toprule
+\textbf{Capability} & \textbf{Status} & \textbf{Where} \\
+\midrule
+S3 streaming replication & \ok{shipped} &
+  \texttt{zapdb/replicate.go} \texttt{Replicator}; wired by
+  \texttt{database/zapdb/db.go:StartReplicator} reading
+  \texttt{REPLICATE\_S3\_*}; called by \texttt{node/node.go:227} via
+  the \texttt{database.Replicatable} interface. \\
+age encryption, PQ recipients & \ok{shipped} &
+  Multi-recipient envelope; classical (\texttt{age1...}) and
+  PQ-hybrid (\texttt{age1pq1...}) both accepted by
+  \texttt{StartReplicator}. \\
+Snapshot + incremental restore & \ok{shipped} &
+  \texttt{Replicator.Restore} downloads latest snapshot then replays
+  ordered incrementals. \\
+Content-addressed 4\,KiB chunks & \warn{not yet} &
+  Current \texttt{Replicator} writes one whole-DB delta blob per
+  interval (\texttt{inc/\{version\}.zap.age}) directly through an
+  \texttt{s3.Client} (the \texttt{hanzoai/s3} fork --- not upstream
+  minio --- exposes the same surface but is the canonical S3 SDK
+  across the stack). Per-blob granularity defeats cross-replica
+  dedup regardless of which S3 client sits behind it. \\
+Finalized-SST-only promotion & \warn{not yet} &
+  Cadence-driven (1\,s incremental, 1\,h snapshot) rather than
+  triggered by SST finalization. The whole hot tier is shipped to
+  S3, not only the post-finality archive. \\
+Shared bucket prefix (cluster dedup) & \warn{not yet} &
+  Per-node \texttt{Path} (default \texttt{d.dbPath}) writes into
+  \texttt{snap/} and \texttt{inc/} under that prefix. With $N$
+  replicas the same finalized data is stored $N$ times. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+The cluster-dedup invariant the cost model proves (one writer's
+storage cost is independent of fleet size, \S7) therefore does
+\emph{not} hold against today's \texttt{Replicator}. The $\$534/\text{mo}$
+R2 number for a 1000-replica fleet requires the dedup layer below.
+
+\subsection*{Delivery path}
+
+Two concrete options, in order of disruption:
+
+\begin{enumerate}
+  \item \textbf{Backend swap.} Replace the \texttt{s3.Client} field
+    on \texttt{Replicator} (today imported from \texttt{hanzoai/s3},
+    historically from upstream \texttt{minio/minio-go/v7}) with a
+    \texttt{vfs.FS} backend and run all writer nodes with a shared
+    \texttt{Path} prefix. VFS's content-addressed chunking provides
+    dedup without changing the backup serialization. Lowest risk;
+    smallest patch; preserves the existing snap+inc semantics.
+  \item \textbf{Finalized-SST promotion.} Hook into
+    \texttt{zapdb/levels.go} compaction events to detect when a given
+    SST file crosses the finality horizon, and PUT only that SST's
+    chunks into VFS at finalization time. Aligns more cleanly with the
+    paper's hot/cold split and lets the hot tier stay
+    cluster-local. Higher complexity but stronger semantics: the
+    archive is exactly the set of immutable finalized SSTs.
+\end{enumerate}
+
+\noindent
+Recommendation: ship (1) first to unlock the cost win, then layer (2)
+on top once SST-finalization events are exposed by \texttt{zapdb}. The
+\texttt{REPLICATE\_S3\_*} env-var surface stays unchanged in either case;
+operators only see a backend-implementation difference.
 
 \section*{Reproducing the numbers}
 

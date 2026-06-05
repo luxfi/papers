@@ -1,0 +1,191 @@
+\section{Architectural Decision: Single Slot, Kind-Byte Dispatch}
+\label{sec:architectural-decision}
+
+\subsection{The prior sibling-slots model}
+
+The pre-decomplection draft of LP-220 (dated 2026-05-29)
+allocated three EVM precompile slots:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \texttt{0x012205} -- P3Q-Pulsar, wrapping the rollup-batch
+  ABI around the Pulsar threshold-FIPS-204 verifier core.
+\item \texttt{0x012206} -- P3Q-Corona, wrapping the rollup-batch
+  ABI around the Corona (Corona) Ring-LWE threshold verifier
+  core.
+\item \texttt{0x012207} -- P3Q-Magnetar, wrapping the rollup-
+  batch ABI around the Magnetar threshold-SLH-DSA verifier core.
+\end{itemize}
+
+Each slot reused the corresponding LP-0120 raw-primitive verifier
+as the underlying implementation (\texttt{0x012204} raw Pulsar,
+\texttt{0x012206} raw Corona, \texttt{0x012207} raw Magnetar) and
+layered a rollup-batch-specific wrapper on top: structural
+parsing for the \texttt{(prev\_root, new\_root, batch\_hash)}
+tuple, a separate FIPS context string per slot, separate gas
+calibration billed inside each wrapper.
+
+The collision between LP-220's rollup-batch wrappers and
+LP-0120's raw-primitive verifiers at slots \texttt{0x012206} and
+\texttt{0x012207} was the first symptom that the design was
+overcomplecting two concerns:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item ``Verify a threshold signature of family $F$ over a 32-byte
+  digest'' (the raw primitive concern, owned by LP-0120).
+\item ``Verify a rollup-batch envelope of family $F$ where the
+  digest is $H(\text{prev\_root} \,\|\, \text{new\_root} \,\|\,
+  \text{batch\_hash})$ and the FIPS context binds the rollup
+  pattern'' (the rollup-batch concern, owned by LP-218 /
+  LP-220).
+\end{enumerate}
+
+These are two distinct concerns. They deserve two distinct
+surfaces. But they do not deserve six precompile slots between
+them.
+
+\subsection{The 2026-06-03 unification}
+
+The decomplection allocates the rollup-batch concern exactly one
+slot -- \texttt{0x012205} -- and reuses the existing raw-primitive
+slots (\texttt{0x012204}, \texttt{0x012206}, \texttt{0x012207})
+for the raw-primitive concern. The rollup-batch slot dispatches
+on a leading \texttt{kind} byte to per-primitive verifier
+implementations:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Slot} & \textbf{Concern} & \textbf{Wire} & \textbf{Owner} \\
+\midrule
+\texttt{0x012202} & Raw ML-DSA single-party & FIPS-204 & LP-0120 \\
+\texttt{0x012203} & Raw SLH-DSA single-party & FIPS-205 & LP-0120 \\
+\texttt{0x012204} & Raw Pulsar (Module-LWE threshold) & FIPS-204 ctx + sig & LP-0120 \\
+\textbf{\texttt{0x012205}} & \textbf{P3Q family} (rollup-batch ABI) & \textbf{kind-byte dispatch} & \textbf{LP-218 + LP-220} \\
+\texttt{0x012206} & Raw Corona (Ring-LWE threshold) & Corona ctx + sig & LP-0120 \\
+\texttt{0x012207} & Raw Magnetar (SLH-DSA threshold) & FIPS-205 ctx + sig & LP-0120 \\
+\bottomrule
+\end{tabular}
+\caption{Precompile slot ownership after the 2026-06-03
+decomplection. Slots \texttt{0x012204}, \texttt{0x012206},
+\texttt{0x012207} remain owned by LP-0120 for the raw-primitive
+non-rollup-batch use case; LP-218 + LP-220 own \texttt{0x012205}
+as the P3Q rollup-batch family.}
+\label{tab:slot-ownership}
+\end{table}
+
+A Solidity contract that needs Corona-kind verify for a
+rollup-batch envelope calls
+\texttt{P3Q.verify(0x02, sig, h, pk)} at \texttt{0x012205}. A
+Solidity contract that needs raw Corona primitive verify -- a
+non-rollup-batch use case, e.g.\ a custody attestation contract
+verifying an off-chain Corona-signed certificate -- calls the
+LP-0120 raw-primitive verifier at \texttt{0x012206} directly. Two
+distinct callers, two distinct surfaces, two distinct slots,
+zero overlap.
+
+The P3Q family ABI is the single canonical entry point for
+rollup-batch verification across all PQ kinds. This honors
+LP-200~\S~``One and only one way to do everything''~\cite{lp200}.
+
+\subsection{Kind-byte dispatch}
+
+The unified \texttt{0x012205} precompile reads a 1-byte
+\texttt{kind} discriminator at offset~0 of calldata and routes
+to one of three (today) registered verifier implementations. The
+dispatch is at runtime, populated by package
+\texttt{init()} functions; the precompile entry-point is one
+function in one file. The full dispatch logic from the reference
+implementation at
+\texttt{lux/precompile/p3q/contract.go::Run}:
+
+\begin{lstlisting}[language={}]
+kind := input[0]
+switch kind {
+case KindPulsar:     // 0x01
+    // fall through to FIPS 204 ML-DSA verify path
+case KindCorona,     // 0x02
+     KindMagnetar:   // 0x03
+    // Reserved kinds -- verifier not yet wired. Return abiFalse
+    // (the LP-218 "no revert on cryptographic failure" contract)
+    // so callers still see a consistent surface; once the
+    // lattice/hash threshold libraries land, this branch routes
+    // to its own verifier.
+    return abiFalse(), remaining, nil
+default:
+    // Unknown kind -- abiFalse, same as any malformed input.
+    return abiFalse(), remaining, nil
+}
+\end{lstlisting}
+
+Three properties hold by construction:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Constant-time over the kind byte.} The switch is on
+  a PUBLIC field (the calldata kind byte is observable on-chain).
+  Branching on it does not constitute a timing side channel
+  against any secret.
+\item \textbf{No revert on cryptographic failure.} An unknown
+  kind, an unwired reserved kind, a malformed sig, a FIPS-204
+  reject -- all return \texttt{abiFalse} (a 32-byte
+  zero-encoded EVM \texttt{bool}) with no Go error. The Solidity
+  caller observes \texttt{false} via the return word and
+  decides whether to revert. This matches LP-218~\S~``Failure
+  modes.''
+\item \textbf{Uniform gas billing.} The \texttt{RequiredGas}
+  function is monotonic in input length and does NOT depend on
+  the kind. A short malformed input pays the base gas, a
+  well-formed N-byte input pays \texttt{base + N * PerByteGas}.
+  No reduced price for early rejection -- uniform billing
+  prevents a gas-side channel from leaking which validation
+  stage rejected the input.
+\end{itemize}
+
+Per-kind gas \emph{rates} differ (Pulsar \SI{50000}{gas}, Corona
+\SI{5000000}{gas}, Magnetar \SI{30000}{gas}); the resolution
+happens inside the per-kind \texttt{P3QVerifier.GasCost()} method
+described in section~\ref{sec:verifier-interface}. The
+\texttt{0x012205} precompile multiplexes those rates over a
+single observable address.
+
+\subsection{What this is not}
+
+It is worth being explicit about two design decisions LP-220
+does \emph{not} make:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{It is not a generic PQ-signature precompile.} The
+  three kinds are not interchangeable. A Pulsar signature
+  submitted under \texttt{kind=0x02} (Corona) will fail
+  structurally -- Pulsar sigs are \SI{3309}{B}, Corona sigs are
+  $\sim\SI{33}{KB}$, and the verifier core for kind $0x02$ is the
+  Corona Ring-LWE verifier (which does not parse FIPS-204
+  output). The kind byte selects a specific verifier; it does
+  not abstract over them.
+\item \textbf{It is not a backwards-compatible upgrade of the
+  sibling-slots draft.} There is no LP-220-v1 deployment in the
+  wild; the activation marker
+  \texttt{2025-12-25T16:20:00-08:00} places the unified-slot
+  ABI at network genesis. Existing test corpora that target
+  \texttt{0x012206} / \texttt{0x012207} for rollup-batch wrappers
+  are obsolete (those slots are now LP-0120 raw-primitive
+  surfaces with different wire format); they must be re-targeted
+  to \texttt{0x012205} with the appropriate kind byte. No
+  compatibility shim exists.
+\end{enumerate}
+
+\subsection{Activation marker}
+
+\begin{verbatim}
+activates:      2025-12-25T16:20:00-08:00
+activates-unix: 1766708400
+\end{verbatim}
+
+The P3Q family ABI at slot \texttt{0x012205} with kinds $0x01$,
+$0x02$, $0x03$ registered in the dispatch table is callable from
+the genesis block of the new final Lux network. Rollup
+deployments that target PQ-strict or PQ-heavy mode call
+\texttt{P3Q.verify(kind, ...)} from height~0 with the appropriate
+kind byte (subject to per-kind verifier wiring, see
+sections~\ref{sec:corona-kind}--\ref{sec:magnetar-kind}).

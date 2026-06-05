@@ -1,0 +1,125 @@
+\section{Composition With Sibling LPs}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lp{9cm}@{}}
+\toprule
+\textbf{LP} & \textbf{Composition} \\
+\midrule
+LP-022 & ZAP wire protocol; the framing under schema IDs \texttt{0xF0}/\texttt{0xF1} \\
+LP-077 & Round-digest binding; used by the consumer LP-209 ordering, not by DAG construction \\
+LP-182 & Consensus wire / QuasarCert; the cert that finalizes the LP-209 ordering of this DAG \\
+LP-200 & ZAP Stack umbrella; the immutable-buffer guarantee this LP relies on for content-addressing \\
+LP-201 & ZAP P2P; schema IDs \texttt{0xF0}--\texttt{0xFF} do not collide with LP-201's \texttt{0xD0}--\texttt{0xDF} reservation; Kademlia DHT used for body storage \\
+LP-202 & Pipelining contract; per-stage unwind primitives apply to the Select stage that consumes from this DAG \\
+LP-203 & GPU-native verify; saturates the per-header sig-verify path \\
+LP-205 & Pipelined Quasar (sibling); consumes from this DAG via the Select stage \\
+LP-209 & Mysticeti ordering (sibling); the consumer that totally orders this DAG \\
+LP-217 & Cert profile modes; the consumer's ordering is committed at the chosen mode \\
+\bottomrule
+\end{tabular}
+\caption{Composition of LP-208 with sibling LPs.}
+\label{tab:composition}
+\end{table}
+
+\subsection{With LP-205 (pipelined Quasar)}
+
+The two LPs compose orthogonally:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item LP-205 specifies the per-leader pipeline at depth~$3$.
+\item LP-208 specifies the per-validator emission of headers into a DAG.
+\end{itemize}
+
+A pipelined-Quasar chain using a DAG mempool runs:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item Every validator emits DAGHeader every $K{=}$\SI{50}{\milli\second} (this LP).
+\item LP-209 Mysticeti totally orders the DAG; the ordered output is the
+  stream of txs.
+\item The current leader's Select stage (LP-205) consumes from the
+  Mysticeti output instead of a local mempool.
+\item Build (LP-205) constructs a block frame referencing the consumed
+  tx-set.
+\item Sign (LP-205) produces a QuasarCert at the LP-217 mode.
+\end{enumerate}
+
+The leader's Select stage is the only LP-205 stage that changes; the
+other two stages are unchanged. The aggregate throughput becomes
+$\sum(\textrm{validator\_emit\_rate})$ rather than
+$\min(\textrm{validator\_mempool\_rate})$.
+
+\subsection{With LP-209 (Mysticeti ordering)}
+
+The contract LP-208 makes to LP-209:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item The DAG is content-addressed; LP-209 can refer to vertices by
+  hash and rely on byte-identity across validators.
+\item Headers from honest validators carry honest tx-hash lists and
+  honest-best-effort parent pointers; LP-209 specifies how to recover
+  ordering against adversarial headers.
+\item Bodies are eventually consistent in the DHT under
+  \texttt{body\_hash}; LP-209 specifies when to wait for body
+  availability versus proceeding with header-only ordering.
+\end{enumerate}
+
+\subsection{With LP-203 (GPU verify)}
+
+Tx sig verify runs on Blackwell as DAG headers arrive. Each header
+carries up to $1000$ tx hashes; the bodies for those hashes are
+batched into a single CUDA dispatch on the verify path. Verify
+throughput tracks the LP-203 bench numbers directly -- at
+$\sim$\SI{1}{\mega verifies/s} on Blackwell, the GPU is not the
+bottleneck up to a per-validator emit rate of
+$\sim$\SI{1}{\mega tx/s}.
+
+\subsection{With LP-217 (cert profile modes)}
+
+The DAG ordering (from LP-209 Mysticeti consuming this LP's DAG) is
+committed at the LP-217 mode the consumer chain has configured --
+PQ-fast for typical workloads, PQ-strict for custody/treasury,
+PQ-heavy for archival anchoring. The DAG itself is mode-agnostic;
+only the cert that finalizes the ordering of DAG vertices into
+blocks carries the mode posture.
+
+\section{Activation Marker}
+
+\begin{verbatim}
+activates:      2025-12-25T16:20:00-08:00
+activates-unix: 1766708400
+\end{verbatim}
+
+DAG mempool is opt-in at activation. A chain enables it via genesis
+config:
+
+\begin{verbatim}
+dag_mempool:
+  enabled: true
+  emission_ms: 50
+  active_window_headers: 320
+  schema_ids:
+    header: 0xF0
+    body: 0xF1
+\end{verbatim}
+
+\section{Backwards Compatibility}
+
+None. Chains that do not enable DAG mempool use the single-mempool
+model unchanged. LP-205 (pipelined Quasar) works against either
+input source.
+
+\section{Future Work}
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{LP-209} -- Mysticeti ordering: total-ordering of the
+  DAG with sub-second finality; this LP's DAG is its input
+  \cite{mysticeti2024}.
+\item \textbf{LP-210} -- Block-STM speculation: speculative execute
+  against the DAG's tx stream ahead of LP-209 ordering; commit on
+  ordering arrival.
+\item \textbf{LP-211} -- Cross-shard atomic commit: DAG mempools
+  across peer shards exchange parent-pointers via cross-shard schema
+  IDs (\texttt{0xF2}--\texttt{0xFF} reserved for this).
+\end{itemize}

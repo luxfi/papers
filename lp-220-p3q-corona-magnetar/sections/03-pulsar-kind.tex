@@ -1,0 +1,147 @@
+\section{Pulsar Kind ($\textnormal{kind} = 0x01$)}
+\label{sec:pulsar-kind}
+
+\subsection{Slot and ABI}
+
+\texttt{0x012205} with leading \texttt{kind=0x01}. The Solidity
+shim is:
+
+\begin{lstlisting}[language={}]
+// EVM precompile at slot 0x012205, kind = 0x01
+bool ok = P3Q.verify(
+    0x01,                        // Pulsar kind
+    pulsarSig,                   // FIPS-204 ML-DSA-{44|65|87} sig
+    messageHash,                 // H(prev_root || new_root || batch_hash)
+    groupPubKey                  // Pulsar group public key
+);
+\end{lstlisting}
+
+The kind byte at offset~0 selects dispatch into the Pulsar
+verifier; the mode byte at offset~1 selects which FIPS-204
+parameter set is in play.
+
+\subsection{Wire format}
+
+The full \SI{5303}{B} canonical input for ML-DSA-65 (the
+production target):
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}rrl@{}}
+\toprule
+\textbf{Offset} & \textbf{Size} & \textbf{Field} \\
+\midrule
+0 & 1 & \texttt{kind = 0x01} \\
+1 & 1 & \texttt{mode} (\texttt{0x44}/\texttt{0x65}/\texttt{0x87} = ML-DSA-44/65/87) \\
+2 & 4 & \texttt{sigLen} (BE32) \\
+6 & \texttt{sigLen} & \texttt{pulsarSig} (\SI{3309}{B} for ML-DSA-65) \\
+$6{+}\textit{sigLen}$ & 4 & \texttt{pkLen} (BE32) \\
+$10{+}\textit{sigLen}$ & \texttt{pkLen} & \texttt{groupPubKey} (\SI{1952}{B} for ML-DSA-65) \\
+$10{+}\textit{sigLen}{+}\textit{pkLen}$ & 32 & \texttt{messageHash} \\
+\bottomrule
+\end{tabular}
+\caption{Pulsar-kind wire format. Total at ML-DSA-65:
+$1+1+4+3309+4+1952+32 = \SI{5303}{B}$.}
+\label{tab:pulsar-wire}
+\end{table}
+
+Trailing bytes after the messageHash are accepted as padding to
+match the convention used by the sibling STARK-FRI precompile;
+padding does not affect verification.
+
+\subsection{Verifier core}
+
+The Pulsar verifier core IS the FIPS-204 ML-DSA verifier. Pulsar
+signatures serialize byte-identically to FIPS-204 ML-DSA
+signatures per LP-073~\cite{lp073} -- the Pulsar threshold
+ceremony's Class-N1 claim is that the aggregated signature is
+byte-equal to a single-party FIPS-204 ML-DSA signature on the
+same message and group public key. Any conformant FIPS-204
+verifier suffices; the reference implementation at
+\texttt{lux/precompile/p3q/contract.go::Run} dispatches via
+\texttt{mldsa.PublicKeyFromBytes(...) + pk.VerifySignatureCtx(...)},
+which is a thin alias over the cloudflare/circl FIPS-204
+implementation.
+
+The Pulsar kind is the only kind with a fully-wired verifier
+today. Corona ($0x02$) and Magnetar ($0x03$) reserve their
+dispatch entries and return \texttt{abiFalse} via the
+\texttt{ErrKindNotImplemented} path until their threshold
+libraries land. See sections~\ref{sec:corona-kind}
+and~\ref{sec:magnetar-kind}.
+
+\subsection{Gas cost}
+
+\textbf{\SI{50000}{gas}} base $+$ \SI{10}{gas/byte} per-byte
+adder. At the canonical \SI{5303}{B} input, total gas is
+$50000 + 5303 \times 10 = \SI{103030}{gas}$. This is well under
+the \SI{12}{M} C-Chain block-gas-limit (\textasciitilde 116
+verifies per block; per the audit at
+\texttt{contract.FeeConfigReporter}). The gas calibration is
+$10\times$ the BLS pairing verify charge of \SI{5000}{gas},
+reflecting lattice verification's inherent cost (NTT inverse +
+matrix-vector multiplication mod $q$).
+
+\subsection{Domain separation}
+
+Every Pulsar-kind verify binds the FIPS-204 context string
+\texttt{lux-evm-precompile-p3q-v1}. Mismatched context between
+signer and verifier causes the FIPS-204 verifier to reject. This
+prevents cross-precompile replay: a Pulsar signature minted for
+the LP-0120 raw-Pulsar precompile at \texttt{0x012204} (which
+uses context \texttt{lux-evm-precompile-pulsar-v1}) cannot be
+re-submitted to the rollup-batch P3Q path at \texttt{0x012205}.
+
+\subsection{Performance}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrl@{}}
+\toprule
+\textbf{Metric} & \textbf{M1 Max} & \textbf{Spark} & \textbf{Source} \\
+\midrule
+Per-validator Pulsar sign at $N{=}64$ & \SI{391}{\milli\second} & \SI{585}{\milli\second} & matrix bench (measured)~\cite{parityaudit} \\
+CPU verify (single sig) & $\sim$\SI{80}{\micro\second} & $\sim$\SI{80}{\micro\second} & circl benchmark (measured) \\
+Blackwell sm\_120 verify & --- & $\sim$\SI{50}{\micro\second} & projected (LP-203 kernel) \\
+Blackwell sm\_120 batched ($N{=}64$) & --- & $\sim$\SI{5}{\milli\second} aggregate & projected \\
+\bottomrule
+\end{tabular}
+\caption{Pulsar kind performance. Sign times are measured per
+the Quasar 4-scheme matrix bench (mean of 50 rounds at $N{=}64$);
+verify times tagged ``projected'' have not been exercised in the
+matrix bench (GPU dispatch boundary gap, see
+section~\ref{sec:pulsar-perf-note}).}
+\label{tab:pulsar-perf}
+\end{table}
+
+\subsubsection{Note on GPU verify projection}
+\label{sec:pulsar-perf-note}
+
+The Blackwell verify numbers cited in earlier LP-203 drafts
+(\textasciitilde\SI{50}{\micro\second} single,
+\textasciitilde\SI{5}{\milli\second} batched) are kernel-level
+micro-benchmarks, not end-to-end measurements through the
+precompile entry-point. The matrix bench captured \num{4595}
+\texttt{nvidia-smi dmon} samples during the 2-hour Spark run:
+mean \texttt{SM\%} = \SI{11.9}{\percent} (idle/background only).
+Until \texttt{lux-lattice.pc} is installed on Spark and
+\texttt{lux\_pulsar\_verify\_batch} is exposed in
+\texttt{lux/accel/c\_api.h}, GPU verify timings remain
+projections.
+
+\subsection{Use case}
+
+Pulsar-kind is the default PQ-fast verifier for any rollup that
+wants Module-LWE-grade PQ assurance on its batch envelope
+without paying the cross-family premium of Corona or Magnetar.
+Per LP-217, PQ-fast (BLS + Pulsar) is the recommended mode for
+payment rails, gaming, and DEX matching. The gas cost is
+$\sim$\SI{55000}{} per batch (BLS + Pulsar), well below the
+$\sim$\SI{5}{M} cost of adding Corona.
+
+LP-218 specifies the Pulsar kind in detail as part of the
+rollup-batch envelope pattern; this section restates the
+Pulsar-kind facts in the LP-220 per-kind structure so the three
+kinds are commensurable in one document.

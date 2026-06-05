@@ -1,0 +1,283 @@
+\section{Composition With Sibling LPs}
+\label{sec:composition}
+
+\subsection{LP-218 P3Q at slot \texttt{0x012205}}
+
+LP-218~\cite{lp218} defines \texttt{0x012205} as a single precompile
+that takes a leading kind byte ($0x01$ Pulsar, $0x02$ Corona, $0x03$
+Magnetar) and verifies a PQ \textbf{threshold signature}. LP-220
+\cite{lp220} extends LP-218 with the Corona and Magnetar kind
+specifications on the same slot. LP-221 (this LP) defines
+\texttt{0x012220} as a single precompile that verifies a STARK
+\textbf{proof}. The two are composed at the rollup layer:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item LP-218 \texttt{RollupBatchTx} (schema \texttt{0xE8}) carries
+  both a \texttt{pulsar\_sig} field and a \texttt{ZKProofOff}
+  field.
+\item A \textbf{ZK-rollup} variant carries both: the Pulsar
+  signature authenticates the sequencer's commit, and the STARK
+  proof authenticates correct execution of the batch under the
+  rollup-VM's transition relation.
+\item An \textbf{optimistic-rollup} variant carries only the
+  Pulsar signature; \texttt{ZKProofOff = 0} and the integrity
+  model is fraud-proof challenges (LP-218 schema \texttt{0xE9}
+  \texttt{RollupChallengeTx}).
+\end{itemize}
+
+Z-Chain block validation under the ZK-rollup variant calls
+\textbf{both precompiles}: \texttt{0x012205} for the signature,
+\texttt{0x012220} for the proof. Both must accept. No nested call.
+Gas budget is the sum: Pulsar verify $\sim$\num{50000} $+$ STARK
+verify $\sim$\num{500000} $\approx$ \num{550000} gas per
+ZK-rollup batch under typical parameters.
+
+\subsubsection{Sample ZK-rollup validator (Solidity)}
+
+\begin{lstlisting}[language={}]
+function validateZKBatch(
+    bytes32 prevRoot,
+    bytes32 newRoot,
+    bytes32 batchHash,
+    bytes calldata pulsarSig,
+    bytes calldata groupPk,
+    bytes calldata starkProof,
+    bytes calldata pubInputs
+) external returns (bool) {
+    bytes32 h = sha256(abi.encodePacked(prevRoot, newRoot, batchHash));
+
+    // Signature leg: WHO authored this batch
+    if (!P3Q.verify(0x01, pulsarSig, h, groupPk)) return false;
+
+    // Proof leg: WHAT was executed
+    if (!STARKFRI.verify(VersionV1, starkProof, pubInputs)) return false;
+
+    return true;
+}
+\end{lstlisting}
+
+Two precompiles, two slots, two checks. The Solidity caller does
+not need to know that they live at different slots; the import
+shims (\texttt{P3Q.verify} at \texttt{0x012205}, \texttt{STARKFRI.verify}
+at \texttt{0x012220}) hide the slot allocation behind named
+function calls.
+
+\subsection{LP-0120 PQ precompile band}
+
+LP-0120 owns the \texttt{0x012201..0x012208} PQ-signature~/ KEM
+band. LP-221 sits one nibble above at \texttt{0x012220},
+\textbf{chosen so the strict-PQ STARK family can grow its own
+sub-range (\texttt{0x012220..0x01222F}) without recolliding with
+the PQ-signature block}. Future SNARK-family allocations
+(recursive STARK, hash-based zkVM variants, etc.) land inside
+\texttt{0x012220..0x01222F} per LP-300 master registry amendments.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Slot range} & \textbf{Owner} & \textbf{Family} \\
+\midrule
+\texttt{0x012201..0x012208} & LP-0120 & PQ signatures + KEMs (raw primitives) \\
+\texttt{0x012205}           & LP-218~/ LP-220 & P3Q signature dispatch (rollup-batch wrapper) \\
+\texttt{0x012220..0x01222F} & LP-221$+$ & STARK SNARK family (reserved) \\
+\texttt{0x012220}           & LP-221 (this LP) & STARK-FRI v1 \\
+\bottomrule
+\end{tabular}
+\caption{PQ precompile slot map. LP-0120 / LP-218 / LP-221 are
+deliberately spaced for sub-range growth.}
+\label{tab:slot-map}
+\end{table}
+
+\subsection{LP-300 master schema registry}
+
+LP-300~\cite{lp300} is normative for the slot pin. LP-221 carries
+the slot informatively. Any future amendment to LP-221's wire
+format, gas schedule, or version byte must be registered in
+LP-300 first.
+
+The LP-300 row for \texttt{0x012220} is closed by this LP. Per
+Section~\ref{sec:specification}~\S``Cross-reference to the
+registry'', the post-LP-221 row should read:
+
+\begin{quote}
+\texttt{0x012220 -- LP-221 -- STARK-FRI -- Plonky3-fork FRI~/
+cSHAKE256~/ Goldilocks STARK verifier; magic header "P3Q1"
+preserved verbatim for proof-artifact stability -- Draft --
+2026-06-04.}
+\end{quote}
+
+\subsection{LP-4800 and LP-4820 (related primitives)}
+
+LP-4800 and LP-4820 are the broader strict-PQ SNARK substrate LPs
+(parameter schedules, transcript bindings, and recursive-proof
+extensions). LP-221 implements the EVM-callable verifier surface
+for the LP-4800 baseline; recursive variants from LP-4820 will
+land at separate slots inside the reserved \texttt{0x012220..0x01222F}
+range with their own version bytes or dedicated LPs.
+
+The split is deliberate: LP-221 is normative for the
+on-chain ABI and gas; LP-4800 / LP-4820 are normative for the
+prover-side parameter discipline. A future LP-221 amendment that
+graft a new prover parameter schedule must coordinate with the
+corresponding LP-4800 amendment to keep the prover/verifier
+parameter pair in lockstep.
+
+\subsection{LP-203 GPU-native verify}
+
+LP-203~\cite{lp203} specifies the Blackwell sm\_120 batched-verify
+dispatch path. A STARK batch verify kernel for LP-221 is projected
+at \texttt{lux/accel/cuda/starkfri.cu} (not yet implemented at
+LP-221 publish time). The projected per-verify cost on Blackwell
+sm\_120 is $\sim$\SI{50}{\micro\second} amortized across a batch
+of $\sim$$64$ proofs; the gas schedule above is sized to the
+CPU-class verify cost (\SIrange{5}{10}{\milli\second}), so GPU
+acceleration is a node-operator latency improvement, not a gas
+reduction. LP-221 does NOT claim measured GPU throughput; that
+lands when the kernel ships.
+
+The LP-203 dispatch shim (\texttt{lux/accel/c\_api.h}) will gain
+\texttt{lux\_starkfri\_verify\_batch} as one of its entry points
+once the kernel ships; the precompile's
+\texttt{RegisterVerifier} hook accepts the GPU-backed verifier
+function as a drop-in replacement for the CPU verifier, with the
+hot-swap pattern preserved (atomic load on the verifier function
+pointer).
+
+\subsection{LP-217 cert profile modes}
+
+LP-221 is orthogonal to the QuasarCert ladder (PQ-off, PQ-fast,
+PQ-strict, PQ-heavy)~\cite{lp217}. The STARK verifier is invoked
+inside EVM execution, not inside consensus cert formation. Cert
+profile mode affects how LP-221's precompile call is
+\textbf{finalized} (which signature families validate the
+containing block) but does not affect the precompile's verify
+cost or correctness.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{4.2cm}p{4.5cm}p{4cm}@{}}
+\toprule
+\textbf{LP-217 mode} & \textbf{Block cert leg set} & \textbf{LP-221 STARK verify} \\
+\midrule
+\texttt{PQ-off}    & BLS only & callable; result trusted under classical adversary \\
+\texttt{PQ-fast}   & BLS + P3Q($0x01$ Pulsar) & callable; result trusted under PQ adversary \\
+\texttt{PQ-strict} & BLS + P3Q($0x01$) + P3Q($0x02$ Corona) & callable; result trusted under cross-family PQ adversary \\
+\texttt{PQ-heavy}  & BLS + P3Q($0x01$) + P3Q($0x02$) + P3Q($0x03$ Magnetar) & callable; result trusted under three-family-independent PQ adversary \\
+\bottomrule
+\end{tabular}
+\caption{LP-217 cert profile mode affects block finalization (the
+signature legs that validate the containing block), not the
+STARK-FRI precompile's verify path. The verify path is the same
+across all four modes; the cert mode determines what \emph{else}
+must verify to finalize the block carrying the STARK verify call.}
+\label{tab:cert-modes-starkfri}
+\end{table}
+
+\subsection{LP-300 registry entry}
+
+The canonical LP-300 row for LP-221, as it should appear in the
+next LP-300 amendment:
+
+\begin{verbatim}
+slot:    0x012220
+LP:      LP-221
+name:    STARK-FRI
+abi:     STARKFRI.verify(uint8 version, bytes proof, bytes pubInputs) -> bool
+gas:     200000 + len(input) * 10
+version: 0x01 (VersionV1)
+magic:   "P3Q1"
+backend: Plonky3 fork (cSHAKE256 / Goldilocks / FRI strict-PQ)
+status:  Draft
+created: 2026-06-04
+\end{verbatim}
+
+\subsection{Cross-reference table}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lp{9.5cm}@{}}
+\toprule
+\textbf{LP} & \textbf{Relationship to LP-221} \\
+\midrule
+LP-078~\cite{lp078}  & EVM precompile suite -- broad allocation policy; LP-221 sits in the strict-PQ band per that policy \\
+LP-0120~\cite{lp120} & Quasar mainnet defaults -- the historical \texttt{0x012205} STARK row vacated to \texttt{0x012220} by this LP \\
+LP-203~\cite{lp203}  & GPU-native verify -- projected Blackwell batched-verify kernel for STARK-FRI \\
+LP-204~\cite{lp204}  & Network of blockchains -- Tier-3 ZK rollups consume the LP-221 precompile per batch \\
+LP-217~\cite{lp217}  & Cert profile modes -- orthogonal; affects block finalization, not precompile semantics \\
+LP-218~\cite{lp218}  & P3Q signature dispatch at sibling slot \texttt{0x012205}; defines the rollup pattern that consumes LP-221 in the ZK variant \\
+LP-220~\cite{lp220}  & P3Q Corona + Magnetar kinds at sibling slot \texttt{0x012205}; specifies the other two PQ-signature kinds that compose with LP-221 STARK verify \\
+LP-300~\cite{lp300}  & Master schema registry; normative slot pin; placeholder row for \texttt{0x012220} closed by this LP \\
+\bottomrule
+\end{tabular}
+\caption{LP-221 composition references.}
+\label{tab:composition-refs}
+\end{table}
+
+\subsection{Backwards compatibility}
+
+None. The pre-Quasar Edition Lux network (2020--2025) had no
+STARK-FRI precompile and is a separate network out of scope. The
+genesis state of the new final Lux network (activation
+\texttt{2025-12-25T16:20:00-08:00}) ships the LP-221 ABI at slot
+\texttt{0x012220} as the only ABI; no shim exists for any
+pre-LP-221 STARK verifier (there was no such verifier on any
+running network).
+
+\subsection{Future work}
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{GATE-3 dudect closure} (Section~\ref{sec:constant-time}):
+  $10^9$-sample dudect run on the structural pre-filter,
+  producing a signed CSV plus an EasyCrypt-checkable assertion of
+  statistical indistinguishability.
+\item \textbf{GATE-4 external audit}: third-party review of the
+  Rust verifier crate at \texttt{lux/p3q/crates/p3q-verifier}.
+\item \textbf{GPU batch dispatch}: implement
+  \texttt{lux/accel/cuda/starkfri.cu} and expose
+  \texttt{lux\_starkfri\_verify\_batch} via \texttt{c\_api.h}.
+  Once landed, the precompile's verifier function pointer can be
+  hot-swapped to the GPU-backed implementation for validators
+  with Blackwell-class GPUs.
+\item \textbf{Cross-tree CT-harness rename}: relocate
+  \texttt{lux/crypto/p3q/ct/dudect/} to
+  \texttt{lux/crypto/starkfri/ct/dudect/} in lockstep with the
+  EasyCrypt theory file rename. Defer until the proof-artifact
+  byte-stability requirement is reassessed.
+\item \textbf{Recursive STARK variant}: a future LP at slot
+  \texttt{0x012221} (or a higher version byte at \texttt{0x012220})
+  for the recursive-proof variant once the prover-side parameter
+  discipline lands in LP-4820.
+\end{itemize}
+
+\subsection{Activation marker}
+
+\begin{verbatim}
+LP-221 Activation
+-----------------
+Activates:      2025-12-25T16:20:00-08:00
+Activates-Unix: 1766708400
+Status:         Draft
+Slot:           0x0000000000000000000000000000000000012220
+Config key:     starkfriVerify
+Wire version:   0x01 (VersionV1)
+Magic header:   "P3Q1" (preserved verbatim from pre-rename era)
+Gas:            BaseVerifyGas (200,000) + len(input) * 10
+Reference:      lux/precompile/starkfri/
+Tests passing:  22 / 22 under `go test -race -count=1 -v ./...`
+                (measured 2026-06-04 on darwin/arm64, 1.376s)
+Master pin:     LP-300 "Post-quantum precompile registry" row 292
+                (placeholder closed by this LP)
+EasyCrypt:      4 theory files, admit budget 0 / 0
+Jasmin:         verify.jazz CT-checked via `jasminc -checkCT`
+Sign-off:       APPROVED WITH GATES (GATE-1, GATE-2 closed;
+                GATE-3 dudect $10^9$, GATE-4 external audit open)
+\end{verbatim}
+
+Per LP-300~/ LP-217 convention, LP-221 activates at the genesis of
+the new final Lux network. The pre-Quasar Edition Lux network
+(2020--2025) had no STARK-FRI precompile; there is nothing to
+migrate, no backwards-compat layer, no replay window.

@@ -1,0 +1,122 @@
+\section{Corona / Pulsar Parity Audit (2026-06-03)}
+\label{sec:parity}
+
+\textbf{Verdict: Pulsar-first is locked.}
+
+The Corona/Pulsar parity audit
+(\texttt{lux/threshold/protocols/parity/parity\_test.go},
+completed 2026-06-03) measured the two schemes apples-to-apples on
+Apple M1 Max + DGX Spark GB10 and found Corona is
+\emph{$141\times$ slower than Pulsar at $N{=}64$ validators} (CPU
+baseline; GPU acceleration pending for both). This is not an
+optimization gap -- it is algorithmic.
+
+\subsection{Cost-ratio table at $N{=}64$}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Phase} & \textbf{Pulsar} & \textbf{Corona} & \textbf{Ratio} \\
+\midrule
+Keygen (one-time per epoch) & $\sim$\SI{15}{\second} & $\sim$\SI{60}{\second} & $4\times$ \\
+Round 1 (per-validator) & --- & $\sim$\SI{30}{\milli\second} & --- \\
+Round 2 / sign (per-validator) & $\sim$\SI{0.4}{\milli\second} & $\sim$\SI{30}{\milli\second} & $\sim 75\times$ \\
+Aggregate (collector) & $\sim$\SI{5}{\milli\second} & $\sim$\SI{800}{\milli\second} & $\sim 160\times$ \\
+\textbf{Total signing round-trip} & \textbf{\SI{23}{\milli\second}--\SI{28}{\milli\second}} & \textbf{\SI{3.2}{\second}--\SI{4.0}{\second}} & \textbf{$\mathbf{141\times}$} \\
+\textbf{Aggregate GPU (projected H100)} & $\sim$\SI{1}{\milli\second} & $\sim$\SI{15}{\milli\second} & $\sim 15\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Pulsar vs Corona cost at $N{=}64$. CPU rows measured;
+GPU row projected from LP-203 datasheet extrapolation. The
+\textbf{$141\times$} CPU ratio is the load-bearing number.}
+\label{tab:parity}
+\end{table}
+
+\subsection{Why the gap is algorithmic}
+
+\paragraph{Pulsar is a ``reconstruct-on-aggregator'' Shamir scheme.}
+The aggregator briefly materializes the 32-byte master sk via
+Shamir reconstruction over GF($257$), runs unmodified FIPS 204
+ML-DSA sign once on that host, zeroizes. Output is byte-equal to
+vanilla ML-DSA -- verifiable by any FIPS 204 verifier (circl,
+BoringSSL, RustCrypto). \cite{fips204}
+
+\paragraph{Corona is a genuine 2-round threshold lattice scheme}
+(Corona family \cite{corona2024}). Each party performs $392$
+NTT polynomial multiplies in Round~1 plus $256$ independent
+Gaussian eliminations in Round~2 plus $2t$ PRF expansions. No party
+ever materializes the master sk. Different security property;
+different cost class.
+
+\paragraph{At $N{=}64$ on the same hardware} Pulsar lands at
+\SI{28.5}{\milli\second} total; Corona lands at \SI{4031}{\milli\second}
+total. The $141\times$ gap is the price of ``never trust the
+aggregator.'' Worth it for high-value chains; not worth it for the
+minimum-PQ tier.
+
+\subsection{Vector availability}
+
+Pulsar has committed KAT vectors (\texttt{lux/pulsar/vectors/*.json})
+and cross-impl validation against circl. Corona's KAT vectors are
+pending; the audit harness produced the seed for the first set.
+
+\subsection{The architectural decision}
+
+The audit locks two architectural choices:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{PQ-fast $=$ BLS $+$ Pulsar.} Pulsar is cheap (\SI{28.5}{\milli\second})
+  CPU, FIPS 204 interoperable, and has committed KAT vectors. It is
+  the minimum-PQ tier.
+\item \textbf{PQ-strict adds Corona on top.} For chains that need
+  the never-trust-aggregator property (custody, treasury, regulated
+  securities), the $\sim 100\times$ latency cost buys a real
+  security upgrade (threshold lattice without aggregator trust),
+  not a redundant lane. Corona is therefore on top of Pulsar at
+  PQ-strict, not in place of it.
+\end{enumerate}
+
+\paragraph{GPU caveat.} Once GPU-accelerated Corona lands (the
+NTT-batched aggregate kernel is in flight, per LP-203 follow-up),
+the absolute cost drops by an estimated $50\times$
+(\SI{4.0}{\second} $\to$ $\sim$\SI{80}{\milli\second}); the
+\emph{ratio} to Pulsar drops by less because Pulsar's aggregate
+also benefits from GPU. The architectural ranking (Pulsar cheap,
+Corona expensive) is preserved.
+
+\paragraph{This paper adds:} the Corona/Pulsar parity audit verdict
+as a \emph{first-class section} of the LP. The LP itself references
+the audit; this paper makes the verdict explicit, names the
+$141\times$ ratio, and ties it to the LP-217 mode ladder locking
+decision.
+
+\subsection{Update from the Quasar matrix bench (2026-06-04)}
+
+The matrix bench (Section~\ref{sec:modes}) measured PQ-strict
+total wall-clock at $N{=}64$ on Spark = \SI{595}{ms}, vs the parity
+audit's per-host Corona total of \SI{4.0}{s}. The reconciliation:
+the parity-audit measurement is single-host CPU work; the matrix
+bench is the parallel deployment model where each validator runs
+its R1/R2/sign on its own host with the whole machine to itself,
+then the slowest validator's wall-clock dominates. With $N{=}64$
+validators each doing $\approx 30$ ms of Corona work in parallel,
+the max-validator wall-clock is bounded by the slowest single-host
+ceremony plus aggregation, not by $N \times$ ceremony cost.
+
+The architectural ranking from the parity audit stands -- Pulsar is
+intrinsically cheaper per-validator than Corona -- but production
+deployments see the parallel wall-clock, not the per-host total.
+PQ-strict at $N{=}64$ inside \SI{600}{ms} on Spark validates the
+``Corona + Pulsar at PQ-strict'' choice: the cross-family lattice
+diversity arrives inside the round budget when measured at
+deployment scale.
+
+Pulsar's per-validator sign on Spark is \SI{175}{\micro\second}, well
+under Corona's per-validator ceremony of $\sim$\SI{30}{ms}. Pulsar
+therefore composes ``for free'' on top of Corona in the wall-clock
+sense: each validator's Pulsar leg completes during the Corona R1
+window. This is why PQ-strict's wall-clock is barely above PQ-fast
+($\sim$\SI{595}{ms} vs $\sim$\SI{585}{ms} at $N{=}64$ Spark) --
+the Pulsar leg overlaps the Corona R1 leg.

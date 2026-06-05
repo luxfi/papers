@@ -1,0 +1,196 @@
+\section{Architecture}
+\label{sec:architecture}
+
+The architecture is three layers: \texttt{luxfi/accel} dispatches
+verify operations to the active backend (CUDA, Metal, ROCm, or
+CPU); the ZAP transport carries bytes from the wire into unified
+memory; and DPDK plus GPUDirect RDMA make the wire-to-UMA hop
+zero-copy where the hardware supports it.
+
+\subsection{\texttt{luxfi/accel}: the dispatch layer}
+
+\texttt{luxfi/accel} (v1.1.9) \cite{accelmod} exposes
+per-primitive batch entry points keyed by signature scheme:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \texttt{accel.BatchVerifyBLS} -- BLS12-381 pairing-based
+  signature batch verify; Miller loop plus final exponentiation
+  per signature, $N$ signatures per grid.
+\item \texttt{accel.BatchVerifyEd25519} -- Edwards-curve verify,
+  one thread per signature, 256 sigs per warp.
+\item \texttt{accel.BatchVerifySecp256k1} -- ECDSA verify on
+  secp256k1, one thread per sig, 128 sigs per warp.
+\item \texttt{accel.BatchVerifyMLDSA} -- FIPS 204 \cite{fips204}
+  verify via NTT-based polynomial verify, one block per signature.
+\item \texttt{accel.BatchVerifySLHDSA} -- FIPS 205 \cite{fips205}
+  verify; hash-based; one thread per verify with warp-level
+  parallelism over the hash chain.
+\end{itemize}
+
+The runtime picks the active backend from the build tags (\texttt{cgo gpu cuda} /
+\texttt{cgo gpu metal} / \texttt{cgo gpu rocm} / pure-Go CPU
+fallback). The Go-visible signature is identical across backends;
+the dispatch table is opaque to callers.
+
+Lattice ops live in a sibling package \texttt{luxfi/lattice}
+(v7.1.4) \cite{latticemod}, which holds the GPU lattice
+primitives for Corona and Pulsar (Module-LWE NTT). The two
+packages share the CUDA / Metal / ROCm backend through a common
+ABI.
+
+\subsection{UMA: \texttt{cudaMallocManaged} as the verify substrate}
+
+The ZAP buffer is allocated through
+\texttt{zap/transport/uma.go}'s \texttt{UMAAlloc(size)}. The
+platform-split implementation is on disk today:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \texttt{uma\_linux\_cuda.go} (\num{371} lines of Go +
+  cgo) -- probes the CUDA runtime via
+  \texttt{C.luxzap\_cuda\_probe()}, builds a slab-backed
+  \texttt{cudaMallocManaged} pool sized by
+  \texttt{ZAP\_UMA\_POOL\_BYTES} (default \SI{4}{GiB}), and
+  returns a \texttt{Transport} whose \texttt{Recv} envelopes
+  alias unified memory. Build constraint:
+  \texttt{cgo + linux + cuda}.
+\item \texttt{uma\_darwin.go} -- Metal \texttt{MTLBuffer} with
+  \texttt{storageModeShared}; Apple Silicon UMA is
+  hardware-native (single physical memory pool shared by CPU
+  and GPU).
+\item \texttt{uma\_linux\_hip.go} -- ROCm
+  \texttt{hipMallocManaged} equivalent.
+\item \texttt{uma\_other.go} -- heap allocation with no GPU
+  mapping; pure-CPU fallback.
+\end{itemize}
+
+The Go-visible type is \texttt{zap.UMABuffer}, a \texttt{[]byte}
+whose backing memory is page-locked and visible to the active
+GPU device. Hand-offs between CPU and GPU are explicit fence
+points; there is no shared writer state.
+
+\subsection{DPDK: kernel-bypass ingest into UMA}
+
+For deployments without GPUDirect-capable NICs, DPDK
+(\texttt{zap/transport/dpdk\_linux.go}) provides kernel-bypass
+ingest. The DPDK Poll-Mode Driver binds to a dedicated NIC queue
+isolated via \texttt{isolcpus} / \texttt{nohz\_full}. Received
+packets land in a hugepage-backed mempool registered as UMA
+through \texttt{cudaHostRegister} \cite{dpdk}. The GPU reads
+packet bytes without an intermediate copy.
+
+The PMD thread does the first byte's ZAP-magic check inline.
+Bad-magic packets are dropped at the PMD thread before any
+further work. Good packets are handed to the GPU verify ring
+buffer by writing a UMA pointer to a ring slot; the verify
+kernel polls the ring on the GPU side.
+
+End-to-end CPU latency from wire-arrival to first-byte
+ZAP-magic-check is under \SI{1}{\micro\second} (PMD poll loop;
+no interrupts, no syscall).
+
+\subsection{GPUDirect RDMA: NIC $\to$ GPU memory, no CPU
+involvement}
+
+For top-of-rack validators with a Mellanox ConnectX-5/6/7 or
+Broadcom Stingray NIC, the file
+\path{zap/transport/gpudirect_linux_real.go} (\num{246} lines;
+build constraint \texttt{cgo + linux + gpudirect + cuda})
+registers a CUDA buffer with the NIC driver via
+\texttt{nvidia-peermem} (the in-tree replacement for
+out-of-tree \texttt{nv\_peer\_mem}, with the ibverbs
+\texttt{MEMORY\_REGION} registration) \cite{nvpeermem,gpudirect}.
+
+The implementation probes four prerequisites at startup:
+ibverbs, \texttt{nvidia-peermem}, the CUDA runtime, and a
+visible HCA. The probe returns \texttt{ErrNotAvailable} if any
+is missing, which causes the transport \texttt{Pick()} to fall
+through to DPDK + UMA. On a DGX with a CX-7 plus
+\texttt{nvidia-peermem}, the probe succeeds and the transport
+opens the first Mellanox-class HCA, allocates a Protection
+Domain, and builds Buffers that live in \texttt{cudaMallocManaged}
+memory \emph{and} are registered as DMA-buf MRs with the NIC.
+Packets DMA straight from wire into GPU memory.
+
+The wire side (QP setup, post\_send/recv, polling) is staged for
+a follow-up PR. The current commit delivers the registration
+framework and an honest probe so \texttt{Pick()} does the right
+thing on every host:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lp{8cm}@{}}
+\toprule
+\textbf{Host class} & \textbf{Transport \texttt{Pick()} resolves to} \\
+\midrule
+GB10 with no HCA visible & UMA only (\texttt{cudaMallocManaged})
+  via \texttt{uma\_linux\_cuda.go} \\
+DGX with CX-7 +
+  \texttt{nvidia-peermem} & GPUDirect RDMA + UMA via
+  \texttt{gpudirect\_linux\_real.go} \\
+Generic CUDA box, no IB & UMA only \\
+Apple Silicon developer
+  workstation & UMA only via \texttt{uma\_darwin.go} (Metal
+  \texttt{MTLBuffer} \texttt{storageModeShared}) \\
+Linux non-CUDA host & Heap fallback via \texttt{uma\_other.go};
+  CPU verify only \\
+\bottomrule
+\end{tabular}
+\caption{Transport selection results for the four canonical
+host classes. \texttt{Pick()} is built on the LP-201 transport
+selector; DPDK and GPUDirect are NIC-ingest mechanisms
+underneath whichever transport (QUIC by default) the selector
+picked for the peer.}
+\label{tab:transport-pick}
+\end{table}
+
+\subsection{Memory ownership rules}
+
+The verify pipeline has explicit owners per phase. There is no
+shared writer state at any point.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lllp{2.5cm}@{}}
+\toprule
+\textbf{Phase} & \textbf{Owner} & \textbf{Writers} & \textbf{Readers} \\
+\midrule
+NIC ingest (GPUDirect) & NIC DMA engine & NIC only & none \\
+Magic + scheme dispatch & CPU & CPU only & CPU \\
+Sig verify & GPU & GPU only & GPU (read-only) \\
+Merkle root compute & GPU & GPU & GPU; CPU after fence \\
+ZapDB write & CPU & CPU & CPU \\
+\bottomrule
+\end{tabular}
+\caption{Memory ownership per pipeline phase. Hand-offs are
+explicit fence points.}
+\label{tab:ownership}
+\end{table}
+
+\subsection{The data-flow diagram}
+
+\begin{verbatim}
++--------------+    GPUDirect RDMA    +--------------+
+|   NIC RAM    | -------------------> |  GPU memory  |
+|  (Mellanox/  |   (DMA, no CPU       |  (UMA-mapped |
+|   Broadcom)  |    involvement)      |  cudaMalloc- |
+|              |                      |   Managed)   |
++--------------+                      +--------------+
+                                             ^
+                                             | UMA: CPU + GPU
+                                             |  see same buffer
+                                             v
+                                      +--------------+
+                                      |  CPU cores   |
+                                      | (ZapDB,      |
+                                      |  consensus   |
+                                      |  state mgmt) |
+                                      +--------------+
+\end{verbatim}
+
+Bytes arrive at the GPU through one of three paths: kernel
+sockets (the developer default), DPDK with a hugepage UMA mempool
+(top-of-rack with a non-GPUDirect NIC), or GPUDirect RDMA
+(top-of-rack with \texttt{nvidia-peermem}). The verify kernel
+reads from UMA in every case; only the ingest cost differs.

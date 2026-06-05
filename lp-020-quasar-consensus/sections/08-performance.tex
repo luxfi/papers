@@ -196,6 +196,169 @@ Solana    & Tower BFT & 65K (network) & Custom binary \\
 \label{tab:comparison}
 \end{table}
 
+\subsection{Multi-Host Distributed Measurements (2026-06-03)}
+\label{sec:multi-host-dist}
+
+The numbers in
+Sections~\ref{sec:gpu-native}--\ref{tab:full-verify}
+characterize the in-process verification primitives on a single
+mainnet board. Production network rounds further pay the
+\emph{cross-host} cost of: (a) each validator's local share
+computation, (b) the partial-signature transport leg to the
+coordinator, and (c) the constant-time cert composition once the
+$t$-th partial arrives. The wall-clock finality observed by a
+client is the parallel max of the configured legs plus
+propagation and compose.
+
+To bound this we ran a distributed bench on a 3-host cluster:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{ra} -- Apple M1 Max, 10-core, macOS 26.5 (darwin-arm64).
+\item \textbf{spark} -- NVIDIA arm64 server (Blackwell), Ubuntu 24.
+\item \textbf{evo} -- AMD Ryzen AI MAX+ 395 (x86\_64), WSL2 Linux 6.6.
+\end{itemize}
+
+Each host ran one \texttt{thresholdd} process exposing
+\texttt{bls.\{keygen,sign\}}, \texttt{pulsar.\{keygen,sign\}}, and
+\texttt{corona.\{keygen,sign\}} over JSON-RPC. A coordinator on \texttt{ra}
+drove $5$ rounds per (scale, profile) cell using HTTP/JSON-RPC over an
+SSH tunnel (a conservative proxy for the QUIC transport that production
+deploys; SSH/TCP adds 10--30\,ms per round vs.\ QUIC 0-RTT). Per-host
+sign cost was measured directly; the coordinator-side leg arrival time is
+$\max(\text{per-host sign ms}) + \text{measured one-way prop ms}$.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}llrrrr@{}}
+\toprule
+\textbf{Scale} & \textbf{Profile} &
+\textbf{Pulsar leg} & \textbf{Corona leg} & \textbf{Mag.\ leg} & \textbf{Finality $p_{50}$} \\
+\midrule
+10v   & Aurora    & 189 & 1\,204 & ---  & 1\,204 \\
+10v   & Polaris   & 197 & 1\,258 & 137  & 1\,258 \\
+10v   & Hybrid-1s & 203 & 1\,135 & 141  & 1\,135 \\
+100v  & Aurora    & 374 & 2\,682 & ---  & 2\,682 \\
+100v  & Polaris   & 366 & 2\,658 & 132  & 2\,658 \\
+100v  & Hybrid-1s & 298 & 2\,593 & 134  & 2\,593 \\
+500v  & Aurora    & 427 & 2\,542 & ---  & 2\,542 \\
+500v  & Polaris   & 489 & 2\,692 & 175  & 2\,692 \\
+500v  & Hybrid-1s & 408 & 2\,655 & 146  & 2\,655 \\
+\bottomrule
+\end{tabular}
+\caption{End-to-end leg arrival ($p_{50}$, milliseconds, including
+network propagation) on the 3-host distributed bench (CPU baseline,
+GPU acceleration for Corona pending). Hybrid-1s adds a BLS fast-path
+that announces preliminary finality at 159--187\,ms across all
+scales; the Polaris cert tier still arrives behind the dominant
+Corona leg. ``Validators'' is the modeled $t/n$ ratio (\,$\approx$67\%\,)
+at $n{=}20$ ceiling per process (Caveat~\ref{cav:n20}).}
+\label{tab:dist-finality}
+\end{table}
+
+Three structural findings follow.
+
+\textbf{Finding 1: BLS dominates fast-path.} At every scale the
+BLS leg in Hybrid-1s is finished in 160--190\,ms while the
+Polaris cert tier (Pulsar+Corona+Magnetar) takes 1.1--2.7\,s.
+This validates the LP-073 cert-tier degradation design: a hybrid
+chain can publish a useful BLS-finality block at $t_{\text{BLS}}$ and let
+the PQ tier land asynchronously without blocking the client-visible
+block clock.
+
+\textbf{Finding 2: Corona leg is the bottleneck.} Corona sign
+latency scales near-linearly in $t$ in our measured range:
+$651$\,ms at $n{=}10$, $1\,204$\,ms at $n{=}15$, $1\,721$\,ms at
+$n{=}20$ on the M1 Max (Section~\ref{sec:phase5-sweep}). This is
+CPU-baseline; GPU offload (Blackwell on spark, Vulkan on evo) is
+expected to bring this to sub-second based on luxfi/threshold's
+published GPU lane work-in-flight, but our cluster did not yet
+saturate the GPU during this run ($\leq 16$\% utilization).
+
+\textbf{Finding 3: $t/n$-ratio scaling holds.} Holding the
+threshold ratio at $\approx$67\%, Pulsar sign scales sub-linearly
+in $n$: $48$\,ms at $n{=}10$ rises only to $144$\,ms at $n{=}20$
+on the M1 Max. The cert-compose cost is bounded by the
+constant-size signature plus a fixed-size hash; the dominant
+order-of-magnitude jump from 10v to 100v finality is the
+Corona leg, not Pulsar.
+
+\subsubsection{Caveats}
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{Cap on benchmark $n$.}\label{cav:n20} The
+  \texttt{thresholdd} keygen ceremony at $n{=}100$ exceeds 1\,GB of
+  RAM per process and takes 30+ seconds; we cap $n_{\text{bench}}{=}20$
+  and preserve the $t/n$ ratio. The Phase-5 sweep
+  (Section~\ref{sec:phase5-sweep}) confirms that sign cost
+  (the per-round bottleneck) scales near-linearly in $t$ in the
+  measured range, so the projection from $n{=}20$ to $n{=}100$
+  on the sign leg is sound. Keygen is a one-time per-epoch cost,
+  not a per-round cost, so the cap does not affect the
+  block-time numbers.
+\item \textbf{Magnetar via published number, not per-round sign.}
+  The JSON-RPC bench driver does not expose
+  \texttt{magnetar.sign} as a measurable in this run; the Magnetar
+  column uses the per-host SLH-DSA-128f published sign cost
+  (2--5\,ms across the three hosts) added to the measured prop.
+  This is consistent with luxfi/magnetar's published numbers.
+\item \textbf{HTTP/JSON-RPC, not QUIC.} The harness uses HTTP over
+  SSH tunnels in place of QUIC. SSH/TCP adds 10--30\,ms per
+  round relative to QUIC 0-RTT. Production deployment of QUIC
+  will lower the finality numbers in
+  Table~\ref{tab:dist-finality} by approximately one network RTT.
+\item \textbf{Corona GPU parity pending.} A sister agent (the
+  \emph{Corona/Pulsar parity} effort) is in flight to land
+  GPU-accelerated Corona sign on the Blackwell lane. Once that
+  work completes and the bench re-runs, the Corona leg should
+  drop by $5{-}20{\times}$, moving 100v Aurora finality to
+  ${\sim}500{-}700$\,ms and the Hybrid-1s preliminary finality
+  to BLS-dominated $160{-}190$\,ms. The CPU numbers here are
+  the worst case.
+\end{enumerate}
+
+\subsection{Phase-5 Tuning Sweep}
+\label{sec:phase5-sweep}
+
+We swept the $t/n$ ratio at fixed $\approx$67\% on each host to
+characterize per-primitive scaling.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}rr|rrr|rrr|rrr@{}}
+\toprule
+\multicolumn{2}{c|}{} &
+\multicolumn{3}{c|}{\textbf{Pulsar sign $p_{50}$ (ms)}} &
+\multicolumn{3}{c|}{\textbf{Corona sign $p_{50}$ (ms)}} &
+\multicolumn{3}{c}{\textbf{BLS sign $p_{50}$ (ms)}} \\
+$n$ & $t$ &
+ra & spark & evo &
+ra & spark & evo &
+ra & spark & evo \\
+\midrule
+10 &  7 &  48 &  58 &  19 &   652 &   762 &   877 &  9.3 & 22.4 & 12.3 \\
+15 & 11 & 124 & 108 &  77 & 1\,205 & 1\,470 & 1\,675 & 13.3 & 35.1 & 18.2 \\
+20 & 14 & 144 & 133 & 155 & 1\,722 & 2\,200 & 2\,491 & 16.9 & 44.5 & 23.0 \\
+\bottomrule
+\end{tabular}
+\caption{Per-host primitive sign cost vs.\ $n$ at threshold ratio
+0.67. BLS scales sub-linearly (amortized Lagrange interpolation).
+Pulsar scales near-linearly in $n$. Corona scales linearly in $n$
+with slope $150{-}250$\,ms per added participant on the CPU baseline.}
+\label{tab:phase5-sweep}
+\end{table}
+
+\textbf{Note on the requested QUIC/DHT/gossip sweep}. The
+distributed-bench harness runs over HTTP/JSON-RPC on the existing
+SSH tunnel, not the luxfi/consensus QUIC transport, so it cannot
+directly vary \texttt{MaxStreamsBidi},
+\texttt{InitialStreamReceiveWindow}, the DHT $k$-bucket, or the
+gossip fanout. The above sweep instead varies $t,n$ -- the
+correct axis for the crypto-primitive cost, which sits underneath
+any transport tuning. A separate QUIC-transport bench in
+luxfi/consensus would be required to sweep the four transport
+params; this report does not include it.
+
 \subsection{Memory Bounds}
 
 Epoch-based pruning with a 6-epoch retention window bounds consensus

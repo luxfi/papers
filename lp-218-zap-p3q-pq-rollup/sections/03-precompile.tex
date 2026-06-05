@@ -1,0 +1,121 @@
+\section{The P3Q Precompile}
+
+P3Q is an EVM precompile at slot \texttt{0x012205}. It is the unified
+PQ-verifier family that dispatches on a 1-byte \texttt{kind}
+discriminator: $0x01$ Pulsar (FIPS-204 ML-DSA threshold), $0x02$
+Corona (Ring-LWE threshold), $0x03$ Magnetar (FIPS-205 SLH-DSA
+threshold). The earlier draft of LP-218 allocated separate slots for
+each kind; the 2026-06-03 decomplection collapsed them onto a single
+slot with kind-byte dispatch (LP-220 \S\,``Architectural decision
+-- single slot, kind-byte dispatch''). One slot, one ABI, three
+kinds.
+
+\subsection{Solidity ABI}
+
+\begin{verbatim}
+// EVM precompile at slot 0x012205 -- unified PQ verifier family
+function verify(
+    uint8    kind,         // 0x01 Pulsar | 0x02 Corona | 0x03 Magnetar
+    bytes calldata sig,    // primitive-specific threshold sig
+    bytes32 messageHash,   // H(prev_root || new_root || batch_hash)
+    bytes calldata pk      // primitive-specific group public key
+) external view returns (bool);
+\end{verbatim}
+
+The wire format used by the reference implementation places the
+\texttt{kind} byte at offset 0, the primitive-specific
+\texttt{mode} byte at offset 1, then the existing \texttt{(sigLen,
+sig, pkLen, pk, messageHash)} layout. Canonical Pulsar / ML-DSA-65
+input is \SI{5303}{B} (\SI{5302}{B} pre-decomplection + \SI{1}{B}
+for the kind byte).
+
+\subsection{Properties}
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Stateless.} No storage reads, no storage writes.
+  Function of inputs only.
+\item \textbf{Pure cryptographic check.} Returns true iff
+  \texttt{sig} is a valid threshold signature of the named
+  \texttt{kind} on \texttt{messageHash} under \texttt{pk}.
+\item \textbf{Constant-time.} No data-dependent branches; no side
+  channels.
+\item \textbf{Slot.} \texttt{0x012205} per HANZO-CRYPTO-SUITE \S 5.2.
+  Single slot hosts all three kinds; kind-byte dispatch routes to the
+  primitive's verifier.
+\item \textbf{Kind dispatch.} Unknown or reserved-not-yet-wired
+  \texttt{kind} values return \texttt{abiFalse} -- no revert -- so the
+  Solidity caller can detect via the boolean return rather than via
+  an exception path.
+\end{itemize}
+
+\subsection{Gas cost (honest accounting)}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrll@{}}
+\toprule
+\textbf{Verifier} & \textbf{Gas} & \textbf{Blackwell time} & \textbf{Notes} \\
+\midrule
+\texttt{ecrecover} (secp256k1) & \SI{3000}{} & $\sim$\SI{3}{\micro\second} & Classical; broken by Shor's \\
+BLS pairing verify & \SI{5000}{} & $\sim$\SI{10}{\micro\second} & Classical; broken by Shor's \\
+\textbf{P3Q (Pulsar / ML-DSA-65)} & \textbf{\SI{50000}{}} & \textbf{$\sim$\SI{50}{\micro\second}} & \textbf{PQ-secure} \\
+Re-running rollup consensus & N/A & \SI{5}{\milli\second}--\SI{50}{\milli\second} & What we are NOT doing \\
+\bottomrule
+\end{tabular}
+\caption{Honest gas comparison.}
+\label{tab:gas}
+\end{table}
+
+P3Q is more expensive than BLS verify because PQ verification is
+inherently heavier -- lattice operations dominate elliptic-curve
+operations on every CPU and most GPUs. The $10\times$ factor is
+honest, not pessimistic. Blackwell sm\_120 closes the absolute-time
+gap (\SI{50}{\micro\second} P3Q vs \SI{10}{\micro\second} BLS
+verify), but the gas accounting reflects CPU-class verify cost as
+the gas calibration baseline.
+
+P3Q is dramatically cheaper than re-running consensus to attest to
+the rollup batch. The rollup pays \SI{50000}{gas} per batch instead
+of running an entire validator set per batch. This is the economic
+case for the pattern.
+
+\subsection{Verifier reference}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lp{6cm}p{4cm}@{}}
+\toprule
+\textbf{Artifact} & \textbf{Path} & \textbf{Purpose} \\
+\midrule
+Go reference impl & \texttt{lux/standard/precompiles/p3q/p3q.go} & EVM precompile at slot \texttt{0x012205} \\
+Solidity consumer ABI & \texttt{lux/standard/precompiles/p3q/p3q.sol} & Solidity shim \\
+Pulsar verifier core & \texttt{lux/pulsar/verify/} & Constant-time FIPS 204 verifier -- P3Q wraps this \\
+GPU kernel & \texttt{lux/accel/cuda/p3q.cu} & Blackwell sm\_120 batched verify path \\
+\bottomrule
+\end{tabular}
+\caption{P3Q implementation artifacts.}
+\label{tab:p3q-impl}
+\end{table}
+
+P3Q's verifier core IS the FIPS-204 ML-DSA verifier -- Pulsar
+signatures serialize byte-identically to FIPS-204 ML-DSA
+signatures per LP-073 wire format \cite{fips204}. Any conformant
+FIPS-204 verifier suffices. The precompile exists to give EVM-side
+callers a stable ABI and an audited gas charge.
+
+\subsection{Pulsar-only verifier (not generic PQ)}
+
+P3Q verifies Pulsar / FIPS-204 ML-DSA signatures specifically. It
+is NOT a generic PQ-signature precompile. A Corona (Ring-LWE)
+threshold signature verified on-chain requires a separate
+precompile -- planned as LP-220.
+
+Rationale: Pulsar is the threshold-PQ signature already in
+production across the Lux stack (consensus legs, validator keys,
+treasury authorization). Wallets, sequencers, and tooling already
+produce Pulsar signatures. A second PQ verifier proliferates the
+surface area for no immediate benefit. When Corona-threshold-signed
+rollups become operationally relevant, LP-220 adds the dedicated
+precompile slot.

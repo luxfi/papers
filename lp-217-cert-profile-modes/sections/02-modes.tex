@@ -1,0 +1,170 @@
+\section{The Four Modes}
+
+Each mode defines a REQUIRED leg set. A cert is at mode $M$ if and
+only if every leg in $M$'s required set is present and verified.
+Modes are totally ordered by subset inclusion within their family
+(classical or pure-PQ).
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lp{3.8cm}p{3.5cm}rr@{}}
+\toprule
+\textbf{Mode} & \textbf{Required legs} & \textbf{Recommended use} & \textbf{M1 wall} & \textbf{Spark wall} \\
+\midrule
+\texttt{PQ-off} & BLS & HFT trading; non-financial L2s & \SI{6.9}{\milli\second} & \SI{6.3}{\milli\second} \\
+\texttt{PQ-fast} & BLS + Pulsar & Payment rails; gaming; DEX matching & \SI{391}{\milli\second} & \SI{585}{\milli\second} \\
+\texttt{PQ-strict} & BLS + Pulsar + Corona & \textbf{Default} -- custody, treasury, regulated securities & \SI{360}{\milli\second} & \SI{595}{\milli\second} \\
+\texttt{PQ-heavy} & BLS + Corona + Pulsar + Magnetar & Cross-chain bridges, sovereign anchors & \SI{2.22}{\second} & \SI{1.33}{\second} \\
+\bottomrule
+\end{tabular}
+\caption{Four classical modes with measured wall-clock per signing
+round at $N{=}64$ (Quasar 4-scheme matrix bench, 2026-06-04). M1 Max
+(10-core darwin/arm64); Spark = NVIDIA GB10 Grace Blackwell
+(20-core linux/aarch64). Cert size at $N{=}64$: PQ-off \SI{96}{B},
+PQ-fast \SI{33154}{B}, PQ-strict \SI{245634}{B}, PQ-heavy \SI{1.28}{MB}.
+Magnetar measured with SLH-DSA-192s -- see \S\ref{sec:magnetar-param}
+for the 192f production lock.}
+\label{tab:modes}
+\end{table}
+
+\subsection{Magnetar parameter set choice -- locked 2026-06-04}
+\label{sec:magnetar-param}
+
+SLH-DSA at the 192-bit security level has two parameter sets:
+\emph{192s} (small, \SI{16}{KB} sigs, \SI{795}{ms}/sign on Spark) and
+\emph{192f} (fast, \SI{35}{KB} sigs, \SI{36}{ms}/sign on Spark). The
+matrix bench measured 192s, which is what
+\texttt{\textasciitilde/work/lux/threshold/protocols/magnetar/} ships
+today. At \SI{795}{ms} per per-validator sign, \emph{no Magnetar-
+bearing profile is sub-second at any measured $N$}: PQ-heavy on Spark
+at $N{=}64$ blows past \SI{1.33}{s}. Switching to 192f drops the
+per-validator sign 22$\times$ to \SI{36}{ms} and restores the
+sub-\SI{1}{s} budget. Production deployments configuring PQ-heavy
+MUST use 192f.
+
+\subsection{GPU dispatch is unmeasured today}
+
+The matrix bench captured \num{4595} samples of \texttt{nvidia-smi dmon}
+during the 2-hour run on Spark: mean \texttt{SM\%} = \SI{11.9}{\percent}
+(idle / background only). \textbf{The GPU was not exercised by any
+path in this bench.} Two boundary gaps prevent dispatch:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \texttt{lux-lattice.pc} is not installed on Spark
+  (\texttt{find\_package(MLX REQUIRED)} fails on the CUDA target's
+  dependency chain), so \texttt{lattice/v7/gpu} doesn't build under
+  \texttt{-tags "cgo gpu"}.
+\item Magnetar SLH-DSA's CUDA kernel exists and passes KAT tests on
+  Spark, but \texttt{lux\_slhdsa\_*} entry points are not yet exposed
+  in \texttt{lux/accel/c\_api.h}.
+\end{itemize}
+
+GPU numbers cited in earlier LP-203 drafts (PQ-strict
+$\approx$\SI{15}{ms}--\SI{50}{ms}) are projections, not measurements.
+Until both boundary gaps close, all GPU latency claims in downstream
+LPs are tagged ``projected, not measured.''
+
+\subsection{Pure-PQ variants}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lp{4cm}p{6cm}@{}}
+\toprule
+\textbf{Mode} & \textbf{Required legs} & \textbf{Recommended use} \\
+\midrule
+\texttt{strict-PQ-fast} & Pulsar & Post-PQ-transition L1 with no BLS bridge dependency \\
+\texttt{strict-PQ-strict} & Pulsar + Corona & Sovereign PQ-only treasury chain \\
+\texttt{strict-PQ-heavy} & Corona + Pulsar + Magnetar & PQ-only long-archival anchor \\
+\bottomrule
+\end{tabular}
+\caption{Pure-PQ variants drop BLS.}
+\label{tab:pure-pq}
+\end{table}
+
+\subsection{Mode-to-internal mapping}
+
+The v1 codenames remain in the codebase as INTERNAL identifiers
+(struct names, package paths, EasyCrypt artifact filenames). The
+mode-to-internal map for operator config translation:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{v2 mode} & \textbf{Required legs} & \textbf{Closest v1 codename} & \textbf{Notes} \\
+\midrule
+\texttt{PQ-off} & BLS & (no v1 name) & v1 implicitly required at least one PQ leg \\
+\texttt{PQ-fast} & BLS + Pulsar & v1 ``Pulsar profile'' & Locked by parity audit \\
+\texttt{PQ-strict} & BLS + Pulsar + Corona & Aurora & Same lattice diversity; ZK profile-orthogonal in v2 \\
+\texttt{PQ-heavy} & BLS + Corona + Pulsar + Magnetar & Polaris & Cross-family maximum \\
+\texttt{strict-PQ-*} & PQ legs only & (no v1 name) & New in v2 \\
+\bottomrule
+\end{tabular}
+\caption{v2 mode names mapped to v1 internal codenames.}
+\label{tab:v1-v2}
+\end{table}
+
+\subsection{Operator config}
+
+One struct -- \texttt{CertPolicy} -- declares the full cert posture
+for a chain at genesis. Three previously-scattered knobs
+(\texttt{cert\_mode}, \texttt{cert\_timeout\_ms}, and LP-204's per-L1
+mode picker) collapse to four fields of one record. LP-202 references
+\texttt{CertPolicy.TimeoutMs}; LP-204 attaches a \texttt{CertPolicy}
+per chain-VM (default: inherit from parent L1); LP-218 reuses
+\texttt{CertPolicy.Mode} as the rollup's inherited cert mode.
+
+\begin{verbatim}
+type CertPolicy struct {
+    Mode      CertMode     // PQ-off|PQ-fast|PQ-strict|PQ-heavy
+    Variant   CertVariant  // Hybrid (with BLS) | Strict (pure PQ)
+    TimeoutMs uint32       // max wait for full-mode cert; past TimeoutMs
+                          //  LP-202 tier degradation kicks in
+    Fallback  CertMode     // tier to settle at if Mode's legs don't
+                          //  arrive in TimeoutMs; MUST be <= Mode
+}
+\end{verbatim}
+
+YAML form:
+
+\begin{verbatim}
+quasar:
+  cert_policy:
+    mode:       PQ-strict
+    variant:    hybrid       # hybrid | strict
+    timeout_ms: 1000
+    fallback:   PQ-fast      # MUST be <= mode
+\end{verbatim}
+
+\subsection{Validation rules}
+
+\texttt{CertPolicy} is validated at chain genesis. A chain MUST
+refuse to launch with an invalid \texttt{CertPolicy}:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \texttt{Fallback <= Mode}. The fallback tier cannot be stronger
+  than the target mode; the four modes are subset-ordered.
+\item \texttt{Variant == Strict} requires \texttt{Mode >= PQ-fast}.
+  Pure-PQ at \texttt{PQ-off} is the empty leg set; refused.
+\item \texttt{TimeoutMs >= 2 * expected\_floor\_latency(Mode)}. A
+  chain configured at a high \texttt{Mode} with a \texttt{TimeoutMs}
+  shorter than the floor latency for that mode will routinely publish
+  certs at a lower tier; the validator MUST reject such a
+  configuration at genesis (no operationally-useful chain declares
+  PQ-heavy and then never satisfies it). Floor latencies at
+  Blackwell $N{=}64$:
+  PQ-off $\approx$\SI{1}{\milli\second} (min TimeoutMs
+  \SI{2}{\milli\second});
+  PQ-fast $\approx$\SI{5}{\milli\second} (min \SI{10}{\milli\second});
+  PQ-strict $\approx$\SI{50}{\milli\second} (min
+  \SI{100}{\milli\second});
+  PQ-heavy $\approx$\SI{80}{\milli\second} (min
+  \SI{160}{\milli\second}).
+\item \texttt{Fallback} as a \texttt{(Mode, Variant)} pair under the
+  chain's \texttt{Variant} must itself satisfy rule 2. A chain at
+  \texttt{Variant=Strict} cannot fall back to \texttt{PQ-off} (the
+  eighth-slot configuration).
+\end{enumerate}
