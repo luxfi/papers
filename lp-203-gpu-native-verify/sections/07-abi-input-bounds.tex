@@ -1,0 +1,139 @@
+\section{ABI Input Bounds (Normative)}
+\label{sec:abi-input-bounds}
+
+\emph{Added 2026-06-05 to close Red Probe~8 (Probe~2 + Probe~9
+cross-cutting): every GPU plugin implementing a batch verify or
+sign of \texttt{op\_mldsa\_*} or \texttt{op\_slhdsa\_*} MUST
+reject inputs exceeding the bounds below with
+\texttt{LUX\_BACKEND\_ERROR\_INVALID\_ARGUMENT}. The Go-side
+dispatch (\texttt{lux/accel/internal/capi}) translates this status
+into \texttt{accel.ErrInvalidArgument}, and consumer dispatch sites
+(\texttt{lux/crypto/mldsa}, \texttt{lux/crypto/slhdsa},
+\texttt{lux/precompile/mldsa}, \texttt{lux/precompile/ai}) treat
+this as a hard error -- they propagate, never silently fall back to
+CPU. The propagation discipline is the consensus-split firewall
+between GPU and CPU validators.}
+
+\subsection{Per-element message length cap}
+
+For both \texttt{op\_mldsa\_verify\_batch} /
+\texttt{op\_mldsa\_sign\_batch} and the SLH-DSA siblings:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item Every \texttt{msg\_lens[i]} satisfies
+  \texttt{msg\_lens[i] <= LUX\_GPU\_MLDSA\_MSG\_LEN\_CAP}
+  (=~$\text{INT32\_MAX}-2 = 0\text{x}7\text{FFFFFFD}$).
+  The $-2$ reserves headroom for a 2-byte FIPS 204 ctx prefix
+  (\texttt{0x00 || ctxlen}) so a wrapper that prepends two bytes
+  to the message can never overflow a \texttt{uint32\_t} length
+  field downstream.
+
+\item Every \texttt{msg\_lens[i]} satisfies
+  \texttt{msg\_lens[i] <= LUX\_GPU\_SLHDSA\_MSG\_LEN\_CAP}
+  (also $= \text{INT32\_MAX}-2$). One source of truth across
+  every plugin (CUDA / HIP / Metal), defined in
+  \texttt{include/lux/gpu/backend\_plugin.h}.
+\end{itemize}
+
+Any plugin observing \texttt{msg\_lens[i]} above the cap MUST
+return \texttt{LUX\_BACKEND\_ERROR\_INVALID\_ARGUMENT} \emph{before
+any memory allocation, kernel launch, or sponge absorb}. The cap
+is enforced on \emph{public} input (verify pubkey, sign secret-key
+holder's caller) so the early reject is on data the side-channel
+adversary already controls -- there is no information leak from
+the rejection branch.
+
+\subsection{Per-batch count cap}
+
+Both ML-DSA and SLH-DSA batched ops MUST reject
+\texttt{count > UINT32\_MAX / kBatchMaxFactor} with
+\texttt{LUX\_BACKEND\_ERROR\_INVALID\_ARGUMENT}, where
+\texttt{kBatchMaxFactor} is the largest per-element multiplier in
+the orchestrator's device-buffer arithmetic. As of v14:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item ML-DSA: \texttt{kBatchMaxFactor = 24} (driven by the
+  $k_L \cdot 4$ gamma1-sampling factor inside
+  \texttt{mldsa\_verify\_orchestrator.cu}).
+\item SLH-DSA: \texttt{kBatchMaxFactor = 7680} (most conservative
+  across the v14 batched ops; Red M-NEW-3).
+\end{itemize}
+
+This cap is independent of \texttt{LUX\_GPU\_*\_MSG\_LEN\_CAP};
+both gates fire on different overflow surfaces and both MUST be
+enforced before any device allocation.
+
+\subsection{Cumulative pool offset width}
+
+Red Probe~2 (2026-06-05): every batched op MUST stage per-element
+pool offsets as \texttt{uint64\_t} -- not \texttt{uint32\_t}. The
+per-element \emph{length} fields can remain \texttt{uint32\_t}
+(they are capped by the per-element cap above), but the
+\emph{cumulative} message cursor across the batch can exceed
+$2^{32}$ at modest batch sizes:
+
+\begin{quote}
+With \texttt{cap = 0x7FFFFFFD} and \texttt{count = 3}, three
+elements each at cap-length produce a cumulative
+\texttt{msg\_cursor[3] = 3 * cap = 0x17FFFFFF7}. Truncated to
+\texttt{uint32\_t}, this becomes \texttt{0x7FFFFFF7} -- inside
+element~1's region at \texttt{0x7FFFFFFD}. The kernel reads
+element~1's bytes when verifying element~3, producing
+\emph{cross-element verdict contamination} -- a non-deterministic
+verify output that splits consensus between GPU-equipped and
+CPU-only validators.
+\end{quote}
+
+The fix (Red Probe~2 Option~A) widens the orchestrator's
+\texttt{VerifyElem.{pk\_off,msg\_off,sig\_off,result\_off}} from
+\texttt{uint32\_t} to \texttt{uint64\_t} across both ML-DSA (landed
+in the v14 cycle as C-2) and SLH-DSA (landed 2026-06-05). The
+per-element \emph{length} fields stay \texttt{uint32\_t} for layout
+compactness; the cap above keeps them in range. The widened
+struct is the canonical wire layout across every backend
+(CUDA / HIP / Metal) -- mismatches between host-stage and device
+kernel structs produce silent NVCC misalignment, so the layout
+invariant is hard-locked via the \texttt{\_pad\_<field>\_len}
+trailer pattern (8-byte alignment, no holes).
+
+\subsection{Error propagation discipline (Probe~9)}
+
+The boundary between the C library's \texttt{LuxBackendError}
+sentinels and the Go-public \texttt{accel.Err*} sentinels MUST be
+mediated by \texttt{translateCapiError}
+(\texttt{lux/accel/session\_c.go:22-41}). Every cgo-routed method
+in \texttt{lux/accel/ops\_c.go} now wraps the
+\texttt{capi.*}-returning call through \texttt{translateCapiError}
+so the public surface emits \texttt{accel.ErrInvalidArgument} (and
+sibling \texttt{accel.Err*} sentinels) that consumers'
+\texttt{errors.Is} checks at:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \texttt{lux/accel/ops/crypto/crypto\_gpu.go:159}
+  (SigMLDSA65)
+\item \texttt{lux/crypto/slhdsa/gpu.go:276, 479}
+  (SLH-DSA verify/sign)
+\item \texttt{lux/crypto/mldsa/gpu.go:163-169, 281-287}
+  (ML-DSA verify/sign)
+\item \texttt{lux/crypto/pq/mldsa/gpu/gpu\_cgo.go:259-265, 380-386}
+\item \texttt{lux/precompile/mldsa/contract.go:401}
+\item \texttt{lux/precompile/ai/ai\_mining.go:484, 537}
+\end{itemize}
+
+\noindent successfully detect as the hard-error case. Failure to
+wrap (Red Probe~9, found 2026-06-05) returns the
+\texttt{capi.ErrInvalidArgument} sentinel which is a \emph{distinct
+\texttt{errors.New} value} from \texttt{accel.ErrInvalidArgument}
+-- \texttt{errors.Is} returns false at the leaves, every M-1
+consumer silently falls back to CPU, and the entire M-1
+propagation chain landed in the v14 cycle is defeated. The
+end-state is the consensus-split shape every GPU/CPU asymmetry
+in the validator set creates.
+
+The integration test at
+\texttt{lux/accel/integration\_invalid\_argument\_test.go}
+(build-tag \texttt{lux\_accel\_real}) exercises this path through
+the real cgo boundary on a CUDA / Metal-equipped host, asserting
+\texttt{errors.Is(err, accel.ErrInvalidArgument) == true} after
+fault-injecting a shape-mismatched batch into the MLDSAVerifyBatch
+/ SLHDSAVerifyBatch / BLSVerifyBatch entry points.
