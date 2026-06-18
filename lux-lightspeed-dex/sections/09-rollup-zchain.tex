@@ -1,0 +1,111 @@
+\section{Rollup to the Z-Chain}
+\label{sec:rollup}
+
+Per-validator re-execution of every trade is a ceiling: a chain that re-runs each match on
+each validator cannot finalize trades faster than one validator can re-run them. We break
+this ceiling by rolling D-Chain trade batches up to the Z-Chain (the Lux ZKVM), which
+verifies \emph{one proof per $K$ trades} instead of re-executing each trade. This section
+gives the two-stage rollup, the measured verification rates, and an honest separation of
+settlement \emph{finality} from matching \emph{throughput}.
+
+\subsection{Batches and proofs}
+
+The D-Chain produces, per market, a batch of $K$ fills together with the batch's execution
+root. A proof attests that the batch is a valid extension of the prior root. The Z-Chain
+verifies the proof and finalizes all $K$ trades in the batch at once. The effective
+settlement-finality rate is
+\begin{equation}
+  \text{settled-tx/s (finality)} \;=\; K \times V \times M,
+  \label{eq:rollup}
+\end{equation}
+where $V$ is the per-core proof-verification rate and $M$ the number of markets verified in
+parallel. Equation~\eqref{eq:rollup} is a finality-axis relation: it counts trades finalized
+per second by verification, which is independent of how fast trades are matched.
+
+\subsection{Two stages: attestation then validity}
+
+\begin{description}
+  \item[P3Q (venue-trust attestation).] The D-Chain signs the batch with an ML-DSA-65
+  (FIPS-204) signature; the Z-Chain verifies the signature at the P3Q precompile
+  (\texttt{0x012205}). This is cheap to produce and to verify, and it is sound under the
+  assumption that the single-operator venue is honest---appropriate for the current
+  single-venue deployment.
+  \item[\texttt{starkfri} (trustless validity).] The D-Chain produces a STARK/FRI validity
+  proof that the batch transition is correct; the Z-Chain verifies it with no trust in the
+  venue. This is the path to a decentralized D-Chain. The verifier is a real post-quantum
+  STARK/FRI implementation (cSHAKE256 Fiat-Shamir transcript over the Goldilocks field), not
+  a placeholder, and carries formal-verification artifacts for its on-chain envelope.
+\end{description}
+
+The two are complementary: P3Q gives cheap finality now under venue trust;
+\texttt{starkfri} gives trustless finality as the venue decentralizes. The carried-fills
+block layout (Section~\ref{sec:determinism}) reserves a signature field precisely so this
+transition needs no further wire change.
+
+\subsection{Measured verification rates}
+
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{l l r l}
+\toprule
+\textbf{Stage} & \textbf{Primitive} & \textbf{Verifies/s ($V$)} & \textbf{Trust model} \\
+\midrule
+P3Q       & ML-DSA-65 attestation & 4{,}714 & venue-trust \\
+\texttt{starkfri} & STARK/FRI validity proof & 986 & trustless \\
+\bottomrule
+\end{tabular}
+\caption{Measured single-core verification rates (Apple M1 Max), through the full precompile
+dispatch. P3Q is the real FIPS-204 verify; \texttt{starkfri} is the real STARK/FRI verifier.
+\textbf{The \texttt{starkfri} figure is for a toy AIR} (degree 16, blowup 8, 16 queries); a
+production DEX-batch AIR has many more constraints and verifies slower. We report 986/s as a
+ceiling for that proof shape, not as a production-batch number; the production-batch AIR is
+scaffolded and not yet measured.}
+\label{tab:verify}
+\end{table}
+
+\subsection{Settlement finality at fleet scale}
+
+Substituting the measured $V$ into Equation~\eqref{eq:rollup} shows the rollup clears
+$10^{9}$ settled-tx/s on the \emph{finality} axis with realistic batch sizes and modest
+parallelism:
+
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{l r r r r}
+\toprule
+\textbf{Primitive} & \textbf{$K$} & \textbf{$M$} & \textbf{cores} & \textbf{settled-tx/s} \\
+\midrule
+P3Q       & 10{,}000  & 22 & 1  & $1.04\times10^{9}$ \\
+P3Q       & 100{,}000 & 3  & 1  & $1.41\times10^{9}$ \\
+\texttt{starkfri} & 10{,}000  & 22 & 10 & $2.17\times10^{9}$ \\
+\bottomrule
+\end{tabular}
+\caption{Settlement-finality throughput from Equation~\eqref{eq:rollup} using the measured
+$V$ of Table~\ref{tab:verify}. These combine a measured per-proof verify rate with a stated
+batch size and parallelism; the verify rate is measured, the batch size and core count are
+configuration. The \texttt{starkfri} row uses the toy-AIR rate and is therefore an
+upper-bound shape, not a production-batch figure.}
+\label{tab:finality}
+\end{table}
+
+\subsection{Finality is not matching}
+
+We are explicit about what these numbers do and do not say. The rollup finalizes $K$ trades
+per verified proof, so its rate (Equation~\eqref{eq:rollup}) is a \emph{settlement-finality}
+rate---it counts already-matched trades being finalized. It is \emph{not} the rate at which
+new trades are matched, which is the GPU-fleet-bound figure of Section~\ref{sec:gpu-matching}
+($\sim$100--250\,M matches/s per node, aggregated across a fleet for $10^{9}$ matches/s).
+Conflating the two is exactly the error this paper retracts. The three axes---matching
+(per-book parallel), settlement (market-sharded Block-STM), and finality (rollup)---are
+independent and independently measured.
+
+\subsection{Private order flow}
+
+Encrypted order flow can be carried inside a batch using fully homomorphic encryption, so
+that order contents remain private while still being matched and proven. We note the honest
+limit: homomorphic bootstrapping runs at single to low-tens of operations per second per
+accelerator, orders of magnitude below the attestation rate, so the private path is bounded
+by FHE bootstrap cost rather than by verification. Private order flow is therefore a distinct
+performance regime from the public path and is governed by FHE throughput.

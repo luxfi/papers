@@ -1,0 +1,81 @@
+\section{The DEX Adapter Precompile (0x9010)}
+\label{sec:dex-adapter}
+
+The twenty precompiles documented above are \emph{cryptographic}
+primitives: pure functions of their input bytes with no external state.
+Lux adds one precompile of a different kind --- an
+\emph{application adapter} --- at address \texttt{0x9010}, in the
+application range \texttt{0x9000}--\texttt{0x90ff} reserved above the
+cryptographic block. It is the EVM-side entry point to the Lux DEX, and
+its engineering is instructive precisely because it is not a pure
+function: it is a deterministic facade over an external matching chain.
+
+\subsection{A CLOB Facade, Not an AMM}
+
+\texttt{0x9010} exposes a Uniswap-V4-\texttt{PoolManager}-style singleton
+interface --- pool keys, hooks, flash accounting --- but it is a
+\textbf{central-limit-order-book (CLOB) facade}, not an automated market
+maker. A call does not move along a bonding curve; it relays an order to
+the D-Chain matching VM (Lux Lightspeed DEX \cite{lux-lightspeed-dex})
+and reports the resulting fill. The V4-shaped surface is retained so that
+existing V4-aware routers and Solidity integrators compose unchanged,
+while the execution semantics underneath are price-time priority CLOB
+matching rather than constant-product swaps.
+
+This is deliberately distinct from the plain Solidity AMMs Lux also
+ships: the V2 (constant-product) and V3 (concentrated-liquidity) pools
+are ordinary contracts with no precompile involvement. The precompile
+exists only for the CLOB path, where on-chain bytecode cannot match a
+limit-order book at the throughput the D-Chain achieves natively.
+
+\subsection{Inert by Default}
+
+The precompile is \textbf{inert unless the validator is configured with a
+\texttt{dex-zap-endpoint}}. With no endpoint configured, \texttt{0x9010}
+is registered but performs no relay: it is dormant, exactly as a
+reserved-but-unwired entry would be. This keeps the public \texttt{luxd}
+binary free of any dependency on the private D-Chain --- the adapter is
+present in the precompile table but does nothing until an operator
+explicitly wires it to a matching endpoint. Determinism is preserved
+trivially in the inert state, and the configured state is made
+deterministic by the idempotency discipline below.
+
+\subsection{Native LUX as \texttt{address(0)}}
+
+The pool-key encoding follows the V4 convention that the native asset is
+the zero address. A pool key referencing \texttt{address(0)} denotes
+native LUX; ERC-20 securities use their token address. This removes the
+wrapped-native special case from the adapter ABI: every asset, native or
+token, is a 20-byte address in the pool key, and \texttt{address(0)}
+routes to the D-Chain's native-balance path.
+
+\subsection{Content-Addressed Idempotency}
+
+A relay precompile faces a hazard a pure precompile does not: the same
+EVM call may be re-executed (block re-org, validator restart,
+speculative execution) and must not double-submit the underlying order.
+The adapter keys idempotency on a \textbf{content-addressed transaction
+identifier} --- the \texttt{txID} is a hash of the order's canonical
+bytes, so an identical order produces an identical \texttt{txID}, and the
+D-Chain deduplicates on it. Re-execution of the same EVM call relays the
+same \texttt{txID}, which the matcher recognizes as already-seen and does
+not re-match. The precompile thus presents exactly-once semantics to the
+EVM despite being a relay rather than a pure computation --- the same
+determinism contract every other precompile honors, achieved by
+content-addressing instead of statelessness.
+
+\subsection{Why This Belongs in the Precompile Layer}
+
+A CLOB cannot be matched in EVM bytecode at competitive cost --- the same
+argument that justifies the cryptographic precompiles. The adapter
+keeps the EVM as the settlement and composition surface (V4-compatible,
+hook-friendly) while delegating the latency-critical matching to a chain
+engineered for it. The full D-Chain VM architecture --- matcher-at-Verify,
+\texttt{zapdb} commit, crash-restart durability, and the GPU CLOB matcher
+behind it --- is specified in the Lux Lightspeed DEX paper
+\cite{lux-lightspeed-dex}; this section documents only the EVM-side
+adapter and the engineering discipline (inert-by-default,
+\texttt{address(0)} native, content-addressed idempotency) that makes a
+stateful relay safe to expose as a precompile.
+
+%% ============================================================

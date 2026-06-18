@@ -1,20 +1,55 @@
-\section{On-Chain Execution: Lux DEX VM}
+\section{On-Chain Execution: Lux D-Chain VM}
 \label{sec:dex}
 
-\subsection{DEX Virtual Machine}
+\subsection{The D-Chain Matching VM}
 
-The Lux DEX VM is a purpose-built virtual machine for on-chain order matching, described in detail in the Lux Lightspeed DEX paper \cite{lux-lightspeed-dex}. For the SOR, the DEX VM provides:
+On-chain order matching runs on the standalone Lux \emph{D-Chain VM}, a
+purpose-built \texttt{block.ChainVM} described in detail in the Lux
+Lightspeed DEX paper \cite{lux-lightspeed-dex}. The D-Chain is the
+source-of-truth product chain for the DEX; the SOR submits orders to it
+exactly as it submits to any other execution venue. For the SOR, the
+D-Chain VM provides:
 
 \begin{itemize}[nosep]
   \item On-chain order book with price-time priority matching.
   \item Atomic settlement: trade execution and token transfer in a single transaction.
   \item Compliance-integrated matching: orders are only matched if both parties pass the security's transfer restriction checks.
-  \item Sub-second finality via Lux consensus.
+  \item Sub-second finality via Lux consensus, with crash-restart durability.
 \end{itemize}
 
-\subsection{DEX VM Order Submission}
+\subsection{Matcher-at-Verify, Commit-at-Accept}
 
-\begin{lstlisting}[language=Go,caption={DEX VM order submission via SOR.}]
+The D-Chain VM is not a generic state machine that replays matching
+inside a contract; matching \emph{is} the block-verification rule. The
+matcher runs in \texttt{Block.Verify} against a \texttt{versiondb}
+overlay, and the resulting fills are committed to the chain's
+\texttt{zapdb} store at \texttt{Accept}. Determinism --- the property
+the SOR relies on for reproducible best-execution accounting --- comes
+from three sources:
+
+\begin{itemize}[nosep]
+  \item The proposer relays each order to the matcher \emph{once}, at
+    block-build time, and carries the resulting fills in the block
+    bytes; every validator re-derives the same fills from the same
+    ordered inputs.
+  \item Trade timestamps are block-derived, not wall-clock; replaying a
+    block on any node yields byte-identical fills.
+  \item Trade identifiers are derived deterministically from the
+    content-addressed order set, so the same matched pair carries the
+    same ID on every node.
+\end{itemize}
+
+Because fills land in \texttt{zapdb} at \texttt{Accept}, a validator
+that crashes mid-block and restarts re-loads committed state and
+resumes without divergence: \emph{Verify-matches $\rightarrow$
+zapdb-commits $\rightarrow$ restart-survives}. The on-chain leg of the
+SOR therefore inherits the same exactly-once settlement guarantee the
+router needs for its position reconciliation, with no off-chain replay
+layer.
+
+\subsection{D-Chain VM Order Submission}
+
+\begin{lstlisting}[language=Go,caption={D-Chain VM order submission via SOR. The order is issued as a transaction to the D-Chain; matching and settlement occur in block verification, and \texttt{AwaitTx} returns once the fill is committed to \texttt{zapdb}.}]
 type DEXProvider struct {
     client *luxclient.Client
     dexVM  ids.ID

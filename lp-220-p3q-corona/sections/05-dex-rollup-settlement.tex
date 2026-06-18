@@ -1,0 +1,94 @@
+\section{Application: DEX Rollup Settlement to Z-Chain}
+\label{sec:dex-rollup}
+
+The DEX matching path (Lux Lightspeed DEX~\cite{luxlightspeeddex}) fills
+orders at hundreds of millions per second per GPU on the D-Chain, far
+above any single chain's finality rate. To anchor that throughput
+trustlessly, per-market fill batches roll up to the Z-Chain and are
+verified there through the P3Q family at slot \texttt{0x012205}. This
+section places Corona (kind $0x02$) in that settlement pipeline; the
+measured verify rates belong to the sibling kinds, and Corona is the
+optional Ring-LWE insurance leg.
+
+\subsection{Two verification rungs}
+
+DEX rollup settlement uses a two-rung ladder, both callable at the same
+P3Q slot:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item \textbf{Attestation rung (venue-trust).} The sequencer signs each
+    per-market batch with a P3Q kind~$0x01$ (Pulsar / FIPS-204 ML-DSA-65)
+    threshold signature. The Z-Chain contract calls
+    \texttt{P3Q.verify(0x01, \ldots)} to confirm the batch was produced
+    by the venue's threshold quorum. This rung trusts the venue's signer
+    set but is cheap: the ML-DSA-65 verify path is measured at
+    $\sim$\num{4714} verifies per second.
+  \item \textbf{Validity rung (trustless).} For trust-minimized
+    settlement the sequencer additionally produces a STARK/FRI validity
+    proof of correct matching, verified by the \texttt{starkfri} verifier
+    (LP-221~\cite{lp221}) --- a cSHAKE256 / Goldilocks PQ Plonky3-fork
+    verifier. This rung proves the fills are correct without trusting the
+    signer set. The current verifier is measured at $\sim$\num{986}
+    proofs per second against a \textbf{toy AIR}; this figure is the
+    operative number and is explicitly not a production-circuit
+    measurement.
+\end{enumerate}
+
+The attestation rung is fast and venue-trusting; the validity rung is
+slower and trustless. A venue chooses the rung (or runs both) per its
+trust requirements.
+
+\subsection{Where Corona fits}
+
+Corona (kind $0x02$) is the \emph{Ring-LWE cross-family insurance leg}
+for the attestation rung, not a separate settlement mechanism. A
+value-bearing DEX rollup that wants independence from the Module-LWE
+assumption underlying ML-DSA-65 signs each batch with \emph{both} a
+Pulsar (kind $0x01$) and a Corona (kind $0x02$) threshold signature and
+requires both \texttt{P3Q.verify} calls to return \texttt{true}, exactly
+as in Section~\ref{sec:corona-kind}'s use case. A Module-LWE break that
+compromises the Pulsar attestation does not compromise the Corona
+attestation; the rollup's settlement remains cryptographically anchored.
+
+The cost discipline of Section~\ref{sec:corona-kind} applies unchanged:
+Corona's \SI{5000000}{gas} makes the second leg appropriate for
+value-bearing markets (custody, treasury, regulated-securities venues)
+and prohibitive for high-volume markets, which settle on the kind~$0x01$
+attestation rung alone (optionally backed by the starkfri validity rung).
+As noted throughout this paper, Corona's GPU dispatch is projected and
+its verifier core is not yet wired; the DEX settlement path that needs a
+second lattice family today uses the measured kind~$0x01$ rung, with
+Corona reserved at its dispatch entry until its threshold library lands.
+
+\subsection{Bundled settlement: $K \times V \times \text{markets}$}
+
+Per-fill, per-venue verification does not scale: at the
+attestation-rung's $\sim$\num{4714} verifies per second, a chain that
+verified one signature per fill would cap settlement far below the
+matcher's fill rate. The settlement model therefore bundles. A single
+Z-Chain settlement object aggregates $K$ signer attestations across $V$
+venues across many markets into one verification event:
+
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \textbf{$K$ signers.} The threshold quorum per venue contributes
+    $K$ partial signatures aggregated into one threshold signature that
+    verifies in a single \texttt{P3Q.verify} call.
+  \item \textbf{$V$ venues.} Independent venues' batches are aggregated
+    into one settlement object rather than verified one venue at a time.
+  \item \textbf{Many markets.} Each venue's per-market arenas (Lux
+    Lightspeed DEX) contribute their batch roots to the bundle, so a
+    single verification covers many books.
+\end{itemize}
+
+Because one verification amortizes over $K \times V \times
+\text{markets}$ fills, the effective settled-fill rate at fleet scale is
+\textbf{projected} to exceed $10^9$ fills per second of finality ---
+this is a fleet-aggregation projection, not a single-verifier
+measurement. The per-verifier measured rates ($\sim$\num{4714}/s
+attestation, $\sim$\num{986}/s validity on a toy AIR) are the operative
+numbers; the $>$$10^9$ figure is what those rates compose to once the
+bundle factor $K \times V \times \text{markets}$ is applied across a
+multi-node Z-Chain settlement fleet. No single P3Q verifier reaches that
+rate.
+
+%% ============================================================
