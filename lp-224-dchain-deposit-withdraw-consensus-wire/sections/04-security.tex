@@ -1,0 +1,126 @@
+\section{Security Considerations}
+\label{sec:security}
+
+\subsection{Proposer-trust surface}
+
+The carried-payload model concentrates the irreversible venue
+interaction in the proposer: the proposer performs the import-credit and
+the debit-export once at \texttt{BuildBlock}, and validators replay the
+\emph{results}. This is the same trust surface the order-submission work
+established for fills, and it is bounded the same way.
+
+\paragraph{What the proposer can do.} A proposer can build a block whose
+carried custody records reflect venue relays it performed, and then
+\emph{fail to win the consensus poll} for that block. If the block does
+not gain consensus, its custody transitions are not committed to the
+canonical chain, yet the proposer already mutated the venue ledger (and,
+for a withdraw, may have produced an export UTXO). This is the same
+``built-and-relayed but lost the poll'' surface as for fills.
+
+\paragraph{What the proposer cannot do.} The surface is
+\emph{conservation-bounded}. A proposer cannot inflate supply:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item It cannot carry a \texttt{credited} larger than the consumed-UTXO
+  value --- the import leg refuses, so no such block is even valid
+  (Section~\ref{sec:conservation}, fact~2).
+\item It cannot carry a \texttt{realized} larger than the account's
+  \texttt{available} at relay, nor export more than \texttt{realized}
+  --- the export leg refuses.
+\item It cannot double-credit a deposit or double-export a withdraw ---
+  the consumed-UTXO set and \texttt{seen:<txID>} forbid it
+  (Section~\ref{sec:replay}), and both are state the root commits to, so
+  a divergent replay outcome is a divergent root.
+\end{itemize}
+
+Therefore the worst a malicious or faulty proposer achieves is a
+\emph{stranded} custody transition (Section~\ref{sec:strand}), never
+created or destroyed value. The blast radius of a single bad block is a
+single deposit or a single withdraw escrow, bounded by that
+transaction's own value. This matches the accepted single-operator-venue
+posture today; the trustless path of Section~\ref{sec:reserved} removes
+even the stranding risk by requiring the venue's signature over the
+carried results.
+
+\subsection{Reorg}
+
+A reorg that drops an accepted block drops its carried custody records
+with it. Two cases:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Deposit in a reorged-out block.} The import consumed a
+  source UTXO. If the block is reorged out, the consumed-UTXO set entry
+  is rolled back along with the rest of the block's state, so the UTXO
+  is spendable again and the deposit can be re-proposed in the new
+  canonical chain. No double-credit can occur because the credit only
+  exists where the consuming block exists.
+\item \textbf{Withdraw in a reorged-out block.} The debit of
+  \texttt{available} is rolled back with the block. The export UTXO,
+  however, is produced into cross-chain shared memory at
+  \texttt{Accept}; a reorg that removes the producing block must also
+  remove its shared-memory effect, or the system would have exported
+  value with no backing debit. The withdraw path therefore MUST tie the
+  export's shared-memory production to the same atomic commit point as
+  the block's acceptance, so that reorg removes both or neither.
+\end{itemize}
+
+\paragraph{Requirement.} The custody records and their cross-chain
+shared-memory effects MUST be committed at a single atomic point with
+the block's acceptance --- the same all-or-nothing discipline the proxy
+already uses for imports/exports. The carried record is the
+in-consensus half; the shared-memory apply is the cross-chain half; they
+are one atomic step.
+
+\subsection{Replay}
+
+Replay is addressed structurally in Section~\ref{sec:replay} and is
+restated here as a security property: there is no sequence of proposer
+re-builds, vertex re-issues, crash-before-commit, or network
+re-delivery that credits a deposit twice or exports a withdraw twice,
+because (i) the import consumes its UTXO exactly once, (ii) the venue
+\texttt{seen:<txID>} returns the original outcome on re-relay, and (iii)
+both facts are committed to the state root, so any validator that
+replayed differently would fork the root and lose consensus. Replay
+safety is thus not a best-effort property of the proxy; it is enforced
+by the consensus check itself.
+
+\subsection{Failed-export recoverability}
+\label{sec:strand}
+
+The only residual hazard is a \emph{stranded} custody transition: a
+block whose proposer mutated the venue (and possibly began an export)
+but which did not gain consensus, or whose export leg failed after the
+venue debit. The governing requirement is that funds are always
+\emph{unspent and recoverable, never burned}:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Failed export after debit.} If the venue debited
+  \texttt{available} but the export leg failed, the realized amount MUST
+  be returned to the account (full refund of the would-be-withdrawn
+  amount), exactly as the order-submission failure path full-refunds
+  escrow rather than stranding it. The withdraw then either does not
+  occur (account made whole) or is re-attempted; it never half-occurs.
+\item \textbf{Lost-poll block.} A block that loses the consensus poll
+  does not commit its custody transitions to the canonical chain. The
+  source UTXO of a deposit remains unconsumed on the canonical chain and
+  is re-proposable. For a withdraw, the atomic discipline of the reorg
+  requirement ensures the export UTXO is not produced on the canonical
+  chain if the debit is not committed there --- so the funds remain on
+  the venue, available, and recoverable.
+\item \textbf{Never burned.} No failure path destroys units. A stranded
+  transition leaves value either on the originating chain (deposit not
+  finalized) or on the venue (withdraw not finalized), always spendable.
+  This is the conservation invariant of Section~\ref{sec:conservation}
+  holding even under failure: $I = A + L + F + E$ never loses a term to
+  a black hole.
+\end{itemize}
+
+\subsection{Determinism as a security property}
+
+Finally, the determinism that motivates the whole LP is itself a safety
+property: because every validator applies byte-identical carried records
+and reaches an identical state root, there is no state at which honest
+validators disagree about how much value entered or left the system.
+Disagreement about custody is, for a value-bearing venue, the most
+dangerous failure mode; the carried-payload model removes it by
+construction rather than detecting it after the fact.
