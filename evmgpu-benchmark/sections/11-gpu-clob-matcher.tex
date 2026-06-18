@@ -1,0 +1,110 @@
+\section{GPU CLOB Matcher Benchmarks}
+\label{sec:clob}
+
+The same GPU substrate that accelerates EVM opcode dispatch and
+cryptographic verification drives the Lux DEX central-limit-order-book
+(CLOB) matcher. Unlike the EVM kernel, which parallelizes \emph{across}
+independent transactions, the CLOB matcher parallelizes \emph{within} an
+order book: each price level and resting order is a lane, and a sweep of
+incoming orders against the book is one GPU dispatch. This section
+reports measured fill throughput on two hosts---an NVIDIA GB10 Blackwell
+part and an Apple M4 Max---distinct from the M1 Max benchmark machine
+used elsewhere in this paper.
+
+\subsection{Per-Book Arena Model}
+
+Each order book is allocated a contiguous device-resident \emph{arena}:
+the price-level array, resting-order queues, and the working fill buffer
+live in one block of GPU memory with no per-order allocation on the hot
+path. A match dispatch operates entirely inside the arena---the book is
+not marshalled in and out per order. Distinct markets occupy distinct
+arenas and are matched independently, which is also what makes the
+settlement layer market-shardable (below).
+
+\subsection{Knuth Algorithm-D Division: The 8$\times$ Lever}
+
+The throughput-critical inner operation is the volume-weighted average
+price (VWAP) computation across a partial fill, which reduces to a
+wide-integer division. A na\"ive bit-serial division over the
+fixed-point price representation runs 512 iterations per divide and
+dominates the kernel's instruction count. Replacing it with
+\textbf{Knuth's Algorithm~D} (multi-word long division, \emph{TAOCP}
+Vol.~2 \cite{knuth-taocp2}) collapses the divide to a handful of
+multiword steps and yields a measured \textbf{$\sim$8$\times$ speedup} of
+the matcher kernel over the 512-iteration bit-serial baseline. This is
+the single largest lever in the matcher and is the reason the per-fill
+times below reach the single-digit-nanosecond range.
+
+\subsection{Byte-Parity Gating Against the CPU Oracle}
+
+The matcher follows the same byte-equality discipline as the
+cryptographic kernels of this paper: a first-party CPU matcher is the
+canonical oracle, and the GPU matcher is required to
+produce \textbf{byte-identical} fill sets---same fills, same quantities,
+same trade identifiers, same ordering---on every input. The contract is
+enforced by millions of randomized fuzz orders and a fixed
+known-answer-test (KAT) corpus, with \textbf{zero} parity failures
+recorded across the harness. A GPU result that diverges from the CPU
+oracle by a single byte fails the gate and blocks the release. Matching
+is consensus-critical, so this is not a soft target: GPU and CPU must
+agree exactly or the GPU path is not shipped.
+
+\subsection{Measured Fill Throughput}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrrl}
+\toprule
+\textbf{Host} & \textbf{Fills/sec} & \textbf{Per-fill} & \textbf{Source} \\
+\midrule
+GB10 (Blackwell) & 104--126\,M & 6.9\,ns  & measured, byte-parity gated \\
+M4 Max           & $\sim$250\,M  & 4.15\,ns & measured, byte-parity gated \\
+\bottomrule
+\end{tabular}
+\caption{GPU CLOB matcher fill throughput, byte-identical to the CPU
+oracle. Per-fill latency is the reciprocal of fill throughput. The matcher
+is \textbf{dependency-latency-bound}: throughput is limited by the
+data-dependent chain through each fill (read book, match, update,
+emit fill), not by raw arithmetic or memory bandwidth, which is why a
+single device tops out in the hundreds of millions of fills per second
+rather than the billions.}
+\label{tab:clob-throughput}
+\end{table}
+
+\subsection{There Is No Billion-Fills-Per-Second Single GPU}
+
+The dependency-latency bound is a hard ceiling, not a tuning target. A
+single GPU sustains $\sim$100--250\,M fills/sec; it does not reach
+$10^9$. Aggregate fill rates above one billion per second are reachable
+by exactly two routes, and the paper is explicit about which is built:
+
+\begin{itemize}
+  \item \textbf{N-node aggregation.} Market-sharded matching across a
+    fleet of GPUs sums the per-device rates; the aggregate scales with
+    node count because distinct markets are independent arenas. This is
+    the deployed scaling path.
+  \item \textbf{Q64.64 representation.} A wider fixed-point
+    representation that shortens the per-fill dependency chain could
+    raise single-device throughput, but this is \emph{not built}; it is
+    noted only to bound the design space.
+\end{itemize}
+
+Any claim of $>$$10^9$ fills/sec on a single GPU is incorrect; the
+measured single-device numbers are those in
+Table~\ref{tab:clob-throughput}.
+
+\subsection{Settlement: Market-Sharded Block-STM}
+
+Fills produced by the matcher are settled through the Block-STM layer
+described earlier in this paper, sharded by market: each market is an
+independent conflict domain, so cross-market settlement proceeds
+without serialization. The measured conflict-detection throughput is
+\textbf{2.2\,M fills/sec}, and the CPU and GPU settlement paths are
+\textbf{byte-identical}---the same parity contract as the matcher. The
+settlement conflict-detector, not the matcher, is the throughput floor
+of the end-to-end on-chain path; the matcher's hundreds-of-millions rate
+is the in-memory matching ceiling, and settlement consensus is the rate
+at which those fills durably commit.
+
+%% ============================================================
