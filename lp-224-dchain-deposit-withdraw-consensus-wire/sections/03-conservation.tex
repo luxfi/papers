@@ -1,0 +1,139 @@
+\section{Conservation Invariant}
+\label{sec:conservation}
+
+The release gate for the consensus-wired custody path is a value
+conservation invariant that MUST hold across the full deposit $\to$
+trade $\to$ withdraw lifecycle, with every validator agreeing on each
+term. We state it formally, fix the sign convention so it balances, and
+then show why the carried-payload mechanism preserves it.
+
+\subsection{Ledger terms}
+
+Fix an asset and a window of blocks $[\,0, h\,]$. All quantities are
+non-negative integers in the asset's smallest unit (wei-exact). Define,
+summed over the window:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item $I$ --- value \emph{imported} from C/X, i.e.\ the sum of consumed
+  source-UTXO values across all \texttt{DepositAck} records. Each import
+  consumes a UTXO exactly once (Section~\ref{sec:replay}).
+\item $A$ --- the D-Chain \texttt{available} balance currently held
+  across all accounts.
+\item $L$ --- the D-Chain \texttt{locked} balance currently held across
+  all accounts (reserved by resting orders).
+\item $F$ --- fees collected (or burned) by settled matches.
+\item $E$ --- value \emph{exported} back to C/X, i.e.\ the sum of
+  \texttt{realized} across all \texttt{WithdrawCommit} records.
+\end{itemize}
+
+\subsection{The invariant}
+
+The balanced conservation identity is
+
+\begin{equation}
+\boxed{\;I \;=\; A \;+\; L \;+\; F \;+\; E\;}
+\label{eq:cons}
+\end{equation}
+
+i.e.\ every unit that entered the system via an import is, at every
+height, accounted for in exactly one of: still available, still locked,
+taken as fees, or already exported. Equivalently, writing the C/X-side
+net custody as $(\,\text{released } E) - (\text{consumed } I)$, the form
+stated in the work item
+
+\[
+\underbrace{\big(E - I\big)}_{\text{C-chain released} - \text{locked/consumed}}
+\;+\; \underbrace{A}_{\text{D-chain available}}
+\;+\; \underbrace{L}_{\text{D-chain locked}}
+\;+\; \underbrace{F}_{\text{fees}} \;=\; 0
+\]
+
+is the rearrangement of \eqref{eq:cons} with the C/X custody change
+moved to the left; before any withdrawal ($E = 0$) it reduces to the
+``$\Sigma$ available $+\,\Sigma$ locked $+$ fees $=$ initial deposited''
+form, with $I$ the initial deposited total. We treat \eqref{eq:cons} as
+the canonical statement because every term is a non-negative quantity
+the state root already commits to.
+
+\subsection{Per-transition deltas (why each phase preserves it)}
+
+Each custody/match transition moves value between the terms of
+\eqref{eq:cons} without changing the total:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lp{8.5cm}@{}}
+\toprule
+\textbf{Transition} & \textbf{Effect on \eqref{eq:cons} terms} \\
+\midrule
+Deposit & $I \mathbin{+}= v$, $A \mathbin{+}= v$ (with carried
+  \texttt{credited} $= v =$ consumed-UTXO value). Both sides grow by
+  $v$; identity preserved. \\
+Order-lock & $A \mathbin{-}= r$, $L \mathbin{+}= r$ (reserve $r =
+  \lceil \mathrm{size}\cdot\mathrm{price}\rceil$ quote, or $\mathrm{size}$
+  base). Internal $A\!\to\!L$ move; total unchanged. \\
+Match & for each filled unit, $L \mathbin{-}= x$ on one account and
+  $A \mathbin{+}= (x-f)$ on the counterparty, $F \mathbin{+}= f$. Both
+  legs settled; $L$ down by $x$, $A{+}F$ up by $x$; total unchanged.
+  (The maker leg is credited, not dropped.) \\
+Refund of unspent lock & $L \mathbin{-}= u$, $A \mathbin{+}= u$ for the
+  unfilled remainder. Internal $L\!\to\!A$ move; total unchanged. \\
+Withdraw & $A \mathbin{-}= w$, $E \mathbin{+}= w$ (with carried
+  \texttt{realized} $= w \le A$ at relay). $A$ down by $w$, $E$ up by
+  $w$; total unchanged. \\
+\bottomrule
+\end{tabular}
+\caption{Each transition is a value-preserving move between the terms of
+\eqref{eq:cons}. No transition creates or destroys units; fees are an
+explicit term, not leakage.}
+\label{tab:deltas}
+\end{table}
+
+\subsection{Why the consensus wire preserves it across validators}
+
+The novelty this LP must defend is not the single-venue invariant ---
+that is proven against the venue VM directly and against the proxy
+atomic rail. The novelty is that \emph{every validator} must agree on
+each term of \eqref{eq:cons} once the transitions are carried in the
+proxy consensus block. This follows from three facts established in
+Section~\ref{sec:spec}:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \textbf{Each term is a deterministic fold of carried records.}
+  $I$ is the sum of \texttt{DepositAck.credited}; $E$ is the sum of
+  \texttt{WithdrawCommit.realized}; $A$, $L$, $F$ evolve by the
+  per-transition deltas of Table~\ref{tab:deltas}, all driven by carried
+  records and carried fills. No term depends on a per-validator venue
+  query.
+\item \textbf{Carried records are pinned, not free.} The carried
+  \texttt{credited} is pinned to the consumed-UTXO value (the import
+  refuses otherwise); the carried \texttt{realized} is pinned $\le
+  \texttt{available}$ at relay and the export refuses to release more.
+  A proposer cannot carry an inflated credit or an over-realized
+  withdraw without the import/export leg refusing --- so a malformed
+  carried record does not even produce a valid block.
+\item \textbf{Identical bytes $\Rightarrow$ identical terms $\Rightarrow$
+  identical root.} Every validator folds the identical carried bytes, so
+  every validator computes identical $I, A, L, F, E$, so every validator
+  commits the identical state root. The state transition is a pure
+  function of the block bytes --- the same determinism discipline
+  LP-210~\cite{lp210} requires for parallel execution. A divergence in
+  any term would surface as a divergent root and the block would not
+  gain consensus.
+\end{enumerate}
+
+\subsection{The release gate}
+
+\begin{quote}
+\textbf{Release gate.} The consensus-wired custody path is releasable
+when \eqref{eq:cons} holds at every height across a multi-validator
+deposit $\to$ order-lock $\to$ match $\to$ withdraw run \emph{and} all
+validators commit the identical state root at every height. The
+single-venue proof of \eqref{eq:cons} is necessary but not sufficient;
+the multi-validator agreement on every term is the additional condition
+this LP exists to make checkable.
+\end{quote}
+
+The acceptance gates of Section~\ref{sec:acceptance} are the concrete
+multi-validator checks that discharge this gate.

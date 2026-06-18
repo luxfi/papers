@@ -1,0 +1,274 @@
+\section{Specification}
+\label{sec:spec}
+
+This section specifies the carried custody payloads, their placement in
+the block and DAG vertex, replay protection, the network-upgrade
+activation height, and the strict backward-compatibility regime. The
+specification is additive: the four frozen CLOB ZAP frames
+(\texttt{clob\_ensure\_market}, \texttt{clob\_place},
+\texttt{clob\_cancel}, \texttt{clob\_submit}) are untouched, and the
+carried-fills section appended by the order-submission work is
+unchanged. Custody uses the additive ZAP frames
+\texttt{clob\_deposit}, \texttt{clob\_withdraw}, and
+\texttt{clob\_open\_market}, which already exist on the venue rail; this
+LP does not add or alter any ZAP frame --- it adds a \emph{carried
+block payload} that records the results of those relays.
+
+\subsection{Carried-payload model}
+
+The proxy block already carries a self-delimiting fills section
+appended after the transaction bytes, and the block identifier and the
+DAG-vertex identifier already commit to that section (so tampering is
+detectable). This LP adds two further carried sections, governed by the
+same rules:
+
+\begin{enumerate}[leftmargin=2em,nosep]
+\item The proposer produces the section once at \texttt{BuildBlock}, as
+  the result of the venue relay it performs there.
+\item The section is appended to the block bytes and to the DAG-vertex
+  bytes, length-prefixed and self-delimiting.
+\item The block identifier and the DAG-vertex identifier commit to the
+  section (it is inside the hashed pre-image), so a proposer cannot
+  carry one set of custody results in the bytes and a different set in
+  the identifier.
+\item Every validator applies the section deterministically at
+  \texttt{Block.Accept}; no validator relays to the venue during
+  \texttt{Verify} or \texttt{Accept}.
+\end{enumerate}
+
+\subsection{Deposit acknowledgements}
+
+A \texttt{DepositAck} records one import-then-credit. It is the datum
+that lets every validator apply the identical credit to the venue
+view without re-relaying.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{Meaning} \\
+\midrule
+\texttt{account}      & \texttt{[16]byte} & D-Chain account the credit lands in \\
+\texttt{asset}        & \texttt{[8]byte}  & asset identifier (matches ledger key) \\
+\texttt{credited}     & \texttt{uint256}  & amount credited to \texttt{available} (wei-exact) \\
+\texttt{source\_chain}& \texttt{uint32}   & originating chain (C or X) \\
+\texttt{source\_utxo} & \texttt{[36]byte} & consumed UTXO reference (\texttt{txID[32]}$\|$\texttt{outIdx[4]}) \\
+\texttt{tx\_index}    & \texttt{uint32}   & index of the deposit tx within the block \\
+\bottomrule
+\end{tabular}
+\caption{\texttt{DepositAck} carried fields. The credit applied by
+every validator is \texttt{(account, asset) += credited}; the import
+leg is identified by \texttt{(source\_chain, source\_utxo)} and is
+consumed exactly once (Section~\ref{sec:replay}).}
+\label{tab:depositack}
+\end{table}
+
+The proposer obtains a \texttt{DepositAck} by performing
+\texttt{executeImport} (the atomic, consume-once debit of
+\texttt{source\_utxo}) followed by the \texttt{clob\_deposit} relay,
+which returns the credited amount and \emph{refuses if credited does
+not equal imported}. The invariant \texttt{credited == imported} is
+enforced at relay time by the venue and re-checkable by any validator
+against the consumed UTXO's value (Section~\ref{sec:conservation}). The
+carried \texttt{credited} is therefore not a free parameter: it is
+pinned to the value of the consumed UTXO.
+
+\subsection{Withdraw-realized / export commitments}
+
+A \texttt{WithdrawCommit} records one debit-then-export. The export is
+\emph{committed} in the block: the carried record names the exact
+amount that will be released on the originating chain and the
+identifier of the exported UTXO, so every validator applies the same
+debit and the same export.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{Meaning} \\
+\midrule
+\texttt{account}       & \texttt{[16]byte} & D-Chain account debited \\
+\texttt{asset}         & \texttt{[8]byte}  & asset identifier \\
+\texttt{realized}      & \texttt{uint256}  & amount debited from \texttt{available}
+                                            and exported (wei-exact) \\
+\texttt{dest\_chain}   & \texttt{uint32}   & destination chain (C or X) \\
+\texttt{export\_utxo}  & \texttt{[36]byte} & exported UTXO id produced on \texttt{dest\_chain} \\
+\texttt{tx\_index}     & \texttt{uint32}   & index of the withdraw tx within the block \\
+\bottomrule
+\end{tabular}
+\caption{\texttt{WithdrawCommit} carried fields. The debit applied by
+every validator is \texttt{(account, asset) -= realized}; the export
+leg releases exactly \texttt{realized} to \texttt{dest\_chain} as
+\texttt{export\_utxo}.}
+\label{tab:withdrawcommit}
+\end{table}
+
+The proposer obtains a \texttt{WithdrawCommit} by relaying
+\texttt{clob\_withdraw}, which debits \texttt{available} and returns the
+\emph{realized} amount \emph{clamped to the actually-available balance}
+($\texttt{realized} \le \texttt{requested}$, and $\texttt{realized} \le
+\texttt{available}$ at relay time), then performing
+\texttt{executeExport} of exactly \texttt{realized}. The export leg
+\emph{refuses if it would release more than realized}. Because the
+realized amount is fixed in the carried record, every validator applies
+the identical debit and the identical export; the moving-ledger
+divergence of Section~1 cannot arise.
+
+\subsection{Block / vertex layout}
+
+The custody payload is two length-prefixed sub-sections appended after
+the carried-fills section, preserving the existing self-delimiting
+framing:
+
+\begin{lstlisting}
+block.Bytes() =
+    txCount[4] | txBytes...                 // existing, self-delimiting
+  | <carried-fills section>                 // existing (order-submission LP)
+  | depositCount[4]  | depositCount  x DepositAck
+  | withdrawCount[4] | withdrawCount x WithdrawCommit
+  | sigLen[4] | sig                         // RESERVED (see below)
+\end{lstlisting}
+
+The DAG-vertex bytes carry the identical custody sub-sections, and the
+vertex identifier computation folds them into the digest exactly as it
+already folds the fills section. \texttt{DepositAck} and
+\texttt{WithdrawCommit} are fixed-width, so each sub-section is fully
+described by its \texttt{uint32} count prefix; the parser is
+self-delimiting and rejects trailing or truncated bytes.
+
+\subsection{Reuse of the reserved fill-signature field}
+\label{sec:reserved}
+
+The carried-fills layout already carved a single trailing
+\texttt{sigLen[4] | sig} field --- empty in the default operator-venue
+mode, reserved for the trustless path in which the venue signs its
+emitted results and a P3Q~\cite{lp218,lp219} / STARK-FRI~\cite{lp221}
+verifier checks them, so that no \emph{further} wire bump is needed when
+the trustless path activates.
+
+This LP \textbf{extends the meaning of that same reserved field to
+cover the custody sub-sections}: when populated, the signature is over
+the concatenation of the fills section \emph{and} the
+\texttt{DepositAck}/\texttt{WithdrawCommit} sub-sections, i.e.\ over all
+proposer-relayed venue results in the block. No new signature field is
+introduced. In the default mode the field stays empty and the block is
+accepted under the proposer-trust surface of
+Section~\ref{sec:security}; in the trustless mode --- a strictly higher
+cert profile in the sense of LP-217~\cite{lp217} --- the field carries
+the venue's signature and validators verify it before applying any
+carried fills \emph{or} custody deltas. This keeps the trustless escape hatch a
+single field for the whole carried-payload family --- one and only one
+way to make the carried results trustless.
+
+\subsection{Replay protection}
+\label{sec:replay}
+
+Custody must be safe against two replays: crediting a deposit twice and
+exporting a withdraw twice. Both reuse machinery already present; this
+LP only binds the carried payloads to it.
+
+\paragraph{Deposit double-credit.} The import leg consumes
+\texttt{source\_utxo} from cross-chain shared memory exactly once: a
+consumed UTXO cannot be consumed again, and the consumed-UTXO set is
+part of the state the block's state root commits to. A
+\texttt{DepositAck} whose \texttt{source\_utxo} is already in the
+consumed set is invalid; a block carrying it is rejected. Additionally,
+the venue's per-transaction \texttt{seen:<txID>} idempotency record
+(content-addressed, established by the order-submission work and the
+custody rail) makes a re-relayed \texttt{clob\_deposit} return the
+\emph{original} outcome rather than crediting again. The two mechanisms
+are complementary: the consumed-UTXO set prevents replaying the
+\emph{import} (the value source), and \texttt{seen:<txID>} prevents
+replaying the \emph{credit} (the venue effect). A deposit is therefore
+credited at most once even across proposer re-builds, vertex re-issue,
+or crash-before-commit.
+
+\paragraph{Withdraw double-export.} The withdraw leg is bound the same
+way from the other side. The debit of \texttt{available} occurs once on
+the venue under \texttt{seen:<txID>}; a re-relayed \texttt{clob\_withdraw}
+returns the original realized amount rather than debiting again. The
+export leg produces \texttt{export\_utxo} exactly once into shared
+memory; the same \texttt{export\_utxo} cannot be produced twice, and a
+\texttt{WithdrawCommit} that names an already-produced
+\texttt{export\_utxo} is invalid. A withdraw is therefore exported at
+most once, with realized amount fixed in the carried record.
+
+\paragraph{Determinism of replay outcomes.} Because both the
+consumed-UTXO set and the \texttt{seen:<txID>} records are inputs the
+state root commits to, two validators that disagree on whether a
+deposit/withdraw was already applied would produce divergent roots ---
+i.e.\ a replay-handling divergence is detected by the same state-root
+check that detects every other custody divergence. There is no path by
+which one validator credits/exports and another does not while both
+accept the same block.
+
+\subsection{Upgrade activation height}
+\label{sec:activation}
+
+The carried-custody payload format is a consensus-breaking change to
+the block and DAG-vertex bytes and to the identifier pre-image. It
+activates at a network-upgrade height $H$, exactly as other Lux network
+upgrades are gated. $H$ is a single fixed height (per network) at which
+all validators switch in lockstep; it is not negotiated per block and
+not enabled by individual validator flags.
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item For block height $h < H$: the carried-custody sub-sections MUST be
+  absent. Deposit/withdraw proceeds as it does today --- proven against
+  the venue VM directly and against the proxy atomic rail --- without
+  being carried in the proxy consensus block.
+\item For block height $h \ge H$: every deposit/withdraw effected by the
+  block MUST be represented by a \texttt{DepositAck} /
+  \texttt{WithdrawCommit} in the carried sub-sections. A post-$H$ block
+  that effects a custody transition without carrying its record is
+  invalid.
+\end{itemize}
+
+The activation height is published in the network upgrade descriptor
+and is the same on every node; nodes that have not adopted the upgrade
+descriptor cannot follow the chain past $H$, which is the intended
+forcing function for a lockstep validator upgrade.
+
+\subsection{Backward compatibility and pre-upgrade rejection}
+\label{sec:compat}
+
+There is no ambiguous window. The format is gated strictly on $H$:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Height} & \textbf{Carried custody present} & \textbf{Validator action} \\
+\midrule
+$h < H$ & yes & \textbf{REJECT} (format not yet active) \\
+$h < H$ & no  & accept (legacy framing) \\
+$h \ge H$ & no (but block effects custody) & \textbf{REJECT} (record required) \\
+$h \ge H$ & yes & accept (verify framing, identifier commitment, replay) \\
+\bottomrule
+\end{tabular}
+\caption{Strict pre-/post-$H$ gating. Pre-$H$ blocks MUST reject the new
+carried-custody payloads; post-$H$ blocks MUST require them whenever a
+custody transition occurs. No height accepts both shapes.}
+\label{tab:gate}
+\end{table}
+
+Because the block and vertex identifiers commit to the carried sections,
+a pre-$H$ node and a post-$H$ node compute \emph{different} identifiers
+for any block that carries custody payloads --- so the upgrade cannot
+silently half-apply. The forced divergence at $H$ is exactly the
+lockstep behaviour Lux network upgrades rely on: there is no window in
+which a custody transition is ambiguous as to whether it must be
+carried.
+
+\subsection{Forward compatibility with the trustless path}
+
+The reserved signature field (Section~\ref{sec:reserved}) means the
+trustless custody path does not require a second wire bump after $H$:
+moving the venue from operator-trusted to signature-verified populates
+the existing field. The activation of \emph{signature requirement} (as
+opposed to format) is itself a later policy gate; this LP specifies the
+format that makes that gate a flag flip, not a wire change. One wire,
+two policies (format at $H$, trust later) --- no third format.

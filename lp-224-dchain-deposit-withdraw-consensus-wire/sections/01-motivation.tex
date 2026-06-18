@@ -1,0 +1,113 @@
+\section{Motivation}
+
+\subsection{The decomplected venue}
+
+The DEX is decomplected into orthogonal homes with one concern each.
+The D-Chain is the venue: it owns the per-account ledger, the order
+book, the matcher, and settlement. The public-network DEX VM
+(\texttt{chains/dexvm}) is a \emph{stateless atomic ZAP proxy}. The
+proxy holds no order, pool, position, or balance keys; its only jobs
+are (i) moving value into and out of the venue atomically across
+chains via shared memory, and (ii) relaying order traffic to the
+venue. The venue is the single source of truth for money and matches;
+the proxy is transport. The atomic value movement reuses the cross-chain
+all-or-nothing discipline of LP-211~\cite{lp211}; the relay rail rides the
+ZAP universal wire of LP-201~\cite{lp201}; the proxy block is a DAG vertex in
+the mempool of LP-208~\cite{lp208}.
+
+The custody model, in one line per phase, is:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Deposit} $=$ \texttt{ImportTx} (an atomic debit of a
+  C-chain or X-chain UTXO, consumed exactly once) \emph{then} credit
+  of the D-Chain account's \texttt{available} balance.
+\item \textbf{Order} $=$ move from \texttt{available} to
+  \texttt{locked} (buy locks $\lceil \mathrm{size}\cdot\mathrm{price}
+  \rceil$ quote units; sell locks $\mathrm{size}$ base units).
+\item \textbf{Match} $=$ settle \texttt{locked} against
+  \texttt{available} on \emph{both} legs, wei-exact, plus fees; every
+  unit leaving one account's \texttt{locked} arrives in a
+  counterparty's \texttt{available}.
+\item \textbf{Withdraw} $=$ debit the D-Chain account's
+  \texttt{available} \emph{then} \texttt{ExportTx} (an atomic release
+  back to the originating chain).
+\end{itemize}
+
+\subsection{Why per-validator deposit/withdraw relay would fork}
+
+The carried-fills work established the governing fact for order
+submission: \textbf{a moving venue ledger makes per-validator relay
+non-deterministic}. If each validator independently dialed the venue
+during \texttt{Block.Verify} to relay a \texttt{clob\_submit}, each
+would observe the venue ledger at a different instant and derive a
+different fill set, forking the state root. The cure was to make the
+\emph{proposer} relay the submit once at \texttt{BuildBlock} and carry
+the resulting fills in the block and DAG-vertex bytes; every validator
+then re-derives the same state transition as a pure function of
+(height, carried timestamp, transaction bytes, carried fills), so all
+validators reach a byte-identical state root and zero validators dial
+the venue during verification.
+
+The deposit and withdraw flows have the \emph{same} hazard for the
+\emph{same} reason. Both mutate the venue ledger, and both depend on
+the venue's response to a relay:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Deposit fork.} \texttt{executeDeposit} performs the
+  atomic import (consume-once) then relays \texttt{clob\_deposit} to
+  the venue, which credits \texttt{available} and refuses if the
+  credited amount does not equal the imported amount. The credited
+  amount, the resulting account state, and the deposit acknowledgement
+  are venue responses. If each validator relayed independently during
+  verification, each could observe a different ledger snapshot and
+  apply a different credit (or observe a different idempotency
+  outcome). The deposit acknowledgement is exactly the kind of
+  ``venue said this happened'' datum that the carried-fills argument
+  forbids re-deriving per validator.
+\item \textbf{Withdraw fork.} \texttt{executeWithdraw} relays
+  \texttt{clob\_withdraw}, which debits \texttt{available} and returns
+  the \emph{realized} amount clamped to the actually-available balance,
+  then performs the atomic export of exactly that realized amount. The
+  realized amount is a function of the venue ledger at relay time: two
+  validators relaying independently against a moving ledger could
+  compute different realized amounts, hence different export
+  commitments, hence different state roots --- and worse, different
+  on-chain releases.
+\end{itemize}
+
+\subsection{The consequence the carried-fills work avoided, restated}
+
+For order submission the divergence was a forked state root. For
+custody the divergence is strictly worse: a withdraw realized amount
+that differs across validators is a divergence in \emph{how much value
+leaves the system on the originating chain}. The deposit acknowledgement
+that differs across validators is a divergence in \emph{how much value
+the venue believes entered}. A consensus that cannot agree on these
+numbers cannot agree on the conservation invariant of
+Section~\ref{sec:conservation}, and the venue is not safe to
+decentralize.
+
+\subsection{The fix, by analogy}
+
+This LP applies the carried-fills mechanism to custody. The proposer
+performs the irreversible, non-deterministic venue interaction
+\emph{once} at \texttt{BuildBlock} --- the import-then-credit for
+deposits, the debit-then-export-commitment for withdrawals --- and
+carries the \emph{results} in the block and DAG-vertex bytes. Every
+validator then applies the carried custody delta as a pure,
+deterministic function of the block bytes: no validator dials the
+venue, no validator re-samples a moving ledger, and the block's effect
+on the state root is identical network-wide. The venue ledger remains
+the source of truth; the proxy block becomes a faithful, replayable
+record of the custody transitions the proposer already executed
+against it. The pattern is the prepare-then-commit shape of two-phase
+commit~\cite{gray1978}, specialized so the ``prepare'' is a single
+proposer relay and the ``commit'' is the deterministic application of
+carried results by every validator.
+
+This is deliberately the smallest change that closes the fork: it
+reuses the existing carried-payload framing, the existing
+consume-once/idempotency machinery, and the reserved signature field
+already present for the trustless path. It introduces no new venue
+semantics --- only a deterministic way for every validator to agree on
+the custody transitions the venue performed.
