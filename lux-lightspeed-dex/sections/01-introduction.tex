@@ -1,35 +1,76 @@
 \section{Introduction}
 
+Decentralized exchanges (DEXs) trade away performance for trustlessness. The
+constant-product automated market maker (AMM) that dominates on-chain trading
+prices every swap against a bonding curve, settles at block cadence, and exposes
+order flow to reordering. The result is high slippage, slow finality, and value
+extracted from users by adversarial transaction ordering~\cite{daian2020}.
+High-frequency trading---resting limit orders, price-time priority, marketable
+order execution in microseconds---has no native home on a public chain.
 
-Traditional decentralized exchanges (DEXs) suffer from fundamental performance limitations:
+The obstacle is structural, not merely a matter of faster hardware. A general-purpose
+EVM chain matches orders \emph{inside} a smart contract: every cross walks storage,
+pays opcode-dispatch overhead, and is re-executed by every validator. Throughput is
+bounded by the slowest validator's serial EVM, and latency is bounded by block time.
+Bolting a faster matching engine onto such a chain does not help if the engine still
+runs once per validator under the EVM's execution model.
+
+\subsection{Approach: the DEX is a chain}
+
+We do not add a DEX to a chain. \textbf{The DEX is a chain}---the \textbf{D-Chain},
+a single-operator consensus chain whose sole purpose is matching and settling orders.
+It has its own consensus, its own \texttt{zapdb} persistence, and an execution-root
+state commitment in the style of the Lux XVM. It is the one and only place where
+orders match and where DEX state lives. Matching runs against a native C++/GPU engine
+behind a deterministic Go reference; the GPU path is gated to be byte-identical to the
+reference (Section~\ref{sec:gpu-matching}).
+
+Everything else is kept orthogonal:
+
 \begin{itemize}
-    \item \textbf{Slow finality}: Ethereum: 12 seconds, Solana: 400ms
-    \item \textbf{MEV extraction}: Frontrunning, sandwich attacks cost users \$1B+/year \cite{daian2020}
-    \item \textbf{Low throughput}: Uniswap: 15 TPS, SushiSwap: 20 TPS
-    \item \textbf{Poor UX}: Slippage, failed transactions, high gas fees
+  \item \textbf{Atomic proxy} (\texttt{chains/dexvm}): a \emph{stateless} component
+  on the public Lux network. It relays orders to the D-Chain over ZAP and moves
+  value in and out atomically via shared-memory import/export---the same mechanism
+  the X-Chain and C-Chain use to exchange assets. It holds no order book and no DEX
+  state (Section~\ref{sec:architecture}).
+  \item \textbf{Client wrapper} (\texttt{luxfi/dex}): a Go client SDK and ZAP
+  gateway. It carries no matching logic of its own.
+  \item \textbf{EVM CLOB facade} (precompile \texttt{0x9010}): a Uniswap-V4-style
+  \texttt{PoolManager} surface that is a \emph{central limit order book}, not an AMM.
+  It is an EVM/Solidity adapter into the unified D-Chain and is inert unless a venue
+  configures a D-Chain endpoint (Section~\ref{sec:precompile}).
 \end{itemize}
 
-High-frequency traders (HFTs) require:
-\begin{enumerate}
-    \item \textbf{Latency}: $<$1ms order-to-execution
-    \item \textbf{Determinism}: Guaranteed execution at specified price
-    \item \textbf{Throughput}: 434M+ orders/second (GPU matching)
-    \item \textbf{Fairness}: No frontrunning or MEV
-\end{enumerate}
+The public open-source \texttt{luxd} validates the P-, C-, and X-Chains and other
+sovereign L1s and \emph{excludes} the D-Chain, which is gated behind a build tag and
+carries zero private dependencies. A private venue build links the C++/GPU engine.
+This is the public/private seam: the open network never depends on the proprietary
+matcher, and the proprietary matcher never leaks into the open network.
 
-\textbf{Existing DEXs cannot meet these requirements.}
-
-\subsection{Our Solution}
-
-Lux Lightspeed DEX achieves HFT-grade performance through:
+\subsection{Contributions}
 
 \begin{enumerate}
-    \item \textbf{Co-located validators}: Placed in Equinix NY4, Tokyo CC2, London LD8 (major financial hubs)
-    \item \textbf{Optimized consensus}: 10ms deterministic finality via GPU BLS (Quasar)
-    \item \textbf{Parallel execution}: 434M orders/sec via GPU-accelerated matching engine
-    \item \textbf{MEV protection}: Threshold encryption + commit-reveal schemes
-    \item \textbf{Atomic cross-chain}: Sub-500ms cross-chain swaps (Lux $\leftrightarrow$ Ethereum $\leftrightarrow$ Bitcoin)
+  \item A \textbf{decomplected} DEX architecture with one home per concern: matching
+  and state on the D-Chain, atomic value transport in the proxy, the client in the
+  wrapper, and an inert-by-default EVM facade (Sections~\ref{sec:architecture},
+  \ref{sec:precompile}).
+  \item A \textbf{consensus-determinism} discipline that runs the matcher in
+  \texttt{Block.Verify} against a versioned overlay and carries fills in the block
+  bytes, eliminating wall-clock and randomness from the consensus path
+  (Section~\ref{sec:determinism}).
+  \item A \textbf{measured}, byte-parity-gated GPU CLOB matcher: 104--126\,M fills/s
+  on an NVIDIA GB10 and $\sim$250\,M fills/s on an Apple M4 Max, byte-identical to a
+  CPU oracle, with an honest analysis of the $>$$10^{9}$/s question
+  (Section~\ref{sec:gpu-matching}).
+  \item A \textbf{market-sharded Block-STM} settlement path with a measured
+  conflict-detection rate, byte-identical CPU and GPU commit order
+  (Section~\ref{sec:settlement}).
+  \item A \textbf{rollup to the Z-Chain} that verifies one proof per $K$ trades, with
+  measured P3Q (ML-DSA) and \texttt{starkfri} (STARK/FRI) verification rates and an
+  honest separation of settlement \emph{finality} from matching throughput
+  (Section~\ref{sec:rollup}).
 \end{enumerate}
 
-\textbf{Performance target}: Match centralized exchange latency (Binance: 5ms, Coinbase: 10ms) while maintaining decentralization.
-
+All performance figures in this paper are measured on stated hardware and gated by
+byte-exact parity against a reference oracle. Where a number is a projection, we label
+it as such.

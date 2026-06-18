@@ -1,0 +1,67 @@
+\section{The EVM CLOB Facade}
+\label{sec:precompile}
+
+Solidity contracts and EVM tooling expect a pool-manager interface. The D-Chain exposes
+one through a native precompile at address
+\texttt{0x0000000000000000000000000000000000009010}. The precompile is a facade: it
+presents a Uniswap-V4-\texttt{PoolManager}-style surface but routes every call into the
+unified D-Chain. It is not an embedded AMM and it holds no canonical state.
+
+\subsection{A CLOB behind a PoolManager surface}
+
+The crucial correction to a common misreading: \texttt{0x9010} is a \emph{central limit
+order book}, not a constant-product AMM. The V4-style method names map onto CLOB
+operations:
+
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{p{4.0cm} p{8.0cm}}
+\toprule
+\textbf{V4-style method} & \textbf{CLOB meaning} \\
+\midrule
+\texttt{initialize} & Create the market / order book. \\
+\texttt{modifyLiquidity} & Place or cancel a resting limit order. ``Liquidity'' is
+resting orders, not curve reserves. \\
+\texttt{swap} & Submit a marketable order against the book; the return is the
+\texttt{BalanceDelta} from the resulting fills. \\
+\bottomrule
+\end{tabular}
+\caption{The facade maps Uniswap-V4 \texttt{PoolManager} methods onto CLOB operations.
+The precompile translates Solidity calls into D-Chain order operations over the frozen
+ZAP wire format; it executes no matching itself.}
+\label{tab:facade}
+\end{table}
+
+The precompile speaks the frozen ZAP wire format (\texttt{clob\_place},
+\texttt{clob\_cancel}, \texttt{clob\_submit}) and forwards to the atomic proxy, which
+relays to the D-Chain. It is a read-through adapter: it holds no canonical pools, and DEX
+state lives only on the D-Chain.
+
+\subsection{Inert by default}
+
+The precompile ships in the public EVM but defaults to an inert backend that refuses every
+call until a venue configures a D-Chain endpoint. The endpoint is opt-in configuration; an
+empty endpoint leaves the DEX disabled. Only when a venue sets the endpoint does the facade
+bind to the live ZAP engine and route calls to the D-Chain. This is the property that lets
+the precompile exist in the open-source node without dragging in the proprietary engine or
+forcing any validator to run a DEX.
+
+\subsection{Relationship to the V2/V3 AMMs}
+
+The V2 and V3 contracts are ordinary Solidity constant-product AMMs, self-contained and
+separate from the precompile. They are not the facade and do not route into the D-Chain.
+Native LUX is \texttt{address(0)} as the canonical key; wrapped LUX, where used, is a
+distinct asset. Keeping the AMMs orthogonal to the CLOB facade preserves the
+one-home-per-concern discipline: the curve-based path and the order-book path do not share
+state or implementation.
+
+\subsection{Why a precompile rather than a contract}
+
+Running the facade as compiled node code rather than interpreted EVM bytecode removes
+opcode-dispatch and ABI-decode overhead from the hot path, and---because matching does not
+happen in the precompile at all---removes per-validator re-execution of matching from the
+EVM. The precompile's only job is to translate and forward; matching and state are the
+D-Chain's job. This separation is what allows the matching engine to be a GPU pipeline
+(Section~\ref{sec:gpu-matching}) instead of being bounded by the slowest validator's serial
+EVM.

@@ -1,0 +1,91 @@
+\section{Consensus Determinism}
+\label{sec:determinism}
+
+A chain that matches orders must produce byte-identical state on every validator from
+the same block. Matching engines are full of nondeterminism---wall-clock timestamps,
+randomly minted identifiers, iteration order over hash maps---any of which forks
+consensus. This section states the discipline that makes the D-Chain deterministic and
+the proof obligations it satisfies.
+
+\subsection{The hazard}
+
+A naive matcher stamps each trade with \texttt{time.Now()} and a randomly generated
+identifier, and mints order IDs by incrementing a shared counter. On a single machine
+this is invisible. Across validators it is fatal: two honest nodes processing the same
+block produce different trade IDs and timestamps, hence different state roots, and the
+chain halts. The same hazard appears if any validator independently relays to an external
+service during verification, because the external service's response is not a pure
+function of the block.
+
+\subsection{Discipline}
+
+The D-Chain removes every nondeterministic input from the consensus path.
+
+\begin{description}
+  \item[Block-derived time.] The only clock reading is the proposer's block timestamp,
+  which is written into the block bytes. Validators replay that carried timestamp in
+  \texttt{Block.Verify}; they never sample their own clock. Trade timestamps derive from
+  the order's block-derived timestamp, not from wall-clock time.
+  \item[Deterministic identifiers.] Order and trade identifiers are derived from block
+  height and transaction or sequence index by a domain-separated hash, e.g.
+  \[
+    \mathrm{tradeID} = H\big(\texttt{"dexvmtrd"} \,\|\, \mathrm{maker} \,\|\, \mathrm{taker}
+      \,\|\, \mathrm{height} \,\|\, \mathrm{seq}\big),
+  \]
+  so the same block yields the same identifiers on every node. A marketable taker that
+  never rests has an ephemeral identifier and contributes none to persisted state.
+  \item[Matcher in \texttt{Verify}.] The matcher runs in \texttt{Block.Verify} against a
+  \texttt{versiondb} overlay. Every validator re-derives the fills and can reject a
+  proposer whose carried fills or state root disagree with its own re-execution. The
+  overlay commits to \texttt{zapdb} only at \texttt{Accept}.
+  \item[Relay once, carry fills.] The proposer is the only party that performs the
+  irreversible, externally observable relay to the D-Chain matcher, and it does so once at
+  \texttt{BuildBlock}. The resulting fills are serialized into the block bytes. Validators
+  settle from the carried fills---a pure function of the block---rather than each issuing
+  its own relay. No validator calls the matcher during verification beyond the local
+  re-derivation against the overlay.
+\end{description}
+
+\subsection{State as a pure function of the block}
+
+Under this discipline the accepted state is
+\[
+  \mathrm{state}_{h} = f\big(\mathrm{state}_{h-1},\; t_{h},\; \mathrm{txbytes}_{h},\;
+    \mathrm{fills}_{h}\big),
+\]
+where $t_{h}$ is the carried block timestamp, $\mathrm{txbytes}_{h}$ the ordered
+transaction bytes, and $\mathrm{fills}_{h}$ the carried fills. Each argument is contained
+in the block; $f$ is deterministic. Therefore the state root is identical across all
+validators for a given block, which is the consensus-safety condition.
+
+\begin{remark}
+Because the block bytes commit to the carried fills, a proposer cannot fabricate fills
+undetected: a validator re-running the matcher in \texttt{Verify} obtains the canonical
+fills and rejects a block whose carried fills differ. The carried-fills layout reserves an
+empty signature field as a forward escape hatch, so the trustless path of
+Section~\ref{sec:rollup}---in which the D-Chain signs fills and the Z-Chain verifies
+them---requires no further wire change.
+\end{remark}
+
+\subsection{Proof obligations}
+
+The discipline is backed by tests that fail loudly on regression:
+
+\begin{itemize}
+  \item Two fresh VMs processing the same block produce byte-identical trades and an
+  identical state root (run repeatedly, race-detector clean).
+  \item A per-validator relay during verification is shown to split consensus, and the
+  fix---relay once at build, carry fills---restores an identical state root with zero
+  matcher calls on the verifying validators.
+  \item Replay of a relayed order is deduplicated to a single effect, and a crash before
+  acceptance does not double-submit.
+  \item A grep gate asserts the consensus path contains no continuous-cross sweep that
+  reads wall-clock time, and the marketable-taker path contains no \texttt{time.Now} or
+  shared-counter increment.
+\end{itemize}
+
+The single-operator venue carries one residual trust surface: a block the proposer built
+and relayed that then loses the consensus poll strands a D-Chain match with no settling
+counterpart. The blast radius is bounded to one taker's escrow and causes no supply
+inflation; the trustless rollup path closes it by binding settlement to a verified proof
+rather than to proposer behavior.
