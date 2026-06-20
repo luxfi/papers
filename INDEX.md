@@ -60,6 +60,7 @@ Auto-generated catalogue of research papers — regenerated 2026-05-18.
 | `lux-capsule-architecture` | `lux-capsule-architecture/lux-capsule-architecture.tex` | ✓ |
 | `lux-consensus-engines` | `lux-consensus-engines/lux-consensus-engines.tex` | ✓ |
 | `lux-consensus` | `lux-consensus/lux-consensus.tex` | ✓ |
+| `lux-corona-pq` | `lux-corona-pq/lux-corona-pq.tex` | ✓ |
 | `lux-credit-lending` | `lux-credit-lending/lux-credit-lending.tex` | ✓ |
 | `lux-credit-protocol-spec` | `lux-credit-protocol-spec/lux-credit-protocol-spec.tex` | ✓ |
 | `lux-cross-chain-security` | `lux-cross-chain-security/lux-cross-chain-security.tex` | ✓ |
