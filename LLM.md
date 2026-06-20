@@ -3,7 +3,7 @@
 ## Post-E2E-PQ State (current)
 
 Papers in this repo are the LaTeX backing for the LP / HIP proposal
-set. Pulsar-M (HIP-0084 / LP-171) and Z-Wing (LP-9702 — hybrid PQ secure
+set. Pulsar (HIP-0084 / LP-171) and Z-Wing (LP-9702 — hybrid PQ secure
 channel) are the new additions this session.
 
 ### Recent significant commits
