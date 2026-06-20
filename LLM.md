@@ -60,10 +60,10 @@ LP-020 Thm 7.5 and Thm 7.7 now cross-reference these appendices via `\cite{qcert
 
 - `lux-quasar-consensus.tex`: Earlier Quasar draft (superseded by LP-020).
 - `lux-triple-proof-consensus.tex`: Triple-proof note (superseded by LP-020).
-- `lux-corona-pq.tex`: Pulsar scheme (cited by LP-020 as [corona]).
-- `lux-threshold-mpc.tex`: FROST + CGGMP21 for T-Chain custody.
+- `lux-corona-pq.tex`: **misnamed** — its body is the **Pulsar** scheme (Module-LWE, matrix `A ∈ R_q^{M×N'}`, titled "The Pulsar Scheme"), not Corona. Orphaned (not in INDEX, not on the site, not cited; superseded by `lp-073-pulsar` + LP-4450). The `corona` dir name is pre-rename legacy — Corona the scheme is Ring-LWE rank-1 (LP-4440); Pulsar is its Module-LWE rank-k generalisation (LP-4450). Resolve: archive as a Pulsar dup, or rewrite the scheme section to the real Ring-LWE Corona.
+- `lux-threshold-mpc.tex`: FROST + CGGMP21 for M-Chain custody (the MPC chain).
 - `lux-zchain.tex`: Z-Chain privacy/ZKP architecture.
-- `lux-mchain-mpc.tex`: M-Chain (predecessor of T-Chain concept).
+- `lux-mchain-mpc.tex`: M-Chain MPC — the threshold/MPC chain (T-Chain was split into M-Chain (MPC) + F-Chain (FHE)).
 
 ## Build
 
