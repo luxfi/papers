@@ -33,7 +33,7 @@ Main protocol paper. 19 pages. Sections:
 - **S1 Introduction**: Three-layer consensus, algebraic independence of assumptions.
 - **S2 System Model**: Partial synchrony, static Byzantine corruption, cryptographic config.
 - **S3 Protocol**: Photon (proposal), Wave (FPC voting), Quasar (certificate generation).
-- **S4 Cryptographic Layers**: BLS12-381, Pulsar (Ring-LWE threshold), ML-DSA-65.
+- **S4 Cryptographic Layers**: BLS12-381, Pulsar (Module-LWE threshold), ML-DSA-65.
 - **S5 Chain Separation** (added 2026-04-13): X=verify, Q=Pulsar consensus, T=all MPC, Z=Groth16 of ML-DSA. Table~2.
 - **S6 QuasarCert** (added 2026-04-13): Formal 3-tuple definition. $(\sigma_{RT}, \sigma_{BLS}, \pi_{ZK})$. Groth16 compresses N ML-DSA sigs to 192 bytes. Def~6.1, Def~6.2.
 - **S7 Security Analysis**: Safety (Thm~7.1), Liveness (Thm~7.2), Unforgeability (Thm~7.3), Single-Compromise (Thm~7.4).
