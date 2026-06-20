@@ -60,7 +60,7 @@ LP-020 Thm 7.5 and Thm 7.7 now cross-reference these appendices via `\cite{qcert
 
 - `lux-quasar-consensus.tex`: Earlier Quasar draft (superseded by LP-020).
 - `lux-triple-proof-consensus.tex`: Triple-proof note (superseded by LP-020).
-- `lux-corona-pq.tex`: **misnamed** — its body is the **Pulsar** scheme (Module-LWE, matrix `A ∈ R_q^{M×N'}`, titled "The Pulsar Scheme"), not Corona. Orphaned (not in INDEX, not on the site, not cited; superseded by `lp-073-pulsar` + LP-4450). The `corona` dir name is pre-rename legacy — Corona the scheme is Ring-LWE rank-1 (LP-4440); Pulsar is its Module-LWE rank-k generalisation (LP-4450). Resolve: archive as a Pulsar dup, or rewrite the scheme section to the real Ring-LWE Corona.
+- `lux-corona-pq.tex`: **the canonical Corona paper** — "Corona: Two-Round Ring-LWE Threshold Signatures for Public Permissionless Chains". Ring-LWE rank-1 (single `a ∈ R_q`, `b = a·s + e`), Ring-SIS commitments, leaderless permissionless DKG, ~33 KB sigs (NIST Cat-1), precompile `0x012206` / P3Q kind `0x02`, Aurora-profile diversity leg (Pulsar ‖ Corona). Aligns with LP-4440. (Rewritten 2026-06 from the old mislabeled "Pulsar" Module-LWE body; Pulsar is the rank-k sibling at LP-4450 / `lp-073-pulsar`.) Paper presents Corona as rank-1 per the canonical framing; `luxfi/corona` code's N=256/M=8/Nvec=7 params are the known RLWE/MLWE wobble.
 - `lux-threshold-mpc.tex`: FROST + CGGMP21 for M-Chain custody (the MPC chain).
 - `lux-zchain.tex`: Z-Chain privacy/ZKP architecture.
 - `lux-mchain-mpc.tex`: M-Chain MPC — the threshold/MPC chain (T-Chain was split into M-Chain (MPC) + F-Chain (FHE)).
