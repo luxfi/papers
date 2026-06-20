@@ -1,44 +1,78 @@
-\section{The DEX Adapter Precompile (0x9010)}
+\section{The DEX Receipt-Settlement Precompile (0x9999)}
 \label{sec:dex-adapter}
 
 The twenty precompiles documented above are \emph{cryptographic}
 primitives: pure functions of their input bytes with no external state.
 Lux adds one precompile of a different kind --- an
-\emph{application adapter} --- at address \texttt{0x9010}, in the
+\emph{application adapter} --- at address \texttt{0x9999}, in the
 application range \texttt{0x9000}--\texttt{0x90ff} reserved above the
-cryptographic block. It is the EVM-side entry point to the Lux DEX, and
-its engineering is instructive precisely because it is not a pure
-function: it is a deterministic facade over an external matching chain.
+cryptographic block. It is the canonical EVM-side entry point to the Lux
+DEX, and its engineering is instructive precisely because it is not a
+pure function: it is a deterministic \emph{settlement} adapter over a
+separate matching chain. The earlier \texttt{0x9010} adapter is
+deprecated and retired to a single namespace-shared path; \texttt{0x9999}
+is the sole production money path. The normative specification is
+LP-9999 \cite{lux-lp9999}; this section documents the EVM-side
+engineering and defers the full settlement contract to it.
 
-\subsection{A CLOB Facade, Not an AMM}
+\subsection{A CLOB Settlement Adapter, Not an AMM and Not a Relay}
 
-\texttt{0x9010} exposes a Uniswap-V4-\texttt{PoolManager}-style singleton
-interface --- pool keys, hooks, flash accounting --- but it is a
-\textbf{central-limit-order-book (CLOB) facade}, not an automated market
-maker. A call does not move along a bonding curve; it relays an order to
-the D-Chain matching VM (Lux Lightspeed DEX \cite{lux-lightspeed-dex})
-and reports the resulting fill. The V4-shaped surface is retained so that
-existing V4-aware routers and Solidity integrators compose unchanged,
-while the execution semantics underneath are price-time priority CLOB
-matching rather than constant-product swaps.
+\texttt{0x9999} exposes the Uniswap-V4-\texttt{PoolManager} ABI
+unchanged --- pool keys, hooks, flash accounting --- but it is neither an
+automated market maker nor a live matcher. A call does not move along a
+bonding curve, and --- crucially --- it does \emph{not} relay an order to
+a matching engine and wait for a fill. The matching engine, the resting
+book, and value conservation live entirely on the \textbf{D-Chain} (the
+Lux Lightspeed DEX matching VM \cite{lux-lightspeed-dex}). The D-Chain
+matches an order and a D-validator quorum BLS-signs a \texttt{DFillReceipt};
+\texttt{0x9999} then \emph{settles that receipt} --- it verifies the
+certificate and debits/credits EVM balances. The V4-shaped surface is
+retained so that existing V4-aware routers and Solidity integrators
+compose unchanged, while the execution semantics underneath are
+price-time priority CLOB matching certified out-of-band rather than
+constant-product swaps.
 
 This is deliberately distinct from the plain Solidity AMMs Lux also
 ships: the V2 (constant-product) and V3 (concentrated-liquidity) pools
 are ordinary contracts with no precompile involvement. The precompile
 exists only for the CLOB path, where on-chain bytecode cannot match a
-limit-order book at the throughput the D-Chain achieves natively.
+limit-order book at the throughput the D-Chain achieves natively. The
+design slogan is \emph{D matches $\cdot$ C settles $\cdot$ BLS certifies
+day-1 $\cdot$ Q later $\cdot$ X finalizes}.
 
-\subsection{Inert by Default}
+\subsection{The Build-vs-Verify Split (Why Not a Live Relay)}
 
-The precompile is \textbf{inert unless the validator is configured with a
-\texttt{dex-zap-endpoint}}. With no endpoint configured, \texttt{0x9010}
-is registered but performs no relay: it is dormant, exactly as a
-reserved-but-unwired entry would be. This keeps the public \texttt{luxd}
-binary free of any dependency on the private D-Chain --- the adapter is
-present in the precompile table but does nothing until an operator
-explicitly wires it to a matching endpoint. Determinism is preserved
-trivially in the inert state, and the configured state is made
-deterministic by the idempotency discipline below.
+A live relay is fork-unsafe. If the precompile called a matcher against a
+moving book during block execution, every validator would re-execute that
+call at \emph{Verify} at a different instant, obtain a different fill, and
+compute a different state root --- a consensus split. The resolution is a
+strict \textbf{build-vs-verify split} carried by a certificate. On the
+\emph{build/propose} path, a node that validates the D-Chain obtains the
+fill from its local matcher and assembles a signed \texttt{DFillReceipt}.
+On the \emph{verify/replay} path --- every C-Chain validator, inside
+\texttt{Run} --- the precompile MUST NOT query any live matcher; it settles
+solely from the certificate carried in the V4 \texttt{hookData} (or,
+equivalently, the block-header predicate rail). Because certificate
+verification is a pure function of the receipt bytes and the verifier key,
+it yields an identical result on every validator. This is exactly the
+determinism contract every other precompile in this paper honours --- here
+achieved not by statelessness but by verifying a certificate rather than
+recomputing a fill.
+
+\subsection{Inline BLS Certificate Verification (Deterministic)}
+
+The day-1 certificate is a BLS aggregate signature over a receipt root: a
+D-validator quorum signs the per-block (or per-batch) receipt root, and
+each C-Chain swap carries the receipt, its Merkle inclusion proof, and one
+BLS certificate. Aggregate BLS verification is deterministic and side-effect
+free, so it is safe to perform inside \texttt{Run} --- the same pairing
+machinery documented in the cryptographic sections above, applied to an
+application certificate. The certificate kind is a versioned
+\texttt{certType} enum resolved through an on-chain verifier registry, so
+the cryptography upgrades with \textbf{no ABI change}: BLS fast-path on
+day-1, then QuasarCert, a post-quantum finality profile, or a STARK/zk
+batch proof register a new \texttt{certType} at an activation height while
+the V4 ABI and the \texttt{DFillReceipt} envelope stay fixed.
 
 \subsection{Native LUX as \texttt{address(0)}}
 
@@ -46,36 +80,64 @@ The pool-key encoding follows the V4 convention that the native asset is
 the zero address. A pool key referencing \texttt{address(0)} denotes
 native LUX; ERC-20 securities use their token address. This removes the
 wrapped-native special case from the adapter ABI: every asset, native or
-token, is a 20-byte address in the pool key, and \texttt{address(0)}
-routes to the D-Chain's native-balance path.
+token, is an address in the pool key, and \texttt{address(0)} routes to
+the D-Chain's native-balance path. Internally, settlement binds the full
+32-byte \texttt{AssetID} --- never an alias or fold --- so the pool-key
+address is resolved to a canonical asset identity before any balance moves.
 
-\subsection{Content-Addressed Idempotency}
+\subsection{Exactly-Once Settlement via Consumed Receipts}
 
-A relay precompile faces a hazard a pure precompile does not: the same
-EVM call may be re-executed (block re-org, validator restart,
-speculative execution) and must not double-submit the underlying order.
-The adapter keys idempotency on a \textbf{content-addressed transaction
-identifier} --- the \texttt{txID} is a hash of the order's canonical
-bytes, so an identical order produces an identical \texttt{txID}, and the
-D-Chain deduplicates on it. Re-execution of the same EVM call relays the
-same \texttt{txID}, which the matcher recognizes as already-seen and does
-not re-match. The precompile thus presents exactly-once semantics to the
-EVM despite being a relay rather than a pure computation --- the same
-determinism contract every other precompile honors, achieved by
-content-addressing instead of statelessness.
+A settlement precompile faces a hazard a pure precompile does not: the
+same EVM call may be re-executed (block re-org, validator restart,
+speculative execution) and must not settle the same fill twice. Each
+\texttt{DFillReceipt} carries a unique \texttt{receiptID}, and the
+precompile records \texttt{consumedReceipt[receiptID]} on success;
+re-presenting a consumed receipt reverts. The receipt is further bound to
+exactly one swap on exactly one chain: it commits to the pool-key hash,
+the swap-parameters hash, the sender, the recipient, the minimum output,
+the deadline, and the precompile address \texttt{0x9999}, and the
+precompile reverts on any mismatch. A revert means nothing happened --- no
+input taken, no output credited, no partial DEX state --- preserving the
+all-or-nothing ownership invariant that only the named counterparties move
+value. Replay protection is thus state (the consumed-receipt set) rather
+than content-addressing, which is what makes settlement, as opposed to a
+fire-and-forget relay, safe and idempotent.
+
+\subsection{Block-STM Parallel Settlement}
+
+\texttt{0x9999} is Block-STM-aware. It declares a fine-grained read/write
+access set --- the consumed-receipt slot for this receipt, the sender's and
+recipient's per-asset balance slots, the relevant pool and asset registry
+entries, the verifier-registry entry for the signing validator set, and a
+sharded fee bucket --- with \textbf{no global hot write slots} (no global
+nonce, volume counter, single fee accumulator, or last-receipt slot). Two
+swaps conflict only if they share an account, asset, receipt, allowance, or
+pool key, so the universal C-Chain validator set becomes a parallel
+settlement fabric: thousands of independent fills settle concurrently and
+only genuine conflicts serialize. Trading is stoppable at fine-grained halt
+scopes (global, per-market, per-asset, per-receipt-type, per-validator-set),
+and the fund-preserving default on an incident is to stop new swaps while
+still allowing cancels, settlement of already-certified safe receipts, and
+withdrawals.
 
 \subsection{Why This Belongs in the Precompile Layer}
 
 A CLOB cannot be matched in EVM bytecode at competitive cost --- the same
-argument that justifies the cryptographic precompiles. The adapter
-keeps the EVM as the settlement and composition surface (V4-compatible,
-hook-friendly) while delegating the latency-critical matching to a chain
-engineered for it. The full D-Chain VM architecture --- matcher-at-Verify,
+argument that justifies the cryptographic precompiles --- and a BLS
+aggregate certificate cannot be verified in bytecode at competitive gas.
+The adapter keeps the EVM as the settlement and composition surface
+(V4-compatible, hook-friendly) while delegating latency-critical matching
+to a chain engineered for it and certificate verification to the precompile
+layer. The full D-Chain VM architecture --- matcher-at-\emph{Verify},
 \texttt{zapdb} commit, crash-restart durability, and the GPU CLOB matcher
 behind it --- is specified in the Lux Lightspeed DEX paper
-\cite{lux-lightspeed-dex}; this section documents only the EVM-side
-adapter and the engineering discipline (inert-by-default,
-\texttt{address(0)} native, content-addressed idempotency) that makes a
-stateful relay safe to expose as a precompile.
+\cite{lux-lightspeed-dex}, and the receipt-settlement contract --- receipt
+binding, the certType verifier registry, the Block-STM access set, halt
+scopes, and the \texttt{0x9010} migration --- is normative in LP-9999
+\cite{lux-lp9999}. This section documents only the EVM-side adapter and the
+engineering discipline (build-vs-verify split, \texttt{address(0)} native,
+inline deterministic certificate verification, exactly-once consumed
+receipts) that makes a stateful settlement adapter safe to expose as a
+precompile.
 
 %% ============================================================
