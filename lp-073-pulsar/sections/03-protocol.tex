@@ -388,6 +388,234 @@ carry propagation across the rounding boundary. $\Delta$ corrects this
 per-coefficient; the $L_2$ bound prevents a forger from inflating
 $\Delta$ to satisfy the equation with an arbitrary $c$.
 
+\subsection{Byte-equal threshold ML-DSA (BCC/CEF)}
+\label{sec:protocol:bcc}
+
+The protocol above is the shared two-round lattice-threshold
+\emph{kernel} (the mechanism Pulsar holds in common with Corona): it
+produces a $(c, z, \Delta)$ signature with a rounded-coefficient hint
+$\Delta \in R_\nu$. This subsection specifies the \emph{canonical Pulsar
+production target}: a threshold whose combined output is \textbf{byte-equal
+to FIPS~204 ML-DSA} ($\mathsf{ML\text{-}DSA\text{-}65}$ and
+$\mathsf{ML\text{-}DSA\text{-}87}$), so the verifier is the stock FIPS~204
+$\mathsf{ML\text{-}DSA.Verify}$ rather than the kernel verifier of
+\S\ref{sec:protocol:verify}. The construction is
+\emph{boundary-cleared / carry-elimination} (BCC/CEF). All symbols in
+this subsection are FIPS~204 ML-DSA symbols: prime $q = 8380417$, ring
+$R_q = \mathbb{Z}_q[X]/(X^{256}+1)$, low-bits modulus $\gamma_2$,
+challenge weight $\tau$, dropped-bits $d = 13$, hint-weight cap $\omega$,
+secret $\mathbf{s}_1, \mathbf{s}_2$, and $\mathbf{t} = \mathbf{A}\mathbf{s}_1
++ \mathbf{s}_2$ split as $\mathbf{t}_1 \cdot 2^d + \mathbf{t}_0$.
+
+\subsubsection{The obstacle and the idea}
+
+Single-party ML-DSA signing samples a mask $\mathbf{y}$, commits
+$\mathbf{w} = \mathbf{A}\mathbf{y}$, sets $\mathbf{w}_1 =
+\mathsf{HighBits}(\mathbf{w}, 2\gamma_2)$, derives $c$ from $\tilde c =
+H(\mu, \mathbf{w}_1)$, forms $\mathbf{z} = \mathbf{y} + c\mathbf{s}_1$,
+and runs a \emph{secret-dependent} rejection-and-hint sequence: it
+rejects unless $\|\mathsf{LowBits}(\mathbf{w} - c\mathbf{s}_2)\|_\infty <
+\gamma_2 - \beta$ and $\|c\mathbf{t}_0\|_\infty < \gamma_2$, then sets
+$\mathbf{h} = \mathsf{MakeHint}(-c\mathbf{t}_0, \mathbf{w} - c\mathbf{s}_2
++ c\mathbf{t}_0, 2\gamma_2)$. A naive threshold must reconstruct
+$c\mathbf{s}_2$ and $c\mathbf{t}_0$ to run this sequence --- and
+broadcasting those quantities \emph{leaks long-term key material}
+(the V13 finding, \S\ref{sec:protocol:bcc:v13}).
+
+BCC/CEF removes both secret-dependent steps. The rejection decision is
+moved \emph{offline} and made \emph{message-independent} (boundary
+clearance, \S\ref{sec:protocol:bcc:clear}); the hint is recovered from
+\emph{public data only} ($\mathsf{FindHint}$, \S\ref{sec:protocol:bcc:hint}).
+No party ever forms $c\mathbf{s}_2$, $c\mathbf{t}_0$, $\mathbf{r}_0 =
+\mathsf{LowBits}(\mathbf{w} - c\mathbf{s}_2)$, or the full commitment
+$\mathbf{w}$.
+
+\subsubsection{Mode restriction}
+\label{sec:protocol:bcc:mode}
+
+BCC/CEF is sound \emph{only} where
+\[
+  \|c\mathbf{t}_0\|_\infty \;\leq\; \tau \cdot 2^{d-1} \;<\; \gamma_2 .
+\]
+This makes the FIPS $\|c\mathbf{t}_0\|_\infty < \gamma_2$ check vacuous
+and bounds the carry contribution of $c\mathbf{t}_0$ to a single
+high-bit step. It holds for $\mathsf{ML\text{-}DSA\text{-}65}$
+($\tau\cdot 2^{d-1} = 49 \cdot 4096 = 200704 < \gamma_2 = 261888$) and
+$\mathsf{ML\text{-}DSA\text{-}87}$ ($60 \cdot 4096 = 245760 < \gamma_2 =
+261888$), but \emph{not} for $\mathsf{ML\text{-}DSA\text{-}44}$
+($39 \cdot 4096 = 159744 > \gamma_2 = 95232$). Pulsar therefore supports
+ML-DSA-65 and ML-DSA-87 only; the parameter selector returns
+``out of scope'' for ML-DSA-44.
+
+\subsubsection{Boundary clearance (offline, message-independent)}
+\label{sec:protocol:bcc:clear}
+
+Parties generate masked nonce shares and form the aggregate commitment
+$\mathbf{w} = \mathbf{A}\mathbf{y}$ in secret-shared form. A nonce is
+\emph{boundary-clear} iff
+\[
+  \mathsf{BoundaryClear}(\mathbf{w}) \;:\;\;
+  \bigl|\,[\mathbf{w}]_{0,j}\,\bigr| \;<\; \gamma_2 - 2\beta - \text{slack}
+  \qquad \forall j \in [0, 256\cdot k),
+\]
+where $[\mathbf{w}]_{0,j}$ is the centred low-bits coefficient and
+$\text{slack}$ absorbs the carry margin. A boundary-clear nonce
+guarantees, for \emph{every} admissible challenge $c$ (weight $\tau$,
+ternary), both
+\[
+  \mathsf{HighBits}(\mathbf{w} - c\mathbf{s}_2) =
+  \mathsf{HighBits}(\mathbf{w}) = \mathbf{w}_1
+  \quad\text{and}\quad
+  \|\mathsf{LowBits}(\mathbf{w} - c\mathbf{s}_2)\|_\infty < \gamma_2 - \beta ,
+\]
+because $\|c\mathbf{s}_2\|_\infty \leq \beta$ and $\|c\mathbf{t}_0\|_\infty
+< \gamma_2$ (the mode restriction) jointly keep every coefficient strictly
+inside its high-bit cell. This is evaluated \emph{once, offline}, over the
+public-after-clearance high bits --- without forming $c\mathbf{s}_2$,
+$c\mathbf{t}_0$, $\mathbf{r}_0$, or $\mathbf{w}_0$ in any party's view.
+The yield is $\approx 10\%$ per nonce for ML-DSA-65; the offline phase
+oversamples.
+
+\paragraph{NonceCert (consensus-native quorum).} Boundary clearance is
+certified by a NonceTranscript quorum \emph{run by the validator set
+itself} (consensus-native MPC, not a separate signing service). The
+quorum emits a $\mathsf{NonceCert}$ carrying \emph{only} $\mathbf{W}_1 =
+\mathsf{HighBits}(\mathbf{w})$ and a clearance quorum certificate
+$\mathsf{ClearanceQC}$. The $\mathsf{NonceCert}$ \textbf{never carries the
+full commitment} $\mathbf{w}$ --- exposing $\mathbf{w}$ would re-introduce
+the V13 leak surface --- only its public high bits and the clearance
+proof.
+
+\subsubsection{Online signing (Ringtail-style two rounds)}
+\label{sec:protocol:bcc:online}
+
+Given $\mu$ and a $\mathsf{NonceCert}$:
+
+\begin{enumerate}[leftmargin=2em, nosep]
+\item \textbf{Round 1 --- bind canonical nonce.} Signers bind the
+      canonical nonce index and the signing subset by a
+      \emph{transcript-derived} rule (anti-grinding: neither the nonce
+      nor the $t$-subset is chosen by a party). The challenge
+      $\tilde c = H(\mu, \mathbf{w}_1)$, $c = \mathsf{SampleInBall}(\tilde
+      c)$ is derived from public data.
+\item \textbf{Round 2 --- $z$-partial.} Each signer opens a partial
+      $\mathbf{z}_i$ that aggregates \emph{linearly}: $\mathbf{z} =
+      \sum_{i} \mathbf{z}_i = \mathbf{y} + c\mathbf{s}_1$ (Lagrange
+      identity at $0$). Partial shares carry the $\mathbf{z}$-contribution
+      only --- \emph{no} $c\mathbf{s}_2$, $c\mathbf{t}_0$, $\mathbf{r}_0$,
+      or $\mathsf{LowBits}$ fields. The wire type omits these and the
+      reference implementation reflection-guards against forbidden field
+      fragments.
+\item \textbf{Finalize --- public hint.} The combiner runs
+      $\mathsf{FindHint}$ (\S\ref{sec:protocol:bcc:hint}) and emits the
+      FIPS~204 signature $\sigma = (\tilde c, \mathbf{z}, \mathbf{h})$.
+\end{enumerate}
+
+\subsubsection{Public hint recovery (\textsc{FindHint})}
+\label{sec:protocol:bcc:hint}
+
+The combiner forms the public reconstruction
+\[
+  \mathbf{w}' \;=\; \mathbf{A}\mathbf{z} - c\mathbf{t}_1 \cdot 2^d
+  \;=\; \mathbf{w} - c\mathbf{s}_2 + c\mathbf{t}_0
+  \pmod q
+\]
+--- exactly the quantity the FIPS verifier forms --- and derives
+$\mathbf{h}$ from $\mathbf{w}'$ and the public $\mathbf{w}_1$ via the
+standard FIPS $\mathsf{UseHint}$ decision, per coefficient $j$:
+\[
+  h_j =
+  \begin{cases}
+    0 & \text{if } \mathsf{HighBits}(\mathbf{w}'_j) = \mathbf{w}_{1,j}, \\
+    1 & \text{if } \mathsf{UseHint}(1, \mathbf{w}'_j) = \mathbf{w}_{1,j}, \\
+    \bot & \text{otherwise (no valid FIPS hint; consume the nonce and retry).}
+  \end{cases}
+\]
+If $\mathsf{weight}(\mathbf{h}) > \omega$, retry with the next nonce. No
+party reconstructs $c\mathbf{s}_2$ or $c\mathbf{t}_0$: $\mathbf{w}'$ is a
+public function of $\mathbf{z}$ (output), $c$ (public), and the public
+key $(\mathbf{A}, \mathbf{t}_1)$.
+
+\subsubsection{Verification-equivalence}
+\label{sec:protocol:bcc:equiv}
+
+\begin{theorem}[BCC/CEF byte-equality]
+\label{thm:bcc-byte-equal}
+Let $\sigma = (\tilde c, \mathbf{z}, \mathbf{h})$ be produced by the
+BCC/CEF protocol above on a boundary-clear nonce at mode
+$\mathsf{ML\text{-}DSA\text{-}65}$ or $\mathsf{ML\text{-}DSA\text{-}87}$.
+Then unmodified FIPS~204 $\mathsf{ML\text{-}DSA.Verify}(\mathit{pk},
+\mu, \sigma) = 1$, and $\sigma$ is byte-identical to a signature a
+single-party ML-DSA signer would emit on the same $(\mathbf{y}, c)$.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+FIPS~204 $\mathsf{Verify}$ computes $\mathbf{w}'_{\text{approx}} =
+\mathbf{A}\mathbf{z} - c\mathbf{t}_1 2^d$ and accepts iff $\tilde c =
+H(\mu, \mathsf{UseHint}(\mathbf{h}, \mathbf{w}'_{\text{approx}}))$ and the
+norm checks on $\mathbf{z}$ and $\mathsf{weight}(\mathbf{h})$ pass.
+$\mathsf{FindHint}$ builds $\mathbf{h}$ so that
+$\mathsf{UseHint}(\mathbf{h}, \mathbf{w}') = \mathbf{w}_1$ by
+construction, and $\mathbf{w}'_{\text{approx}} = \mathbf{w}'$. Boundary
+clearance (\S\ref{sec:protocol:bcc:clear}) plus the mode restriction
+(\S\ref{sec:protocol:bcc:mode}) bound the residual $c\mathbf{t}_0 -
+c\mathbf{s}_2$ so it perturbs each high-bit cell by at most $\pm 1$,
+which the $\pm 1$ hint corrects; hence $\mathsf{UseHint}(\mathbf{h},
+\mathbf{w}'_{\text{approx}}) = \mathbf{w}_1$ and $\tilde c = H(\mu,
+\mathbf{w}_1)$ as derived in Round~1. The linear aggregate $\mathbf{z} =
+\mathbf{y} + c\mathbf{s}_1$ is exactly the single-party response, and the
+encoding ($\tilde c \,\|\, \mathsf{packed}\ \mathbf{z} \,\|\,
+\mathsf{packed}\ \mathbf{h}$) is the FIPS~204 byte layout. The
+mechanised correspondence (boundary clearance $\Rightarrow$
+$\mathsf{FindHint} \leftrightarrow \mathsf{UseHint}$) is in
+\texttt{proofs/lean/Crypto/Pulsar/}.
+\end{proof}
+
+\paragraph{Interop evidence.} A no-leak BCC/CEF signature verifies
+byte-equal under \texttt{cloudflare/circl} ($\mathsf{mldsa65}$,
+$\mathsf{mldsa87}$) and under a \texttt{pq-crystals} cgo binding, for
+both ML-DSA-65 and ML-DSA-87 round-trips. Both interop harnesses load the
+signature as opaque bytes and do not import the Pulsar package.
+
+\subsubsection{The V13 finding (what NOT to do)}
+\label{sec:protocol:bcc:v13}
+
+An earlier construction (\texttt{v0.3 AlgebraicAggregate}) had parties
+broadcast $(\mathbf{W}, \mathbf{Z}, \mathbf{C}\mathbf{S}_2 = c\mathbf{s}_2,
+\mathbf{C}\mathbf{T}_0 = c\mathbf{t}_0)$ shares; an aggregator summed
+them and ran the FIPS sign-side sequence verbatim ($\|\mathbf{w}_0 -
+c\mathbf{s}_2\| < \gamma_2 - \beta$, $\|\mathbf{z}\| < \gamma_1 - \beta$,
+$\|c\mathbf{t}_0\| < \gamma_2$, then $\mathsf{MakeHint}(\mathbf{w}_0 -
+c\mathbf{s}_2 + c\mathbf{t}_0, \mathbf{w}_1)$). Broadcasting
+$c\mathbf{s}_2$ and $c\mathbf{t}_0$ \emph{leaks long-term secret-key
+material} (the \textbf{V13 finding}, \texttt{PULSAR-V13-HINT-LEAK}; a
+sibling \texttt{PULSAR-V13-W-LEAK} exposes the full $\mathbf{w}$ in a
+nonce certificate). That path is gated fail-closed (returns
+\texttt{ErrUnsafeThresholdV03HintPath}) and retained only for research
+comparison. BCC/CEF is the no-leak replacement: every secret-dependent
+decision is either offline-and-message-independent (boundary clearance)
+or computed on public data ($\mathsf{FindHint}$ over $\mathbf{w}'$), and
+$\mathsf{NonceCert}$ carries only $\mathbf{w}_1$ plus a clearance proof.
+
+\subsubsection{Honest status}
+\label{sec:protocol:bcc:status}
+
+Pulsar's BCC/CEF signer is \emph{review-ready, not production-certified}.
+Theorem~\ref{thm:bcc-byte-equal}'s byte-equality is demonstrated under
+\texttt{cloudflare/circl} and \texttt{pq-crystals} (ML-DSA-65 and
+ML-DSA-87) and the boundary-clearance / hint-recovery correspondence is
+machine-checked in Lean. Two genuinely novel components are
+\emph{fail-closed pending external review}: (i) tight small-norm lattice
+range proofs for the nonce and DKG witnesses (a uniform-mask
+$\Sigma$-protocol cannot by itself bound norms; BDLOP/LNS-style proofs
+are required), and (ii) the evaluation of $\mathsf{HighBits}$ /
+$\mathsf{BoundaryClear}$ \emph{inside} the MPC over secret-shared
+$\mathbf{w}$. Until reviewed verifiers are installed
+($\mathsf{ProductionBCCSigningReady}()$ returns false), the production
+signer refuses the BCC/CEF path and the consensus layer composes the
+Corona leg in Pulsar's place. Pulsar's stock FIPS~204 \emph{verifier}
+is always available; only the threshold \emph{signer} is gated.
+
 \subsection{\textsc{Refresh} (HJKY97 proactive refresh)}
 \label{sec:protocol:refresh}
 
