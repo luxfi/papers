@@ -10,6 +10,7 @@ Auto-generated catalogue of research papers — regenerated 2026-05-18.
 | `cover-lux` | `cover-lux.tex` | — |
 | `ethos-of-lux` | `ethos-of-lux.tex` | ✓ |
 | `lp-104-graph-engine` | `lp-104-graph-engine.tex` | ✓ |
+| `lp-311-one-venue-dex-settlement` | `lp-311-one-venue-dex-settlement.tex` | ✓ |
 | `lux-adoption-roadmap` | `lux-adoption-roadmap.tex` | ✓ |
 | `lux-agentic-consensus-zap` | `lux-agentic-consensus-zap.tex` | ✓ |
 | `lux-chain-architecture` | `lux-chain-architecture.tex` | ✓ |
