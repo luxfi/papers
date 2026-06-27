@@ -388,7 +388,7 @@ carry propagation across the rounding boundary. $\Delta$ corrects this
 per-coefficient; the $L_2$ bound prevents a forger from inflating
 $\Delta$ to satisfy the equation with an arbitrary $c$.
 
-\subsection{Byte-equal threshold ML-DSA (BCC/CEF)}
+\subsection{Byte-equal threshold ML-DSA: TALUS (BCC / CEF / CSCP)}
 \label{sec:protocol:bcc}
 
 The protocol above is the shared two-round lattice-threshold
@@ -399,9 +399,30 @@ production target}: a threshold whose combined output is \textbf{byte-equal
 to FIPS~204 ML-DSA} ($\mathsf{ML\text{-}DSA\text{-}65}$ and
 $\mathsf{ML\text{-}DSA\text{-}87}$), so the verifier is the stock FIPS~204
 $\mathsf{ML\text{-}DSA.Verify}$ rather than the kernel verifier of
-\S\ref{sec:protocol:verify}. The construction is
-\emph{boundary-cleared / carry-elimination} (BCC/CEF). All symbols in
-this subsection are FIPS~204 ML-DSA symbols: prime $q = 8380417$, ring
+\S\ref{sec:protocol:verify}.
+
+We call this construction \textbf{TALUS}. It composes three orthogonal
+pillars: \emph{(i)} a dealerless Shamir \textbf{nonce} DKG that produces
+the mask $\mathbf{y}$ and the aggregate commitment $\mathbf{w} =
+\mathbf{A}\mathbf{y}$ in secret-shared form (no party holds $\mathbf{y}$);
+\emph{(ii)} \textbf{BCC} (Boundary Clearance Condition,
+\S\ref{sec:protocol:bcc:clear}), which moves the FIPS rejection decision
+offline and makes it message-independent; and \emph{(iii)} \textbf{CEF}
+(Carry Elimination Framework, the distributed-$\mathbf{w}_1$ identity),
+whose secret-shared $\mathsf{HighBits}$ step is realised leak-free by the
+\textbf{CSCP} CarryCompare secure-comparison circuit
+(\S\ref{sec:protocol:bcc:cscp}). The hint is then recovered from public
+data alone ($\mathsf{FindHint}$, \S\ref{sec:protocol:bcc:hint}). TALUS runs
+under two profiles: \textbf{Pulsar-TEE} (the boundary-cleared $\mathbf{w}_1$
+is sourced from a TEE-attested enclave) and \textbf{Pulsar-MPC} (the
+$\mathbf{w}_1$ step runs as an honest-majority MPC at $N \geq 2T-1$).
+
+\emph{Why a bespoke construction is necessary.} A FROST-style
+\emph{additive}-nonce threshold cannot reach ML-DSA: the $\mathsf{HighBits}$
+/ $\mathbf{r}_0$ / carry rounding is non-linear, so there is no homomorphic
+nonce commitment whose shares add to the FIPS decision. TALUS routes around
+this wall with the three pillars above rather than relaxing the FIPS
+algebra. All symbols in this subsection are FIPS~204 ML-DSA symbols: prime $q = 8380417$, ring
 $R_q = \mathbb{Z}_q[X]/(X^{256}+1)$, low-bits modulus $\gamma_2$,
 challenge weight $\tau$, dropped-bits $d = 13$, hint-weight cap $\omega$,
 secret $\mathbf{s}_1, \mathbf{s}_2$, and $\mathbf{t} = \mathbf{A}\mathbf{s}_1
@@ -485,6 +506,52 @@ $\mathsf{ClearanceQC}$. The $\mathsf{NonceCert}$ \textbf{never carries the
 full commitment} $\mathbf{w}$ --- exposing $\mathbf{w}$ would re-introduce
 the V13 leak surface --- only its public high bits and the clearance
 proof.
+
+\subsubsection{CSCP: leak-free $\mathsf{HighBits}$ (closes \texttt{PULSAR-V13-W-LEAK})}
+\label{sec:protocol:bcc:cscp}
+
+The one step that earlier designs could not perform without exposing the
+secret-bearing commitment is the evaluation of $\mathbf{w}_1 =
+\mathsf{HighBits}(\mathbf{w})$ over secret-shared $\mathbf{w}$. TALUS
+performs it with the \textbf{CSCP} CarryCompare secure-comparison protocol
+(\texttt{talus\_cscp.go}), a real arithmetic circuit --- not a stub. CSCP
+computes the FIPS decomposition as a count of boundary crossings,
+\[
+  \mathbf{w}_{1} \;=\; \Bigl(\textstyle\sum_{k=1}^{16}
+  \bigl[\,\mathbf{w} > (2k-1)\gamma_2\,\bigr]\Bigr) \bmod 16,
+\]
+where each secure comparison $[\mathbf{w} > \theta]$ is a prefix
+less-than evaluated bit-by-bit: a mask-opened bit-decomposition feeds a
+carry-save adder ($\mathsf{bitAdd}$) and a prefix comparator
+($\mathsf{bitLT}$), all over BGW share multiplication. The output is
+validated coefficient-exact against the FIPS~204 $\mathsf{Decompose}$
+oracle.
+
+\paragraph{Leak-freeness.} On the production
+$\mathsf{CEFComputeW1} \to \mathsf{cscpSecureHighBits}$ path the only values
+ever reconstructed are three \emph{masked} openings --- a validity flag, a
+challenge mask, and the public $\mathbf{w}_1$ itself. No party forms
+$\mathbf{w}_0$, the centred low bits, or the full commitment $\mathbf{w}$,
+\emph{even transiently}; the reference enforces this by transcript,
+structural, and reflection guards (\texttt{TestCSCP\_MultiNode\_LeakFree},
+\texttt{TestCSCP\_LeakFree\_Structural}, \texttt{TestCSCP\_MaskOpen\_HidesW}).
+This closes the \texttt{PULSAR-V13-W-LEAK} hazard
+(\S\ref{sec:protocol:bcc:v13}) on the TALUS-MPC path.
+
+\paragraph{Honest scope.} CSCP is proven leak-free and correct in the
+\textbf{semi-honest} model, in an in-process $N$-party \emph{simulation}
+(one process holds all parties' share-vectors and never reconstructs
+$\mathbf{w}/\mathbf{w}_0$ --- a property of the \emph{algorithm}, faithfully
+proven, but not yet a networked deployment). Honest-majority $N \geq 2T-1$
+is required and enforced ($\mathsf{TalusMinPartiesMPC}$,
+$\mathsf{newCSCPCtx}$, $\mathsf{bgwMulShares}$). A \emph{malicious} party
+cannot forge or leak: a corrupted $\mathbf{w}_1$ is caught downstream by
+$\mathsf{FindHint}$ (\S\ref{sec:protocol:bcc:hint}) and the
+$\mathsf{ReleaseGate}$ (which runs a mandatory stock FIPS~204 verify and
+never releases a failed signature), so the worst a deviating party
+achieves is an abort/retry. The malicious-secure CSCP layer and a
+networked (non-simulation) deployment are the open residual
+(\S\ref{sec:protocol:bcc:status}, Residual~A).
 
 \subsubsection{Online signing (Ringtail-style two rounds)}
 \label{sec:protocol:bcc:online}
@@ -589,32 +656,78 @@ $\|c\mathbf{t}_0\| < \gamma_2$, then $\mathsf{MakeHint}(\mathbf{w}_0 -
 c\mathbf{s}_2 + c\mathbf{t}_0, \mathbf{w}_1)$). Broadcasting
 $c\mathbf{s}_2$ and $c\mathbf{t}_0$ \emph{leaks long-term secret-key
 material} (the \textbf{V13 finding}, \texttt{PULSAR-V13-HINT-LEAK}; a
-sibling \texttt{PULSAR-V13-W-LEAK} exposes the full $\mathbf{w}$ in a
-nonce certificate). That path is gated fail-closed (returns
-\texttt{ErrUnsafeThresholdV03HintPath}) and retained only for research
-comparison. BCC/CEF is the no-leak replacement: every secret-dependent
-decision is either offline-and-message-independent (boundary clearance)
-or computed on public data ($\mathsf{FindHint}$ over $\mathbf{w}'$), and
-$\mathsf{NonceCert}$ carries only $\mathbf{w}_1$ plus a clearance proof.
+sibling \texttt{PULSAR-V13-W-LEAK} exposed the full $\mathbf{w}$ in a
+nonce certificate). That construction is \emph{removed} --- no
+\texttt{AlgebraicAggregate} definition remains in the tree. TALUS is the
+no-leak replacement: every secret-dependent decision is either
+offline-and-message-independent (boundary clearance), evaluated leak-free
+over secret-shared $\mathbf{w}$ by CSCP (\S\ref{sec:protocol:bcc:cscp},
+which closes \texttt{PULSAR-V13-W-LEAK} on the TALUS-MPC path,
+semi-honest), or computed on public data ($\mathsf{FindHint}$ over
+$\mathbf{w}'$); $\mathsf{NonceCert}$ carries only $\mathbf{w}_1$ plus a
+clearance proof, never the full $\mathbf{w}$.
 
-\subsubsection{Honest status}
+\subsubsection{Why key generation stays trusted-dealer}
+\label{sec:protocol:bcc:keydkg}
+
+TALUS's \emph{nonce} DKG (pillar (i)) is dealerless, but its \emph{key}
+generation is not --- and this is forced, not incidental. FIPS~204
+$\mathsf{KeyGen}$ samples $\mathbf{s}_1, \mathbf{s}_2$ \emph{uniformly}
+from the small-norm set $S_\eta = \{\mathbf{p} \in R : \|\mathbf{p}\|_\infty
+\leq \eta\}$, and the whole parameter set is calibrated to
+$\|\mathbf{s}_1\|_\infty, \|\mathbf{s}_2\|_\infty \leq \eta$
+(e.g.\ $\beta = \tau\eta$). A dealerless DKG forms the joint secret as a
+sum / Lagrange combination of $N \geq 2$ independent contributions, each
+itself in $S_\eta$; the result has $\ell_\infty$-support up to $N\eta >
+\eta$ and is therefore \emph{not} $S_\eta$-distributed. Two independent
+failures follow. \emph{(1)} Byte-validity breaks: $\|c\mathbf{s}_2\|_\infty
+\leq N\beta > \beta$, so the boundary-clearance bound of
+\S\ref{sec:protocol:bcc:clear} no longer holds and the combined output is
+not byte-equal to FIPS~204. \emph{(2)} Security-equivalence breaks
+\emph{regardless} of byte-equality: a sum-of-contributions secret is an
+efficiently distinguishable distribution from a uniform-$S_\eta$ secret,
+so the FIPS~204 EUF-CMA claim does not transfer. Constraining a
+reconstruction back into $S_\eta$ without any party knowing the secret is
+exactly a dealer. The reference makes this explicit --- a dealerless
+byte-FIPS key DKG over $N \geq 2$ parties returns
+$\mathsf{ErrDealerlessByteFIPSUnreachable}$
+(\texttt{distributed\_bcc\_dkg.go}). \textbf{Consequence.} Pulsar key
+generation is trusted-dealer; the permissionless-public guarantee a
+sovereign validator set requires is carried instead by the
+natively-dealerless Corona leg \cite{corona} (Pedersen DKG over $R_q$),
+composed alongside Pulsar in the Quasar dual-PQ certificate
+(\S\ref{sec:quasar}).
+
+\subsubsection{Honest status (\texttt{v1.2.0})}
 \label{sec:protocol:bcc:status}
 
-Pulsar's BCC/CEF signer is \emph{review-ready, not production-certified}.
-Theorem~\ref{thm:bcc-byte-equal}'s byte-equality is demonstrated under
-\texttt{cloudflare/circl} and \texttt{pq-crystals} (ML-DSA-65 and
-ML-DSA-87) and the boundary-clearance / hint-recovery correspondence is
-machine-checked in Lean. Two genuinely novel components are
-\emph{fail-closed pending external review}: (i) tight small-norm lattice
-range proofs for the nonce and DKG witnesses (a uniform-mask
-$\Sigma$-protocol cannot by itself bound norms; BDLOP/LNS-style proofs
-are required), and (ii) the evaluation of $\mathsf{HighBits}$ /
-$\mathsf{BoundaryClear}$ \emph{inside} the MPC over secret-shared
-$\mathbf{w}$. Until reviewed verifiers are installed
-($\mathsf{ProductionBCCSigningReady}()$ returns false), the production
-signer refuses the BCC/CEF path and the consensus layer composes the
-Corona leg in Pulsar's place. Pulsar's stock FIPS~204 \emph{verifier}
-is always available; only the threshold \emph{signer} is gated.
+TALUS's byte-equal threshold signer is realised at \texttt{v1.2.0}.
+Theorem~\ref{thm:bcc-byte-equal}'s byte-equality is demonstrated under the
+\emph{unmodified} \texttt{cloudflare/circl} and \texttt{pq-crystals}
+FIPS~204 verifiers (ML-DSA-65 and ML-DSA-87), and the boundary-clearance /
+hint-recovery correspondence is machine-checked in Lean. The leak hazard of
+earlier designs is closed: the secret-shared $\mathsf{HighBits}$ step runs
+inside the CSCP CarryCompare circuit (\S\ref{sec:protocol:bcc:cscp}), so no
+party forms $\mathbf{w}_0$ or the full $\mathbf{w}$. Two residuals remain,
+stated honestly.
+
+\paragraph{Residual A (malicious-secure CSCP / networked MPC).} CSCP's
+leak-freeness is proven in the \emph{semi-honest} model, in an in-process
+$N$-party simulation. A malicious party is bounded to abort/retry
+(liveness) by $\mathsf{FindHint}$ and the $\mathsf{ReleaseGate}$, never a
+forge or a leak; the malicious-secure CSCP layer --- together with a
+networked, non-simulation deployment and a malicious-VSS nonce DKG --- is
+the open item.
+
+\paragraph{Residual B (dealerless key DKG).} A dealerless byte-FIPS-204
+\emph{key} generation is provably unreachable
+(\S\ref{sec:protocol:bcc:keydkg}); key generation is trusted-dealer and the
+permissionless guarantee is delegated to the Corona leg.
+
+The stock FIPS~204 \emph{verifier} is always available; the residuals
+concern only the threshold \emph{signer}. The consensus layer composes the
+Corona leg alongside Pulsar (\S\ref{sec:quasar}) so that permissionless PQ
+finality never depends on Residual~A or~B.
 
 \subsection{\textsc{Refresh} (HJKY97 proactive refresh)}
 \label{sec:protocol:refresh}
