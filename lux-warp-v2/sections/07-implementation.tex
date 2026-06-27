@@ -11,13 +11,14 @@ The shipping implementation lives in two Go packages: \texttt{github.com/luxfi/w
   \toprule
   \textbf{Path} & \textbf{Role} \\
   \midrule
-  \texttt{warp/envelope.go} & \texttt{EnvelopeV2}, \texttt{ParseEnvelope}, \texttt{ParseEnvelopeV2}, the version-byte dispatcher, and the wire-size guards \\
-  \texttt{warp/message.go} & v1 \texttt{Message} (unchanged) \\
-  \texttt{warp/signature.go} & v1 \texttt{BitSetSignature} (unchanged) \\
-  \texttt{warp/validator.go} & v1 validator-set / canonical validator-set machinery (unchanged) \\
-  \texttt{warp/verifier.go} & v1 \texttt{Verifier} interface (unchanged) \\
-  \texttt{warp/fuzz\_envelope\_test.go} & \texttt{FuzzEnvelopeV2}: the version-byte dispatcher fuzz harness \\
-  \texttt{warp/pulsar/pulsar.go} & \texttt{KernelVerifier}, \texttt{BuildSigningBytes}, frame walkers, hardened deserializer \\
+  \texttt{warp/codec.go} & ZAP profile constants: the four DSTs, \texttt{keccak256}, the digest $D$, \texttt{BeamSigningBytes} / \texttt{PulseSigningBytes} / \texttt{MLDSASigningBytes}, and the size caps \\
+  \texttt{warp/zap.go} & the canonical TLV codec: \texttt{wireMagic}, the append-primitives, the strict \texttt{zapReader}, and the bitset-canonicality helpers \\
+  \texttt{warp/envelope.go} & \texttt{Envelope}, \texttt{NewEnvelope}, \texttt{ParseEnvelope}, \texttt{VerifyEnvelope}, \texttt{VerifyWithOptions}, \texttt{VerifyPQLanes}, and the wire-size guards \\
+  \texttt{warp/message.go} & \texttt{Message} (the single signed subject; folds the former unsigned body + PQ lineage), \texttt{NewMessage}, \texttt{ParseMessage}, \texttt{VerifyWeight} \\
+  \texttt{warp/signature.go} & \texttt{BitSetSignature} (the Beam lane), \texttt{SignMessage}, \texttt{AggregateSignatures} \\
+  \texttt{warp/validator.go} & validator-set / canonical validator-set machinery \\
+  \texttt{warp/fuzz\_envelope\_test.go} & \texttt{FuzzEnvelope} / \texttt{FuzzEnvelopeRaw}: the envelope-parser fuzz harnesses \\
+  \texttt{warp/pulsar/pulsar.go} & \texttt{KernelVerifier} (Pulse over \texttt{PulseSigningBytes}$(D)$), \texttt{SerializePulse} / \texttt{DeserializePulse}, frame walkers, hardened deserializer \\
   \texttt{warp/pulsar/classification.go} & \texttt{HorizonCertificate} helper (lifts envelope + transcript fields into the LP-105 cert shape) \\
   \texttt{warp/pulsar/fuzz\_pulse\_test.go} & \texttt{FuzzPulseDeserialize}, \texttt{FuzzPulseSerialize}: the Pulse wire-format fuzz harness \\
   \texttt{warp/pulsar/fuzz\_horizon\_cert\_test.go} & \texttt{FuzzHorizonCertificate}: the Horizon cert fuzz harness \\
@@ -26,70 +27,78 @@ The shipping implementation lives in two Go packages: \texttt{github.com/luxfi/w
   \bottomrule
 \end{tabular}
 
-\subsection{The dispatch surface}
+\subsection{The single parser}
 
-The root \texttt{warp} package exposes \texttt{ParseEnvelope}: the dispatcher that detects v1 vs v2 wire bytes and returns an \texttt{EnvelopeV2}.
+The root \texttt{warp} package exposes one envelope parser, \texttt{ParseEnvelope}. There is no version-byte dispatcher and no cross-version fallback: \texttt{ParseEnvelope} requires the ZAP magic and the \texttt{kindEnvelope} byte, then reads the fields in order through a strict, bounds-checked cursor (\texttt{zapReader}).
 
 \begin{verbatim}
-func ParseEnvelope(b []byte) (*EnvelopeV2, error) {
-    if len(b) == 0 {
-        return nil, ErrEnvelopeEmpty
+func ParseEnvelope(b []byte) (*Envelope, error) {
+    if len(b) == 0 { return nil, ErrEnvelopeEmpty }
+    if len(b) > MaxEnvelopeSize { return nil, ErrEnvelopeTooLarge }
+
+    r := newZapReader(b)
+    if err := r.expectMagic(); err != nil {        // "LWZP"||0x01
+        return nil, err
     }
-    switch b[0] {
-    case EnvelopeVersion2:
-        return ParseEnvelopeV2(b)
-    default:
-        // Fall back to v1; lift v1 message into a v2 envelope.
-        msg, err := ParseMessage(b)
-        if err != nil {
-            return nil, fmt.Errorf("warp: %w", err)
-        }
-        return &EnvelopeV2{Message: msg}, nil
+    kind, err := r.u8()
+    if err != nil { return nil, err }
+    if kind != kindEnvelope {                       // 0x02
+        return nil, fmt.Errorf("%w: envelope kind 0x%02x",
+            ErrInvalidMessage, kind)
     }
+
+    e := &Envelope{}
+    if e.Message, err = parseMessage(r); err != nil { return nil, err }
+    if e.Beam, err = parseBeam(r); err != nil { return nil, err }
+    if e.PulseSig, err = r.varbytes(); err != nil { return nil, err }
+    if e.MLDSACertSet, err = r.varbytes(); err != nil { return nil, err }
+    if err := r.end(); err != nil { return nil, err } // reject trailing
+    if err := e.Verify(); err != nil { return nil, err }
+    return e, nil
 }
 \end{verbatim}
 
-The dispatcher is the only place where v1 / v2 wire formats are distinguished. Downstream consumers see a uniform \texttt{EnvelopeV2}; v1-only callers see a v2 envelope with PQ lanes empty.
+Legacy RLP bytes (lead \texttt{0xc0}--\texttt{0xff} or the bare \texttt{0x02}) fail \texttt{expectMagic} and are rejected; there is no in-band lift of legacy v1 bytes into the envelope. \texttt{ParseMessage} is the analogous single parser for a standalone $\mathsf{Message}$.
 
 \subsection{The PulseVerifier interface}
 
 \begin{verbatim}
 type PulseVerifier interface {
-    VerifyPulse(env *EnvelopeV2) error
+    VerifyPulse(env *Envelope) error
 }
 \end{verbatim}
 
-The root \texttt{warp} package's \texttt{VerifyV2} accepts a \texttt{PulseVerifier}. Production code wires \texttt{warp/pulsar/KernelVerifier} (the concrete Pulsar-kernel-driven verifier). Tests wire a \texttt{FakePulseVerifier} that records calls without invoking the kernel.
+The root package's \texttt{VerifyWithOptions} (and the PQ-only entrypoint \texttt{VerifyPQLanes}) accept a \texttt{PulseVerifier} and an \texttt{MLDSACertSetVerifier} through a \texttt{VerifyOptions} struct. Production code wires \texttt{warp/pulsar/KernelVerifier} (the concrete Pulsar-kernel-driven verifier). Tests wire a stub \texttt{PulseVerifier} that records calls without invoking the kernel.
 
-The split keeps the import graph clean: the root \texttt{warp} package does not import \texttt{github.com/luxfi/pulsar}, so it has no dependency on the lattigo deserializer; downstream consumers that want only the Beam path do not pay for the lattigo dependency.
+The split keeps the import graph clean: the root \texttt{warp} package does not import the Pulsar kernel (\texttt{github.com/luxfi/corona}), so it has no dependency on the lattigo deserializer; downstream consumers that want only the Beam path do not pay for the lattigo dependency. The concrete \texttt{KernelVerifier} lives in the \texttt{warp/pulsar} subpackage, which imports the kernel.
 
 \subsection{The KernelVerifier flow}
 
 \begin{enumerate}[leftmargin=2em,nosep]
-  \item Parse the envelope (\texttt{ParseEnvelope}). v1 bytes lift to a Beam-only envelope.
-  \item If the envelope's \texttt{PulsarPulse} is empty, return early (Beam-only path).
-  \item Resolve $(\mathsf{sourceChainID}, \mathsf{sourceKeyEraID}, \mathsf{sourceGeneration})$ via the \texttt{GroupKeyResolver} to obtain $(\mathsf{GroupKey}, \mathsf{HashSuiteID})$.
-  \item Check \texttt{HashSuiteID} matches the envelope's \texttt{HashSuiteID}; return \texttt{ErrSuiteMismatch} on mismatch.
-  \item Build the canonical signing bytes via \texttt{BuildSigningBytes}: $H_T$ over (\texttt{WARP-PULSAR-ENVELOPE-v1}, \texttt{sourceChainID}, \texttt{payload}, \texttt{sourceNebulaRoot}, \texttt{sourceKeyEraID}, \texttt{sourceGeneration}).
+  \item The envelope must carry a non-empty Pulse (\texttt{env.HasPulse()}); otherwise \texttt{ErrPulseAbsent}. (The Beam-only path never reaches here --- \texttt{VerifyPQLanes} skips an absent lane unless \texttt{RequirePulse}.)
+  \item Resolve $(\mathsf{SourceChainID}, \mathsf{SourceKeyEraID}, \mathsf{SourceGeneration})$ via the \texttt{GroupKeyResolver} to obtain $(\mathsf{GroupKey}, \mathsf{suiteID})$.
+  \item Check \texttt{suiteID} matches the envelope's resolved \texttt{HashSuiteOrDefault()}; return \texttt{ErrSuiteMismatch} on mismatch.
+  \item Recompute $D = \texttt{env.Message.ID()}$ and build the signing bytes $\texttt{PulseSigningBytes}(D) = \text{``LUX-WARP-ZAP-PULSE-v1''} \,\|\, D$. Because $D$ folds \texttt{SourceNebulaRoot} / \texttt{SourceKeyEraID} / \texttt{SourceGeneration} / \texttt{HashSuiteID} / \texttt{SourceChainID} / \texttt{NetworkID} / \texttt{Payload}, verifying over these bytes binds the Pulse to every one of them.
   \item Validate the Pulse wire bytes via the four-layer guards (Section~\ref{sec:fuzz-vuln}): outer wire-size cap, per-lane frame cap, frame walker, defer-recover.
-  \item Deserialize via \texttt{DeserializePulse} into a \texttt{pulsarKernel.Signature}.
-  \item Verify via $\mathsf{Pulsar.Verify}(\mathsf{GroupKey}, \mathsf{signingBytes}, \mathsf{signature})$. Return the kernel's verification result.
+  \item Deserialize via \texttt{DeserializePulse} into a \texttt{corona.Signature}.
+  \item Verify via $\texttt{corona.Verify}(\mathsf{GroupKey}, \texttt{PulseSigningBytes}(D), \mathsf{signature})$; return \texttt{ErrPulseVerifyFailed} on rejection.
 \end{enumerate}
 
-The Beam verification (BLS aggregate) is run separately by the destination's existing v1 \texttt{Verifier}; the Pulse path is additive. A destination chain that wants the full Horizon path on its incoming envelopes wires both verifiers and Prism-binds them via the destination's own \texttt{HorizonCertificate} construction.
+The Beam verification (BLS aggregate over $\text{``LUX-WARP-ZAP-BEAM-v1''}\,\|\,D$) is run by \texttt{VerifyEnvelope}; the Pulse and ML-DSA lanes are additive. A destination chain that wants the full Horizon path wires all lanes via \texttt{VerifyWithOptions} and Prism-binds them via the \texttt{HorizonCertificate} helper (\texttt{warp/pulsar}).
 
 \subsection{Test status}
 
-The Mar-3 freeze tag (\texttt{v0.1.0-rc1-pq-consensus-freeze} on \texttt{github.com/luxfi/warp}) carries the following test status:
+The v1.22.0 tag on \texttt{github.com/luxfi/warp} carries the following test status:
 
 \begin{itemize}[leftmargin=2em,nosep]
-  \item \texttt{warp/envelope\_test.go}: 100\% pass. v1 / v2 dispatcher coverage; round-trip; forward-compat decode of v1 bytes; backward-incompat reject of v2 bytes by v1 path.
-  \item \texttt{warp/envelope\_negative\_test.go}: 100\% pass. Malformed v2 envelope rejection.
-  \item \texttt{warp/fuzz\_envelope\_test.go}: zero panics in 60 s.
-  \item \texttt{warp/pulsar/pulsar\_test.go}: 100\% pass. End-to-end ceremony + sign + serialize + deserialize + verify.
+  \item \texttt{warp/envelope\_test.go}: 100\% pass. Round-trip; empty optional lanes; legacy-RLP rejection; trailing-byte rejection; non-canonical-bitset rejection; \texttt{VerifyWithOptions} / \texttt{VerifyPQLanes} lane coverage.
+  \item \texttt{warp/message\_test.go}: 100\% pass. \texttt{TestMessageIDIsLegacyKeccak} (digest is legacy Keccak, not SHA3); \texttt{TestLaneSigningBytesDistinct} (the four DSTs separate); per-field ID sensitivity; bad-kind / trailing-byte rejection.
+  \item \texttt{warp/envelope\_negative\_test.go}: 100\% pass. Message-transcript mutation rejection; explicit-vs-empty \texttt{HashSuiteID} binds distinctly.
+  \item \texttt{warp/zap\_test.go} / \texttt{warp/fuzz\_envelope\_test.go} / \texttt{warp/fuzz\_signature\_test.go}: zero panics in 60 s (\texttt{FuzzZapReader}, \texttt{FuzzEnvelope}, \texttt{FuzzEnvelopeRaw}, \texttt{FuzzBeamCodec}, \texttt{FuzzCorruptedMLDSACertSet}).
+  \item \texttt{warp/pulsar/pulsar\_test.go}: 100\% pass. End-to-end ceremony + sign + serialize + deserialize + verify; tampered-envelope-field rejection.
   \item \texttt{warp/pulsar/fuzz\_pulse\_test.go}: zero panics in 60 s.
   \item \texttt{warp/pulsar/fuzz\_horizon\_cert\_test.go}: zero panics in 60 s.
-  \item \texttt{warp/pulsar/groth16\_classification\_test.go}: 100\% pass. \texttt{IsPQRootOfTrust} correctly classifies Groth16-wrapped lanes as classical.
+  \item \texttt{warp/pulsar/groth16\_classification\_test.go}: 100\% pass. The optional Groth16 wrapper is classified as classical.
   \item \texttt{warp/pulsar/hashsuite\_mismatch\_test.go}: 100\% pass. \texttt{ErrSuiteMismatch} returned on mismatch.
 \end{itemize}
 
@@ -101,27 +110,28 @@ The build / test gate is \texttt{go test -count=1 ./...} from the \texttt{warp/}
   \toprule
   Operation & Time \\
   \midrule
-  v1 envelope parse + verify (BLS aggregate, $n=21$) & $\sim 875\,\mu\mathrm{s}$ \\
-  v2 envelope parse (no Pulse) & $\sim 30\,\mu\mathrm{s}$ \\
-  v2 envelope parse + Pulse deserialize + verify ($K=21$) & $\sim 5\,\mathrm{ms}$ \\
+  Beam-only envelope parse + verify (BLS aggregate, $n=21$) & $\sim 875\,\mu\mathrm{s}$ \\
+  Envelope parse (no Pulse) & $\sim 30\,\mu\mathrm{s}$ \\
+  Envelope parse + Pulse deserialize + verify ($K=21$) & $\sim 5\,\mathrm{ms}$ \\
   Frame walker (\texttt{validatePolyFrame}) on $33\,\mathrm{KB}$ Pulse & $\sim 50\,\mu\mathrm{s}$ \\
   \texttt{HashSuiteID} resolver lookup (cached) & $\sim 1\,\mu\mathrm{s}$ \\
   \bottomrule
 \end{tabular}
 
-The Pulse verify dominates v2 envelope verification cost; the Beam aggregate verify is a few-percent overhead. Measurements on Apple M1 Max single core; full numbers and reproduction commands in the benchmark report \cite{luxbenchmarks}.
+The Pulse verify dominates full-envelope verification cost; the Beam aggregate verify is a few-percent overhead. Measurements on Apple M1 Max single core; full numbers and reproduction commands in the benchmark report \cite{luxbenchmarks}.
 
 \subsection{Cross-implementation parity}
 
 The Go canonical (\cite{warpgo}) is the byte oracle. The wire format is normative; any other-language implementation must produce byte-equal envelopes. The KAT vectors gate every release: fuzz seeds + a representative real-ceremony Pulse + the Mar-3 exploit input, all checked into \texttt{warp/pulsar/testdata/}.
 
-\subsection{Forward / backward compatibility tests}
+\subsection{Wire-format / lane tests}
 
 \begin{itemize}[leftmargin=2em,nosep]
-  \item \texttt{TestParseEnvelopeForwardCompatV1Bytes}: v2 receiver decodes v1 bytes, lifts into v2 envelope with empty PQ lanes, verifies via Beam-only path.
-  \item \texttt{TestParseEnvelopeBackwardIncompatV2Bytes}: v1 receiver rejects v2 bytes (the leading \texttt{0x02} fails RLP-list prefix check).
-  \item \texttt{TestEnvelopeRoundTrip}: v2 \texttt{Bytes()} $\to$ \texttt{ParseEnvelopeV2} produces a byte-equal envelope.
-  \item \texttt{TestEnvelopeBeamUnchanged}: the BLS aggregate inside an \texttt{EnvelopeV2} is bit-equal to the BLS aggregate in a corresponding v1 \texttt{Message}.
+  \item \texttt{TestParseEnvelopeRejectsLegacyRLP}: \texttt{ParseEnvelope} rejects legacy RLP bytes at the magic check (the wire boundary is mutual --- legacy decoders likewise reject the ZAP magic because \texttt{'L'} = \texttt{0x4c} is below RLP's \texttt{0xc0} list floor).
+  \item \texttt{TestEnvelopeRoundTrip}: \texttt{Envelope.Bytes()} $\to$ \texttt{ParseEnvelope} produces a byte-equal envelope.
+  \item \texttt{TestEnvelopeEmptyOptionalLanes}: an envelope with both PQ lanes carried as empty \texttt{u32(0)} frames round-trips and verifies on the Beam-only path.
+  \item \texttt{TestParseEnvelopeRejectsTrailingBytes} / \texttt{TestParseEnvelopeRejectsNonCanonicalBitset}: canonicality enforcement on decode.
+  \item \texttt{TestMessageIDIsLegacyKeccak} / \texttt{TestLaneSigningBytesDistinct}: the digest $D$ is legacy Keccak and the four lane DSTs are pairwise distinct.
 \end{itemize}
 
-All pass on the freeze tag.
+All pass on the v1.22.0 tag.
