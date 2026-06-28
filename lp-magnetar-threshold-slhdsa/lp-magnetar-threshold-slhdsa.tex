@@ -1,0 +1,734 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{../shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{array}
+\usepackage{tabularx}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+% Absorb the few unbreakable \texttt{} tokens (paths, ALL_CAPS constants)
+% so they never overrun the margin.
+\setlength{\emergencystretch}{3em}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{remark}{Remark}
+\newtheorem{claim}{Claim}
+
+\newcommand{\PRF}{\mathsf{PRF}}
+\newcommand{\PRFmsg}{\mathsf{PRF}_{\mathsf{msg}}}
+\newcommand{\Hmsg}{\mathsf{H}_{\mathsf{msg}}}
+\newcommand{\Fhash}{\mathsf{F}}
+\newcommand{\Hhash}{\mathsf{H}}
+\newcommand{\Tl}{\mathsf{T}_{\ell}}
+\newcommand{\skseed}{\mathsf{SK.seed}}
+\newcommand{\skprf}{\mathsf{SK.prf}}
+\newcommand{\pkseed}{\mathsf{PK.seed}}
+\newcommand{\pkroot}{\mathsf{PK.root}}
+\newcommand{\GF}{\mathbb{F}}
+\newcommand{\adv}{\mathcal{A}}
+\newcommand{\chain}{\mathsf{chain}}
+
+\title{Magnetar-Threshold: No-Reconstruct Threshold\\Hash-Based Signatures and the\\Obstruction Map for SLH-DSA}
+
+\author{Zach Kelling \\ \textit{Lux Industries, Inc.} \\ \texttt{research@lux.network}}
+\date{2026}
+
+\begin{document}
+
+\luxcoverpage
+
+\maketitle
+
+\begin{abstract}
+The Lux \emph{trustless-by-default} law requires every consensus threshold
+signature lane to be \emph{no-reconstruct}: no party or coordinator ever forms
+the full secret key, even transiently at signing time. For the lattice lanes
+(Pulsar / ML-DSA, Corona / Ringtail) this is achieved by exploiting the algebraic
+linearity of the signature response. The hash-based lane, Magnetar
+(threshold SLH-DSA, FIPS~205), has no such structure: the secret seed controls a
+forest of one-time (WOTS$^+$) and few-time (FORS) secrets bound to the public key
+\emph{only} through the non-homomorphic hash $\mathsf{SHAKE}$. This paper is a
+rigorous feasibility study of \emph{no-reconstruct} threshold SLH-DSA.
+
+We establish the central structural fact that makes the problem tractable
+\emph{in part}: FIPS~205 verification never recomputes a pseudorandom function of
+the seed; it only checks that the opened one-time material hashes consistently to
+the single published hypertree root. Leaf secrets therefore need not be
+pseudorandom images of a master seed; they need only be Merkle-consistent with the
+root. We rank four approaches (distributed tree generation, threshold leaf
+opening, MPC over the hash chain, and ZK-consistent partial openings) and identify
+the two hard walls: (i)~the SLH-DSA hypertree has $2^{63}\text{--}2^{68}$ leaves
+and cannot be materialised; (ii)~deriving a leaf from the seed is a keyed hash and
+admits no algebraic threshold shortcut (the Cozzo--Smart obstruction).
+
+We then build and prove the one concretely realisable, stock-FIPS-205-verifiable,
+genuinely no-reconstruct sub-protocol: \emph{distributed FORS-leaf threshold
+opening}. Leaf secrets are shared directly (no master seed exists); the combiner
+interpolates only the message-selected one-time leaves, each exactly one leaf
+wide; the assembled FORS signature is byte-identical to centralised FIPS~205
+\textsf{forsSign} and is accepted by the unmodified FIPS~205 Algorithm~17 verifier.
+We isolate the precise residual obstruction: the crux is not the no-reconstruct
+property of a single opening but \emph{Byzantine-safe distributed one-time/few-time
+state}---the guarantee that no WOTS$^+$ keypair is ever opened twice and no FORS
+few-time budget is exceeded across a live, adversarially scheduled committee. We
+prove this reduces no-reconstruct threshold SLH-DSA to a distributed burn-state
+problem and explain why, until that state is proven Byzantine-safe, the full
+construction must remain fail-closed and excluded from the \texttt{POLARIS\_MAX}
+certificate tier. A reference implementation accompanies the paper; its signing
+entry returns an explicit \texttt{ErrNoReconstructUnproven} and a structural gate
+proves the opening path is incapable of reconstructing the seed.
+\end{abstract}
+
+\tableofcontents
+
+\section{Introduction}
+\label{sec:intro}
+
+Lux finalises blocks under a post-quantum certificate whose lanes provide
+cryptographic-family diversity: two lattice lanes (Pulsar, an ML-DSA / FIPS-204
+threshold; Corona, a Ring-LWE / Ringtail threshold) and one hash-based lane,
+Magnetar, instantiating threshold SLH-DSA (FIPS~205, SPHINCS$^+$~\cite{fips205,sphincsplus}).
+The hash-based lane is the genuine assumption diversifier: a break of the
+Module-LWE/Module-SIS problems underlying both lattice lanes does not touch a
+construction whose only assumption is the (second-)preimage and pseudorandomness
+of a hash function.
+
+The governing design rule is the \emph{trustless-by-default law}: every consensus
+threshold scheme must run with \emph{no trusted dealer} and with
+\emph{no-reconstruct signing}---no party or coordinator ever forms the full secret
+key or seed, even transiently. A reveal-and-aggregate path in which a combiner
+reconstructs the key for one signing call is, at best, a non-strict accelerator; it
+is not admissible to the strict trustless tiers.
+
+\paragraph{The two Magnetar tracks.}
+Magnetar is split into two tracks that must not be conflated.
+
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{Track A --- Magnetar-Quorum (production, trustless today).}
+Validators hold \emph{independent} ordinary FIPS-205 keys; each signs the same
+finality subject; a post-quantum STARK (P3Q) proves that a weighted quorum of
+stock SLH-DSA signatures verified. There is no dealer, no DKG, no shared secret,
+and no threshold SLH-DSA at all---the difficulty is side-stepped entirely. This is
+the near-term hash-based lane and is out of scope here.
+
+\item \textbf{Track B --- Magnetar-Threshold (research; this paper).} A genuine
+$t$-of-$n$ threshold SLH-DSA that emits \emph{one} stock FIPS-205 signature with
+no-reconstruct signing. This is an open problem. The contribution of this paper is
+a rigorous design, a ranked taxonomy of approaches, one concretely-buildable and
+proven sub-protocol, and a precise map of what is solved versus open.
+\end{itemize}
+
+\paragraph{Why threshold SLH-DSA is hard.}
+In ML-DSA and BLS the signing response is a (rounded) linear function of the
+secret over a ring or group; Shamir/additive shares of the secret yield shares of
+the response, and a threshold signature is assembled by linear combination. SLH-DSA
+has no such structure. The secret is an $n$-byte seed $\skseed$; every WOTS$^+$
+chain base and every FORS leaf secret is $\PRF(\pkseed,\mathrm{ADRS},\skseed) =
+\mathsf{SHAKE256}(\pkseed\Vert\mathrm{ADRS}\Vert\skseed)[{:}n]$, and the public key
+is a Merkle hash of an astronomically large forest of such secrets. There is no
+linear map from shares of $\skseed$ to the published signature.
+
+\paragraph{Contributions.}
+\begin{enumerate}[leftmargin=1.6em]
+\item A structural observation (Section~\ref{sec:obstruction}) that FIPS-205
+verification \emph{never} evaluates a PRF of the seed---it only checks
+Merkle/chain consistency to the single published root---so leaf secrets are free
+to be jointly-random rather than pseudorandom images of a master seed. This is the
+opening that makes \emph{threshold leaf opening} possible.
+\item A ranked taxonomy of four approaches and the identification of the two hard
+walls---tree-size and keyed-hash leaf derivation---including the Cozzo--Smart cost
+bound (Section~\ref{sec:approaches}).
+\item A concrete, no-reconstruct, stock-FIPS-205-verifiable sub-protocol:
+\emph{distributed FORS-leaf threshold opening} (Section~\ref{sec:fors}), with a
+byte-identity theorem and a leaf-width no-reconstruct theorem.
+\item An exact analysis of one-time-material handling (Section~\ref{sec:onetime}):
+the reduction of no-reconstruct threshold SLH-DSA to a \emph{Byzantine-safe
+distributed burn-state} for WOTS$^+$ one-time and FORS few-time discipline, and
+the argument that this is the true residual obstruction.
+\item The obstruction map (Section~\ref{sec:map}) and the fail-closed admission
+discipline that keeps Track B out of \texttt{POLARIS\_MAX} until proven
+(Section~\ref{sec:impl}).
+\end{enumerate}
+
+\section{Background: the structure of SLH-DSA}
+\label{sec:background}
+
+We recall the parts of FIPS~205~\cite{fips205} needed below, using the SHAKE
+parameter family. Fix the per-set parameters: $n$ (hash output bytes), $h$ (total
+hypertree height), $d$ (hypertree layers), $h' = h/d$ (XMSS subtree height), $a$
+(FORS tree height, $2^a$ leaves per tree), $k$ (number of FORS trees), and
+Winternitz $w=16$. The recommended Lux set is SHAKE-192s ($n=24$, $h=63$, $d=7$,
+$a=14$, $k=17$).
+
+\paragraph{Secret key and PRF.}
+The scheme seed expands deterministically to
+$(\skseed, \skprf, \pkseed)$. Every secret leaf is derived by the keyed hash
+\begin{equation}
+\PRF(\pkseed,\mathrm{ADRS},\skseed) = \mathsf{SHAKE256}(\pkseed \Vert \mathrm{ADRS} \Vert \skseed)[{:}n],
+\label{eq:prf}
+\end{equation}
+where $\mathrm{ADRS}$ is the address of the leaf in the forest. $\skseed$ is the
+only secret input; $\PRF$ is a non-homomorphic hash of it.
+
+\paragraph{WOTS$^+$ (one-time).}
+A WOTS$^+$ keypair has $\mathit{len} = 2n + 3$ chains. Chain $i$ has a secret base
+$\mathsf{sk}_i = \PRF(\cdots)$ and public end
+$\mathsf{pk}_i = \Fhash^{\,w-1}(\mathsf{sk}_i)$, where $\Fhash$ is a public hash.
+A signature on message digits $(b_1,\dots)$ publishes
+$\chain(\mathsf{sk}_i, 0, b_i) = \Fhash^{\,b_i}(\mathsf{sk}_i)$ per chain. WOTS$^+$
+is \emph{strictly one-time}: signing two digit-vectors $b \neq b'$ reveals chains
+at two lengths; from the shorter one an adversary forges the other by extending the
+public hash---full key recovery.
+
+\paragraph{FORS (few-time).}
+FORS has $k$ trees of $2^a$ leaves. Leaf secret $\mathsf{sk}[i][j] = \PRF(\cdots)$;
+leaf node $= \Fhash(\mathsf{sk}[i][j])$; tree $i$ Merkle-hashes (via $\Hhash$) to a
+root; $\mathsf{pk}_{\mathrm{FORS}} = \Tl(\text{root}_0 \Vert \dots \Vert
+\text{root}_{k-1})$. For digest $md$, FORS opens one leaf secret per tree at the
+$md$-selected index plus its $a$-node authentication path. FORS is
+\emph{few-time}: signing several messages under one FORS keypair degrades security
+roughly as $(\text{reuse})^{k}$.
+
+\paragraph{Hypertree and statelessness.}
+The hypertree has $d$ layers of XMSS trees ($2^h$ bottom keypairs in total). A
+signature picks a bottom keypair $(\mathit{idxTree}, \mathit{idxLeaf})$ determined
+by a randomiser $R = \PRFmsg(\skprf, \pkseed, M')$ and digest
+$\Hmsg(R, \pkseed, \pkroot, M')$. The huge tree makes keypair collisions negligible
+for a single signer over its lifetime, which is what makes SLH-DSA \emph{stateless}
+and one-time-safe without explicit state.
+
+\paragraph{Verification (the load-bearing fact).}
+FIPS-205 verification (\textsf{slh\_verify}, Algorithm~20) does the following and
+\emph{nothing else}: parse $(R, \sigma_{\mathrm{FORS}}, \sigma_{\mathrm{HT}})$;
+recompute $md, \mathit{idxTree}, \mathit{idxLeaf}$; reconstruct
+$\mathsf{pk}_{\mathrm{FORS}}$ from $\sigma_{\mathrm{FORS}}$ via the public hashes
+$\Fhash,\Hhash,\Tl$ (Algorithm~17, \textsf{forsPkFromSig}); reconstruct the
+hypertree root from $\mathsf{pk}_{\mathrm{FORS}}$ and the WOTS$^+$ signatures and
+authentication paths; accept iff that root equals $\pkroot$. \textbf{Verification
+never calls $\PRF$ and never touches $\skseed$.} It checks Merkle/chain consistency
+to the single published root.
+
+\section{Threat model, goals, and the three hard constraints}
+\label{sec:model}
+
+\paragraph{Adversary.} A static, computationally bounded, post-quantum adversary
+$\adv$ corrupting up to $t-1$ of the $n$ committee members; full network control of
+message delivery and scheduling; the ability to observe all broadcast and the
+internal state of corrupted parties. The hash function is modelled as a (quantum)
+random oracle for the FIPS-205 security argument; the threshold layer adds only
+information-theoretic Shamir secrecy over $\GF_{257}$.
+
+\paragraph{Security goal.} EUF-CMA of the produced signature under the unmodified
+FIPS-205 verifier, plus \emph{key-secrecy}: the joint view of any $t-1$ parties is
+independent of the global seed.
+
+\paragraph{The three hard constraints (acceptance gates).}
+\begin{enumerate}[leftmargin=1.7em,label=\textbf{C\arabic*.}]
+\item \textbf{No-reconstruct.} No party or aggregator ever forms the global seed or
+full secret key, even transiently.
+\item \textbf{Stock verify.} The output verifies under ordinary FIPS-205 Verify,
+unmodified.
+\item \textbf{One-time safety.} Any revealed WOTS$^+$/FORS one-time material is
+burned forever; no reusable secret leaks.
+\end{enumerate}
+
+A subtle but decisive reading: \textbf{C1 draws the no-reconstruct line at the
+\emph{global seed}, not at individual leaves.} C3 \emph{anticipates} that one-time
+leaf material is revealed (``any revealed WOTS$^+$/FORS one-time material\dots'').
+Opening a single one-time leaf secret is therefore permitted; assembling the global
+seed is forbidden. This distinction is what separates a viable threshold-leaf
+construction from a renamed seed reconstruction.
+
+\paragraph{A cautionary baseline.}
+The current production-adjacent Magnetar threshold construction (THBS-SE) and even
+its ``dealerless'' DKG \emph{reconstruct the master seed transiently}: the combiner
+Lagrange-interpolates all $4n$ seed bytes into a buffer (named
+\texttt{derivedExpandInput} / \texttt{lagrangeScratch}) and runs a centralised
+signer. Its ``strict-atom'' audit gate forbids only the variable \emph{name}
+\texttt{seed}, not the reconstruction. That is Option~A (reveal-and-aggregate) and
+\emph{fails C1}. Track B must do genuinely better; renaming a buffer is not a
+no-reconstruct proof.
+
+\section{The fundamental obstruction}
+\label{sec:obstruction}
+
+\subsection{Structural freedom: verification is root-relative}
+\label{sec:freedom}
+
+\begin{proposition}[Root-relative verification]
+\label{prop:root}
+Let $\Sigma$ be any tuple of byte strings of the FIPS-205 signature shape. The
+FIPS-205 verifier accepts $\Sigma$ against $(\pkseed,\pkroot)$ for message $M$ iff
+the opened one-time values and authentication paths in $\Sigma$ hash, under the
+public functions $\Fhash,\Hhash,\Tl$, to a hypertree root equal to $\pkroot$.
+Acceptance is independent of whether the opened secrets are images of any seed
+under \eqref{eq:prf}.
+\end{proposition}
+\begin{proof}
+Immediate from the verification algorithm recalled in Section~\ref{sec:background}:
+the only check is root equality; $\PRF$ and $\skseed$ never appear.
+\end{proof}
+
+Proposition~\ref{prop:root} is the opening. It means a committee may, at keygen, fix
+the forest's secret leaves to \emph{jointly-random} values (not PRF images) and
+publish a consistent root; signatures that open those leaves will still verify under
+the stock verifier. There is no obligation to reproduce \eqref{eq:prf}. This is
+exactly what frees \emph{threshold leaf opening} (approach~B) from needing an MPC
+evaluation of $\PRF$ at signing time.
+
+\subsection{The two walls}
+\label{sec:walls}
+
+Proposition~\ref{prop:root} does not make the \emph{full stateless} scheme free.
+Two walls remain.
+
+\paragraph{Wall 1 --- tree size.} The hypertree has $2^h$ bottom keypairs
+($2^{63}$ for SHAKE-192s, $2^{64}$ for 256s). A jointly-random forest cannot be
+generated, shared, or committed in full: it is exponentially large. The randomiser
+$R$ selects a keypair pseudo-uniformly over the whole tree, so a committee that has
+materialised only a small sub-forest cannot answer an arbitrary $R$ without changing
+the scheme (and thereby breaking stock verification, which recomputes the full
+index range from the published $R$).
+
+\paragraph{Wall 2 --- keyed-hash leaf derivation.} If instead the leaves \emph{are}
+derived from a compact shared seed via \eqref{eq:prf} (so the tree need not be
+materialised), then producing the secret-dependent signature material requires
+evaluating $\mathsf{SHAKE256}(\cdots \Vert \skseed)$ on a secret-shared $\skseed$.
+$\mathsf{SHAKE}$ is non-homomorphic; there is no algebraic threshold shortcut. The
+only generic route is multiparty computation of the Keccak permutation on shared
+state.
+
+\begin{remark}[Cozzo--Smart cost]
+\label{rem:cs}
+Cozzo and Smart~\cite{cozzosmart} analysed the cost of thresholdising each NIST
+round-2 signature and concluded that hash-based schemes (then SPHINCS$^+$) require
+MPC over the hash function, which is prohibitively expensive. A single SLH-DSA
+signature evaluates on the order of $10^{6}\text{--}10^{7}$ hash compressions
+(dominated by recomputing WOTS$^+$ public keys for authentication-path siblings);
+the Keccak-$f$ permutation has $\approx 1600$ AND gates per round and $24$ rounds.
+Evaluating $\sim 10^{7}$ permutations in MPC is $\gtrsim 10^{11}$ AND gates per
+signature: feasible in principle, but minutes-to-hours of compute and gigabytes-to-
+terabytes of communication. This is a max-assurance ceremony, never a consensus hot
+path.
+\end{remark}
+
+\subsection{Consequence}
+\label{sec:consequence}
+
+\begin{theorem}[Stateless dichotomy]
+\label{thm:dichotomy}
+A no-reconstruct $t$-of-$n$ producer of a \emph{stock, stateless} FIPS-205 SLH-DSA
+signature must, for each signature, either
+\begin{enumerate}[label=(\alph*),leftmargin=1.8em]
+\item materialise a jointly-random forest covering the $R$-selected keypair
+(infeasible by Wall~1 for $h \geq 63$), or
+\item evaluate the leaf-deriving PRF and the secret-dependent
+authentication-path hashes under MPC on a shared seed (Wall~2; the Cozzo--Smart
+cost of Remark~\ref{rem:cs}).
+\end{enumerate}
+Equivalently, route~(b)---generic MPC over $\mathsf{SHAKE}$---is the only path to a
+stock, stateless, no-reconstruct SLH-DSA signature, and it is a max-assurance
+ceremony, not a hot-path primitive.
+\end{theorem}
+\begin{proof}[Proof sketch]
+By Proposition~\ref{prop:root} the leaves may be jointly random, but answering an
+arbitrary $R$ requires either the full forest (route~a) or on-demand derivation
+from a compact secret (route~b). Route~(a) needs $2^h$ shared leaves, contradicting
+feasibility for $h \geq 63$. Route~(b) needs $\PRF$ on a shared seed; by Wall~2
+this is MPC over $\mathsf{SHAKE}$, whose cost is Remark~\ref{rem:cs}. No third
+option produces a stateless signature: the only way to avoid materialising the
+forest \emph{and} avoid on-demand secret derivation is to restrict the leaf set,
+which is statefulness (Section~\ref{sec:fors-stateful}).
+\end{proof}
+
+Theorem~\ref{thm:dichotomy} is the headline negative result: \emph{stock stateless}
+threshold SLH-DSA with no-reconstruct is, in essence, generic hash-MPC. The
+constructive value lies in (i)~the FORS component, which is realisable and proven,
+and (ii)~the \emph{stateful} relaxation, which escapes Wall~1.
+
+\section{Approach taxonomy and ranking}
+\label{sec:approaches}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}l l X c@{}}
+\toprule
+& \textbf{Approach} & \textbf{What it does / wall it hits} & \textbf{Verdict} \\
+\midrule
+A & Distributed tree/seed gen & Dealerless generation of a secret-shared forest +
+published root. The keygen half of B. Bounded by Wall~1 (only small trees). &
+Viable (stateful) \\[2pt]
+B & Threshold leaf opening & Share leaves directly (jointly random); open only the
+message-selected one-time leaves; auth paths public. No master seed. Stock-verifies
+by Prop.~\ref{prop:root}. Bounded by Wall~1 for the full hypertree. &
+\textbf{Best (component / stateful)} \\[2pt]
+C & MPC hash-chain signing & Share the seed; MPC-evaluate $\PRF$ and the hash tree
+on demand (route~b of Thm.~\ref{thm:dichotomy}). The only stock-\emph{stateless}
+path. & Viable, max-assurance only \\[2pt]
+D & ZK-consistent partial openings & Parties prove in ZK (P3Q STARK) that opened
+material is root-consistent, removing combiner trust. Composes with A/B/C; not a
+standalone signer. & Orthogonal hardening \\
+\bottomrule
+\end{tabularx}
+\caption{The four approaches. B is the most viable for a buildable,
+stock-verifiable component and for the stateful lane; C is the only stateless path
+and is max-assurance only; A is B's keygen; D hardens any of them.}
+\label{tab:approaches}
+\end{table}
+
+\paragraph{Chosen design for Lux.} A hybrid of B and A, scoped two ways:
+\begin{itemize}[leftmargin=1.4em]
+\item As a \emph{proven component}: distributed FORS-leaf opening
+(Section~\ref{sec:fors}), buildable today and stock-FIPS-205-verifiable at the FORS
+boundary.
+\item As the \emph{full-signature lane}: a \emph{stateful} hash-based signature
+(XMSS$^{MT}$/LMS, SP~800-208~\cite{sp800208}) over a tractable tree, which escapes
+Wall~1; this is the NIST \emph{Haystack} direction~\cite{haystack} of threshold and
+distributed stateful HBS. Its cost is moved into a Byzantine-safe distributed state
+(Section~\ref{sec:onetime}).
+\end{itemize}
+Approach~C is documented as the only route to stock \emph{stateless} SLH-DSA and is
+reserved for a max-assurance ceremony, never the Quasar hot path. Approach~D (P3Q)
+is the natural consistency-hardening layer because P3Q is already the canonical Lux
+proof verifier.
+
+\section{Distributed FORS-leaf threshold opening}
+\label{sec:fors}
+
+This is the concrete, no-reconstruct, stock-verifiable sub-protocol. It realises the
+FORS bottom of an SLH-DSA signature from a $t$-of-$n$ committee.
+
+\subsection{Construction}
+\label{sec:fors-construction}
+
+\paragraph{Sharing.} Each FORS leaf secret is an $n$-byte value. We share it
+byte-wise over $\GF_{257}$ (the smallest prime $> 255$; every byte is a distinct
+field element). Party $p$ at evaluation point $x_p \in [1,257)$ holds, for each
+shared leaf, the vector $\big(f_b(x_p)\big)_{b<n}$ where $f_b$ is a degree-$(t-1)$
+polynomial with constant term the $b$-th leaf byte and \emph{independent} random
+higher coefficients per leaf (coefficient reuse across leaves leaks differences and
+is explicitly avoided).
+
+\paragraph{Setup (keygen).} For a FORS keypair address $K$ and digest $md$, the
+setup provisions the $k$ message-selected leaves: it shares each selected leaf secret
+and publishes the public material---the $k$ authentication paths and
+$\mathsf{pk}_{\mathrm{FORS}}$. The public auth-path nodes and $\mathsf{pk}_{\mathrm{
+FORS}}$ are hashes of the secret leaves; computing them from shares without exposing
+unopened leaves requires either an MPC over $\Fhash$ at keygen or a setup-TCB dealer
+(``dealer for setup only''). The reference uses the dealer pattern and \emph{erases}
+all leaf material before returning; the dealerless+MPC keygen is the documented
+keygen cost. The SIGN-side wire shape is identical under either keygen.
+
+\paragraph{Partial open.} Party $p$ releases its $\GF_{257}$ share vectors for the
+$k$ selected leaves, bound by a commitment to $(K, md, p)$ so the shares cannot be
+replayed for a different keypair or message.
+
+\paragraph{Combine (public).} Anyone collecting $\geq t$ valid partial opens
+interpolates, \emph{per leaf}, the $n$-byte leaf secret over $\GF_{257}$---guarded so
+each interpolation is exactly one leaf wide---then writes the leaf secrets and the
+public authentication paths into the FORS signature buffer. Each opened leaf address
+is burned in the one-time ledger before its secret is released.
+
+\begin{algorithm}[H]
+\caption{$\mathsf{OpenForsThreshold}$ (public combiner, no-reconstruct)}
+\label{alg:open}
+\begin{algorithmic}[1]
+\Require public material $(K, md, \{\text{authpath}_j\}_{j<k}, \mathsf{pk}_{\mathrm{FORS}}, \pkseed, t)$; partial opens $\{P_p\}$; burn ledger $L$
+\Ensure FORS signature $\sigma_{\mathrm{FORS}}$, byte-identical to centralised \textsf{forsSign}
+\State validate each $P_p$ against its commit on $(K, md, p)$; collect $\geq t$ share-points per FORS tree $j$
+\For{$j = 0$ to $k-1$}
+  \State \textbf{assert} interpolation width $=n$ \Comment{C1 guard: one leaf, never the seed}
+  \State $L.\mathsf{Burn}(\mathrm{addr}(K,j), md)$ \Comment{C3: abort on reuse (slashable)}
+  \State $\mathsf{sk}_j \gets \mathsf{LagrangeAtZero}_{\GF_{257}}(\text{any } t \text{ share-points})$ \Comment{one leaf wide}
+  \State write $\mathsf{sk}_j$ and $\text{authpath}_j$ into $\sigma_{\mathrm{FORS}}$ at tree $j$
+\EndFor
+\State \Return $\sigma_{\mathrm{FORS}}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Security}
+\label{sec:fors-security}
+
+\begin{theorem}[Byte-identity]
+\label{thm:byte}
+If the shared leaves equal the leaves of a genuine FORS keypair $K$ and the
+published authentication paths equal that keypair's, then for any $t$ honest partial
+opens, $\mathsf{OpenForsThreshold}$ outputs the byte-identical FORS signature that
+centralised FIPS-205 \textsf{forsSign} produces on the same $(K, md)$, and
+\textsf{forsPkFromSig} of the output equals $\mathsf{pk}_{\mathrm{FORS}}$.
+\end{theorem}
+\begin{proof}
+$\GF_{257}$ Lagrange interpolation of $t$ shares of a degree-$(t-1)$ polynomial
+returns its constant term, i.e. the exact leaf byte. Hence each interpolated
+$\mathsf{sk}_j$ equals the genuine leaf secret. The combiner writes
+$(\mathsf{sk}_j, \text{authpath}_j)$ into the FORS signature at the same offsets
+\textsf{forsSign} uses, with identical public auth-path bytes; the outputs are
+byte-equal. \textsf{forsPkFromSig} is a deterministic public function of those
+bytes, so it reproduces $\mathsf{pk}_{\mathrm{FORS}}$.
+\end{proof}
+
+\begin{corollary}[Stock-FIPS-205 acceptance]
+The assembled FORS signature is accepted by the unmodified FIPS-205 FORS
+public-key reconstruction (Algorithm~17), which is byte-equal to the cloudflare/circl
+reference. A full signature embedding this FORS component (with a matching
+hypertree part) verifies under stock SLH-DSA Verify.
+\end{corollary}
+
+\begin{theorem}[No-reconstruct, leaf-width]
+\label{thm:noreconstruct}
+$\mathsf{OpenForsThreshold}$ interpolates secret material only at width $n$ (one
+leaf). It never forms a buffer of the $\geq 4n$-byte seed/secret-key width, and it
+never invokes the leaf-deriving PRF, the seed expansion, or a centralised signer.
+The joint view of any $t-1$ parties is independent of every unopened leaf and of the
+(nonexistent) master seed.
+\end{theorem}
+\begin{proof}
+The combiner's only secret-bearing operation is the per-leaf
+$\GF_{257}$ interpolation at line~5 of Algorithm~\ref{alg:open}, of fixed width $n$,
+asserted at line~3 (any wider width is refused before the secret is touched). The
+construction has \emph{no master seed}: leaves are shared directly, so there is no
+seed object to reconstruct---C1 holds vacuously for the seed and by the width-guard
+for any secret. Key-secrecy of each unopened leaf is Shamir
+information-theoretic secrecy over $\GF_{257}$ for a degree-$(t-1)$ polynomial given
+$\leq t-1$ evaluations; the opened leaves are exactly the FIPS-205 one-time material
+a signature reveals anyway, no more.
+\end{proof}
+
+\begin{remark}[Mechanised structural gate]
+The no-reconstruct property of Theorem~\ref{thm:noreconstruct} is enforced
+mechanically in the reference implementation by a static gate that parses the
+combiner and asserts its call graph excludes every seed-reconstruction / secret-side
+primitive (the leaf-deriving PRF, the seed expansion, the centralised signer, the
+share-dealing routines) and includes the leaf-width interpolation and the C1/C3
+guards (Section~\ref{sec:impl}).
+\end{remark}
+
+\subsection{The stateful full-signature lane}
+\label{sec:fors-stateful}
+
+For a complete signature, Wall~1 forbids materialising the SLH-DSA hypertree. The
+escape is to use a \emph{stateful} hash-based signature over a tractable tree
+(XMSS$^{MT}$/LMS, $h \le 20\text{--}25$): the committee distributively generates a
+secret-shared tree, publishes all public WOTS$^+$ keys and internal nodes (so
+authentication paths are public lookups), and at sign time advances to the next
+unused leaf and threshold-opens only that leaf's WOTS$^+$ chain material. This is
+exactly threshold leaf opening (approach~B) over a materialisable tree, and it is
+genuinely no-reconstruct at signing (only one one-time leaf is opened). Its public
+key is a stock SP~800-208 public key and its signatures verify under the stock LMS/
+XMSS verifier. The price is statefulness, which becomes the distributed burn-state of
+Section~\ref{sec:onetime}; this is the NIST Haystack lane~\cite{haystack}. It is a
+different FIPS standard than stateless SLH-DSA and is offered as the
+\emph{max-assurance hash lane}, not as FIPS-205.
+
+\section{One-time material: the crux}
+\label{sec:onetime}
+
+The deepest obstruction is not the no-reconstruct property of a single opening---the
+FORS component achieves it---but \emph{global} one-time/few-time discipline across a
+live, possibly-Byzantine committee.
+
+\paragraph{WOTS$^+$ strict one-time.} If the committee ever opens chain material for
+one WOTS$^+$ address under two distinct message digests, the shorter chains let an
+adversary forge the longer ones: full WOTS$^+$ key recovery, hence a hypertree
+forgery. The committee must guarantee that for every
+$(\text{layer},\text{tree},\text{leaf})$ WOTS$^+$ address, chain material is opened
+for \emph{at most one} message digest, forever.
+
+\paragraph{FORS few-time.} Opening leaves of one FORS keypair across several
+messages degrades few-time security; the budget set by $(k, a)$ must not be
+exceeded.
+
+\paragraph{Stateless selection becomes distributed state.} In stateless SLH-DSA the
+keypair selection $(\mathit{idxTree}, \mathit{idxLeaf})$ is
+$R = \PRFmsg(\skprf, \pkseed, M')$, and the $2^h$ tree makes reuse negligible for a
+single signer. In a threshold setting $\skprf$ is itself shared, so $R$ must be
+produced by the committee, and the committee must \emph{detect and refuse} any second
+opening of an already-burned one-time address. This is the ``stateful subprotocol
+under a stateless-looking certificate boundary'' of NIST Haystack~\cite{haystack}.
+
+\begin{definition}[Burn-state]
+A burn-state is a map from one-time addresses to the message digests they were
+consumed for, with: \emph{(idempotence)} re-opening the same $(\text{addr},
+\text{digest})$ is benign; \emph{(conflict-detection)} opening an addr for a
+\emph{different} digest is refused and yields the two-digest tuple as slashable
+evidence; \emph{(few-time budget)} FORS addresses admit a bounded reuse count.
+\end{definition}
+
+\begin{theorem}[Reduction to a Byzantine-safe burn-state]
+\label{thm:reduction}
+Assume (i)~a no-reconstruct threshold opening of every one-time leaf on the
+$R$-selected path (the FORS component of Section~\ref{sec:fors} plus its WOTS$^+$
+analogue over a materialisable tree), and (ii)~a burn-state that is \emph{safe} under
+$t-1$ Byzantine corruptions and adversarial scheduling: no honest party ever
+co-signs an opening that would re-open a strictly-one-time WOTS$^+$ address or exceed
+a FORS few-time budget. Then the committee produces stock-verifiable signatures
+satisfying C1, C2, C3.
+\end{theorem}
+\begin{proof}[Proof sketch]
+C2 (stock verify) and C1 (no-reconstruct) follow from
+Theorems~\ref{thm:byte}--\ref{thm:noreconstruct} applied to each opened leaf along the
+$R$-path and from Proposition~\ref{prop:root} for the assembled root. C3 (one-time
+safety) is exactly assumption~(ii): the burn-state refuses every reuse before the
+one-time secret is released, so no reusable secret leaks. The signature thus carries
+only the single-use material a stock signature reveals, and verifies to $\pkroot$.
+\end{proof}
+
+\begin{remark}[The residual obstruction, stated exactly]
+Theorem~\ref{thm:reduction} isolates the open problem: a \emph{Byzantine-safe
+distributed burn-state}. A local, single-process ledger (the reference
+implementation) trivially satisfies the burn-state definition---it refuses reuse and
+emits slashable conflicts---but does not survive crashes, restarts, network
+partitions, or Byzantine equivocation, under which two honest sub-committees could be
+driven to open the same WOTS$^+$ address for different messages. Lifting the
+burn-state to consensus-anchored burn proofs (each opening gated on a finalised
+no-reuse certificate) is the missing piece. It is a state-machine-replication
+problem layered \emph{under} the cryptography, and it is why the full Track-B
+construction must remain fail-closed: the crypto is no-reconstruct and stock-
+verifiable, but the one-time discipline that hash-based signatures demand is not yet
+proven Byzantine-safe. \textbf{One-time-material handling, not no-reconstruct
+opening, is the true wall for the full scheme.}
+\end{remark}
+
+\section{The obstruction map}
+\label{sec:map}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}l X l@{}}
+\toprule
+\textbf{Sub-problem} & \textbf{Status} & \textbf{Where} \\
+\midrule
+No-reconstruct opening of a single one-time leaf & \textbf{Solved \& proven} (byte-identical, stock-verifiable) & Thm.~\ref{thm:byte},~\ref{thm:noreconstruct} \\
+FORS bottom of a signature, no-reconstruct & \textbf{Solved \& proven} (component) & Section~\ref{sec:fors} \\
+Direct leaf sharing avoids any master seed & \textbf{Solved} (C1 vacuous for the seed) & Prop.~\ref{prop:root} \\
+Stock-stateless SLH-DSA, no-reconstruct & \textbf{Open / max-assurance only}: route~(b) generic MPC over $\mathsf{SHAKE}$ & Thm.~\ref{thm:dichotomy}, Rem.~\ref{rem:cs} \\
+Full signature over a materialisable tree (stateful) & \textbf{Buildable} (XMSS$^{MT}$/LMS, SP~800-208) & Section~\ref{sec:fors-stateful} \\
+Dealerless keygen of the public forest from shares & \textbf{Open / costly}: MPC over $\Fhash$ at keygen (else setup-TCB dealer) & Section~\ref{sec:fors-construction} \\
+Byzantine-safe distributed one-time/few-time state & \textbf{Open (the crux)}: consensus-anchored burn proofs & Thm.~\ref{thm:reduction}, the residual remark \\
+\bottomrule
+\end{tabularx}
+\caption{What is solved versus open for no-reconstruct threshold SLH-DSA.}
+\label{tab:map}
+\end{table}
+
+\paragraph{Summary in one line.} \emph{No-reconstruct opening is solved; stock
+stateless SLH-DSA reduces to hash-MPC (max-assurance only); the buildable full lane
+is stateful HBS; and the binding obstruction for any live deployment is a
+Byzantine-safe distributed burn-state for one-time material.}
+
+\section{Implementation and fail-closed admission}
+\label{sec:impl}
+
+The reference implementation accompanies this paper in the Magnetar package
+(\texttt{ref/\allowbreak go/\allowbreak pkg/\allowbreak magnetar}). It comprises:
+
+\begin{itemize}[leftmargin=1.4em]
+\item \texttt{threshold\_noreconstruct.go} --- the Track-B interface and the
+\emph{single} admission gate. The signing entry returns
+\texttt{ErrNoReconstructUnproven}; \texttt{NoReconstructProven()} is hard-wired
+\texttt{false}; \texttt{AdmitMagnetarThresholdToPolarisMax(TrackB)} refuses. Track B
+can therefore never be silently admitted to \texttt{POLARIS\_MAX}. It also hosts the
+\texttt{BurnLedger} (the burn-state of Section~\ref{sec:onetime}) and the
+constraint-1 leaf-width guard.
+\item \texttt{fors\_threshold\_open.go} --- the distributed FORS-leaf opening of
+Section~\ref{sec:fors}: setup, partial open, public combiner, and stock-FIPS-205
+verification (Algorithm~17).
+\item Tests proving: byte-identity to centralised \textsf{forsSign} and stock
+acceptance across SHAKE-192s and 256s with strict $t$-of-$n$ subsets
+(Theorem~\ref{thm:byte}); one-time burn refusal with slashable evidence
+(Section~\ref{sec:onetime}); commit-mismatch rejection; the fail-closed signer and
+admission gate; the leaf-width guard; and a \emph{structural AST gate}
+(Theorem~\ref{thm:noreconstruct}, mechanised) that the combiner never calls a
+seed-reconstruction primitive---contrasted against the existing reveal-and-aggregate
+combiner, which does.
+\end{itemize}
+
+\paragraph{Policy.} The refined Quasar policy table places Track~B only in the
+research tier \texttt{MAGNETAR\_EXPERIMENTAL}; \texttt{POLARIS\_MAX} uses Track~A
+(Magnetar-Quorum) for the hash lane. \texttt{NoReconstructProven()} stays
+\texttt{false} until a no-reconstruct producer for the \emph{complete} signature and
+a Byzantine-safe burn-state are proven. Flipping it is a reviewed act gated on
+Table~\ref{tab:map}'s open rows.
+
+\section{Related work}
+\label{sec:related}
+
+Threshold hash-based signatures are nascent. NIST's \emph{Haystack} effort on
+threshold and distributed \emph{stateful} HBS~\cite{haystack} is the closest line;
+its distributed-state techniques are directly relevant and motivate our stateful
+lane and burn-state. Cozzo and Smart~\cite{cozzosmart} bounded the cost of
+thresholdising NIST signatures and flagged the hash-MPC barrier we formalise in
+Theorem~\ref{thm:dichotomy}. The underlying primitives are SPHINCS$^+$/SLH-DSA
+\cite{sphincsplus,fips205}, XMSS/LMS \cite{xmss,sp800208}, Shamir secret
+sharing~\cite{shamir}, verifiable secret sharing and dealerless DKG
+\cite{feldman,pedersen,gennaro}, and generic MPC for the hash-evaluation route
+\cite{gmw,spdz}. The ZK-consistency hardening (approach~D) uses transparent
+post-quantum STARKs~\cite{stark}. In contrast to the lattice threshold lanes, where
+the response is linear and thresholdisation is algebraic, the hash lane has no such
+structure---which is precisely the gap this paper charts.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+No-reconstruct threshold SLH-DSA is not a single problem but a stack. The
+no-reconstruct \emph{opening} of one-time leaves is solved and proven, and we ship a
+stock-FIPS-205-verifiable FORS-leaf component to demonstrate it. Stock
+\emph{stateless} SLH-DSA reduces to generic MPC over $\mathsf{SHAKE}$ and is
+max-assurance only. The buildable full lane is \emph{stateful} hash-based signing
+over a materialisable tree. And the binding obstruction for any live, Byzantine
+deployment is a \emph{distributed burn-state} that enforces WOTS$^+$ one-time and
+FORS few-time discipline---one-time-material handling, not the threshold opening, is
+the wall. Until that state is proven Byzantine-safe and a complete-signature producer
+exists, Magnetar-Threshold stays fail-closed and excluded from \texttt{POLARIS\_MAX};
+the trustless hash lane in production is Magnetar-Quorum (Track~A).
+
+\begin{thebibliography}{99}
+\bibitem{fips205} National Institute of Standards and Technology.
+\emph{FIPS 205: Stateless Hash-Based Digital Signature Standard (SLH-DSA)}. 2024.
+\bibitem{sphincsplus} D.~J.~Bernstein, A.~H\"ulsing, S.~K\"olbl, R.~Niederhagen,
+J.~Rijneveld, P.~Schwabe. \emph{The SPHINCS$^+$ Signature Framework}. ACM CCS, 2019.
+\bibitem{cozzosmart} D.~Cozzo, N.~P.~Smart. \emph{Sharing the LUOV: Threshold
+Post-Quantum Signatures}. IMA Int.\ Conf.\ Cryptography and Coding, 2019.
+\bibitem{haystack} National Institute of Standards and Technology. \emph{Threshold
+and Distributed Stateful Hash-Based Signatures} (``Haystack''), NIST Threshold
+Cryptography (MPTC) program documents. 2023--2025.
+\bibitem{sp800208} D.~Cooper, D.~Apon, Q.~Dang, M.~Davidson, M.~Dworkin, C.~Miller.
+\emph{NIST SP 800-208: Recommendation for Stateful Hash-Based Signature Schemes}.
+2020.
+\bibitem{xmss} A.~H\"ulsing, D.~Butin, S.~Gazdag, J.~Rijneveld, A.~Mohaisen.
+\emph{RFC 8391: XMSS---eXtended Merkle Signature Scheme}. IRTF, 2018.
+\bibitem{shamir} A.~Shamir. \emph{How to Share a Secret}. Communications of the ACM,
+22(11), 1979.
+\bibitem{feldman} P.~Feldman. \emph{A Practical Scheme for Non-Interactive
+Verifiable Secret Sharing}. FOCS, 1987.
+\bibitem{pedersen} T.~P.~Pedersen. \emph{Non-Interactive and Information-Theoretic
+Secure Verifiable Secret Sharing}. CRYPTO, 1991.
+\bibitem{gennaro} R.~Gennaro, S.~Jarecki, H.~Krawczyk, T.~Rabin. \emph{Secure
+Distributed Key Generation for Discrete-Log Based Cryptosystems}. EUROCRYPT, 1999.
+\bibitem{gmw} O.~Goldreich, S.~Micali, A.~Wigderson. \emph{How to Play Any Mental
+Game}. STOC, 1987.
+\bibitem{spdz} I.~Damg\aa rd, V.~Pastro, N.~Smart, S.~Zakarias. \emph{Multiparty
+Computation from Somewhat Homomorphic Encryption} (SPDZ). CRYPTO, 2012.
+\bibitem{stark} E.~Ben-Sasson, I.~Bentov, Y.~Horesh, M.~Riabzev.
+\emph{Scalable, Transparent, and Post-Quantum Secure Computational Integrity}
+(STARK). ePrint 2018/046.
+\end{thebibliography}
+
+\end{document}
