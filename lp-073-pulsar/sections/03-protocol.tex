@@ -41,6 +41,11 @@ the Go canonical at \texttt{github.com/luxfi/pulsar} (Pulsar fork) and
 \subsection{\textsc{Gen} (key generation, trusted-dealer or DKG)}
 \label{sec:protocol:gen}
 
+This is the \emph{shared-kernel} key generation (the mechanism shared with
+Corona). Pulsar's \emph{production} FIPS-204 keygen is dealerless via
+Mithril RSS (\S\ref{sec:protocol:bcc:keydkg}); the trusted-dealer seed
+path below is retained only as the kernel reference and for test vectors
+(a CI invariant forbids a trusted-dealer keygen in any production file).
 \textsc{Gen} (\texttt{sign/sign.go:48}) takes a 32-byte trusted-dealer
 seed $k_{\mathrm{TD}}$ and a list of pre-computed Lagrange coefficients
 $\lambda_i$ for the active set $T = \{0, \ldots, K-1\}$
@@ -553,10 +558,14 @@ achieves is an abort/retry. The malicious-secure CSCP layer and a
 networked (non-simulation) deployment are the open residual
 (\S\ref{sec:protocol:bcc:status}, Residual~A).
 
-\subsubsection{Online signing (Ringtail-style two rounds)}
+\subsubsection{Online signing: the Mithril hyperball three-round no-reconstruct signer}
 \label{sec:protocol:bcc:online}
 
-Given $\mu$ and a $\mathsf{NonceCert}$:
+Signing is no-reconstruct: it is the Mithril hyperball three-round signer
+\cite{mithril2026} over the RSS shares of \S\ref{sec:protocol:bcc:keydkg}.
+No party --- and no combiner --- ever forms $\mathbf{s}_1$, $\mathbf{s}_2$,
+the key seed, $\mathbf{sk}$, or the full mask $\mathbf{y}$; the mask is
+never serialised. Given $\mu$ and a $\mathsf{NonceCert}$:
 
 \begin{enumerate}[leftmargin=2em, nosep]
 \item \textbf{Round 1 --- bind canonical nonce.} Signers bind the
@@ -565,17 +574,30 @@ Given $\mu$ and a $\mathsf{NonceCert}$:
       nor the $t$-subset is chosen by a party). The challenge
       $\tilde c = H(\mu, \mathbf{w}_1)$, $c = \mathsf{SampleInBall}(\tilde
       c)$ is derived from public data.
-\item \textbf{Round 2 --- $z$-partial.} Each signer opens a partial
-      $\mathbf{z}_i$ that aggregates \emph{linearly}: $\mathbf{z} =
-      \sum_{i} \mathbf{z}_i = \mathbf{y} + c\mathbf{s}_1$ (Lagrange
-      identity at $0$). Partial shares carry the $\mathbf{z}$-contribution
-      only --- \emph{no} $c\mathbf{s}_2$, $c\mathbf{t}_0$, $\mathbf{r}_0$,
-      or $\mathsf{LowBits}$ fields. The wire type omits these and the
-      reference implementation reflection-guards against forbidden field
-      fragments.
+\item \textbf{Round 2 --- $z$-partial.} Each active party $j$ opens
+      \emph{only} its partial response
+      \[
+        \mathbf{z}_j \;=\; \mathbf{y}_j + c\,\mathbf{s}_1^{(j)},
+      \]
+      formed from its own RSS share $\mathbf{s}_1^{(j)}$ and its own mask
+      share $\mathbf{y}_j$. The coordinator sums them,
+      $\mathbf{z} = \sum_{j} \mathbf{z}_j = \mathbf{y} + c\mathbf{s}_1$
+      (the single-party ML-DSA response): the only secret-bearing step,
+      $\mathbf{z} = \mathbf{y} + c\mathbf{s}_1$, is \emph{linear}, so it
+      distributes additively and the secret $\mathbf{s}_1 = \sum_j
+      \mathbf{s}_1^{(j)}$ appears only as the coefficient of the public
+      $c$ in the summed response, never materialised. Partials carry the
+      $\mathbf{z}$-contribution only --- \emph{no} $c\mathbf{s}_2$,
+      $c\mathbf{t}_0$, $\mathbf{r}_0$, $\mathsf{LowBits}$, or mask fields;
+      the wire type omits these and the reference reflection-guards
+      against forbidden field fragments.
 \item \textbf{Finalize --- public hint.} The combiner runs
       $\mathsf{FindHint}$ (\S\ref{sec:protocol:bcc:hint}) and emits the
-      FIPS~204 signature $\sigma = (\tilde c, \mathbf{z}, \mathbf{h})$.
+      FIPS~204 signature $\sigma = (\tilde c, \mathbf{z}, \mathbf{h})$,
+      which verifies byte-for-byte under stock \texttt{cloudflare/circl}
+      \texttt{mldsa65.Verify}. The hint is recovered from the public
+      $\mathbf{w}' = \mathbf{A}\mathbf{z} - c\mathbf{t}_1 2^d$, so the
+      coordinator forms no secret either.
 \end{enumerate}
 
 \subsubsection{Public hint recovery (\textsc{FindHint})}
@@ -667,67 +689,118 @@ semi-honest), or computed on public data ($\mathsf{FindHint}$ over
 $\mathbf{w}'$); $\mathsf{NonceCert}$ carries only $\mathbf{w}_1$ plus a
 clearance proof, never the full $\mathbf{w}$.
 
-\subsubsection{Why key generation stays trusted-dealer}
+\subsubsection{Dealerless key generation via Mithril RSS}
 \label{sec:protocol:bcc:keydkg}
 
-TALUS's \emph{nonce} DKG (pillar (i)) is dealerless, but its \emph{key}
-generation is not --- and this is forced, not incidental. FIPS~204
-$\mathsf{KeyGen}$ samples $\mathbf{s}_1, \mathbf{s}_2$ \emph{uniformly}
-from the small-norm set $S_\eta = \{\mathbf{p} \in R : \|\mathbf{p}\|_\infty
-\leq \eta\}$, and the whole parameter set is calibrated to
-$\|\mathbf{s}_1\|_\infty, \|\mathbf{s}_2\|_\infty \leq \eta$
-(e.g.\ $\beta = \tau\eta$). A dealerless DKG forms the joint secret as a
-sum / Lagrange combination of $N \geq 2$ independent contributions, each
-itself in $S_\eta$; the result has $\ell_\infty$-support up to $N\eta >
-\eta$ and is therefore \emph{not} $S_\eta$-distributed. Two independent
-failures follow. \emph{(1)} Byte-validity breaks: $\|c\mathbf{s}_2\|_\infty
-\leq N\beta > \beta$, so the boundary-clearance bound of
-\S\ref{sec:protocol:bcc:clear} no longer holds and the combined output is
-not byte-equal to FIPS~204. \emph{(2)} Security-equivalence breaks
-\emph{regardless} of byte-equality: a sum-of-contributions secret is an
-efficiently distinguishable distribution from a uniform-$S_\eta$ secret,
-so the FIPS~204 EUF-CMA claim does not transfer. Constraining a
-reconstruction back into $S_\eta$ without any party knowing the secret is
-exactly a dealer. The reference makes this explicit --- a dealerless
-byte-FIPS key DKG over $N \geq 2$ parties returns
-$\mathsf{ErrDealerlessByteFIPSUnreachable}$
-(\texttt{distributed\_bcc\_dkg.go}). \textbf{Consequence.} Pulsar key
-generation is trusted-dealer; the permissionless-public guarantee a
-sovereign validator set requires is carried instead by the
-natively-dealerless Corona leg \cite{corona} (Pedersen DKG over $R_q$),
-composed alongside Pulsar in the Quasar dual-PQ certificate
-(\S\ref{sec:quasar}).
+Earlier Pulsar drafts argued that dealerless byte-FIPS-204 key generation
+was \emph{unreachable}. The obstruction they identified is real but
+specific to the \emph{naive additive} construction: if the joint secret
+is formed as a sum / Lagrange combination of $N \geq 2$ independent FIPS
+secrets, each itself drawn from the small-norm set $S_\eta = \{\mathbf{p}
+\in R : \|\mathbf{p}\|_\infty \leq \eta\}$, the result has
+$\ell_\infty$-support up to $N\eta > \eta$ and is therefore not
+$S_\eta$-admissible --- $\|c\mathbf{s}_2\|_\infty$ grows past $\beta$,
+breaking both the boundary-clearance bound of
+\S\ref{sec:protocol:bcc:clear} and byte-equality. That wall holds only
+for the naive sum.
 
-\subsubsection{Honest status (\texttt{v1.2.0})}
+\paragraph{Mithril short replicated secret sharing (RSS).}
+Mithril \cite{mithril2026} escapes the wall. Instead of summing $N$
+full-norm secrets, the joint key is assembled from many \emph{short}
+per-subset secrets: for a $(t, n)$ committee, each of the
+$\binom{n}{\,n-t+1}$ qualified subsets $S$ samples one short secret
+$\mathbf{s}^{(S)} \sim \chi_\eta$, the subset secret is replicated to its
+members (RSS), and the signing key is $\mathbf{s}_1 = \sum_S
+\mathbf{s}^{(S)}$. Because every summand is short and the subset count
+$C = \binom{n}{\,n-t+1}$ is fixed by $(t, n)$ --- not by an adversarially
+large $N$ --- the key norm $\|\mathbf{s}_1\|_\infty \leq C\cdot\eta$ stays
+inside the ML-DSA $S_\eta$-class admissibility bound for the production
+committees. The construction is \emph{deterministic in the per-party
+seeds} and runs with no trusted dealer: no party ever holds
+$\mathbf{s}_1$, $\mathbf{s}_2$, or the key seed.
+
+\paragraph{Large committees: per-subset modular reduction.}
+A naive accumulation of $C$ subset secrets in a fixed-width integer ring
+overflows once $C \geq \lfloor 2^{32}/q \rfloor = 512$ --- e.g.\ the owner
+default $n{=}16$, $t{=}14$ has $C = \binom{16}{3} = 560$ --- silently
+corrupting the key into an unsignable wall value. The reference reduces
+each subset contribution modulo $q$ \emph{before} accumulation; since
+$\bmod\,q$ is additively homomorphic this is bit-identical to the
+small-committee path and removes the overflow, so fault-tolerant
+committees are admissible ($n{=}8$, $t{=}7$ tolerating one fault and
+$n{=}16$, $t{=}14$ tolerating two are proven end-to-end). The admission
+test is the per-$(n,t)$ norm bound $\tau \cdot C \cdot \eta < \gamma_2$,
+not a flat committee-size cap.
+
+\begin{theorem}[Dealerless RSS key signs under stock FIPS-204 --- compatibility]
+\label{thm:mithril-rss-keygen}
+For every committee $(t, n)$ admitted by the norm bound above, the
+Mithril RSS group public key together with the hyperball threshold
+signature of \S\ref{sec:protocol:bcc:online} verifies byte-for-byte under
+the \emph{unmodified} \texttt{cloudflare/circl} FIPS-204 ML-DSA-65
+verifier.
+\end{theorem}
+
+This is \emph{standard-FIPS-204-verifier compatibility}, demonstrated
+end-to-end over real \texttt{circl} for every $t$-subset quorum of the
+admitted committees. Under strict claim discipline we separate it from a
+stronger property we do \emph{not} claim: full \emph{FIPS-204 KeyGen
+distribution-equivalence}, i.e.\ that the RSS key (a sum of subset
+secrets) is distributed identically to a stock FIPS-204 \textsf{KeyGen}
+key (a single uniform draw from $S_\eta$). That equivalence is the
+labeled \textbf{open residual~B} (\S\ref{sec:protocol:bcc:status}); the
+standard EUF-CMA reduction is stated conditional on it. The reference is
+\texttt{mithril\_rss.go}.
+
+\paragraph{Consequence.} Pulsar key generation is \emph{dealerless} --- the
+dealer is now dead at both ends: Mithril RSS keygen here, and the
+hyperball no-reconstruct signer of \S\ref{sec:protocol:bcc:online}. The
+natively-dealerless Corona leg \cite{corona} (Pedersen-VSS DKG over $R_q$)
+composes alongside Pulsar in the Quasar dual-PQ certificate
+(\S\ref{sec:quasar}) as defence-in-depth, no longer as the sole carrier of
+the permissionless-public guarantee a sovereign validator set requires.
+
+\subsubsection{Honest status (\texttt{v1.7.1})}
 \label{sec:protocol:bcc:status}
 
-TALUS's byte-equal threshold signer is realised at \texttt{v1.2.0}.
-Theorem~\ref{thm:bcc-byte-equal}'s byte-equality is demonstrated under the
-\emph{unmodified} \texttt{cloudflare/circl} and \texttt{pq-crystals}
-FIPS~204 verifiers (ML-DSA-65 and ML-DSA-87), and the boundary-clearance /
-hint-recovery correspondence is machine-checked in Lean. The leak hazard of
-earlier designs is closed: the secret-shared $\mathsf{HighBits}$ step runs
-inside the CSCP CarryCompare circuit (\S\ref{sec:protocol:bcc:cscp}), so no
-party forms $\mathbf{w}_0$ or the full $\mathbf{w}$. Two residuals remain,
-stated honestly.
+The dealerless byte-equal threshold scheme is realised at \texttt{v1.7.1}:
+keygen is Mithril RSS (\S\ref{sec:protocol:bcc:keydkg},
+Theorem~\ref{thm:mithril-rss-keygen}) and signing is the no-reconstruct
+hyperball signer (\S\ref{sec:protocol:bcc:online}). The dealer is dead at
+both ends. Theorem~\ref{thm:bcc-byte-equal}'s byte-equality is demonstrated
+under the \emph{unmodified} \texttt{cloudflare/circl} and
+\texttt{pq-crystals} FIPS~204 verifiers (ML-DSA-65 and ML-DSA-87), and the
+boundary-clearance / hint-recovery correspondence is machine-checked in
+Lean. The leak hazard of earlier designs is closed: the secret-shared
+$\mathsf{HighBits}$ step runs inside the CSCP CarryCompare circuit
+(\S\ref{sec:protocol:bcc:cscp}), so no party forms $\mathbf{w}_0$ or the
+full $\mathbf{w}$. Two residuals remain, stated honestly under strict claim
+discipline.
 
-\paragraph{Residual A (malicious-secure CSCP / networked MPC).} CSCP's
-leak-freeness is proven in the \emph{semi-honest} model, in an in-process
-$N$-party simulation. A malicious party is bounded to abort/retry
-(liveness) by $\mathsf{FindHint}$ and the $\mathsf{ReleaseGate}$, never a
-forge or a leak; the malicious-secure CSCP layer --- together with a
-networked, non-simulation deployment and a malicious-VSS nonce DKG --- is
-the open item.
+\paragraph{Residual A (full malicious security / networked MPC).} The
+signer is \emph{malicious-hardened}: single-use nonces, identifiable abort,
+and a mandatory stock-FIPS-204 $\mathsf{ReleaseGate}$ bound a malicious
+party to abort/retry (liveness), never a forge or a leak (the CSCP
+leak-freeness is proven in the semi-honest model in an in-process $N$-party
+simulation). \emph{Malicious-hardened is not the same as fully
+malicious-secure-proven}: a full malicious-security proof, a networked
+(non-simulation) deployment, and a malicious-VSS nonce DKG are the open
+item.
 
-\paragraph{Residual B (dealerless key DKG).} A dealerless byte-FIPS-204
-\emph{key} generation is provably unreachable
-(\S\ref{sec:protocol:bcc:keydkg}); key generation is trusted-dealer and the
-permissionless guarantee is delegated to the Corona leg.
+\paragraph{Residual B (KeyGen distribution-equivalence).} Following the
+$(A)$-vs-$(B)$ claim discipline: \emph{(A)} standard-FIPS-204-\emph{verifier}
+compatibility of the dealerless Mithril RSS key is \emph{proven} (the group
+key and threshold signature verify under stock \texttt{circl},
+Theorem~\ref{thm:mithril-rss-keygen}); \emph{(B)} full \emph{FIPS-204
+KeyGen distribution-equivalence} --- that the RSS key is distributed
+identically to a stock FIPS-204 \textsf{KeyGen} key --- is the labeled open
+residual, and the EUF-CMA reduction is stated conditional on it.
 
 The stock FIPS~204 \emph{verifier} is always available; the residuals
-concern only the threshold \emph{signer}. The consensus layer composes the
-Corona leg alongside Pulsar (\S\ref{sec:quasar}) so that permissionless PQ
-finality never depends on Residual~A or~B.
+concern only the threshold construction's \emph{proof posture}, not its
+on-the-wire output. The consensus layer composes the Corona leg alongside
+Pulsar (\S\ref{sec:quasar}) as defence-in-depth, so permissionless PQ
+finality never rests on Residual~A or~B alone.
 
 \subsection{\textsc{Refresh} (HJKY97 proactive refresh)}
 \label{sec:protocol:refresh}
