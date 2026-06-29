@@ -31,6 +31,7 @@ Auto-generated catalogue of research papers — regenerated 2026-05-18.
 |-------|-----|-----|
 | `chain-first-architecture` | `chain-first-architecture/chain-first-architecture.tex` | ✓ |
 | `dag-evm-formal` | `dag-evm-formal/dag-evm-formal.tex` | ✓ |
+| `dex-price-coherence` | `dex-price-coherence/dex-price-coherence.tex` | ✓ |
 | `evmgpu-benchmark` | `evmgpu-benchmark/evmgpu-benchmark.tex` | ✓ |
 | `gpu-evm-whitepaper` | `gpu-evm-whitepaper/gpu-evm-whitepaper.tex` | ✓ |
 | `lp-010-quasar-stm-3` | `lp-010-quasar-stm-3/lp-010-quasar-stm-3.tex` | ✓ |
