@@ -6,79 +6,97 @@ cryptographic-offload results on Apple M1 Max Metal. We now report the decisive 
 the two accelerators that ship in the Lux high-frequency settlement fabric---an
 \textbf{NVIDIA GB10} (Grace-Blackwell superchip, CUDA 13.0, 20-core Grace CPU) and an
 \textbf{AMD Radeon 8060S} (RDNA, Ryzen~AI~MAX+~395, 32-core CPU)---and extend the study end to
-end: from the batch order-matching kernel, through the tuned inter-node link, to the
+end: from the deterministic per-book matching kernel, through the tuned inter-node link, to the
 post-quantum signature path. Every figure in this section is measured on real hardware; the
 sole projected quantity (the confidential-compute overhead of NVIDIA IO TEE) is explicitly
 labelled.
 
-\subsection{Methodology: a faithful GPU-versus-CPU head-to-head}
+\subsection{Methodology: a deterministic matcher, tuned per silicon}
+\label{sec:production-method}
 
-To avoid the common pitfall of comparing a throughput GPU kernel against a naive serial CPU
-loop, we run the \emph{identical} batch-matching algorithm on both processors on the same host.
-The kernel mirrors the production \texttt{batch\_match\_kernel} of the Lux DEX engine
-(\texttt{luxcpp/cuda/kernels/gpu/dex\_swap.cu}): one thread-block per taker order, threads
-cooperatively scanning the aggregated price levels of the resting book, with atomic accumulation
-of fills. The CPU reference executes the same level-scan and fill logic, parallelized across all
-cores with OpenMP. Books are provisioned deep so that matching never starves, isolating
-steady-state matching throughput. Timing excludes host--device transfer (kernel-only), and we
-report the best of three runs after warm-up.
+The measured kernel is the \emph{consensus-path} central-limit-order-book matcher, not an
+aggregated-liquidity approximation. Determinism is a hard requirement: every validator must
+re-execute a block bit-identically, so a parallel-within-book match---which would reorder
+fills and fork the chain---is inadmissible. The design that satisfies this is \textbf{one thread
+per order book}, walking that book's resting levels in strict price-time priority (sequential
+\emph{within} a book), with \textbf{millions of books resolved in parallel} across the grid. This
+is the crucial distinction from a naive \verb|<<<1,1>>>| launch: sequential-within-book does
+\emph{not} mean one-book-at-a-time. The parallelism axis is the market count, and at $N=$4--16\,M
+books the grid saturates every SM. Each thread performs $\text{TAKERS}\times\text{DEPTH}$ real
+match steps ($32\times32$), so the kernel is compute- and memory-bound, not dispatch-bound. The
+CPU reference runs the identical logic across all cores with OpenMP, and we verify GPU$=$CPU
+fill-parity on every run (the harnesses print \texttt{parity \dots MATCH}); the throughput
+figures are trustworthy only because the results are bit-identical. Timing is kernel-only on
+CUDA/HIP (best of three after warm-up); Apple Metal figures include command-buffer submit.
 
-\subsection{Result: both vendors exceed one billion orders per second}
+Two backend-portable levers take the matcher to its tuned optimum. First, \textbf{memory
+coalescing}: the naive array-of-structs layout stores each book's orders contiguously
+(\texttt{resting[book*DEPTH+i]}), so adjacent threads read addresses \texttt{DEPTH} apart---an
+uncoalesced, strided access. Transposing to an order-major structure-of-arrays layout
+(\texttt{plane[i*N+book]}) makes a warp's 32 threads read 32 contiguous words, collapsing each
+strided gather into one coalesced transaction. Second, \textbf{per-backend occupancy tuning} of
+threads-per-block and register residency (all resting data preloaded into registers, versus only
+the mutable remaining-quantity vector in registers with read-only price/side re-read from
+coalesced global). Both levers change only performance; the fills, and thus \texttt{parity
+\dots MATCH}, are invariant.
+
+\subsection{Result: a deterministic matcher at up to 12.8 billion orders per second}
 
 \begin{table}[h]
 \centering
-\caption{DEX batch matcher, GPU versus multi-core CPU, same workload and host, at 16\,M taker
-orders (best of three). The upper group is the settlement fabric (discrete/APU GPUs on Linux,
-kernel-only timing); the lower group is Apple Silicon developer workstations (Metal, timing
-includes command-buffer submit).}
+\caption{Deterministic per-book DEX matcher, tuned per backend, GPU versus multi-core CPU, same
+workload and host (best of three, parity-verified). ``Baseline'' is the array-of-structs layout
+at 256 threads/block; ``Tuned'' applies coalesced structure-of-arrays plus the per-backend
+occupancy optimum. The upper group is the settlement fabric (kernel-only); the lower group is
+Apple Silicon workstations (Metal, submit-inclusive).}
 \label{tab:dex-gpu-cpu}
-\sisetup{table-format=4.0}
-\begin{tabular}{llrrr}
+\sisetup{table-format=5.0}
+\begin{tabular}{llrrrl}
 \toprule
-\textbf{Host / accelerator} & \textbf{CPU cores} & \textbf{CPU (M/s)} & \textbf{GPU (M/s)} & \textbf{Speedup} \\
+\textbf{Host / accelerator} & \textbf{Cores} & \textbf{Baseline} & \textbf{Tuned} & \textbf{vs CPU} & \textbf{Tuned config} \\
+ & & \textbf{(M/s)} & \textbf{(M/s)} & & \\
 \midrule
-\multicolumn{5}{l}{\textit{Settlement fabric (kernel-only)}}\\
-AMD Radeon 8060S (RDNA)        & 32 & 579 & \textbf{1560} & \textbf{2.70$\times$} \\
-NVIDIA GB10 (Grace-Blackwell)  & 20 & 595 & \textbf{985}  & 1.66$\times$ \\
-\textbf{Two-node fabric aggregate} & --- & --- & \textbf{2545} & --- \\
+\multicolumn{6}{l}{\textit{Settlement fabric (kernel-only)}}\\
+AMD Radeon 8060S (RDNA)       & 32 & 1940 & \textbf{12760} & 12.5$\times$ & SoA, preload, TPB 64 \\
+NVIDIA GB10 (Grace-Blackwell) & 20 & 1540 & \textbf{9130}  & 17.5$\times$ & SoA, lowreg, TPB 32 \\
+\textbf{Two-node fabric aggregate} & --- & --- & \textbf{21890} & --- & --- \\
 \midrule
-\multicolumn{5}{l}{\textit{Apple Silicon workstations (Metal, submit-inclusive)}}\\
-ra --- Apple M1 Max (local, full clocks) & 10 & 155 & \textbf{1091} & \textbf{7.03$\times$} \\
-dbc --- Apple M4 Max (headless/SSH)      & 16 & 481 & 559           & 1.16$\times$ \\
+\multicolumn{6}{l}{\textit{Apple Silicon workstations (Metal, submit-inclusive)}}\\
+dbc --- Apple M4 Max (128\,GB)  & 16 & 5600 & \textbf{5600} & 8.1$\times$ & AoS, TPB 256 \\
+ra --- Apple M1 Max (64\,GB)    & 10 & 2430 & \textbf{2800} & 9.8$\times$ & SoA, TPB 256 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:dex-gpu-cpu} reports the headline result. GPU-native matching is decisively
-faster than a fully parallel multi-core CPU on every host measured, and three of the four GPUs
-cross the symbolic \textbf{one-billion-orders-per-second} threshold. On the settlement fabric the
-AMD RDNA APU leads at \SI{1.56}{\giga\text{orders}/\second} ($2.7\times$ its 32-core CPU) and the
-two-node fabric aggregates to \SI{2.55}{\giga\text{orders}/\second}. The Apple workstations frame
-the measurement honestly: the M1~Max, run locally at full GPU clocks, reaches
-\SI{1.09}{\giga\text{orders}/\second}---a \textbf{$7.0\times$} margin over its 10-core CPU,
-the widest of any host because its CPU is comparatively modest---whereas the M4~Max, measured
-headless over SSH (no attached display, so the GPU throttles and command-buffer submit is
-included in the timing), shows a compressed $1.16\times$ against its much stronger 16-core CPU.
-We note three qualifications: (i)~this is the lightweight batch-match kernel; the heavier
-warp-per-book kernel with full book mutation sustains a lower, occupancy-bound rate
-(Section~\ref{sec:production-occupancy}); (ii)~the Apple GPU timings include command-buffer
-submit and are not clock-for-clock comparable to the kernel-only CUDA/HIP figures; and (iii)~the
-raw matching rate is an upper bound that the network and consensus layers, analyzed below, bind
-well beneath.
+Table~\ref{tab:dex-gpu-cpu} reports the headline result. The \emph{deterministic, consensus-safe}
+matcher---the path a validator actually re-executes---sustains \SI{12.76}{\giga\text{orders}/
+\second} on the AMD RDNA APU and \SI{9.13}{\giga\text{orders}/\second} on the NVIDIA GB10,
+aggregating to \SI{21.9}{\giga\text{orders}/\second} across the two-node fabric, every point
+GPU$=$CPU fill-parity verified. Coalescing plus per-backend tuning lifts each discrete accelerator
+$5.9$--$6.6\times$ over its own array-of-structs baseline (AMD $1.94\to12.76$\,B, GB10
+$1.54\to9.13$\,B) and $12$--$17.5\times$ over its fully parallel multi-core CPU. Two engineering
+facts emerge. (i)~\textbf{Coalescing is a discrete/APU-memory optimization}: on Apple unified
+memory it is neutral-to-negative---the large shared cache already absorbs the strided
+array-of-structs access, so the M4~Max's tuned optimum is in fact the array-of-structs layout at
+\SI{5.60}{\giga\text{orders}/\second}. (ii)~\textbf{The two discrete backends want opposite
+register strategies}: the GB10 is occupancy-bound and prefers low register pressure with small
+32-thread blocks, whereas the bandwidth-rich 8060S prefers register-resident data at 64-thread
+blocks (the low-register variant costs it $\sim$25\%). No single configuration is optimal
+everywhere; the tuned rate is a per-silicon result. The one qualification carried forward is that
+this raw matching rate is an upper bound that the network and consensus layers, analyzed below,
+bind well beneath.
 
-\subsection{Occupancy is the ceiling, not silicon}
+\subsection{Occupancy was the ceiling---and it is now saturated}
 \label{sec:production-occupancy}
 
-The determinism-preserving matcher launches one block per order and---for consensus safety,
-since a parallel-within-book match would reorder fills and fork the chain---executes each book
-single-threaded (\verb|<<<1,1>>>| per book, no atomics across the book). The parallelism axis is
-therefore \emph{across} the 10{,}000--20{,}000 markets, one warp or block per market. On the GB10
-the warp-per-book kernel measures \SI{41.75}{\mega\text{fills}/\second} at 10{,}000 markets, but
-at only \textbf{16.7\% occupancy} (one block per streaming multiprocessor): the silicon is
-\SI{23}{\nano\second} per match while $\sim$85\% of the GPU sits idle. A dense-grid launch that
-saturates every SM recovers the missing $\sim6\times$, projecting to $\sim$\SI{250}{\mega\text{
-fills}/\second} on the GB10 alone. The lesson is that the DEX-matching ceiling on these parts is
-a kernel launch-configuration problem, not a hardware limit.
+An earlier, pessimistic launch of this matcher---one block per market at only
+$10{,}000$ markets---measured \SI{41.75}{\mega\text{fills}/\second} on the GB10 at just
+\textbf{16.7\% occupancy} (one block per streaming multiprocessor, $\sim$85\% of the GPU idle),
+which had suggested the DEX ceiling was a launch-configuration problem rather than a hardware
+limit. Table~\ref{tab:dex-gpu-cpu} confirms that diagnosis and closes it: scaling the market
+count to millions of books saturates every SM, and layering coalescing and per-backend register
+tuning on top recovers the idle throughput and more, landing at billions of orders per second on
+both discrete parts. The ceiling was occupancy, not silicon, and the tuned launch reaches it.
 
 \subsection{The tuned inter-node link}
 
@@ -124,23 +142,27 @@ post-quantum DEX that clears the world's order flow and one that clears a single
 
 Composing the measured layers over the target \SI{800}{\giga bit/\second} InfiniBand fabric of a
 colocated San~Francisco venue yields a network ceiling of \SI{1.79}{\giga\text{orders}/\second}
-(BLS-aggregate discipline), with the two-GPU matcher at \SI{2.56}{\giga\text{orders}/\second}
-retaining headroom---the venue remains network-bound even at \SI{800}{Gbps}. Against real market
-scale (Table~\ref{tab:world}), the significance is that a \emph{single two-accelerator node} over
+(BLS-aggregate discipline), with the tuned two-GPU matcher at \SI{21.9}{\giga\text{orders}/
+\second}---a $12\times$ compute margin over the wire---so the venue is decisively network-bound
+even at \SI{800}{Gbps}, and the matcher is nowhere near its own limit. Against real market scale
+(Table~\ref{tab:world}), the significance is that a \emph{single two-accelerator node} over
 \SI{800}{Gbps} exceeds the entire world's traded order flow---and even its full quote-and-cancel
 message flow at OPRA-scale microbursts---with substantial headroom, while remaining fully
 confidential and post-quantum.
 
 \begin{table}[h]
 \centering
-\caption{Colocated two-GPU venue over \SI{800}{Gbps} InfiniBand versus global market scale.}
+\caption{Colocated two-GPU venue over \SI{800}{Gbps} InfiniBand versus global market scale. The
+network column uses the BLS-aggregate + PQ-block-finality discipline
+(\SI{1.79}{\giga\text{ord}/\second}); the GPU column uses the tuned deterministic matcher
+(\SI{21.9}{\giga\text{ord}/\second}).}
 \label{tab:world}
 \begin{tabular}{lrr}
 \toprule
 \textbf{Reference load} & \textbf{Rate} & \textbf{Venue headroom} \\
 \midrule
-World traded flow (equities+crypto+FX+deriv), peak & $\sim$\SI{10}{\mega\text{tr}/\second}  & $179\times$ (net), $256\times$ (GPU) \\
-World full message flow (incl.\ quotes/cancels)    & $\sim$\SI{100}{\mega\text{msg}/\second} & $17.9\times$ (net), $26\times$ (GPU) \\
+World traded flow (equities+crypto+FX+deriv), peak & $\sim$\SI{10}{\mega\text{tr}/\second}  & $179\times$ (net), $2189\times$ (GPU) \\
+World full message flow (incl.\ quotes/cancels)    & $\sim$\SI{100}{\mega\text{msg}/\second} & $17.9\times$ (net), $219\times$ (GPU) \\
 \bottomrule
 \end{tabular}
 \end{table}
