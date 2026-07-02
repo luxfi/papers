@@ -1,0 +1,129 @@
+\section{The visible$\leftrightarrow$shielded bridge}
+\label{sec:bridge}
+
+The bridge is the only place value crosses between X (visible) and Z
+(shielded). It has three operations --- shield, unshield, and shielded
+settlement --- and one invariant that gates all three.
+
+\paragraph{Cryptographic caveat (read first).} The constructions in
+this section are cryptographic. \textbf{Shielded-pool soundness and the
+P3Q/starkfri trust model require cryptographer sign-off before
+implementation.} This document specifies the \emph{conservation
+bookkeeping} at the boundary and cites the implemented primitives it
+would compose; it does \emph{not} assert that the shielded pool is
+sound, that the commitment/nullifier scheme is binding and hiding as
+deployed, or that the attestation/STARK trust assumptions are
+acceptable for value transfer. Those are open items
+(Section~\ref{sec:open}).
+
+\subsection{The boundary invariant}
+
+For every asset $a$ and every height $h$:
+\[
+  \mathrm{supply}_{\text{visible}}(a,h)
+  \;+\;
+  \mathrm{supply}_{\text{shielded}}(a,h)
+  \;=\;
+  \mathrm{supply}_{\text{total}}(a)
+  \quad\text{(constant in $h$).}
+\]
+Visible supply is the sum over spendable and locked X UTXOs of asset
+$a$. Shielded supply is the sum of values committed in live (un-nullified)
+Z notes of asset $a$. Shield moves a quantum from visible to shielded;
+unshield moves it back; both preserve the total. \DESIGN{} \textbf{No
+code tracks this sum today} --- the ZKVM maintains a nullifier DB and a
+commitment tree (\texttt{lux/chains/zkvm/nullifier\_db.go};
+\texttt{state\_tree.go}) but no visible$+$shielded$=$total accounting
+exists across the X and Z chains. Establishing and enforcing this
+invariant is the central new obligation of the bridge.
+
+\subsection{Shield: visible X UTXO $\to$ Z note}
+
+\textbf{Flow.}
+\begin{enumerate}[leftmargin=2em,nosep]
+\item User submits a shield that names a spendable X UTXO of asset $a$,
+  value $v$, and a target Z note commitment $C$ (commitment to value
+  $v$, recipient, randomness).
+\item X \emph{burns} the named UTXO (consumes it; it is gone from the
+  visible pool).
+\item Z \emph{mints} the commitment $C$ into the note pool, with a
+  proof that $C$ commits to exactly $v$ of asset $a$.
+\end{enumerate}
+
+\textbf{Conservation effect.} $\mathrm{supply}_{\text{visible}}(a)$
+decreases by $v$; $\mathrm{supply}_{\text{shielded}}(a)$ increases by
+$v$; total unchanged. The equal-value link between the burned UTXO and
+the minted commitment is what the validity proof must establish.
+
+\textbf{Status.} \IMPL{} model objects (\texttt{TransactionTypeShield},
+\texttt{Note}, \texttt{Commitment} --
+\texttt{lux/chains/zkvm/transaction.go:28,113--120}); \DESIGN{}
+execution (the shield handler is a stub,
+\texttt{lux/chains/zkvm/handlers.go:141,313}).
+
+\subsection{Unshield: Z note $\to$ visible X UTXO}
+
+\textbf{Flow.}
+\begin{enumerate}[leftmargin=2em,nosep]
+\item User submits an unshield that spends a live Z note of value $v$,
+  asset $a$, revealing the note's \emph{nullifier} $N$ and a target
+  visible owner.
+\item Z checks $N$ is not already in the spent-nullifier set, publishes
+  $N$ (the note is now nullified), with a proof the note was live and
+  committed to $v$ of $a$.
+\item X \emph{mints} a spendable UTXO of value $v$, asset $a$, to the
+  target owner.
+\end{enumerate}
+
+\textbf{Conservation effect.} $\mathrm{supply}_{\text{shielded}}(a)$
+decreases by $v$; $\mathrm{supply}_{\text{visible}}(a)$ increases by $v$;
+total unchanged.
+
+\textbf{Double-spend prevention.} The published nullifier $N$ is the
+sole anti-replay device: a note may be unshielded (or spent on Z) once,
+because its nullifier may enter the spent set once. \IMPL{} persistent
+nullifier tracking (\texttt{lux/chains/zkvm/nullifier\_db.go};
+\texttt{MarkNullifierSpent}); \IMPL{} nullifier computation in the zk
+precompile (\texttt{precompile/zk/commitment.go} \texttt{Nullifier}).
+\textbf{The soundness of the nullifier as an anti-double-spend device
+across the visible/shielded boundary is a \CRYPTO{} item} --- in
+particular that a single note cannot both be unshielded on X and spent
+again on Z, and that nullifiers are unlinkable to their commitments.
+
+\subsection{Shielded settlement: \texttt{SettleTx} to a Z note}
+
+A computing module may settle a result directly into the shielded pool
+rather than to a visible UTXO --- e.g. a shielded DEX fill. This is the
+\texttt{shieldedOutputs} branch of \texttt{SettleTx}
+(Section~\ref{sec:primitives}): X consumes the order-locks, and instead
+of minting visible UTXOs it drives the shield path so the settled value
+appears as Z commitments. Conservation is the \texttt{SettleTx} sum
+combined with the shield effect: locked value is destroyed; equal value
+is created as shielded commitments; visible$+$shielded$=$total holds.
+
+\subsection{Why this is the rollup, generalized}
+
+The validity that crosses the boundary uses the same two verifiers the
+DEX rollup uses: \textbf{P3Q} (ML-DSA-65 attestation, the
+``rollup-commit verifier'' its own header names ---
+\texttt{precompile/p3q/contract.go:30,41}) for the
+single-venue/attested path, then \textbf{starkfri} (STARK/FRI ---
+\texttt{precompile/starkfri/contract.go:75}) for the trustless path,
+feeding Z's ZKVM. The intended pipeline --- batch $\to$ P3Q attestation
+$\to$ starkfri STARK $\to$ Z --- is the subject of LP-218~\cite{lp218}
+and LP-221~\cite{lp221}.
+
+\textbf{Honest status.} \DESIGN{} \textbf{The rollup pipeline is not
+wired in code today.} A search of \texttt{lx/dex/} for
+\texttt{rollup}/\texttt{attest}/\texttt{P3Q}/\texttt{starkfri} finds the
+DEX does not yet produce P3Q attestations or starkfri proofs from its
+batches; the precompiles exist and are registered for C-Chain and
+Z-Chain, but nothing in the DEX invokes them for batch commitment.
+The claim ``shield/unshield generalizes the DEX rollup'' is therefore an
+\emph{architectural} claim: the same verifier primitives, composed the
+same way, applied to the value boundary instead of the order boundary.
+It is grounded in the implemented \emph{verifiers}
+(\texttt{0x012205}, \texttt{0x012220}) and the implemented \emph{note
+model}, not in an existing wired rollup. That wiring (for both the DEX
+batch and the shield boundary) is \DESIGN{} and gated on the
+cryptographer review below.

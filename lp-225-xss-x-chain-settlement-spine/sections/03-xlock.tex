@@ -1,0 +1,86 @@
+\section{The XLock object}
+\label{sec:xlock}
+
+\subsection{An X settlement lock, not a raw UTXO}
+
+The object an app-chain references under XSS is \emph{not} a raw UTXO.
+A raw UTXO is freely spendable by its owner's signature; that is exactly
+the property a computing module must not have over committed value. The
+referenced object is an \textbf{X settlement lock}: a UTXO whose spend
+authority has been transferred from ``the owner's signature'' to ``an
+accepted settlement of a specific module on a specific chain.''
+
+\begin{lstlisting}[language=Go]
+XLock {
+  lockID          // unique id of this lock (derived from the LockTx)
+  sourceUTXOs     // the normal X UTXOs consumed to fund the lock
+  assetID         // single asset; one lock locks one asset
+  amount          // total locked amount (sum of sourceUTXOs values)
+  owner           // who gets unused value back (UnlockTx target)
+  targetChainID   // which computing chain may settle this lock
+  targetModule    // which module on that chain may settle it
+  purpose         // stake | dex | bridge | execution | governance
+  nonce           // owner-scoped replay separator
+  expiry          // height/time after which UnlockTx-by-timeout is valid
+  unlockCondition // predicate for early owner-initiated unlock
+  consumed        // set true exactly once, by SettleTx or UnlockTx
+}
+\end{lstlisting}
+
+\DESIGN{} No such output type exists in xvm today. The closest existing
+constructs are the \texttt{secp256k1fx} \texttt{OutputOwners} with a
+\texttt{Locktime} (a time gate, not a settlement-authority transfer,
+\texttt{vms/xvm/service.go:644}) and the P-Chain's \texttt{StakeOuts}
+(a single-purpose stake lock living on the \emph{wrong} chain,
+\texttt{txs/add\_permissionless\_validator\_tx.go:50}). The XLock
+generalizes the \texttt{StakeOuts} idea to all purposes and moves it
+onto X.
+
+\subsection{Why these fields}
+
+\begin{itemize}[leftmargin=2em]
+\item \textbf{\texttt{sourceUTXOs}, \texttt{amount}, \texttt{assetID}.}
+  The lock is funded by consuming ordinary spendable UTXOs. Their summed
+  value is the locked \texttt{amount}; \texttt{assetID} is single because
+  conservation is checked per asset (mirroring \texttt{lux.VerifyTx},
+  which is per-asset). A multi-asset commitment is several locks.
+\item \textbf{\texttt{owner}.} Locking does not transfer ownership; it
+  suspends spendability. Unused value (a rejected order, an unfilled
+  remainder, an expired stake) returns to \texttt{owner} via
+  \texttt{UnlockTx}.
+\item \textbf{\texttt{targetChainID} $+$ \texttt{targetModule}.} The lock
+  names \emph{exactly one} settler. Only an accepted settlement proof
+  from this (chain, module) pair can consume the lock. This is the
+  capability scoping that makes ``other chains compute, X settles''
+  enforceable: a DEX proof cannot settle a stake-lock.
+\item \textbf{\texttt{purpose}.} A coarse, human- and policy-legible tag
+  (\texttt{stake}/\texttt{dex}/\texttt{bridge}/\texttt{execution}/
+  \texttt{governance}) used by X's acceptance rules and by the plugin
+  registry (Section~\ref{sec:migration}, P5). It does not replace
+  \texttt{targetModule}; it classifies it.
+\item \textbf{\texttt{nonce}.} Owner-scoped replay separator so two
+  otherwise-identical locks have distinct \texttt{lockID}s.
+\item \textbf{\texttt{expiry} $+$ \texttt{unlockCondition}.} Liveness.
+  A lock must never be able to strand value forever if the target module
+  stalls. \texttt{expiry} permits an \texttt{UnlockTx}-by-timeout;
+  \texttt{unlockCondition} permits an earlier owner-initiated unlock
+  under a stated predicate (e.g. ``order never rested'').
+\item \textbf{\texttt{consumed}.} The single-use flag. Exactly one of
+  \texttt{SettleTx} or \texttt{UnlockTx} sets it; X rejects any second
+  attempt. This is the lock-exclusivity guarantee
+  (Section~\ref{sec:safety}) and reuses the consume-once discipline the
+  atomic rail already implements
+  (\texttt{lux/chains/dexvm/atomic.go} \texttt{MarkConsumed}).
+\end{itemize}
+
+\subsection{The lock as the universal claim handle}
+
+Every computing module's internal record points at a \texttt{lockID}
+rather than carrying its own balance. A D-Chain order references the
+\texttt{lockID} that funds it; a P-Chain validator record references the
+stake \texttt{lockID}; a bridge record references the \texttt{lockID}
+being bridged. The module's ledger thus becomes a table of
+\emph{claims over locks}, and ``settlement'' is uniformly: \emph{prove
+the computation, then \texttt{SettleTx} the referenced locks into new X
+UTXOs (or Z notes)}. This is the single shape that replaces three
+different custody mechanisms.

@@ -1,0 +1,143 @@
+\section{The XSS model}
+\label{sec:model}
+
+XSS partitions the network into three roles. There is one visible
+ledger, one shielded ledger, and a set of computing modules. Nothing
+else holds spendable value.
+
+\subsection{X-Chain: the visible settlement spine}
+
+\textbf{X-Chain is the only canonical economic ledger that is openly
+auditable.} It owns:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{UTXOs} --- the spendable representation of all value.
+  \IMPL{} (\texttt{vms/xvm/state/state.go:142,144,221}).
+\item \textbf{Asset IDs} --- minted by \texttt{CreateAssetTx}. \IMPL{}
+  (\texttt{vms/xvm/txs/create\_asset\_tx.go:18}).
+\item \textbf{Operator-capability NFTs} --- the \texttt{nftfx} and
+  \texttt{propertyfx} mint/transfer outputs already supported by xvm.
+  \IMPL{} (\texttt{vms/xvm/fxs/fx.go:10,13--14,22--24};
+  \texttt{vms/xvm/static\_service.go:36--46}). XSS uses these as
+  capability tokens (Section~\ref{sec:primitives}, \texttt{RequireNFT}).
+\item \textbf{Lock state} --- the explicit ``this value is committed to
+  a computation and is no longer freely spendable'' state. \DESIGN{}
+  Today xvm outputs carry a \texttt{Locktime} (a wall-clock unlock
+  gate, \texttt{vms/xvm/service.go:644}) but \emph{no} stakeable lock
+  output --- a search of \texttt{vms/xvm/} finds no
+  \texttt{stakeable.LockOut}. The XSS lock
+  (Section~\ref{sec:xlock}) is a new output type, not a relabel of
+  \texttt{Locktime}.
+\item \textbf{Total ordering of all asset movements} --- X is the chain
+  whose block order \emph{is} the canonical order of settlement.
+\item \textbf{The conservation invariant} --- enforced once, on X, by
+  \texttt{lux.VerifyTx} for every transaction
+  (\texttt{vms/xvm/txs/executor/syntactic\_verifier.go:58,120,167,226,267}).
+\end{itemize}
+
+\noindent X is transparent by construction: every output owner and
+amount is in the clear, so anyone can reconstruct the full balance set
+from the chain alone.
+
+\subsection{Z-Chain: shielded settlement}
+
+\textbf{Z-Chain is the shielded counterpart of X} --- a private value
+pool shaped like Zcash Sapling~\cite{sapling2018}: commitments,
+nullifiers, and notes rather than transparent UTXOs. A user
+\emph{shields} a visible X UTXO into a Z note, transacts privately on Z,
+and \emph{unshields} back into a visible X UTXO. The model objects exist
+today:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Note / commitment / nullifier model.} \IMPL{} The ZKVM
+  defines \texttt{Note} with a \texttt{Commitment} and \texttt{Nullifier}
+  (\texttt{lux/chains/zkvm/transaction.go:113--120}), a transaction type
+  carrying \texttt{Nullifiers} of spent notes and output
+  \texttt{Commitment}s (\texttt{transaction.go:43,78--79}), and persistent
+  spent-nullifier tracking (\texttt{lux/chains/zkvm/nullifier\_db.go}).
+\item \textbf{Shield / unshield transaction \emph{types}.} \IMPL{} as
+  enum members: \texttt{TransactionTypeShield} and
+  \texttt{TransactionTypeUnshield}
+  (\texttt{lux/chains/zkvm/transaction.go:28--29}).
+\item \textbf{The shield/unshield \emph{execution}.} \DESIGN{} The
+  proof-generation and conversion handlers are explicit stubs ---
+  \texttt{"Not implemented"} / ``Would implement shield proof
+  generation'' (\texttt{lux/chains/zkvm/handlers.go:141,271,278,307,313}).
+\end{itemize}
+
+\noindent Validity crosses the X$\leftrightarrow$Z boundary through two
+verifiers that \emph{are} implemented:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{P3Q} --- ML-DSA-65 (FIPS-204~\cite{fips204}) attestation
+  at precompile \texttt{0x012205}. \IMPL{}
+  (\texttt{precompile/p3q/contract.go:117} address;
+  \texttt{:409} the \texttt{VerifySignatureCtx} ML-DSA verify). Its own
+  header describes it as ``the LP-218 rollup-commit verifier''
+  (\texttt{contract.go:30,41}).
+\item \textbf{starkfri} --- STARK/FRI validity proof at precompile
+  \texttt{0x012220}. \IMPL{} (\texttt{precompile/starkfri/contract.go:75}
+  address; the proof must begin with the \texttt{MagicHeader}
+  \texttt{"P3Q1"}, \texttt{contract.go:42}).
+\end{itemize}
+
+\noindent The boundary's conservation rule (Section~\ref{sec:bridge})
+is: \emph{shield} burns a visible X UTXO and mints a Z commitment of
+equal value; \emph{unshield} consumes a Z note, publishes its nullifier,
+and mints a visible X UTXO of equal value. The global invariant is
+\[
+  \mathrm{supply}_{\text{visible}}(a) \;+\;
+  \mathrm{supply}_{\text{shielded}}(a) \;=\;
+  \mathrm{supply}_{\text{total}}(a)
+  \qquad\text{for every asset } a, \text{ at every height.}
+\]
+\textbf{Today no code tracks or enforces this cross-pool sum} (a search
+of the ZKVM and precompile trees finds no visible$+$shielded$=$total
+invariant). It is \DESIGN{} and is the first item for cryptographer
+review (Section~\ref{sec:open}).
+
+\subsection{P / D / B / C / Q: computing modules over X-locked value}
+
+Everything else is an execution state machine. A module holds
+\emph{claims} --- intents, orders, stake-records, bridge-records ---
+that point back to X-settled value. \textbf{A module never mints and
+never maintains an independent spendable balance.} It settles results
+either to a visible X UTXO or to a shielded Z note. Concretely:
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Module & Computes & Settles to \\
+\midrule
+P (staking)   & validator lifecycle, rewards, reward-eligibility & X UTXO \\
+D (DEX)       & order book, matching, fills            & X UTXO or Z note \\
+B (bridge)    & outbound/return bridge proofs          & X UTXO \\
+C (EVM)       & smart-contract execution               & X UTXO (execution-only) \\
+Q (general)   & registered plugin computations         & X UTXO or Z note \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Today P and D each hold their own ledger
+(Section~\ref{sec:motivation}); under XSS those ledgers become
+\emph{claim tables keyed by an X lock} (Section~\ref{sec:per-chain}).
+The modules keep everything that is genuinely theirs --- the order book,
+the matcher, the validator set, the contract state --- and drop exactly
+one thing: the second copy of the money.
+
+\subsection{One state per unit}
+
+The model reduces to a single statement that the rest of this document
+makes precise. \emph{Every unit of value is, at every height, in exactly
+one X state:}
+\[
+  \text{spendable UTXO} \;\big|\;
+  \text{locked UTXO} \;\big|\;
+  \text{consumed UTXO}
+\]
+plus, for the shielded pool, the mirror states \emph{live note} and
+\emph{nullified note}, where the shield/unshield boundary moves a unit
+between the visible and shielded sides while conserving the total. No
+module introduces a fourth state and no module makes a locked or
+consumed unit spendable on its own --- only X (or Z, via the bridge)
+can.

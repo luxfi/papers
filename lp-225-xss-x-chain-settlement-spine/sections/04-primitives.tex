@@ -1,0 +1,205 @@
+\section{The five X-level primitives}
+\label{sec:primitives}
+
+XSS adds exactly five primitives to X. Each is specified by wire shape,
+preconditions (what X checks before accept), postconditions (the state
+after accept), and conservation effect (its term in the global
+invariant). All five are \DESIGN{}: none exists in xvm today. Where a
+primitive reuses an existing mechanism, the citation marks the
+\IMPL{} part it builds on.
+
+\subsection{\texttt{LockTx} --- commit spendable value}
+
+\begin{lstlisting}
+LockTx {
+  sourceUTXOs[]   // spendable X UTXOs to consume
+  targetChainID
+  targetModuleID
+  purpose
+  amount          // == sum(value(sourceUTXOs)); single asset
+  expiry
+  unlockCondition
+  ownerSig        // signatures authorizing the source UTXOs
+}
+\end{lstlisting}
+
+\textbf{Preconditions.} (1) Every \texttt{sourceUTXO} is currently
+spendable and owned by the signer (the existing
+\texttt{secp256k1fx} verify path). (2) All source UTXOs are the same
+asset. (3) \texttt{amount} $=$ $\sum \texttt{value(sourceUTXOs)}$ ---
+the lock neither creates nor destroys value, so the standard
+\texttt{lux.VerifyTx} conservation check applies with the lock output as
+the sole output
+(\texttt{vms/xvm/txs/executor/syntactic\_verifier.go:58}). (4)
+\texttt{targetChainID}/\texttt{targetModuleID} resolve in the plugin
+registry (P5). (5) If \texttt{purpose} requires an operator capability,
+the matching NFT is present (see \texttt{RequireNFT}).
+
+\textbf{Postconditions.} The source UTXOs are consumed; a single
+\texttt{XLock} object (Section~\ref{sec:xlock}) is created with
+\texttt{consumed=false} and a \texttt{lockID} derived from the
+\texttt{LockTx} id. The locked value is no longer returned by any
+spendable-UTXO query.
+
+\textbf{Conservation effect.} Net zero. Value leaves the
+\emph{spendable} pool and enters the \emph{locked} pool of the same
+asset; $\mathrm{supply}_{\text{visible}}$ is unchanged because locked
+UTXOs are part of visible supply --- they are simply not spendable.
+
+\subsection{\texttt{UnlockTx} --- return unused locked value}
+
+\begin{lstlisting}
+UnlockTx {
+  lockID
+  proof   // one of: ownerSig | timeout | moduleProof(no-settlement)
+  outputs[]  // new spendable X UTXOs returning value to owner
+}
+\end{lstlisting}
+
+\textbf{Preconditions.} (1) The lock exists and \texttt{consumed=false}.
+(2) \texttt{proof} authorizes the unlock by exactly one route:
+\emph{ownerSig} valid against \texttt{unlockCondition};
+\emph{timeout} where current height/time $>$ \texttt{expiry}; or
+\emph{moduleProof} in which the target module attests it produced no
+settlement against this lock. (3) $\sum\texttt{value(outputs)} =
+\texttt{amount}$ and all outputs are the lock's asset, paid to
+\texttt{owner}.
+
+\textbf{Postconditions.} \texttt{consumed} is set true; the
+\texttt{outputs} become spendable X UTXOs.
+
+\textbf{Conservation effect.} Net zero; value moves from locked back to
+spendable, same asset, same owner.
+
+\subsection{\texttt{SettleTx} --- consume locks per an accepted proof}
+
+\begin{lstlisting}
+SettleTx {
+  lockIDs[]          // one or more locks being settled together
+  settlementProof    // chain/module proof (see VerifyChainCommitment)
+  outputs[]          // new visible X UTXOs ...
+  shieldedOutputs[]  // ... and/or new Z commitments (shielded fill)
+}
+\end{lstlisting}
+
+\textbf{Preconditions.} (1) Every lock in \texttt{lockIDs} exists, has
+\texttt{consumed=false}, and shares one \texttt{(targetChainID,
+targetModuleID)} that the proof is for --- a proof from module $M$ on
+chain $C$ may only consume locks scoped to $(C,M)$. (2)
+\texttt{settlementProof} verifies (Section~\ref{sec:primitives},
+\texttt{VerifyChainCommitment}). (3) \emph{Conservation across the
+settlement}: for each asset $a$,
+\[
+  \sum_{\ell \in \texttt{lockIDs}} \texttt{amount}_\ell(a)
+  \;=\;
+  \sum \texttt{value}(\texttt{outputs}, a)
+  \;+\;
+  \sum \texttt{value}(\texttt{shieldedOutputs}, a).
+\]
+X checks this directly; it does \emph{not} re-execute the module's
+computation. This is the LP-224 discipline generalized: X agrees on the
+\emph{result} the module proved, by checking the proof and the sum, not
+by re-running the match.
+
+\textbf{Postconditions.} Every settled lock has \texttt{consumed=true};
+\texttt{outputs} become spendable X UTXOs; \texttt{shieldedOutputs}
+become Z commitments via the bridge (Section~\ref{sec:bridge}), each
+carrying the value that left the visible pool.
+
+\textbf{Conservation effect.} Per asset, locked value equal to the
+settled locks is destroyed and an equal value is created across
+visible outputs and shielded commitments. Total supply per asset is
+preserved; the split between visible and shielded supply shifts by the
+shielded portion (and the global visible$+$shielded$=$total invariant of
+Section~\ref{sec:bridge} absorbs that shift).
+
+\subsection{\texttt{RequireNFT} --- capability gate}
+
+\begin{lstlisting}
+RequireNFT {
+  operatorNFT     // an nftfx/propertyfx output id held by the actor
+  targetChainID
+  targetModuleID
+}
+\end{lstlisting}
+
+\textbf{Purpose.} A capability predicate, not a value movement. It
+gates privileged roles: bridge operators, DEX operators, plugin
+activation, and validator permissions. X already mints and transfers
+the capability tokens this consumes --- \texttt{nftfx} and
+\texttt{propertyfx} mint/transfer outputs are \IMPL{}
+(\texttt{vms/xvm/fxs/fx.go:10,13--14,22--24};
+\texttt{vms/xvm/static\_service.go:36--46}).
+
+\textbf{Preconditions.} The named \texttt{operatorNFT} exists, is owned
+by the actor, and its capability scope covers
+\texttt{(targetChainID,targetModuleID)}.
+
+\textbf{Postconditions / conservation effect.} None on value. Used as a
+sub-predicate inside \texttt{LockTx} (gating who may create a privileged
+lock), \texttt{SettleTx} (gating which operator may submit a settlement
+for an operator-scoped module), and the plugin registry (P5).
+
+\subsection{\texttt{VerifyChainCommitment} --- accept an external result}
+
+\begin{lstlisting}
+VerifyChainCommitment {
+  chainID
+  height
+  stateRoot
+  proof    // P3Q attestation and/or starkfri STARK over (chainID,height,stateRoot)
+}
+\end{lstlisting}
+
+\textbf{Purpose.} The single seam where chain/zk proof machinery plugs
+into X. \texttt{SettleTx} calls it; X accepts the external chain's
+result \emph{without re-executing it}. The verifiers it dispatches to
+are \IMPL{}:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{P3Q} (ML-DSA-65 attestation): a named-operator/validator
+  set attests the commitment. \IMPL{}
+  (\texttt{precompile/p3q/contract.go:117,409}). Trust model:
+  attestation soundness reduces to the honesty of the attesting set ---
+  a \emph{single-venue / trusted-operator} assumption.
+\item \textbf{starkfri} (STARK/FRI validity proof): a trustless proof
+  that the state transition to \texttt{stateRoot} at \texttt{height} was
+  valid. \IMPL{}
+  (\texttt{precompile/starkfri/contract.go:75}; \texttt{MagicHeader}
+  \texttt{"P3Q1"}).
+\end{itemize}
+
+\textbf{Preconditions.} (1) \texttt{chainID} resolves in the registry
+and names the verification method it requires (P3Q, starkfri, or both).
+(2) The proof verifies under that method against
+\texttt{(chainID,height,stateRoot)}. (3) The settlement outputs in the
+enclosing \texttt{SettleTx} are consistent with \texttt{stateRoot}
+(the settled deltas are committed under that root).
+
+\textbf{Postconditions / conservation effect.} None directly; it returns
+accept/reject to \texttt{SettleTx}, which performs the value movement.
+
+\textbf{Layering.} P3Q $\to$ starkfri is a progression, not two
+unrelated options: P3Q gives a cheap attestation usable while a single
+trusted venue operates (the LP-218 rollup-commit role its own header
+names, \texttt{contract.go:30,41}); starkfri replaces that trust with a
+proof when the trustless path is available. A chain registers which it
+requires; X enforces it. The trust-model boundary (when an attestation
+is acceptable vs when a STARK is mandatory) is a
+\CRYPTO{} item (Section~\ref{sec:open}).
+
+\subsection{Summary}
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Primitive & Moves value & Conservation effect & Status \\
+\midrule
+\texttt{LockTx}                & yes & spendable $\to$ locked (net 0) & \DESIGN{} \\
+\texttt{UnlockTx}              & yes & locked $\to$ spendable (net 0) & \DESIGN{} \\
+\texttt{SettleTx}             & yes & locked $\to$ visible$+$shielded & \DESIGN{} \\
+\texttt{RequireNFT}          & no  & none (capability gate)         & gate \DESIGN{}, NFT \IMPL{} \\
+\texttt{VerifyChainCommitment} & no  & none (accept/reject)           & seam \DESIGN{}, verifiers \IMPL{} \\
+\bottomrule
+\end{tabular}
+\end{center}

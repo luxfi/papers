@@ -1,0 +1,671 @@
+\section{\texttt{XAppCommitment}: staking without a P fund ledger}
+\label{sec:xappcommitment}
+
+The XLock (Section~\ref{sec:xlock}) is the universal claim handle for a
+\emph{transient} commitment --- an order, a bridge transfer --- that
+settles and releases on a short horizon. Staking is the same idea on a
+long horizon, and it is where the parallel-ledger problem is sharpest:
+the P-Chain today owns a second spendable UTXO set and \emph{mints new
+value} on its own state. This section defines the object that removes
+that --- \textbf{\texttt{XAppCommitment}} --- and its staking
+specialization \textbf{\texttt{XStakeCommitment}}.
+
+The thesis of this section is narrow and load-bearing, so we state it
+before the mechanism: \textbf{Lux does not require economic slashing for
+staking safety.} Stake safety is asset exclusivity --- the committed
+principal can be used in exactly one place --- and exclusivity is a
+property of X's single consume-once state machine, not of a threat to
+burn the principal. Misbehavior is answered by withholding the reward,
+ejecting the validator, and revoking its capability NFT; the principal
+is always returned.
+
+\subsection{The key idea: P owns no spendable fund ledger}
+
+Under XSS, \textbf{P owns no spendable fund ledger.} X finalizes a
+\emph{commitment} of funds to P, and P treats that commitment as stake
+weight --- nothing more. P never holds the principal, never returns it,
+and never mints the reward; it \emph{computes} the validator lifecycle
+and asks X to settle. The funds stay locked on X for the entire bond and
+move only by an X transition.
+
+This is the same move XSS makes for the DEX, generalized. A DEX order
+locks value on X and the matcher holds a \emph{claim}; a validator
+commitment locks value on X and the validator set holds a \emph{claim}.
+One mechanism, two purposes.
+
+We say P owns no spendable fund ledger, not that P owns no ledger at all.
+P keeps lifecycle and reward-eligibility bookkeeping --- a delegatee
+reward accumulator, uptime, the validator set --- and that bookkeeping
+is real (the delegatee accumulator is \texttt{GetDelegateeReward} /
+\texttt{AddRewardUTXO} in \texttt{vms/platformvm/txs/executor/\allowbreak
+proposal\_tx\_executor.go:327--359}, \IMPL{}). The precise claim is that
+none of P's bookkeeping is \emph{spendable}: it is eligibility data X
+consumes when it settles, never an output a P transaction can move.
+
+\subsection{The object}
+
+\texttt{XAppCommitment} generalizes \texttt{XLock} so a single object
+covers stake, trade, and bridge commitments to any app-chain module:
+
+\begin{lstlisting}
+XAppCommitment {
+  commitmentID    // unique id, derived from the committing X tx
+  sourceUTXOIDs   // the spendable X UTXOs consumed to fund it
+  owner           // who the principal returns to (release/abort target)
+  assetID         // single asset; one commitment locks one asset
+  amount          // == sum(value(sourceUTXOIDs))
+  appChainID      // which app-chain may reference this commitment
+  appModuleID     // which module on that chain (e.g. validator_set)
+  purpose         // stake | trade | bridge
+  constraints     // interval [start,end], minAmount, ...
+  activated       // X-visible flag; set by AcceptStake, never unset
+  consumed        // set true exactly once, by a settlement transition
+}
+\end{lstlisting}
+
+\noindent For staking the instantiation is fixed: \texttt{purpose=stake},
+\texttt{appChainID=P}, \texttt{appModuleID=validator\_set}, and
+\texttt{constraints} carries the bond interval and the minimum bond. We
+call that instantiation \texttt{XStakeCommitment}; it is not a new type,
+it is \texttt{XAppCommitment} with these fields pinned. Note what is
+\emph{absent}: there is no \texttt{slashable} flag and no slashed-fraction
+field. The object cannot express confiscation of principal because the
+protocol never confiscates principal (Theorem~\ref{thm:noslash}).
+
+\DESIGN{} No such object exists today. Its relationship to the existing
+code is precisely the relationship \texttt{XLock} has to the P-Chain's
+\texttt{StakeOuts}: \texttt{XStakeCommitment} is what \texttt{StakeOuts}
+becomes when the lock moves off P and onto X, and the principal stops
+being a P-Chain output (the \texttt{StakeOuts} citation and the full
+contradiction are in Section~\ref{sec:stake-contradiction} below).
+
+\subsection{The transition lattice: exactly six transitions}
+\label{sec:stake-transitions}
+
+A commitment moves through a fixed state machine. The six transitions
+below are the \emph{only} ways its \texttt{consumed} or \texttt{activated}
+flag is touched or its funds move; X rejects anything else. There is no
+burn transition and no confiscation transition --- those are not omitted
+for brevity, they are absent by design.
+
+\begin{enumerate}[leftmargin=2.4em,label=\textbf{T\arabic*.}]
+\item \textbf{\texttt{CommitStake}} \;(X UTXO $\to$
+  \texttt{XStakeCommitment}, \texttt{target=P}).
+  Consume \texttt{sourceUTXOIDs}; create one \texttt{XStakeCommitment}
+  with \texttt{activated=false}, \texttt{consumed=false}. Conservation:
+  net zero --- spendable value enters the locked pool, total unchanged.
+
+\item \textbf{\texttt{AcceptStake}} \;(P references the finalized
+  commitment). P's \texttt{validator\_set} module records a validator
+  claim keyed by \texttt{commitmentID}; X sets \texttt{activated=true}.
+  \textbf{This touches no X value and does not set \texttt{consumed}} ---
+  it is a pure P-side computation over a finalized X fact, plus the one
+  X-visible flag flip that closes the activate/abort race
+  (Section~\ref{sec:activate-race}). Capability-gated: a
+  validator-permission NFT (\texttt{RequireNFT},
+  Section~\ref{sec:primitives}) may gate acceptance; absent it,
+  acceptance fails closed.
+
+\item \textbf{\texttt{CompleteStake}} \;(P completion proof $\to$ X
+  releases principal $+$ bounded reward if eligible). On bond expiry
+  with the validator having met the reward conditions, P emits a
+  completion certificate; X consumes the commitment
+  (\texttt{consumed=true}) and creates (a)~the principal output back to
+  \texttt{owner} and (b)~a reward output, where the reward amount is
+  \textbf{recomputed by X} from its own schedule
+  (Section~\ref{sec:rewardmodel}), not taken on P's word. This is the
+  only transition that may increase $\mathrm{total}(a)$
+  (Section~\ref{sec:rewardinflation}).
+
+\item \textbf{\texttt{AbortStake}} \;(stake never accepted / invalid /
+  expired $\to$ X releases principal \emph{only}). If the commitment was
+  never accepted (\texttt{activated=false}) and is invalid or past
+  \texttt{constraints.end}, X consumes the commitment and returns the
+  full \texttt{amount} to \texttt{owner}. No reward. This is the staking
+  instance of the XLock liveness guarantee
+  (Section~\ref{sec:xlock}): value can always come home if P fails to
+  accept. Conservation: net zero.
+
+\item \textbf{\texttt{FailReward}} \;(validator accepted but did not meet
+  reward conditions $\to$ X releases principal \emph{only}). The
+  commitment was accepted (\texttt{activated=true}) but the validator was
+  offline or insufficiently correct, so P's outcome proof says
+  ``no reward.'' X consumes the commitment and returns the full
+  \texttt{amount} to \texttt{owner}. \textbf{The principal is returned in
+  full; only the reward is withheld.} Conservation: net zero. This is the
+  no-slash analog of the legacy abort-block path: same economics
+  (principal back, no reward), no burn.
+
+\item \textbf{\texttt{RevokeOperator}} \;(governance / authorization
+  event revokes a validator or plugin-operator capability). An authorized
+  revocation (e.g. via a \texttt{DisableAuth}-style authorization, modeled
+  on \texttt{vms/platformvm/txs/\allowbreak disable\_l1\_validator\_tx.go:15--22},
+  \IMPL{}) ejects the operator and revokes its capability NFT. It
+  \textbf{does not consume the stake commitment and burns nothing}; the
+  staked principal settles through \texttt{CompleteStake} or
+  \texttt{FailReward} on the normal schedule (reward only if the
+  pre-revocation interval qualified). Revocation removes future
+  capability, not past principal.
+\end{enumerate}
+
+\noindent \texttt{CompleteStake}, \texttt{AbortStake}, and
+\texttt{FailReward} are mutually exclusive and each sets
+\texttt{consumed} exactly once; \texttt{CommitStake} and
+\texttt{AcceptStake} precede them; \texttt{RevokeOperator} is orthogonal
+(it sets neither \texttt{consumed} nor \texttt{activated} and may fire at
+any point a capability exists). There is no transition that makes the
+committed principal spendable while the validator is active, and no
+transition that destroys it.
+
+\paragraph{Economic outcomes, enumerated.} Every terminal state returns
+principal in full. The reward and capability differ:
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Outcome & Principal & Reward / capability \\
+\midrule
+success (\texttt{CompleteStake})        & returned & $+$ bounded reward \\
+offline / incorrect (\texttt{FailReward}) & returned & zero reward \\
+never accepted (\texttt{AbortStake})     & returned & zero reward \\
+misconduct / authz (\texttt{RevokeOperator}) & returned & capability revoked, ejected \\
+\bottomrule
+\end{tabular}
+\end{center}
+\noindent \textbf{Principal is never lost} in any column.
+
+\subsection{The activate/abort race}
+\label{sec:activate-race}
+
+\texttt{AcceptStake} and \texttt{AbortStake}/Expire must not both fire on
+the same commitment --- one would mint a validator claim while the other
+returns the bond. The \texttt{activated} flag serializes them on X:
+\texttt{AcceptStake} sets \texttt{activated=true} and is the only writer
+of that flag; \texttt{AbortStake}/Expire is admissible \emph{only if}
+\texttt{activated=false} at the height it executes. Because both observe
+a single finalized X total order (A1, Section~\ref{sec:stake-theorems}),
+exactly one wins: if acceptance finalized first, the abort is rejected
+(\texttt{activated} is set); if the expiry finalized first, acceptance is
+rejected (the commitment is consumed/expired). \DESIGN{} The flag is the
+new part; the serialization it relies on is X's existing single-order
+finality.
+
+\subsection{P's validation duty is a predicate, not custody}
+
+Under this model P validates a single predicate before
+\texttt{AcceptStake} and before honoring any reference to the commitment:
+
+\begin{quote}
+\emph{A finalized X commitment exists, targeted to P
+(\texttt{appChainID=P}, \texttt{appModuleID=validator\_set}), for this
+owner / validator / amount / asset / interval, that is not expired and
+not consumed.}
+\end{quote}
+
+\noindent That is the whole of P's coupling to value. P does not hold
+the funds, does not track a spendable balance, and does not decide when
+value becomes spendable --- it checks a T2 fact (a finalized X
+commitment) and runs its T1/T3-free computation (the validator
+lifecycle and reward eligibility) on top of it. This is the access model
+of Section~\ref{sec:mesh} applied to staking: P is a computing module
+over X-committed value.
+
+\subsection{Anti-double-spend: exclusivity without P custody}
+\label{sec:stake-exclusivity}
+
+The property that makes this safe \emph{without} P holding custody:
+
+\begin{quote}
+\textbf{Commitment exclusivity.} Once \texttt{CommitStake} consumes
+\texttt{sourceUTXOIDs}, that value cannot be traded on D, bridged on B,
+spent on X, shielded on Z, or re-staked --- because the originating X
+UTXOs are \emph{consumed}, and a consumed UTXO has no spend path on any
+chain.
+\end{quote}
+
+\noindent The argument is the consume-once discipline of the UTXO
+engine, not a new lock service. \texttt{CommitStake} consumes its
+source UTXOs exactly as any X transaction consumes its inputs (the
+\IMPL{} consume-once on inputs, \texttt{vms/xvm/txs/executor/\allowbreak
+semantic\_verifier.go:152--187} \texttt{verifyTransfer}; the same
+consume-once the atomic mailbox relies on,
+\texttt{lux/chains/dexvm/atomic.go:126--138}). After consumption the
+value exists in exactly one place --- inside the
+\texttt{XStakeCommitment} on X --- and is reachable only by the
+settlement transitions above, each of which sets \texttt{consumed} once.
+Exclusivity across \emph{all} uses (trade / bridge / spend / shield /
+re-stake) is therefore free: there is one X state per unit
+(Section~\ref{sec:model}), and a committed unit is in the
+\emph{locked} state under one named commitment. No P-side custody, no
+second ledger, no reconciliation --- the exclusion is a property of X's
+single state machine.
+
+Crucially, this exclusivity \emph{rides on} X's consensus safety; it does
+not manufacture it. ``Consume-once'' is meaningful only because X
+provides a single finalized total order in which each source UTXO is
+spent at most once (A1 below). Atomicity of the
+consume-and-commit step prevents double-\emph{use} of a finalized UTXO;
+it does not by itself guarantee that the order is final --- that is the
+job of consensus. The staking theorems are therefore stated as
+implications from consensus safety, never as replacements for it.
+
+\subsection{Staking safety theorems}
+\label{sec:stake-theorems}
+
+We make the kernel above precise. The theorems are conditional on
+consensus safety and reduce to the ledger-level consume-once /
+conservation results proved in the XSS soundness note
+(\texttt{lux/proofs/xss-double-spend-inflation-soundness.tex}); they
+restate those results in staking terms and add the no-slash corollary.
+
+\paragraph{A1 (consensus assumption).} X provides a single finalized
+total order of accepted transactions, and atomically applies, per
+transaction, the consumption of its input UTXOs together with the
+creation of its outputs and commitments. (This is X's Quasar finality
+guarantee; we assume it, we do not prove it here.)
+
+\begin{theorem}[No double-spend of committed stake]
+\label{thm:nodouble}
+Given A1, once an X UTXO $u$ is consumed by a \texttt{CommitStake} into an
+\texttt{XStakeCommitment} (\texttt{purpose=stake}, \texttt{target=P}), no
+other valid X transition can consume $u$.
+\end{theorem}
+\begin{proof}[Proof sketch]
+By A1 the consumption of $u$ is applied atomically with the creation of
+the commitment in one finalized transaction, and $u$ is thereafter
+absent from the unspent set. Any later transaction naming $u$ as an input
+fails the consume-once check (\IMPL{}
+\texttt{semantic\_verifier.go:152--187}); the single total order admits no
+``later'' that precedes the consumption. Hence $u$ is spent exactly once.
+The conclusion is the staking instance of the ledger consume-once lemma
+in the soundness note. Note the dependence on A1: without finality of the
+order, two branches could each consume $u$ --- atomicity alone does not
+exclude that, consensus does.
+\end{proof}
+
+\begin{theorem}[No inflation from staking settlement]
+\label{thm:noinfl}
+Given A1 and an X-enforced reward schedule
+(Section~\ref{sec:rewardmodel}), staking settlement creates only
+(1)~returned principal already committed in the consumed
+\texttt{XStakeCommitment}, and (2)~a bounded protocol reward permitted by
+that schedule. P cannot mint: P produces only lifecycle evidence
+(completion / failure certificates), which X consumes; the spendable
+outputs are created by X.
+\end{theorem}
+\begin{proof}[Proof sketch]
+\texttt{AbortStake} and \texttt{FailReward} create exactly the principal
+recorded in \texttt{amount} and nothing else (net-zero). \texttt{CompleteStake}
+creates that same principal plus a reward output whose amount X recomputes
+from \texttt{XRewardSchedule}; by construction the schedule bounds the
+reward (the legacy bound is the supply invariant
+\texttt{state\_changes.go:173--175}: \texttt{rewards.Calculate} can never
+push \texttt{supply + reward} past \texttt{maximumSupply}). P emits no
+output and holds no mint authority: \texttt{RewardValidatorTx} has empty
+\texttt{InputIDs}/\texttt{Outputs}
+(\texttt{vms/platformvm/txs/reward\_validator\_tx.go:45--50}, \IMPL{}). Thus the
+only new value is the schedule-bounded reward, which reduces to the
+inflation-soundness result of the proofs note.
+\end{proof}
+
+\begin{theorem}[No slashing required for stake safety]
+\label{thm:noslash}
+Stake safety (Theorems~\ref{thm:nodouble},~\ref{thm:noinfl}) does not
+depend on burning, confiscating, or redirecting committed principal.
+Misbehavior affects reward eligibility (\texttt{FailReward}) or
+authorization status (\texttt{RevokeOperator}); neither alters the
+conservation of committed principal, which is returned in full on every
+terminal transition.
+\end{theorem}
+\begin{proof}[Proof sketch]
+Exclusivity (Theorem~\ref{thm:nodouble}) follows from consume-once under
+A1 and is independent of any burn: no transition in
+Section~\ref{sec:stake-transitions} reduces \texttt{amount} below the
+committed principal, and the only supply-increasing transition is the
+bounded reward (Theorem~\ref{thm:noinfl}). The three terminal transitions
+(\texttt{CompleteStake}, \texttt{AbortStake}, \texttt{FailReward}) each
+return the full principal; \texttt{RevokeOperator} consumes nothing.
+Therefore the safety properties hold with the slash transition removed,
+which establishes the claim. (Liveness incentives are a separate concern,
+handled by reward non-payment and ejection, not by conservation.)
+\end{proof}
+
+\subsection{The reward model: X recomputes, P proves the branch}
+\label{sec:rewardmodel}
+
+The reward is a function evaluated \emph{by X}:
+\[
+\mathrm{rewardAmount} = \texttt{XRewardSchedule}\bigl(
+  \text{validatorID},\,\text{stakeCommitmentID},\,\text{amount},
+\]
+\[
+  \text{startTime},\,\text{endTime},\,\text{uptime/correctness proof},
+  \,\text{network params}\bigr).
+\]
+\texttt{CompleteStake} consumes the commitment and creates a principal
+output plus a reward output of \texttt{rewardAmount} when eligible;
+\texttt{FailReward} consumes the commitment and creates the principal
+output only. No P/D/B/T transition mints: there is no
+\texttt{Fx.CreateOutput} of a reward on any chain but X.
+
+\paragraph{C2 --- the commit/abort fork is a BFT vote, not an
+attestation.} What P hands X is \emph{not} a signed ``proof of good
+standing.'' The legacy reward path settles through a P-Chain
+\emph{proposal vote}: \texttt{RewardValidatorTx} carries no credentials
+at all --- its struct is just a \texttt{TxID} plus cached bytes
+(\texttt{reward\_validator\_tx.go:28--32}), and it declares empty inputs
+and outputs (\texttt{:45--50}). The reward-vs-no-reward decision is made
+by the option-block oracle: \texttt{prefersCommit} fetches the staker,
+computes a local \texttt{float64} uptime via
+\texttt{CalculateUptimePercentFrom}, and prefers the \texttt{CommitBlock}
+iff \texttt{uptime >= expectedUptimePercentage}
+(\texttt{vms/platformvm/block/executor/options.go:102--148}); on error it
+falls back to commit to err toward over-rewarding (\texttt{:79--85}).
+Validators then vote a \texttt{CommitBlock} or \texttt{AbortBlock} and
+BFT finalizes one branch.
+
+\CRYPTO{}\,/\,\DESIGN{} The X-side conditioning object for
+\texttt{CompleteStake}/\texttt{FailReward} is therefore a \emph{finality
+proof of which block branch P finalized} (CommitBlock $\Rightarrow$
+reward eligible, AbortBlock $\Rightarrow$ no reward), \emph{not} an
+attestation of good standing. X reads the branch P committed and
+\textbf{recomputes the reward itself} from \texttt{XRewardSchedule}; it
+never trusts a P-supplied amount. This is what keeps
+Theorem~\ref{thm:noinfl} honest: a compromised P can at most steer the
+branch (a liveness/eligibility lie), it cannot inflate, because X owns
+the schedule. The exact branch-finality proof and the schedule are
+cryptographer- and economics-review items
+(Section~\ref{sec:open}).
+
+\paragraph{C1 --- supply-timing reconciliation (the one explicit
+reward-schedule design decision).} This target model mints the reward at
+\texttt{CompleteStake}. The current code does the opposite: it
+\textbf{pre-mints at activation}. When a pending staker is promoted to
+current, \texttt{state\_changes.go} computes \texttt{potentialReward} and
+immediately does
+\texttt{SetCurrentSupply(supply + potentialReward)} before
+\texttt{PutCurrentValidator}
+(\texttt{vms/platformvm/txs/executor/state\_changes.go:166--175}, \IMPL{}),
+then claws the reward back on the abort branch
+(\texttt{proposal\_tx\_executor.go:294--295} write the refund to
+\emph{both} commit and abort states, while the reward UTXO is added only
+on commit, \texttt{:300--322}). \texttt{XRewardSchedule} can preserve the
+\emph{per-validator} amount under either timing, but \textbf{mint-at-completion
+versus mint-at-admission changes how supply compounds}: pre-minting
+inflates \texttt{currentSupply} (and thus the denominator
+\texttt{rewards.Calculate} sees for the next staker) at admission rather
+than at completion. We default to the spec --- \textbf{mint at
+\texttt{CompleteStake}} --- and flag the supply-timing as the single
+explicit \DESIGN{} decision the reward-schedule design must ratify in P4.
+
+\subsection{Delegation and L1 continuous-fee staking}
+\label{sec:stake-delegation}
+
+Two existing staking shapes must map onto the lattice; both already
+exist in code and neither requires slashing.
+
+\paragraph{Delegation.} A delegator's stake is a second
+\texttt{XStakeCommitment} that shares a validator's weight ceiling.
+Admissibility is cross-commitment: the combined weight on a validator may
+not exceed the limit (\texttt{overDelegated}/\texttt{GetMaxWeight},
+\texttt{vms/platformvm/txs/executor/\allowbreak staker\_tx\_verification\_helpers.go:116--133},
+\IMPL{}), and the delegation interval must be a subset of the validator's
+(\texttt{BoundedBy}). The delegatee's cut accrues in a reward accumulator
+that X reads at \texttt{CompleteStake}
+(\texttt{GetDelegateeReward} $\to$ \texttt{AddRewardUTXO},
+\texttt{proposal\_tx\_executor.go:327--359}, \IMPL{}). This is the precise
+sense in which ``P holds no \emph{spendable} ledger'' is the right
+phrasing: P holds an eligibility accumulator, which X turns into a
+reward output --- P never holds a spendable balance.
+
+\paragraph{L1 continuous-fee staking.} Sovereign-L1 validators do not
+post a fixed bond for a fixed interval; they hold a continuously-debited
+balance. \texttt{IncreaseL1ValidatorBalanceTx} tops the balance up by at most the
+net \$LUX it consumes (the \texttt{Balance} field is bounded by
+inputs less outputs less fee,
+\texttt{vms/platformvm/txs/\allowbreak increase\_l1\_validator\_balance\_tx.go:20--26},
+\IMPL{}) and \texttt{DisableL1ValidatorTx} is an authorized early exit
+(\texttt{DisableAuth.Verify()},
+\texttt{vms/platformvm/txs/\allowbreak disable\_l1\_validator\_tx.go:15--22}, \IMPL{})
+--- neither burns. \DESIGN{} The lattice covers this with a
+\emph{continuous-balance variant} of \texttt{XStakeCommitment}: top-up is
+a \texttt{CommitStake} that augments an existing commitment's
+\texttt{amount}; early-exit is an authorized \texttt{AbortStake} that
+returns the remaining balance. Where the continuous variant is not built,
+the base lattice is explicitly scoped to fixed-bond staking and L1
+continuous staking remains on the legacy path until P4 --- we say so
+rather than pretend the fixed-bond lattice already models it.
+
+\paragraph{The complete outcome lattice (no slash).} Collecting the
+above, a validator's economic outcome is one of:
+\[
+\{\,\text{activate-fail} \to \text{return},\;
+   \text{under-uptime}/\texttt{FailReward} \to \text{return, no reward},
+\]
+\[
+   \text{good-standing}/\texttt{CompleteStake} \to \text{return} + \text{reward},\;
+   \text{L1-topup},\; \text{L1-early-exit}\,\}.
+\]
+No element burns principal.
+
+\subsection{Operator model and accountability without burn}
+\label{sec:operator-accountability}
+
+The same no-slash discipline governs the non-staking operators ---
+DEX matchers and bridge signers --- that settle through X. An operator's
+authority is a capability NFT (Section~\ref{sec:primitives}); its
+accountability is the NFT's revocability, not a bond at risk.
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Invalid receipt:} the settlement is \emph{rejected} at X's
+  \texttt{VerifyChainCommitment} --- no state moves, nothing to slash.
+\item \textbf{Repeated bad output / equivocation:} the operator's
+  capability NFT is \emph{revoked}; it can no longer activate the module.
+\item \textbf{Unavailable:} the operator earns no fees or rewards and is
+  deprioritized / its endpoint marked unhealthy --- non-payment, not
+  confiscation.
+\item \textbf{Malicious:} \emph{ejection} and NFT revocation.
+\end{itemize}
+
+\noindent To make equivocation accountable we record evidence, not a
+penalty:
+\begin{lstlisting}
+EquivocationEvidence {
+  operatorID            // the capability-NFT holder
+  chainID               // the module/chain it equivocated on
+  conflictingMessages   // the two (or more) conflicting signed outputs
+  signatures            // operator signatures binding it to each
+  height                // X height at which the conflict is recorded
+}
+\end{lstlisting}
+\noindent \textbf{Allowed consequences} of recorded evidence: revoke the
+capability NFT, eject the operator, mark its endpoint unhealthy, deny
+future rewards, pause the module's route. \textbf{Disallowed in the base
+model}: burn principal, confiscate stake, redirect stake to a treasury.
+Equivocation evidence is for accountability and capability revocation; it
+does not imply stake confiscation. \DESIGN{} The evidence object and its
+consequence set are new; the capability NFTs it acts on are the \IMPL{}
+\texttt{nftfx}/\texttt{propertyfx} outputs (\texttt{vms/xvm/fxs/fx.go}).
+
+\subsection{The slashing-policy statement}
+\label{sec:slash-policy}
+
+We state the policy verbatim, as the authoritative position of this LP:
+
+\begin{quote}
+Lux does not require economic slashing for staking or plugin-chain
+safety. \texttt{XAppCommitment}s provide asset exclusivity by consuming
+source X UTXOs into purpose-bound commitments. P manages validator
+lifecycle and reward eligibility, but cannot mint, burn, or confiscate
+stake. X settles principal and rewards according to X-level rules.
+Misbehavior is handled by non-payment of rewards, validator/operator
+ejection, and capability NFT revocation. Equivocation evidence may be
+recorded for accountability, but it does not imply stake confiscation in
+the base protocol.
+\end{quote}
+
+\subsection{The contradiction in current code}
+\label{sec:stake-contradiction}
+
+\texttt{XStakeCommitment} is a migration target precisely because the
+P-Chain today does the opposite on three counts. All three are
+\IMPL{} (they are what the code does now) and all three contradict
+``other chains compute, X settles'':
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{P keeps its own spendable UTXO ledger.} The platform state
+  holds \texttt{modifiedUTXOs}, \texttt{utxoDB}, and \texttt{utxoState}
+  --- a second, independent UTXO set
+  (\texttt{vms/platformvm/state/state.go:429--431}). \IMPL{}
+\item \textbf{P holds the principal as its own locked output.} Stake is
+  \texttt{StakeOuts}, P-Chain \texttt{TransferableOutput}s held on P,
+  not a lock on X
+  (\texttt{vms/platformvm/txs/\allowbreak add\_permissionless\_validator\_tx.go:49--50}).
+  \IMPL{}
+\item \textbf{P mints reward value and returns principal on its own
+  state.} At end-of-stake the proposal executor refunds the stake by
+  adding UTXOs to P's state on both forks (\texttt{onCommitState.AddUTXO}
+  / \texttt{onAbortState.AddUTXO},
+  \texttt{vms/platformvm/txs/executor/\allowbreak
+  proposal\_tx\_executor.go:294--295}) \emph{and mints the reward} on the
+  commit fork --- it calls
+  \texttt{Fx.CreateOutput(reward, validationRewardsOwner)} and adds it as
+  a fresh reward UTXO
+  (\texttt{proposal\_tx\_executor.go:300--322},
+  \texttt{AddUTXO}/\texttt{AddRewardUTXO}). \IMPL{}
+\end{enumerate}
+
+\noindent Under \texttt{XStakeCommitment} all three move: (1)~P's
+\texttt{utxoDB} is dropped (P holds claims and eligibility data, not
+spendable UTXOs); (2)~the principal lives in an \texttt{XStakeCommitment}
+on X, not in \texttt{StakeOuts} on P; (3)~principal return becomes
+\texttt{CompleteStake}/\texttt{AbortStake}/\texttt{FailReward} on X, and
+reward issuance becomes the X-level reward-mint transition. This is the
+work of Phase P4 (Section~\ref{sec:migration}); it is the single clearest
+place current code contradicts the model, already surfaced for the
+DEX-vs-stake symmetry in Section~\ref{sec:per-chain}.
+
+\paragraph{The commit/abort fork is the structural obstacle.} Beyond
+minting, P's reward path has a structural dependency the DEX path does
+not: the reward UTXO is written to \texttt{onCommitState} \emph{and} the
+refund UTXO is written to \emph{both} \texttt{onCommitState} and
+\texttt{onAbortState} (\texttt{proposal\_tx\_executor.go:294--295},
+\texttt{300--322}). P's settlement is thus entangled with the
+\emph{proposal commit/abort fork} --- a P-Chain BFT-vote construct (C2,
+Section~\ref{sec:rewardmodel}) with no analog on X.
+\texttt{CompleteStake}/\texttt{FailReward} must reproduce the
+commit/abort economics (reward only on commit, principal returned on
+either) as X settlements \emph{conditioned on the branch P's BFT vote
+finalized}, \emph{without} importing P's proposal-vote machinery onto X
+and \emph{without} X ever trusting a P-supplied reward amount. Getting
+that conditioning right --- a reward minted on X exactly when P committed
+and never when P aborted, recomputed by X --- is a P4 design obligation
+that the transient DEX \texttt{SettleTx} never faces; it is recorded as a
+distinct item for Section~\ref{sec:open}.
+
+\subsection{Rewards are new value: an X-level inflation primitive}
+\label{sec:rewardinflation}
+
+Every other XSS transition is net-zero on total supply: \texttt{LockTx},
+\texttt{UnlockTx}, the transient \texttt{SettleTx}, and the no-reward
+staking transitions (\texttt{CommitStake}, \texttt{AcceptStake},
+\texttt{AbortStake}, \texttt{FailReward}, \texttt{RevokeOperator}) only
+move value between the spendable, locked, and shielded pools
+(Section~\ref{sec:safety}, S2). \textbf{Staking rewards are not.} A
+reward is \emph{new} value of asset $a$, created at \texttt{CompleteStake},
+and it therefore cannot be expressed as a net-zero \texttt{SettleTx}.
+
+\CRYPTO{}\,/\,\DESIGN{} XSS requires a \emph{distinct X-level inflation
+primitive} --- the reward-mint transition --- that is the \emph{only}
+transition allowed to increase $\mathrm{total}(a)$, and only by the
+amount X's schedule permits. Its obligations:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item It fires \emph{only} inside \texttt{CompleteStake}, gated by the
+  branch-finality conditioning of C2 (X reads which block branch P
+  finalized; reward on the commit branch, none on the abort branch). X
+  recomputes the amount from \texttt{XRewardSchedule} --- P proposes the
+  branch, X authorizes and sizes the inflation.
+\item It is the \emph{sole} writer of new supply. With it, the global
+  conservation invariant (Section~\ref{sec:safety}, S2) is restated:
+  $\mathrm{total}(a)$ is constant \emph{except} at the reward-mint
+  transition (which increases it by exactly the authorized reward) and at
+  fee burn (which decreases it). \textbf{There is no slash-burn term} ---
+  no staking transition decreases supply by confiscating principal. Every
+  other transition is net-zero.
+\item The amount must be bound by an X-enforced schedule, not taken on
+  P's word --- the legacy bound already exists as the supply-cap
+  invariant (\texttt{state\_changes.go:173--175}). The precise schedule,
+  the branch-finality proof that ties a reward to a specific bond and
+  uptime, and the monetary-policy bound are cryptographer- and
+  economics-review items.
+\end{itemize}
+
+\noindent This connects to the open question already recorded in
+Section~\ref{sec:open} (``P's mint authority \ldots\ reward minting
+becomes an X-level inflation primitive gated by P's settlement, distinct
+from the net-zero \texttt{SettleTx}''). \texttt{XStakeCommitment}
+specifies \emph{where} that primitive fires (the \texttt{CompleteStake}
+transition), \emph{what} conditions it (the C2 branch-finality proof), and
+\emph{that supply changes only at reward-mint and fee-burn} --- never at a
+slash; it does not assert the schedule or the proof are sound, which
+remain gated on sign-off.
+
+\subsection{The final layered model}
+\label{sec:stake-layers}
+
+The staking design is one instance of a clean layering, which we state
+because the rest of the LP relies on it:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{X} owns money: UTXOs, stake commitments, the reward-mint
+  schedule, and the capability NFTs.
+\item \textbf{P} owns the validator lifecycle: it proves completion,
+  failure, and eligibility, and cannot mint, burn, or confiscate.
+\item \textbf{D / B} own specialized execution: they produce receipts and
+  proofs X settles.
+\item \textbf{Z} proves shielded X-state transitions across the boundary.
+\item \textbf{Misbehavior} costs an actor its reward, its capability, its
+  route, or its operator status --- never another actor's or its own
+  principal.
+\end{itemize}
+\noindent \textbf{The base protocol has no slashing.}
+
+\subsection{Test plan for the X-staking build (design-first TDD)}
+\label{sec:stake-tests}
+
+These are the validation obligations for the staking-on-X migration; they
+are \DESIGN{} targets for Phase P4 (Section~\ref{sec:migration}), written
+now so the migration is test-driven, \emph{not} to be implemented before
+P4. The slash-era cases are removed because the transition they tested no
+longer exists.
+
+\paragraph{Removed (the slash transition is gone).}
+\begin{itemize}[leftmargin=2em,nosep]
+\item \texttt{TestSlashStakeBurnsPrincipal}
+\item \texttt{TestSlashRedirectsStake}
+\item \texttt{TestSlashedStakeConservationWithBurn}
+\end{itemize}
+
+\paragraph{Added (the no-slash lattice).}
+\begin{itemize}[leftmargin=2em,nosep]
+\item \texttt{TestOfflineValidatorReceivesPrincipalNoReward} ---
+  \texttt{FailReward} returns full principal, zero reward.
+\item \texttt{TestInvalidLifecycleProofCannotConsumeStake} --- a malformed
+  completion/failure proof cannot set \texttt{consumed}.
+\item \texttt{TestPChainCannotMintRewardDirectly} --- no P transition
+  creates a reward output; only X's reward-mint does.
+\item \texttt{TestRewardMintBoundedByXSchedule} --- the minted reward
+  equals \texttt{XRewardSchedule} and respects the supply cap.
+\item \texttt{TestEquivocationEvidenceRevokesCapabilityNoBurn} ---
+  recorded evidence revokes the NFT and burns nothing.
+\item \texttt{TestOperatorNFTRevocationBlocksFuturePluginActivation} ---
+  a revoked operator cannot re-activate the module.
+\item \texttt{TestStakeCommitmentPrincipalAlwaysReturnedOnAbortOrFailReward}
+  --- principal conservation on both no-reward terminals.
+\end{itemize}
+
+\noindent These map onto the validation checklist
+(Section~\ref{sec:validation}): the principal-return cases extend P8
+(commitment exclusivity / consume-once), the reward-bound case extends
+the S2/P2 conservation accounting, and the NFT cases extend P5
+(capability gate fails closed).

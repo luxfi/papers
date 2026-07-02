@@ -1,0 +1,225 @@
+\section{Validation properties}
+\label{sec:validation}
+
+The safety properties of Section~\ref{sec:safety} are the invariants XSS
+\emph{is}. This section is operational: it enumerates the properties any
+implementation \textbf{MUST} satisfy as a checklist the test suite maps
+to. Each property states what is being validated, whether it is
+\IMPL{}-\&-tested today or a \DESIGN{}-target, and which LP section and
+code it ties to. This is the bridge between the design and the
+validation harness (Section~\ref{sec:coexistence}): every property here
+is either an assertion already enforced by a test, or an assertion a
+future test must enforce before the corresponding phase flips to
+\texttt{unified}.
+
+\subsection*{P1 --- One X state per unit}
+
+\textbf{Property.} Every unit of value is, at every height, in exactly
+one X state: spendable $\mid$ locked $\mid$ consumed. No unit is in two;
+no unit is in none.
+
+\textbf{Status.} \DESIGN{}-target (extends \IMPL{} consume-once). The
+spendable/consumed states and consume-once on inputs are enforced today
+by the xvm semantic verifier
+(\texttt{vms/xvm/txs/executor/\allowbreak semantic\_verifier.go:152--187});
+the \emph{locked} state is the new \texttt{XLock} the test must add.
+
+\textbf{Ties to.} Safety S1 (Section~\ref{sec:safety}); the \texttt{XLock}
+state machine (Section~\ref{sec:xlock}). \textbf{Test maps to:} a
+state-coverage property over the lock state machine --- lock, unlock,
+settle, double-consume reject --- asserting the disjoint-union of states
+after every transition.
+
+\subsection*{P2 --- Conservation across the X$\leftrightarrow$Z boundary}
+
+\textbf{Property.} For every asset $a$ and height $h$,
+$\mathrm{visible}(a,h) + \mathrm{shielded}(a,h) = \mathrm{total}(a)$,
+constant in $h$ except at exactly \emph{two} supply events
+(Section~\ref{sec:rewardinflation}): the reward-mint at
+\texttt{CompleteStake} (increases $\mathrm{total}(a)$ by the
+X-schedule-bounded reward) and, on the legacy pre-mint path only, the
+abort/under-uptime claw-back that reverses a reward minted at admission
+(\texttt{state\_changes.go:166--175}). \textbf{There is no slash-burn
+term:} no staking transition decreases $\mathrm{total}(a)$ by confiscating
+principal (Theorem~\ref{thm:noslash}).
+
+\textbf{Status.} \DESIGN{}-target, \CRYPTO{}. \textbf{No code tracks the
+cross-pool sum today} (Section~\ref{sec:bridge}): the ZKVM has a
+nullifier DB and commitment tree
+(\texttt{lux/chains/zkvm/nullifier\_db.go}) but no
+visible$+$shielded$=$total accounting across X and Z. The shielded term
+is gated on cryptographer sign-off. The supply-event timing
+(mint-at-completion vs.\ the legacy mint-at-admission $+$ claw-back) is
+the C1 design decision recorded in Section~\ref{sec:rewardmodel}.
+
+\textbf{Ties to.} Safety S2 (Section~\ref{sec:safety}); the boundary
+invariant (Section~\ref{sec:bridge}). \textbf{Test maps to:} a
+shield/unshield round-trip property that recomputes both pool sums after
+every boundary crossing and asserts the total is invariant.
+
+\subsection*{P3 --- Parallel-ledger conservation $I = A + L + F + E$}
+
+\textbf{Property.} On the D-Chain custody ledger, issued (deposited)
+value equals available $+$ locked $+$ fees $+$ exported (withdrawn), at
+every step, wei-exact --- nothing minted, nothing burned, and the maker
+receives exactly what the taker paid.
+
+\textbf{Status.} \IMPL{} \textbf{--- being property-tested.} This is the
+one validation property already enforced end-to-end on the real VM. The
+custody conservation test drives \texttt{BuildBlock $\to$ Verify $\to$
+Accept} through deposit / open / place / cross / settle / withdraw and
+asserts global wei-exact conservation, including the maker leg the prior
+proxy-escrow model dropped
+(\texttt{lx/dex/pkg/dchain/conservation\_test.go:4--15},
+\texttt{TestCustodyConservationFullCycle:121--198}). Companion cases pin
+the corners: same-block place-then-cross
+(\texttt{:206--243}), unfunded-order reject (\texttt{:248--267}),
+cancel-refunds-lock (\texttt{:271--291}), partial-fill conserves \&
+refunds remainder (\texttt{:297--330}), withdraw-clamps-to-available
+(no over-export mint, \texttt{:334--355}). The ledger's own conservation
+comment states the invariant it maintains
+(\texttt{lx/dex/pkg/dchain/state.go:49}).
+
+\textbf{Ties to.} The DEX per-chain reduction (Section~\ref{sec:per-chain});
+the coexistence harness axis~2 (Section~\ref{sec:coexistence}).
+\textbf{Test maps to:} \emph{exists} --- \texttt{conservation\_test.go}.
+Under XSS this invariant must continue to hold in \texttt{shadow} mode
+against the unified ($V{+}L{+}S{=}\mathrm{total}$) path.
+
+\subsection*{P4 --- No optional VM executes on a non-validating node}
+
+\textbf{Property.} A chain's VM runs only on the nodes validating that
+chain; a node that did not join a chain never executes its VM.
+
+\textbf{Status.} \IMPL{} (existing topology). The chain manager hands a
+VM the per-chain context and \texttt{atomic.SharedMemory} only for the
+chains the node validates
+(\texttt{lux/chains/dexvm/vm.go:155--160}); the DEX proxy holds zero
+canonical DEX state and runs no matcher
+(\texttt{vm.go:125--138}).
+
+\textbf{Ties to.} The mesh / access model, ``execution follows the
+chain'' (Section~\ref{sec:mesh}). \textbf{Test maps to:} an integration
+assertion that a node not validating chain $C$ has no $C$ VM instance
+and no $C$ shared-memory handle --- the negative of the role-2/role-3
+distinction (Section~\ref{sec:mesh}).
+
+\subsection*{P5 --- The capability gate fails closed}
+
+\textbf{Property.} A privileged action (validator activation, bridge
+operation, plugin activation) proceeds only if the required
+operator-capability NFT is present; absent the NFT, the action is
+refused --- it fails \emph{closed}, never open.
+
+\textbf{Status.} \DESIGN{} gate over \IMPL{} tokens. The \texttt{nftfx} /
+\texttt{propertyfx} capability mint/transfer outputs exist on X
+(\texttt{vms/xvm/fxs/fx.go}); the \texttt{RequireNFT} predicate that
+gates settlement on them is the new part (Section~\ref{sec:primitives}).
+The fail-closed default is exhibited by the inert-engine discipline:
+without a configured backend the precompile refuses every state-moving
+op (\texttt{precompile/dex/engine\_inert.go:41--60}), the same
+``refuse unless explicitly enabled'' posture the capability gate must
+take.
+
+\textbf{Ties to.} \texttt{RequireNFT} (Section~\ref{sec:primitives});
+\texttt{AcceptStake} gating (Section~\ref{sec:xappcommitment}).
+\textbf{Test maps to:} an activation property asserting that a commitment
+whose actor lacks the scoped NFT cannot activate, and that the
+no-NFT path returns refuse, not proceed.
+
+\subsection*{P6 --- No static registration shadows a PluginDir plugin}
+
+\textbf{Property.} A statically-registered precompile/module must not
+silently override or shadow a plugin loaded from the plugin directory;
+collisions are detected and fail fast, import-order-independently.
+
+\textbf{Status.} \IMPL{} (collision fail-fast) $+$ \DESIGN{}
+(PluginDir precedence). \texttt{RegisterModule} rejects \emph{both} a
+duplicate \texttt{ConfigKey} and a duplicate address with an
+``import-order-independent fail-fast'' error
+(\texttt{precompile/modules/registerer.go:246--274}), so no two static
+registrations can collide unnoticed. The explicit
+\emph{PluginDir-over-static} precedence rule (a dynamically loaded
+plugin wins, or a static registration for a plugin-owned key is
+rejected) is the \DESIGN{} extension P5's registry
+(Section~\ref{sec:migration}) must enforce.
+
+\textbf{Ties to.} The P5 plugin-settlement registry
+(Section~\ref{sec:migration}). \textbf{Test maps to:} a registry
+property asserting (a)~address/key collision fails fast --- \emph{exists}
+as the registerer's guard --- and (b)~a static registration cannot
+shadow a PluginDir-owned module --- to be added with the registry.
+
+\subsection*{P7 --- \texttt{0x9999} reverts rather than simulates}
+
+\textbf{Property.} The DEX EVM precompile never locally simulates D: it
+routes to ZAP/D and commits the returned result, or it reverts. It never
+fabricates a fill, a delta, or a quote.
+
+\textbf{Status.} \IMPL{} \textbf{--- and tested.} The inert default
+reverts every state-moving op with \texttt{ErrDEXBackendNotConfigured}
+and ``never \ldots\ fabricates a fill''
+(\texttt{precompile/dex/engine\_inert.go:12--67}); the embedded matcher
+was removed and its absence is pinned by
+\texttt{TestUnconfiguredPrecompileRevertsNoEmbeddedFallback} and
+\texttt{TestNoLocalQuotePath}, which drive a fully-liquid pool through an
+unconfigured precompile and assert a clean revert and a zero quote ---
+``the proof that no embedded fallback fabricates value''
+(\texttt{precompile/dex/inert\_no\_embedded\_test.go:24--119}).
+
+\textbf{Ties to.} The \texttt{0x9999} ingress rule
+(Section~\ref{sec:ingress}). \textbf{Test maps to:} \emph{exists} ---
+\texttt{inert\_no\_embedded\_test.go}. The XSS-future assertion (route
+intent to D, settle via X proof, revert leaves the lock untouched) is
+added when the lock-funded EVM path lands (P2).
+
+\subsection*{P8 --- X-commitment exclusivity}
+
+\textbf{Property.} Once value is committed (an \texttt{XLock} or an
+\texttt{XAppCommitment}), it cannot be used in parallel anywhere ---
+not traded, bridged, spent, shielded, or re-staked --- until the
+commitment is settled or released, and each commitment is consumed
+exactly once.
+
+\textbf{Status.} \DESIGN{}-target (reuses \IMPL{} consume-once). The
+source UTXOs are consumed exactly as any input is
+(\texttt{vms/xvm/txs/executor/\allowbreak semantic\_verifier.go:152--187});
+the DEX proxy already enforces consume-once on its atomic-import leg with a
+persisted consumed-set (\texttt{lux/chains/dexvm/atomic.go:126--138},
+\texttt{IsConsumed}/\texttt{MarkConsumed}). The commitment's own
+single-use \texttt{consumed} flag is the new part.
+
+\textbf{Ties to.} Safety S5 (Section~\ref{sec:safety}); commitment
+exclusivity (Section~\ref{sec:stake-exclusivity}). \textbf{Test maps
+to:} a property asserting that after \texttt{LockTx}/\texttt{CommitStake}
+the source UTXOs have no spend path on any chain, and that a second
+consume of the same commitment is rejected --- the generalization of the
+proxy's \texttt{errUTXOAlreadyImported} guard
+(\texttt{lux/chains/dexvm/vm.go:44--46}) to the lock layer.
+
+\subsection{Summary: the validation checklist}
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Prop & Statement & Status & Ties to \\
+\midrule
+P1 & one X state per unit         & \DESIGN{} (ext.\ \IMPL{})        & S1, §\ref{sec:xlock} \\
+P2 & visible$+$shielded$=$total   & \DESIGN{}, \CRYPTO{}             & S2, §\ref{sec:bridge} \\
+P3 & $I{=}A{+}L{+}F{+}E$ (DEX)     & \IMPL{}, tested                  & §\ref{sec:per-chain}, harness \\
+P4 & no VM on non-validating node & \IMPL{}                          & §\ref{sec:mesh} \\
+P5 & capability gate fails closed & \DESIGN{} (gate), \IMPL{} (NFTs) & §\ref{sec:primitives} \\
+P6 & no static shadows PluginDir  & \IMPL{} (collision), \DESIGN{}   & §\ref{sec:migration} \\
+P7 & \texttt{0x9999} reverts       & \IMPL{}, tested                  & §\ref{sec:ingress} \\
+P8 & X-commitment exclusivity     & \DESIGN{} (reuses \IMPL{})        & S5, §\ref{sec:stake-exclusivity} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Two properties (P3, P7) are enforced by tests that exist
+today; one topological property (P4) is a property of the current
+mesh; the rest are design targets whose tests are written as their
+phase lands. No phase flips to \texttt{unified}
+(Section~\ref{sec:coexistence}) until the properties it touches are
+green. This checklist is the contract between this specification and the
+swarm's test suite.
