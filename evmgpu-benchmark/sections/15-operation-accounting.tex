@@ -1,0 +1,133 @@
+\section{Full Operation Accounting: EVM, DEX, and FHE Primitives}
+\label{sec:accounting}
+
+For reproducibility and to prevent a single headline figure from standing in for a whole engine,
+this section accounts for every primitive family the unified engine dispatches, with its measured
+cost. The engine comprises \textbf{5} EVM CUDA kernels
+(\texttt{block\_stm}, \texttt{evm\_kernel}, \texttt{keccak256}, \texttt{state\_table},
+\texttt{tx\_validate}), the DEX matching and AMM kernels
+(\texttt{dex\_swap}, \texttt{amm\_xyk}, plus per-backend deterministic CLOB matchers), and
+\textbf{27} FHE CUDA kernels, alongside the post-quantum and classical signature primitives.
+Unless noted, latencies are single-core / single-launch measurements; the accelerator and host
+are stated per table.
+
+\subsection{A necessary correction: two DEX matching models}
+\label{sec:accounting-dex-honesty}
+
+The billion-order figures of Section~\ref{sec:production} measure the \emph{batch} matching kernel
+(\texttt{dex\_swap.cu::batch\_match\_kernel}: one thread-block per taker order, parallel across
+orders)---the model appropriate for the AMM/swap and aggregated-liquidity path. It must not be
+conflated with the \emph{deterministic CLOB} matcher that the consensus path uses. The latter is,
+by deliberate design, launched \verb|<<<1,1>>>|---single-thread, single-block---on every backend
+(CUDA \texttt{dex\_match\_order\_seq}, the HIP \texttt{hipLaunchKernelGGL(\ldots,dim3(1),dim3(1))},
+and the Vulkan \texttt{vkCmdDispatch(1,1,1)}), because any intra-book parallelism would reorder
+fills non-deterministically and fork the chain between validators. The GPU here buys
+\emph{verifiable determinism}, not throughput: it is an oracle that two validators can re-execute
+bit-for-bit, and its per-order latency---not its parallelism---is the figure of merit. Batch
+throughput and deterministic-CLOB determinism are therefore \emph{orthogonal} services of the same
+engine, and we report them separately rather than blending them.
+
+We further note that the Apple-Metal batch figures in Table~\ref{tab:dex-gpu-cpu} are
+dispatch- and submit-bound at this kernel's weight: 16\,M single-order thread-groups doing little
+work each measure command-buffer and dispatch overhead more than matching compute. The CUDA/HIP
+kernel-only figures avoid the submit component; none of these microbenchmarks should be read as
+the sustained deep-book matching rate, which the occupancy analysis
+(Section~\ref{sec:production-occupancy}) bounds.
+
+\subsection{EVM primitives}
+
+\begin{table}[h]
+\centering
+\caption{EVM primitive costs. GPU opcode/gas figures on Apple M1 Max Metal (Sections
+3--4); ecrecover measured single-core on Apple M1 Max (this work).}
+\label{tab:acct-evm}
+\begin{tabular}{lrl}
+\toprule
+\textbf{Operation} & \textbf{Measured} & \textbf{Notes} \\
+\midrule
+GPU opcode throughput      & \SI{85.9}{\mega\text{op}/\second} & $4.85\times$ CPU peak \\
+C++ interpreter (with state) & \SI{20.9}{\giga\text{gas}/\second} & $5.1\times$ Go EVM \\
+Block-STM parallel exec    & \SI{298}{\kilo\text{tx}/\second} & serial heavy-tx baseline, scales to cores \\
+secp256k1 ecrecover        & \SI{242}{\micro\second}/sig (\SI{4124}{sig/\second}) & \textbf{87\% of block time}; $7.1\times$ on 10 cores \\
+keccak256                  & GPU kernel (\texttt{keccak256.cu}) & batched with state hashing \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{DEX primitives}
+
+\begin{table}[h]
+\centering
+\caption{DEX primitive costs. Batch matcher figures from Table~\ref{tab:dex-gpu-cpu} (16\,M
+orders); deterministic CLOB is the single-thread consensus oracle.}
+\label{tab:acct-dex}
+\begin{tabular}{lrl}
+\toprule
+\textbf{Operation} & \textbf{Measured} & \textbf{Notes} \\
+\midrule
+Batch match (parallel, AMM/agg path) & \SI{1.56}{\giga\text{ord}/\second} (AMD) & one block/order; dispatch-bound on Metal \\
+Batch match (CPU, 32 cores)          & \SI{50}{\mega\text{ord}/\second}     & OpenMP reference \\
+Deterministic CLOB match             & \verb|<<<1,1>>>|                       & single-thread \emph{by design} (determinism) \\
+AMM constant-product swap            & \texttt{amm\_xyk} kernel              & CUDA/HIP/Metal/Vulkan/WGSL backends \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{FHE primitives}
+
+The FHE layer's throughput-dominant primitive is the number-theoretic transform (NTT) underlying
+every homomorphic gate. Table~\ref{tab:acct-fhe} reports the measured GPU-vs-CPU speedup of the
+Metal NTT primitive across ring sizes and batch widths (from the FHE microbenchmark suite); the
+programmable bootstrap (PBS) and binary gates are reported as absolute latencies.
+
+\begin{table}[h]
+\centering
+\caption{FHE primitive costs (Metal NTT primitive and OpenFHE-derived PBS/gate timings).}
+\label{tab:acct-fhe}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Operation} & \textbf{Measured} & \textbf{GPU speedup} \\
+\midrule
+NTT $N{=}4096$, batch 128 & \SI{13.9}{\milli\second}$\to$\SI{0.59}{\milli\second} & \textbf{23.6$\times$} \\
+NTT $N{=}4096$, batch 32  & --- & 9.0$\times$ \\
+NTT $N{=}8192$, batch 128 & --- & 6.2$\times$ \\
+NTT $N{=}1024$, batch 128 & --- & 4.3$\times$ \\
+PBS single (TOY)          & \SI{4.99}{\milli\second} & --- \\
+PBS batch $n{=}8$         & \SI{43.93}{\milli\second} & amortized per-slot \\
+Binary gate (AND, STD128) & \SI{50.5}{\micro\second}-class & bootstrapped gate \\
+Kernel count              & 27 CUDA kernels & bootstrap, blind-rotate, ext-product, keyswitch, NTT \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Signature primitives (post-quantum and classical)}
+
+\begin{table}[h]
+\centering
+\caption{Signature primitive costs, single-core on Apple M1 Max (this work). Threshold schemes
+report the canonical CPU body; GPU round-1 dispatch is a separate path.}
+\label{tab:acct-sig}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Scheme} & \textbf{Sign} & \textbf{Verify} \\
+\midrule
+ML-DSA-65 (FIPS 204, PQ)      & \SI{450}{\micro\second} & \SI{134}{\micro\second} \\
+secp256k1 (classical)         & --- & \SI{242}{\micro\second} (recover) \\
+Ringtail threshold ($n{=}3$)  & \SI{99.8}{\milli\second} & \SI{0.44}{\milli\second} \\
+Corona threshold ($n{=}3$)    & \SI{92.1}{\milli\second} & \SI{0.43}{\milli\second} \\
+modexp 2048-bit (CIOS)        & \multicolumn{2}{c}{\SI{0.022}{\milli\second}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{What this accounting shows}
+
+Three facts survive the full accounting. First, the DEX \emph{batch} path and the DEX
+\emph{deterministic} path are distinct services with distinct figures of merit---parallel
+throughput versus verifiable single-thread determinism---and honesty requires reporting both.
+Second, the FHE NTT primitive is the one place a large GPU speedup ($23.6\times$) is both measured
+and load-bearing, because every homomorphic gate is NTT-bound. Third, the classical ecrecover, at
+\SI{242}{\micro\second} and 87\% of EVM block time, remains the single highest-leverage
+optimization target and the strongest argument for the GPU/parallel crypto path---an argument that
+holds independently of the DEX and FHE results. These are the primitives from which the unified
+engine's aggregate behaviour is composed; no single one is the engine.
