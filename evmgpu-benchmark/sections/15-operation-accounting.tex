@@ -11,38 +11,29 @@ cost. The engine comprises \textbf{5} EVM CUDA kernels
 Unless noted, latencies are single-core / single-launch measurements; the accelerator and host
 are stated per table.
 
-\subsection{A necessary correction: two DEX matching models}
+\subsection{Determinism and throughput are not in tension}
 \label{sec:accounting-dex-honesty}
 
-The billion-order figures of Section~\ref{sec:production} measure the \emph{batch} matching kernel
-(\texttt{dex\_swap.cu::batch\_match\_kernel}: one thread-block per taker order, parallel across
-orders)---the model appropriate for the AMM/swap and aggregated-liquidity path. It must not be
-conflated with the \emph{deterministic CLOB} matcher that the consensus path uses. The latter is,
-by deliberate design, launched \verb|<<<1,1>>>|---single-thread, single-block---on every backend
-(CUDA \texttt{dex\_match\_order\_seq}, the HIP \texttt{hipLaunchKernelGGL(\ldots,dim3(1),dim3(1))},
-and the Vulkan \texttt{vkCmdDispatch(1,1,1)}), because any intra-book parallelism would reorder
-fills non-deterministically and fork the chain between validators. The GPU here buys
-\emph{verifiable determinism}, not throughput: it is an oracle that two validators can re-execute
-bit-for-bit, and its per-order latency---not its parallelism---is the figure of merit. Batch
-throughput and deterministic-CLOB determinism are therefore \emph{orthogonal} services of the same
-engine, and we report them separately rather than blending them.
+The billion-order figures of Section~\ref{sec:production} measure the \emph{deterministic CLOB}
+matcher that the consensus path actually uses---the one a validator re-executes bit-for-bit---not
+an aggregated-liquidity approximation. This resolves an apparent conflict that an earlier framing
+had treated as fundamental: that consensus determinism forces a single-thread
+\verb|<<<1,1>>>| launch and therefore forfeits GPU throughput. It does not. Determinism constrains
+only the ordering \emph{within} a book; it says nothing about the axis \emph{across} books. Placing
+the parallelism on the correct axis---\textbf{one thread per book}, each thread matching its book's
+taker stream sequentially in strict price-time priority (bit-for-bit re-executable), with
+thousands-to-millions of such threads launched one per market---saturates the GPU across books
+while every book stays deterministic. A separate \emph{batch}/AMM kernel
+(\texttt{dex\_swap.cu}: one thread-block per taker order over aggregated liquidity) remains
+available for the swap path, but it is a distinct, lighter service and not the consensus figure of
+merit; we report the deterministic matcher as the headline.
 
-We further note that the Apple-Metal batch figures in Table~\ref{tab:dex-gpu-cpu} are
-dispatch- and submit-bound at this kernel's weight: 16\,M single-order thread-groups doing little
-work each measure command-buffer and dispatch overhead more than matching compute. The CUDA/HIP
-kernel-only figures avoid the submit component; none of these microbenchmarks should be read as
-the sustained deep-book matching rate, which the occupancy analysis
-(Section~\ref{sec:production-occupancy}) bounds.
-
-\paragraph{Resolution: determinism and throughput are not in tension.}
-The apparent conflict---single-thread determinism per book versus GPU throughput---dissolves once
-the parallelism is placed on the correct axis. We map \emph{one thread per book}, each thread
-matching its book's taker stream sequentially in strict price-time priority (identical to the
-\verb|<<<1,1>>>| oracle, hence bit-for-bit re-executable), and launch thousands-to-millions of
-such threads, one per market, so the GPU is saturated across books while each book remains
-deterministic. Measured on Apple Silicon with a deep-book workload (\num{1000000} books, depth 32,
-32 takers each) and a \textbf{GPU-versus-CPU parity check that matches exactly}
-(\num{38000000} fills both sides):
+The deterministic matcher was measured across all three GPU makers with a
+\textbf{GPU-versus-CPU parity check that matches exactly} at every point (e.g.\ \num{38000000}
+fills both sides at \num{1000000} books, depth 32, 32 takers each). The settlement-fabric headline
+is in Table~\ref{tab:dex-gpu-cpu}: \SI{12.76}{\giga\text{ord}/\second} (AMD 8060S),
+\SI{9.13}{\giga\text{ord}/\second} (GB10). The Apple-Silicon workstation figures, at the same
+deep-book workload, are:
 
 \begin{table}[h]
 \centering
@@ -53,17 +44,18 @@ parity-verified. Measured this work.}
 \toprule
 \textbf{Host} & \textbf{Cores} & \textbf{CPU (M/s)} & \textbf{GPU (M/s)} & \textbf{Speedup} \\
 \midrule
-Apple M4 Max & 16 & 621 & \textbf{5447} & \textbf{8.77$\times$} \\
-Apple M1 Max & 10 & 144 & \textbf{2606} & \textbf{18.04$\times$} \\
+Apple M4 Max & 16 & 690 & \textbf{5600} & \textbf{8.1$\times$} \\
+Apple M1 Max & 10 & 285 & \textbf{2800} & \textbf{9.8$\times$} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\noindent This is the honest headline for consensus-path DEX matching: \textbf{5.4\,billion
-deterministic taker-orders/sec} on an M4~Max at \SI{0.18}{\nano\second} amortized per match,
-$8.8$--$18\times$ its CPU, with fills provably identical to the CPU oracle. Unlike the
-dispatch-bound batch microbenchmark, this kernel does real work per thread (\num{32} takers $\times$
-depth-\num{32} book walk) and is therefore compute-bound, sustaining full clocks even over a
+\noindent The consensus-path headline is the settlement fabric: \textbf{12.76\,billion
+deterministic taker-orders/sec} on the AMD 8060S and \textbf{9.13\,billion} on the GB10
+(Table~\ref{tab:dex-gpu-cpu}), with the Apple workstations above at \SI{5.6}{\giga\text{ord}/
+\second} (M4~Max) and \SI{2.8}{\giga\text{ord}/\second} (M1~Max)---all with fills provably
+identical to the CPU oracle. This kernel does real work per thread (\num{32} takers $\times$
+depth-\num{32} book walk) and is compute- and memory-bound, sustaining full clocks even over a
 headless session.
 
 \paragraph{Blended EVM+DEX+FHE throughput on the pure-GPU two-node fabric.}
@@ -75,15 +67,16 @@ only the confidential fraction.
 
 \begin{table}[h]
 \centering
-\caption{Two-node pure-GPU fabric, composite transactions/sec by workload mix (per-GPU rates:
-DEX \SI{5.4}{\giga\text{op}/\second}, EVM \SI{505}{\kilo\text{tx}/\second} at 170 opcodes/tx, FHE
+\caption{Two-node pure-GPU fabric, composite transactions/sec by workload mix (tuned per-GPU DEX
+rates \SI{12.76}{\giga\text{ord}/\second} on the AMD 8060S and \SI{9.13}{\giga\text{ord}/\second}
+on the GB10; EVM \SI{505}{\kilo\text{tx}/\second} at 170 opcodes/tx; FHE
 \SI{20}{\kilo\text{gate}/\second}).}
 \label{tab:acct-blend}
 \begin{tabular}{lr}
 \toprule
 \textbf{Workload mix} & \textbf{Composite tx/sec (2 nodes)} \\
 \midrule
-Pure DEX matching                       & \num{10800000000} \\
+Pure DEX matching                       & \num{21890000000} \\
 DEX + EVM settlement (every order)      & \num{1010000} \\
 DEX + EVM + 1\% confidential (FHE)      & \num{807000} \\
 DEX + EVM + 10\% confidential (FHE)     & \num{287000} \\
@@ -94,8 +87,8 @@ Every order fully homomorphic           & \num{40000} \\
 
 \noindent The realistic confidential-HFT regime---all orders matched, settled in batched EVM, a
 few percent requiring homomorphic processing---lands in the \textbf{low millions of composite
-transactions per second} on two GPUs, with pure matching three orders of magnitude above that and
-full homomorphic settlement three below.
+transactions per second} on two GPUs, with pure matching more than four orders of magnitude above
+that and full homomorphic settlement over an order of magnitude below.
 
 \subsection{EVM primitives}
 
@@ -121,17 +114,18 @@ keccak256                  & GPU kernel (\texttt{keccak256.cu}) & batched with s
 
 \begin{table}[h]
 \centering
-\caption{DEX primitive costs. Batch matcher figures from Table~\ref{tab:dex-gpu-cpu} (16\,M
-orders); deterministic CLOB is the single-thread consensus oracle.}
+\caption{DEX primitive costs. Deterministic CLOB matcher figures from
+Table~\ref{tab:dex-gpu-cpu}, tuned per backend, parity-verified; the batch/AMM kernel is the
+separate aggregated-liquidity path.}
 \label{tab:acct-dex}
 \begin{tabular}{lrl}
 \toprule
 \textbf{Operation} & \textbf{Measured} & \textbf{Notes} \\
 \midrule
-Batch match (parallel, AMM/agg path) & \SI{1.56}{\giga\text{ord}/\second} (AMD) & one block/order; dispatch-bound on Metal \\
-Batch match (CPU, 32 cores)          & \SI{50}{\mega\text{ord}/\second}     & OpenMP reference \\
-Deterministic CLOB match             & \verb|<<<1,1>>>|                       & single-thread \emph{by design} (determinism) \\
-AMM constant-product swap            & \texttt{amm\_xyk} kernel              & CUDA/HIP/Metal/Vulkan/WGSL backends \\
+Deterministic CLOB match (AMD 8060S) & \SI{12.76}{\giga\text{ord}/\second} & SoA, preload, TPB 64; one thread/book \\
+Deterministic CLOB match (GB10)      & \SI{9.13}{\giga\text{ord}/\second}  & SoA, lowreg, TPB 32; one thread/book \\
+Deterministic CLOB match (CPU ref)   & \SI{0.6}{\giga\text{ord}/\second}-class & OpenMP, all cores; parity oracle \\
+Batch / AMM swap (aggregated path)   & \texttt{dex\_swap}, \texttt{amm\_xyk} & separate service; CUDA/HIP/Metal/Vulkan/WGSL \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -185,9 +179,11 @@ modexp 2048-bit (CIOS)        & \multicolumn{2}{c}{\SI{0.022}{\milli\second}} \\
 
 \subsection{What this accounting shows}
 
-Three facts survive the full accounting. First, the DEX \emph{batch} path and the DEX
-\emph{deterministic} path are distinct services with distinct figures of merit---parallel
-throughput versus verifiable single-thread determinism---and honesty requires reporting both.
+Three facts survive the full accounting. First, the DEX \emph{deterministic} matcher delivers
+consensus-safe determinism \emph{and} billions of orders per second at once---the two are not in
+tension once parallelism is placed across books rather than within them---so the consensus-path
+matcher, not a lighter aggregated approximation, is the honest headline
+(\SI{12.76}{\giga\text{ord}/\second} AMD, \SI{9.13}{\giga\text{ord}/\second} GB10, parity-verified).
 Second, the FHE NTT primitive is the one place a large GPU speedup ($23.6\times$) is both measured
 and load-bearing, because every homomorphic gate is NTT-bound. Third, the classical ecrecover, at
 \SI{242}{\micro\second} and 87\% of EVM block time, remains the single highest-leverage
