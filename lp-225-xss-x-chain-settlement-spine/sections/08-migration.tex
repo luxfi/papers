@@ -1,0 +1,98 @@
+\section{Phased migration}
+\label{sec:migration}
+
+No phase jumps directly to unified. Each phase is additive, lands behind
+the selector of Section~\ref{sec:coexistence} in \texttt{shadow} first,
+and flips to \texttt{unified} only on the harness exit criterion. Phases
+are ordered by blast radius: the lowest-risk new object first, the
+highest-trust custody (staking) last.
+
+\subsection*{P1 --- X locks as first-class objects}
+
+Add \texttt{LockTx}, \texttt{UnlockTx}, and \texttt{SettleTx} to X as
+new transaction types, plus the \texttt{XLock} output type
+(Section~\ref{sec:xlock}) and the lock state in xvm's state. No module
+uses them yet; this phase delivers the spine itself and its own tests
+(lock $\to$ unlock-by-owner, lock $\to$ unlock-by-timeout, lock $\to$
+settle-by-proof, double-consume rejection, conservation per asset). It
+extends the existing \texttt{lux.VerifyTx} conservation path
+(\texttt{vms/xvm/txs/executor/syntactic\_verifier.go:58}) to count
+locked outputs. Risk: contained to X; no module behavior changes.
+
+\subsection*{P2 --- DEX uses \texttt{lockID} for order funding}
+
+D gains an order-funding path keyed by \texttt{lockID} and a
+\texttt{SettleTx}-to-X settlement path, \emph{alongside} the
+\texttt{available}/\texttt{locked} ledger
+(\texttt{lx/dex/pkg/dchain/state.go:54}). Run in \texttt{shadow}: every
+order funds and settles both ways; the harness diffs fills and balances
+(Section~\ref{sec:coexistence}, axis 1) and both conservation invariants
+(axis 2). This is the first module proven equal. The DEX matcher,
+\texttt{settleFills}, and book are unchanged; only the funding/settlement
+custody is dualized.
+
+\subsection*{P3 --- bridge uses X locks}
+
+B moves to \texttt{LockTx(purpose=bridge)} funding and
+\texttt{RequireNFT} operator gating, settling returns via
+\texttt{SettleTx}. The \texttt{nftfx} capability is \IMPL{}
+(\texttt{vms/xvm/fxs/fx.go}); this phase wires it as the operator gate.
+Bridges carry the most external-trust risk, so they migrate after the
+internal DEX path is proven but before staking. Foreign-chain proof
+verification routes through \texttt{VerifyChainCommitment}.
+
+\subsection*{P4 --- P staking uses X stake-locks}
+
+P moves stake to \texttt{LockTx(purpose=stake)} producing a
+\texttt{stakeLockID}, with reward/unlock finalized by
+\texttt{SettleTx}. P drops its parallel staking custody --- the
+\texttt{StakeOuts} outputs
+(\texttt{txs/add\_permissionless\_validator\_tx.go:50}) and the
+return-and-mint on P's own state
+(\texttt{txs/executor/proposal\_tx\_executor.go:283--325}). This phase
+\textbf{must also resolve the asset-mint contradiction}: P's
+\texttt{CreateAssetTx} (\texttt{txs/executor/create\_asset\_tx.go:61})
+either moves to X or becomes a settled result; P retaining independent
+mint authority is incompatible with the unified model. Staking is last
+because it is the highest-value, longest-lived custody and the one whose
+divergence would be most costly --- it flips to \texttt{unified} only
+after the longest \texttt{shadow} soak.
+
+\subsection*{P5 --- general plugin-settlement registry}
+
+Generalize \texttt{targetChainID}/\texttt{targetModuleID} into a
+registry so any computing chain can settle through X under explicit
+rules. Each registry entry records:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \texttt{chainID} / \texttt{moduleID} --- the settler identity that
+  \texttt{LockTx} and \texttt{SettleTx} scope to.
+\item \texttt{verificationMethod} --- which proof
+  \texttt{VerifyChainCommitment} requires: P3Q attestation, starkfri
+  STARK, or both, and the threshold.
+\item \texttt{operatorNFTRequirement} --- the capability (if any) gating
+  privileged actions, checked via \texttt{RequireNFT}.
+\item \texttt{settlementRules} --- allowed purposes, allowed output
+  forms (visible / shielded), expiry bounds.
+\end{itemize}
+
+\noindent With P5 the five primitives plus the registry are the complete
+public surface: a new module integrates by registering, not by adding a
+new custody mechanism. This is the ``one and only one way to settle''
+end state.
+
+\subsection*{Ordering rationale}
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Phase & Adds & Risk if it diverges & Soak \\
+\midrule
+P1 & lock primitives on X      & contained to X            & short \\
+P2 & DEX lock-funding          & forked fills (internal)   & medium \\
+P3 & bridge lock-funding       & external-chain trust      & medium \\
+P4 & staking lock-funding      & highest-value custody     & long \\
+P5 & plugin registry           & opens the surface         & per-module \\
+\bottomrule
+\end{tabular}
+\end{center}

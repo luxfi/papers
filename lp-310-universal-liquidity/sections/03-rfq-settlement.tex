@@ -1,0 +1,148 @@
+\section{Signed-Quote RFQ and Atomic Settlement}
+\label{sec:rfq}
+
+The request-for-quote path is where universal liquidity earns its
+correctness. We give the order object, the five-step lifecycle, the
+on-chain checks, and the two theorems that make the path safe for both
+parties.
+
+\subsection{The signed order}
+
+\begin{definition}[Quote order]
+\label{def:order}
+A quote order is the tuple
+\[
+\mathcal{O} = (\mathit{tokenIn},\ \mathit{tokenOut},\
+\mathit{amountIn},\ \mathit{amountOut},\ \mathit{expiry},\
+\mathit{nonce},\ \mathit{taker}),
+\]
+signed by the market maker under its ML-DSA-65 key to produce
+$\sigma_{\mathrm{MM}} = \mathrm{Sign}_{sk_{\mathrm{MM}}}(\mathcal{O})$.
+The market maker's commitment is precisely: ``a transaction submitted
+before \emph{expiry} that delivers \emph{amountIn} of \emph{tokenIn}
+will receive at least \emph{amountOut} of \emph{tokenOut}.''
+\end{definition}
+
+It is the \emph{maker} who signs the price. The taker authorizes the
+movement of their own funds separately --- via a Permit2 signature
+(\cite{permit2}) --- which is a gasless approval, not a price commitment.
+This separation is the crux: the maker is bound to the price, the taker
+is bound to the spend, and neither can unilaterally alter the other's
+obligation.
+
+\subsection{Lifecycle}
+
+\begin{enumerate}
+  \item \textbf{Quote.} The taker's frontend requests a price for
+  $\mathit{amountIn}$ of $A\to B$. The backend reads the reference
+  price, adds spread, \emph{reserves} the required $B$ inventory
+  (\S\ref{sec:rfq-inv}), and returns a signed order $\mathcal{O}$ with a
+  short expiry.
+
+  \item \textbf{Sign (taker).} The taker signs a Permit2 message
+  authorizing the settlement contract to pull $\mathit{amountIn}$ of
+  $A$. This is off-chain and gasless.
+
+  \item \textbf{Submit.} The backend relays one transaction to the
+  settlement contract carrying $(\mathcal{O}, \sigma_{\mathrm{MM}},
+  \mathit{permit2}_{\mathrm{taker}})$. The relayer pays gas; its cost is
+  folded into the spread.
+
+  \item \textbf{Settle (atomic).} The contract performs the checks
+  below and, if all pass, pulls $A$ from the taker and delivers
+  $\mathit{amountOut}$ of $B$ from maker inventory in the same call ---
+  fully or not at all.
+
+  \item \textbf{Hedge.} The backend restocks by trading $A\to B$ on the
+  external venue to flatten the inventory move from step~4.
+\end{enumerate}
+
+\subsection{On-chain checks (the settlement predicate)}
+
+The settlement contract accepts $(\mathcal{O}, \sigma_{\mathrm{MM}},
+\mathit{permit2})$ iff all of:
+\begin{enumerate}[label=(C\arabic*),leftmargin=3.2em]
+  \item $\mathrm{Verify}_{pk_{\mathrm{MM}}}(\mathcal{O},
+  \sigma_{\mathrm{MM}})$ holds --- the maker signed this exact order;
+  \item $\mathit{block.timestamp} \le \mathcal{O}.\mathit{expiry}$ ---
+  the quote is live;
+  \item $\mathcal{O}.\mathit{nonce}$ is unused, then marked used ---
+  no replay;
+  \item the Permit2 pull of $\mathit{amountIn}$ from the taker
+  succeeds; and
+  \item maker inventory holds $\ge \mathit{amountOut}$ of
+  $\mathit{tokenOut}$.
+\end{enumerate}
+Any failure reverts the entire transaction, restoring both balances.
+
+\subsection{Inventory reservation}
+\label{sec:rfq-inv}
+
+A quote must be backed by inventory at the moment it is issued, not
+hoped for at settlement. The backend reserves $\mathit{amountOut}$ of
+$B$ against the live quote and releases the reservation on expiry or
+fill. Without reservation a maker can sign more deliverable output than
+it holds; check (C5) then turns oversubscription into user-visible
+reverts. Reservation moves the failure to quote time, where it is
+invisible to the taker (the maker simply quotes a smaller size or
+declines).
+
+\subsection{The two safety theorems}
+
+\begin{theorem}[Quote integrity]
+\label{thm:integrity}
+If the settlement transaction succeeds, the taker receives at least
+$\mathcal{O}.\mathit{amountOut}$ of $\mathit{tokenOut}$ for exactly
+$\mathcal{O}.\mathit{amountIn}$ of $\mathit{tokenIn}$.
+\end{theorem}
+\begin{proof}
+Success requires (C1)--(C5). (C1) binds the realized amounts to the
+signed $\mathcal{O}$; (C4) fixes the input at $\mathit{amountIn}$; the
+delivery in step~4 transfers $\mathit{amountOut}$ gated by (C5).
+Atomicity makes the transfer all-or-nothing, so a successful
+transaction realizes exactly the signed amounts. The maker cannot
+substitute a worse price because any other amounts produce a different
+$\mathcal{O}'$ for which $\sigma_{\mathrm{MM}}$ fails (C1).
+\end{proof}
+
+\begin{theorem}[No free option]
+\label{thm:nooption}
+A taker holding a signed order $\mathcal{O}$ cannot execute it after
+$\mathcal{O}.\mathit{expiry}$.
+\end{theorem}
+\begin{proof}
+Execution requires (C2), $\mathit{block.timestamp} \le
+\mathcal{O}.\mathit{expiry}$, checked against the inclusion block's
+timestamp. After expiry every inclusion fails (C2) and reverts. The
+window in which the quote is exercisable is therefore bounded by
+$\mathcal{O}.\mathit{expiry} - t_{\mathrm{quote}}$, which the maker sets
+to the order of seconds. The taker cannot hold the quote as a
+free option on adverse price movement.
+\end{proof}
+
+\subsection{Hedge risk is the spread's job}
+\label{sec:rfq-risk}
+
+Between the on-chain fill (time $T$) and the completed external hedge
+(time $T+\delta$) the reference price drifts. The maker's profit on a
+filled order is
+\[
+\Pi \;=\; \underbrace{s\cdot \mathrm{ref}_{T}\cdot x}_{\text{spread captured}}
+\;-\; \underbrace{\big(\mathrm{ref}_{T+\delta}-\mathrm{ref}_{T}\big)\cdot x}_{\text{hedge slippage}}
+\;-\; g,
+\]
+with $g$ the relayer gas. The spread $s$ must dominate the expected
+hedge slippage over the latency $\delta$ plus gas; for volatile pairs
+this means a wider $s$ or pre-held inventory rather than
+quote-then-hedge. Two operational invariants follow:
+\begin{itemize}
+  \item \textbf{Hedge failure is not fill failure.} The on-chain fill
+  is final the instant it confirms; if the subsequent external hedge
+  fails (venue outage, insufficient balance) the maker is left
+  directionally exposed and must retry or hedge on a secondary venue.
+  The settlement path must never make the user's fill contingent on the
+  maker's hedge.
+  \item \textbf{Spread is priced for $\delta$, not for $0$.} A spread
+  computed as if the hedge were instantaneous systematically loses on
+  the tail of $\delta$; the maker prices the latency, not the mid.
+\end{itemize}

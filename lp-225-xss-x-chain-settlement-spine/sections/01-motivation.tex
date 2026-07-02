@@ -1,0 +1,137 @@
+\section{Motivation: kill the parallel ledgers}
+\label{sec:motivation}
+
+\subsection{The same coin, ledgered three times}
+
+Lux runs several chains, and today each one that touches value keeps
+its \emph{own} spendable ledger. This is not an abstraction we are
+imposing on the code in order to argue against it; it is what the code
+does right now.
+
+\begin{itemize}[leftmargin=2em]
+\item \textbf{X-Chain (xvm) keeps a UTXO set.} \IMPL{} The state
+  package holds \texttt{modifiedUTXOs} and a metered
+  \texttt{utxoState} backed by a dedicated UTXO database
+  (\texttt{vms/xvm/state/state.go:142,144,221}). Assets are minted by
+  \texttt{CreateAssetTx} (\texttt{vms/xvm/txs/create\_asset\_tx.go:18}),
+  transferred/minted through \texttt{OperationTx}
+  (\texttt{vms/xvm/txs/operation\_tx.go:20}), and conservation
+  (inputs $=$ outputs $+$ fee) is enforced by \texttt{lux.VerifyTx}
+  in the syntactic verifier
+  (\texttt{vms/xvm/txs/executor/syntactic\_verifier.go:58}). This is
+  the chain XSS keeps and elevates.
+
+\item \textbf{P-Chain (platformvm) keeps a \emph{second}, independent
+  UTXO set.} \IMPL{} The platform state has its own
+  \texttt{modifiedUTXOs}, \texttt{utxoDB}, and \texttt{utxoState}
+  (\texttt{vms/platformvm/state/state.go:429--431}), initialised via
+  \texttt{NewMeteredUTXOState} over a \texttt{UTXOPrefix} database
+  (\texttt{state.go:683--684}), with its own
+  \texttt{AddUTXO}/\texttt{GetUTXO}/\texttt{DeleteUTXO}/\texttt{UTXOIDs}
+  (\texttt{vms/platformvm/state/state\_utxos.go:14--34}). Stake is held
+  as locked P-Chain outputs --- \texttt{StakeOuts} on
+  \texttt{AddPermissionlessValidatorTx}
+  (\texttt{txs/add\_permissionless\_validator\_tx.go:50--51}) --- and
+  the P-Chain \emph{mints} reward outputs and returns stake on its own
+  state at the end of staking
+  (\texttt{txs/executor/proposal\_tx\_executor.go:283--325}). The
+  P-Chain can even mint fresh assets with its own
+  \texttt{CreateAssetTx} (\texttt{txs/executor/create\_asset\_tx.go:61}).
+  This is a fully autonomous parallel ledger.
+
+\item \textbf{D-Chain (DEX venue) keeps a \emph{third} ledger.} \IMPL{}
+  The venue stores a per-account, per-asset \texttt{available} balance
+  and a \texttt{locked} balance under the key schema
+  \texttt{balance:<user:8><asset:8>} and
+  \texttt{locked:<user:8><asset:8>}
+  (\texttt{lx/dex/pkg/dchain/state.go:54--59}). Its own comment states
+  the conservation invariant it maintains independently:
+  ``\,\texttt{sum(balance:) + sum(locked:)} over an
+  \texttt{(account,asset)} is constant across deposit~$\to$~trade~$\to$
+  ~withdraw\,'' (\texttt{state.go:45--52}).
+\end{itemize}
+
+\noindent Three chains, three conservation invariants, three places the
+same economic unit is represented. Value moves between them by copying
+it out of one ledger and into another.
+
+\subsection{The shuttle: atomic import/export}
+
+The chains are stitched together by an atomic shared-memory rail. It
+is correct --- it is the cross-chain all-or-nothing discipline of
+LP-211~\cite{lp211} --- and it is duplicative.
+
+\begin{itemize}[leftmargin=2em]
+\item \textbf{X exports/imports.} \IMPL{} \texttt{ExportTx} wire-encodes
+  a UTXO and places it in the destination chain's shared memory
+  (\texttt{vms/xvm/txs/executor/executor.go:107--150}, the
+  \texttt{PutRequests} path); \texttt{ImportTx} reads a UTXO from the
+  source chain's shared memory and consumes it once
+  (\texttt{vms/xvm/txs/executor/semantic\_verifier.go:83--125},
+  \texttt{SharedMemory.Get}; \texttt{executor.go:87--105},
+  \texttt{RemoveRequests}).
+\item \textbf{P imports/exports.} \IMPL{} Symmetric executors consume
+  from peer shared memory and credit the P-Chain UTXO set, and vice
+  versa (\texttt{vms/platformvm/txs/executor/standard\_tx\_executor.go:285--376}
+  import, \texttt{:378--457} export).
+\item \textbf{D imports/exports} via a stateless proxy. \IMPL{} The
+  public-network DEX VM is a stateless atomic ZAP proxy holding zero
+  canonical DEX state (\texttt{lux/chains/dexvm/vm.go:125--141}); it
+  imports a UTXO consume-once then relays \texttt{clob\_deposit} to
+  credit the venue's \texttt{available} balance
+  (\texttt{lux/chains/dexvm/custody.go:120--158}), and on withdraw
+  relays \texttt{clob\_withdraw} for a realized amount then exports
+  exactly that (\texttt{custody.go:160--199}). The consensus-wire
+  activation of this custody path is LP-224~\cite{lp224}.
+\end{itemize}
+
+\subsection{What the duplication costs}
+
+The parallel-ledger model is not wrong, but it pays for itself
+repeatedly:
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Reconciliation surface.} Every chain that holds a balance
+  is a place value can be stranded, double-credited, or diverge under
+  non-deterministic relay. LP-224 exists precisely because the
+  deposit/withdraw custody numbers must be agreed by every validator or
+  the D-Chain forks on \emph{how much value left the system}. Each new
+  ledger multiplies this surface.
+\item \textbf{No single conservation truth.} Each chain proves its own
+  conservation locally. There is no one invariant that says ``the total
+  supply of asset $a$ is fixed across the entire network''; there are
+  $n$ local invariants and a shuttle in between that must be trusted to
+  preserve the sum.
+\item \textbf{Audit fragmentation.} To know who owns what, you must read
+  $n$ ledgers and reconcile the in-flight shared-memory elements. There
+  is no one chain you can point an auditor at.
+\end{enumerate}
+
+\subsection{The XSS thesis}
+
+XSS collapses the parallel ledgers into one economic ledger and demotes
+every other chain to a \emph{computation} over it. The rule, stated
+once:
+
+\begin{quote}
+\textbf{Other chains compute, X settles.} No chain other than X (and its
+shielded counterpart Z) makes value spendable by itself. A computing
+chain may only produce a proof or a settlement request; \emph{X performs
+the settlement.}
+\end{quote}
+
+\noindent Concretely: every unit of value has exactly one X state ---
+\emph{spendable UTXO}, \emph{locked UTXO}, or \emph{consumed UTXO}. The
+P-Chain stops holding a second UTXO set and instead references an X
+\emph{stake-lock}; the D-Chain stops holding an available/locked balance
+ledger and instead references X \emph{order-locks} and settles fills back
+to X; bridges and EVM execution reference X locks and settle to X. The
+conservation invariant becomes global and lives in exactly one place.
+
+This is the natural generalization of work the network has already done.
+LP-224 made the D-Chain's import-then-credit and debit-then-export a
+deterministic, carried, replayable settlement record; XSS observes that
+this is what \emph{every} chain's value movement should be --- a
+settlement against the one spine --- and names the primitive that makes
+it uniform: the X-Chain settlement \emph{lock}
+(Section~\ref{sec:xlock}).
