@@ -1,0 +1,237 @@
+\documentclass[11pt,letterpaper]{article}
+
+% ============================================================================
+% Lux Fee & Settlement Architecture — self-contained preamble (no external .sty)
+% ============================================================================
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\usepackage{microtype}
+\setlist{itemsep=2pt,topsep=3pt}
+
+\newcommand{\chain}[1]{\textsf{#1}}
+\newcommand{\rail}{\ensuremath{\mathsf{X}}}
+\newcommand{\stake}{\ensuremath{\mathsf{P}}}
+
+\begin{document}
+
+% ---- Cover ------------------------------------------------------------------
+\begin{titlepage}
+\vspace*{2cm}
+\begin{center}
+{\LARGE\bfseries UTXO Ownership and Fee Settlement\\in the Lux 9-Chain Topology\par}
+\vspace{0.8em}
+{\large The \chain{X}-Native Fee Rail: \chain{P}/\chain{X} as Money and Stake,\\the Rest as Metered Execution Lanes\par}
+\vspace{2cm}
+{\large Zach Kelling}\par
+\vspace{0.3em}
+{Lux Industries / Lux Network}\par
+{\small research@lux.network \quad @zeekay}\par
+\vspace{2cm}
+{\small LP-companion spec \quad\textbullet\quad Version 0.1 (Draft) \quad\textbullet\quad Aligns to LP-134 / LP-7050}\par
+\end{center}
+\begin{abstract}
+\noindent The canonical Lux topology is nine orthogonal chains ---
+\chain{P} \chain{C} \chain{X} \chain{Q} \chain{Z} \chain{A} \chain{B} \chain{M}
+\chain{F} (LP-134). This note fixes the \emph{economic} invariants that keep
+that topology clean: which chains own canonical asset state, and how fees flow.
+The rule is deliberately narrow. Only \chain{P} and \chain{X} are canonical
+UTXO state machines: \chain{P} is the validator/stake/control-plane ledger and
+\chain{X} is the asset/settlement/payment ledger. \chain{X} is additionally the
+canonical fee asset. Every other chain (\chain{C} \chain{D} \chain{Q} \chain{Z}
+\chain{A} \chain{B} \chain{M} \chain{F}) is a domain-specific execution lane
+that holds VM-local state plus an \chain{X}-funded fee balance, meters its own
+work, and settles rewards and remainders back to \chain{X} (with validator
+economics accounted on \chain{P}). We give the fee-funding model (per-user
+\chain{X} import/export plus per-chain fee-root settlement, finalized on
+\chain{Q}), a per-chain fee policy, and seven conservation invariants that
+prevent any lane from silently becoming a second asset ledger. Shielded state on
+\chain{Z} and encrypted balances on \chain{F} are UTXO-\emph{like} in form but
+are explicitly \emph{not} the canonical transparent \chain{X} set --- they are
+commitments over \chain{X}-backed assets and must prove conservation against it.
+\end{abstract}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+% ============================================================================
+\section{The invariant: only P and X own UTXOs}
+% ============================================================================
+
+A recurring failure mode in multi-chain systems is that specialized chains
+quietly accrete the powers of a money ledger --- they mint balances, hold
+custody of value, and become a second, unreconciled source of asset truth. Lux
+forecloses this by convention:
+
+\begin{quote}
+\textbf{Only \chain{P} and \chain{X} are canonical UTXO state machines. No other
+chain becomes an asset ledger unless it imports/exports value through \chain{X}.}
+\end{quote}
+
+\paragraph{\chain{P}-Chain --- stake / control plane.} \chain{P} holds
+UTXO-style state for validator stake, delegation stake, validator-set
+transitions, staking rewards, sovereign-network / L1 registration, and
+chain-creation / network-governance control transactions. \chain{P} is the
+\emph{stake and reward} rail.
+
+\paragraph{\chain{X}-Chain --- assets / settlement.} \chain{X} holds UTXO-style
+state for native assets, transfers, settlement, bridge lock/release settlement,
+DEX deposit/withdraw settlement, and cross-chain import/export accounting.
+\chain{X} is the \emph{money} rail and the canonical fee asset.
+
+Everything else consumes \chain{P}/\chain{X} settlement or maintains its own
+VM-local domain state --- never a canonical asset UTXO set of its own.
+
+% ============================================================================
+\section{How the other chains relate to P/X}
+% ============================================================================
+
+\begin{longtable}{@{}p{1.6cm}p{4.2cm}p{7.2cm}@{}}
+\toprule
+\textbf{Chain} & \textbf{State kind} & \textbf{Relation to \chain{P}/\chain{X}} \\
+\midrule
+\endhead
+\chain{C} & Account / EVM & Fees paid in EVM gas inside \chain{C}; canonical asset movement imports/exports through \chain{X}. \\
+\chain{D} & DEX / matching & Funds enter from \chain{X} via ImportTx/deposit, trade inside \chain{D}, withdraw/export back to \chain{X}. \\
+\chain{Q} & Finality / checkpoint & Not a user-asset UTXO chain. Fees systemic/metered; fee accounting anchors to \chain{X}/\chain{P}. Finality must never be hostage to app fee markets. \\
+\chain{Z} & ZK / proof / rollup & Commitments/nullifiers are UTXO-\emph{like} but \emph{not} the canonical transparent \chain{X} set. Public settlement roots back to \chain{X}. \\
+\chain{A} & AI / attestation / receipts & Not UTXO. Pays via \chain{X} or an imported fee balance; workers settle to \chain{X}. \\
+\chain{B} & Bridge / teleport state machine & Not canonical UTXO. Owns bridge message lifecycle; locked/released assets settle on \chain{X}. Consumes \chain{M} attestations. \\
+\chain{M} & MPC / custody / signing / attestation & Not UTXO. Signs and attests; holds no canonical asset UTXOs except \chain{X}-backed references. \\
+\chain{F} & FHE / confidential compute & Encrypted state / ciphertext commitments. Not canonical UTXO. Settles to \chain{X}. \\
+\bottomrule
+\end{longtable}
+
+\paragraph{Simple rule.} \chain{P}/\chain{X} have UTXOs. Every other chain has
+domain state plus \chain{X}-backed fee balances.
+
+% ============================================================================
+\section{The fee model}
+% ============================================================================
+
+\begin{quote}
+\chain{X} is the canonical fee asset and payment rail. Each chain meters its own
+execution. Fees are paid from local imported balances or settled back to
+\chain{X}. \chain{P} handles validator economics and reward distribution.
+\end{quote}
+
+So \chain{X} = money rail, \chain{P} = staking/reward rail, and \chain{C}
+\chain{D} \chain{A} \chain{B} \chain{M} \chain{F} \chain{Q} \chain{Z} are
+execution lanes that consume fees.
+
+\subsection{Option 1 --- \chain{X}-native fee import (sovereign clarity)}
+
+A user imports a fee budget from \chain{X} into the target chain; execution
+charges the local balance; any remainder can be exported back:
+\[
+\text{\chain{X} ExportTx} \to \text{target ImportTx} \to \text{local fee balance}
+\to \text{execution charge} \to \text{(optional) export remainder to \chain{X}.}
+\]
+Clean for \chain{D} \chain{F} \chain{A} \chain{B} \chain{M}: they meter
+domain-specific work without mutating \chain{X} on every operation.
+
+\emph{Example (FHE job on \chain{F}).} (1) user holds LUX on \chain{X};
+(2) exports a 10-LUX budget \chain{X}$\to$\chain{F}; (3) \chain{F} imports it as
+local fee credit; (4) GPU workers execute the encrypted job; (5) \chain{F} pays
+workers/validators from the local pool; (6) remaining credit exports back to
+\chain{X}.
+
+\subsection{Option 2 --- fee-root settlement (throughput)}
+
+Each chain accumulates fees internally and periodically commits a fee
+settlement root to \chain{X}:
+\[
+\text{local fee accounting} \to \text{epoch fee root} \to
+\text{\chain{X} settlement / distribution.}
+\]
+Better for high-throughput \chain{D}/\chain{F}/\chain{A} where per-tx \chain{X}
+imports would be too heavy.
+
+\subsection{Recommended hybrid}
+
+Use both. User-facing funding via \chain{X} import/export into local balances;
+high-throughput settlement via per-chain fee roots periodically settled to
+\chain{X}/\chain{P}; validator/operator rewards distributed by \chain{P} using
+\emph{finalized} fee roots. This yields: \chain{X} = source of fee currency;
+local chain = execution metering; \chain{Q} = finality of fee roots; \chain{P} =
+validator reward / stake accounting.
+
+% ============================================================================
+\section{Per-chain fee policy}
+% ============================================================================
+
+\begin{longtable}{@{}p{1.4cm}p{5.6cm}p{6.0cm}@{}}
+\toprule
+\textbf{Chain} & \textbf{Fees} & \textbf{Paid from / settlement} \\
+\midrule
+\endhead
+\chain{P} & staking tx, validator registration, chain/subnet creation & \chain{P} UTXO; rewards to validators/delegators on \chain{P}. \\
+\chain{X} & transfer, asset creation, import/export & \chain{X} UTXO; the canonical settlement + fee asset. \\
+\chain{C} & EVM gas & \chain{C} balance imported/bridged from \chain{X}; optional \chain{X}-backed native accounting. \\
+\chain{D} & order place/cancel, taker/maker, settlement & \chain{D} local balance funded from \chain{X}; assets enter/exit via \chain{X} Import/Export. \\
+\chain{Q} & cert/checkpoint/finality inclusion & system budget or local \chain{Q} balance funded from \chain{X}. Keep cheap/systemic; do not make finality hostage to app fee markets. \\
+\chain{Z} & proof verification, rollup batch inclusion, private settlement/nullifier processing & \chain{Z} balance funded from \chain{X}; roots/public outputs settle to \chain{X}/\chain{Q}. \\
+\chain{A} & inference receipt, model registry update, attestation verify, PoAI job & \chain{A} balance funded from \chain{X}; AI workers paid from \chain{A} pool, settled to \chain{X}. \\
+\chain{B} & bridge message, route, attestation inclusion, relayer & \chain{B} balance funded from \chain{X} or deducted from bridged amount; lock/release/mint/burn reference \chain{X} assets. \\
+\chain{M} & MPC signing session, custody approval, bridge attestation & \chain{M} balance funded from \chain{X}; MPC signers paid from \chain{M} pool, settled to \chain{X}. \\
+\chain{F} & FHE job, encrypted-state update, GPU compute, threshold decrypt & \chain{F} balance funded from \chain{X}; FHE/GPU workers + decrypt committee paid from \chain{F} pool, settled to \chain{X}. \\
+\bottomrule
+\end{longtable}
+
+% ============================================================================
+\section{UTXO-like $\neq$ canonical UTXO: Z and F}
+% ============================================================================
+
+\chain{Z} may carry commitments, nullifiers, shielded notes, and rollup exits;
+\chain{F} may carry encrypted balances and ciphertext state. In \emph{form} these
+resemble a UTXO set, but architecturally they are \textbf{not} the canonical
+transparent \chain{X} asset ledger:
+\[
+\text{\chain{X}} = \text{canonical transparent UTXO assets}, \qquad
+\text{\chain{Z}/\chain{F}} = \text{shielded / encrypted commitments over
+\chain{X}-backed assets.}
+\]
+Consequently \chain{Z} and \chain{F} private state must \emph{prove conservation}
+against \chain{X}-backed commitments (a shielded or encrypted balance may never
+exceed, or mint outside, the \chain{X} value it represents).
+
+% ============================================================================
+\section{Fee \& conservation invariants}
+% ============================================================================
+
+\begin{enumerate}[label=\textbf{I\arabic*.}]
+\item No chain may mint canonical asset supply except through \chain{X}/\chain{P}
+defined rules.
+\item Every non-\chain{P}/\chain{X} fee balance must be funded by an
+\chain{X}/\chain{P} import, a genesis allocation, or a finalized fee settlement.
+\item \chain{D}/\chain{F}/\chain{A}/\chain{M}/\chain{B} worker rewards must be
+claimable / settled back to \chain{X}.
+\item \chain{Q} finality fees cannot block safety or finality.
+\item \chain{Z}/\chain{F} private state must prove conservation against
+\chain{X}-backed commitments.
+\item Bridge fees on \chain{B} are message/relayer fees --- not arbitrary custody
+of canonical assets.
+\item \chain{M} signs attestations but never becomes the asset ledger.
+\end{enumerate}
+
+% ============================================================================
+\section{Summary}
+% ============================================================================
+
+\textbf{UTXO chains:} \chain{P} = staking/validator UTXO; \chain{X} =
+asset/settlement UTXO. \textbf{Fees:} \chain{X} is the canonical fee asset rail;
+\chain{P} handles staking/reward economics; every other chain meters locally with
+fee balances funded from \chain{X}, then settles/rewards back to \chain{X}/\chain{P}
+through finalized roots (finalized on \chain{Q}). That keeps the nine-chain
+architecture clean: \chain{P}/\chain{X} are the money/stake ledgers, and \chain{C}
+\chain{D} \chain{Q} \chain{Z} \chain{A} \chain{B} \chain{M} \chain{F} are
+specialized execution lanes. It is the same discipline as the \chain{T}-braid
+removal: separate what a primitive \emph{is} (asset value, threshold crypto) from
+\emph{where} it is applied (an execution lane) --- values, not places.
+
+\end{document}
