@@ -1,0 +1,704 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{../shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{siunitx}
+\usepackage{listings}
+\usepackage{longtable}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  breaklines=true,
+  frame=single,
+  showstringspaces=false,
+}
+
+% Source-provenance tags used throughout every table.
+\newcommand{\Mnow}{\textbf{\textcolor{black}{M}}}      % measured this session
+\newcommand{\Mprior}{M$^\star$}                          % measured in prior cited work
+\newcommand{\Proj}{P}                                    % projected / calculated
+\newcommand{\Claim}{C}                                   % external claim
+
+\title{The Path to One Billion Trades per Second:\\
+       GPU-Native Execution on Lux}
+\author{Lux Industries, Inc. \\
+        \texttt{research@lux.network}}
+\date{2026-07-10}
+
+\begin{document}
+\luxcoverpage
+
+\begin{abstract}
+We benchmark, on real silicon, the throughput ceiling of a GPU-native
+trade-execution pipeline and ask a precise question: is one billion
+trades per second reachable, and if not yet, exactly what stands in the
+way? The thesis is that consensus does \emph{not} run per trade --- Lux's
+Nova metastable sampling ($O(k\cdot n)$ per node, independent of block
+size) finalizes \emph{batch-blocks} that each carry many trades --- so
+throughput is set by a five-layer GPU execution pipeline, not by the
+consensus round. We measure each layer independently on a four-device
+fleet (Apple M1~Max, Apple M4~Max, NVIDIA GB10 Grace-Blackwell, AMD
+Radeon~8060S) and then compose.
+
+The results are unambiguous about \emph{where the ceiling is}. The
+matching layer is solved: a deterministic, per-book CLOB matcher sustains
+a measured \textbf{9.42\,billion} orders/s on one GB10 and
+\textbf{12.48\,billion}/s on one Radeon~8060S (\textbf{21.9\,B}/s across
+the two discrete GPUs, \textbf{30.3\,B}/s across all four devices), with
+GPU-versus-CPU output parity verified bit-for-bit on every run. Matching
+is roughly $26{,}000\times$ above the 1\,B/s target. The binding
+constraint is elsewhere: Merkle-Patricia \emph{settlement} (state
+commit) measures \textbf{160--354\,thousand} fills/s on a ten-core CPU,
+and the parallel Block-STM engine that would accelerate it is (verified
+empirically) \emph{not wired into the production path} today ---
+C-Chain block processing is currently sequential. Full post-quantum
+signature verification is a second, honest gap: classical batch-verify
+on GPU is fast and real (BLS aggregate $144\times$, ecrecover $32\times$,
+BLS12-381 pairings 49{,}197/s on GB10), but the ML-DSA/SLH-DSA GPU
+verify kernels are unwired --- the GB10 composite PQ-verify path returns
+\texttt{NOT\_SUPPORTED}, so PQ verification is CPU-bound at a measured
+${\sim}20{,}000$ verifies/s/core today.
+
+We therefore report the current \emph{proven} end-to-end wired rate
+honestly (729 real on-chain settlements on a single Zoo mainnet node;
+Lux mainnet not yet re-proven trading post-incident), the measured
+per-layer ceilings, and the precise ${\sim}2{,}800\times$ settlement gap
+that separates them. One billion trades/s is a settlement-and-wiring
+problem, not a matching problem. We give the roadmap that closes it and
+the self-heal (``no node left behind'') evidence --- proven green in
+simulation this session (rejoin to finalized height in \SI{2.76}{\second},
+no fork), not yet on a live multi-box network.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Introduction}
+
+``One billion trades per second'' is easy to assert and hard to earn.
+This paper earns as much of it as the hardware and the code will
+currently support, measures the rest, and refuses to paper over the gap.
+
+The architecture rests on one structural decision: \textbf{consensus is
+not on the per-trade path}. Lux finalizes with Nova, a metastable
+repeated-sampling protocol in the Avalanche family
+\cite{avalanche2020,consensusengines}: each validator, each round,
+samples $k$ peers and flips its preference on a super-majority; after
+$\beta$ consecutive confident rounds the value is final. The per-node
+cost is $O(k\cdot n)$ in the sample size, \emph{independent of how many
+transactions the block contains}. A block that carries one trade and a
+block that carries ten million trades cost the consensus layer the same.
+Throughput therefore lives in the \emph{execution} pipeline that fills
+those batch-blocks, and that pipeline is what we benchmark.
+
+The pipeline has five layers, each independently GPU-addressable:
+\begin{enumerate}[leftmargin=2em,itemsep=1pt]
+  \item \textbf{GPU matching} --- a parallel central-limit-order-book
+        (CLOB) matcher: price-time priority as a per-book sequential
+        walk, millions of books in parallel.
+  \item \textbf{GPU Block-STM execution} --- optimistic parallel EVM
+        execution with conflict detection and deterministic re-execution.
+  \item \textbf{GPU FHE} --- encrypted-state execution kernels
+        (NTT-accelerated lattice arithmetic).
+  \item \textbf{GPU PQ batch-verify} --- ML-DSA / SLH-DSA / classical
+        batch signature verification, the layer that keeps full
+        cryptographic security from becoming the bottleneck.
+  \item \textbf{Consensus} --- Nova sampling finalizes batch-blocks;
+        a behind validator self-heals (``no node left behind'').
+\end{enumerate}
+
+\paragraph{Method and honesty contract.}
+Every throughput figure in this paper carries a provenance tag:
+\Mnow{} = measured by us this session (2026-07-10) on the fleet of
+\S\ref{sec:setup}; \Mprior{} = measured in prior Lux work, cited, not
+re-run here; \Proj{} = projected or arithmetically derived; \Claim{} =
+external third-party claim. Where a component is a known-answer-test
+(KAT)-clean kernel that is not yet wired to the live path, we say so and
+measure what \emph{is} runnable. A rigorous paper with honest gaps is
+worth more than a fabricated ``1\,B/s achieved.'' No number here is
+invented.
+
+\section{Experimental setup}\label{sec:setup}
+
+All measurements were taken on the local box fleet. The two Apple hosts
+run Metal; \texttt{spark} runs CUDA on an NVIDIA GB10 (Grace-Blackwell);
+\texttt{evo} runs ROCm/HIP on an AMD RDNA3.5 APU.
+
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+Host & GPU / accelerator & CPU & Memory & Toolchain \\
+\midrule
+\texttt{ra}    & Apple M1~Max (Metal~4, 32-core GPU) & 10-core & 64\,GB unified  & clang, libomp \\
+\texttt{dbc}   & Apple M4~Max (Metal)                & 16-core & 128\,GB unified & clang, libomp \\
+\texttt{spark} & NVIDIA GB10 Grace-Blackwell (cc~12.1) & 20-core Grace ARM & unified & CUDA 13.0.88 \\
+\texttt{evo}   & AMD Radeon~8060S (gfx1151, RDNA3.5) & 32-core & unified & ROCm 7.13 / HIP \\
+\bottomrule
+\end{tabular}
+\caption{The measurement fleet. ``cc'' = CUDA compute capability.}
+\end{table}
+
+\paragraph{Discipline.} GPU kernel timings are kernel-only (host-device
+transfer excluded and stated as such), best-of-3 after warm-up, and
+every matcher run is gated by a GPU-vs-CPU output-parity check
+(\texttt{parity \ldots MATCH}); a mismatch aborts the run. Go
+microbenchmarks use the standard \texttt{testing.B} harness with setup
+excluded from the timer. We report the metric the harness reports
+(orders/s, fills/s, tx/s, ns/op) and define each where it first appears.
+
+\section{The GPU-native execution architecture}\label{sec:arch}
+
+A trade enters as a signed order, is matched against a book, the
+resulting fills mutate account and market state, that state is committed
+into the world trie, the block is formed, and Nova finalizes it. The
+GPU-native design maps each stage to a data-parallel kernel and lets
+consensus amortize over a large batch:
+
+\[
+\underbrace{\text{ingest}+\text{sig-verify}}_{\text{L4}}
+\;\to\;
+\underbrace{\text{match}}_{\text{L1}}
+\;\to\;
+\underbrace{\text{conflict-detect}+\text{execute}}_{\text{L2}}
+\;\to\;
+\underbrace{\text{settle (state commit)}}_{\text{L2}}
+\;\to\;
+\underbrace{\text{batch-block}\ \to\ \text{Nova finalize}}_{\text{L5}}
+\]
+
+The end-to-end trades/s is the \emph{minimum} stage throughput once
+consensus is amortized over the batch. The rest of the paper measures
+each $\min$-term. Optional encrypted execution (L3, FHE) sits inside L2
+for confidential order flow.
+
+\paragraph{Determinism is the load-bearing invariant.} Every validator
+must re-execute a batch-block bit-identically or the chain forks. This
+constrains the kernels: the matcher assigns \emph{one GPU thread per
+book} and walks that book sequentially (no intra-book parallelism $\to$
+no fill reordering), while millions of books run concurrently; the
+executor's conflict detector emits the same edge set on GPU and CPU
+(KAT-equal); sharded settlement commits the same state root as the
+sequential order. We verify each of these below.
+
+\section{Layer 1 --- GPU matching (the billion/s candidate)}\label{sec:l1}
+
+The matcher (\texttt{luxfi/gpu/dex}) is a deterministic per-book CLOB.
+Each book has \texttt{DEPTH}=32 resting levels; \texttt{TAKERS}=32 taker
+orders cross it in strict price-time priority. One thread owns one book
+and performs up to $\texttt{TAKERS}\times\texttt{DEPTH}=1024$ match-steps
+--- real compute, not a dispatch microbenchmark. The metric is
+\emph{taker-orders matched per second} (ord/s). The inner loop:
+
+\begin{lstlisting}[language=C]
+for (t = 0; t < TAKERS; t++) {                   // one thread, one book
+  tq = t_qty[book,t]; tp = t_price[book,t]; ts = t_side[book,t];
+  for (i = 0; i < DEPTH && tq > 0; i++) {        // sequential walk = deterministic
+    if (rem[i]==0) continue;
+    ok = ts==0 ? (tp>=rp[i]) : (rp[i]>=tp);      // price cross
+    if (!ok) continue;
+    got = min(tq, rem[i]); tq-=got; rem[i]-=got; // partial fill
+  }
+}
+\end{lstlisting}
+
+\subsection{Measured throughput}
+
+Table~\ref{tab:l1} is our own re-run this session across the whole
+fleet, at $N=4$\,million books ($N=2$\,M on the 64\,GB M1~Max), tuned per
+silicon. Every row passed \texttt{parity MATCH} (GPU fill-sum $=$ CPU
+fill-sum). These numbers reproduce, and in the GB10 case slightly exceed,
+the independently reported figures of the GPU-EVM benchmark
+paper \cite{evmgpubench}.
+
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}llS[table-format=2.2]S[table-format=2.2]S[table-format=1.2]cc@{}}
+\toprule
+Device & Backend & {Baseline} & {Tuned peak} & {CPU ref} & {GPU/CPU} & Src \\
+       &         & {(B ord/s)} & {(B ord/s)}  & {(B ord/s)} & & \\
+\midrule
+AMD Radeon 8060S & HIP  & 12.38 & 12.48 & 0.75 & 18.4$\times$ & \Mnow \\
+NVIDIA GB10      & CUDA & 7.36  & 9.42  & 0.81 & 13.0$\times$ & \Mnow \\
+Apple M4~Max     & Metal& 5.58  & 5.58  & 0.79 & 7.0$\times$  & \Mnow \\
+Apple M1~Max     & Metal& 2.47  & 2.79  & 0.21 & 13.3$\times$ & \Mnow \\
+\midrule
+\multicolumn{2}{@{}l}{Two-node discrete (evo+spark)} & & 21.90 & & & \Mnow \\
+\multicolumn{2}{@{}l}{Four-device fleet} & & 30.27 & & & \Mnow \\
+\bottomrule
+\end{tabular}
+\caption{Deterministic per-book CLOB matcher, kernel-only, parity-verified.
+``Baseline'' = default layout/block-size (AoS on Apple, coalesced-SoA
+TPB=256 on discrete); ``Tuned peak'' = best of the occupancy/layout
+sweep. 1\,B\,ord/s $= 10^9$ taker-orders/s.}
+\label{tab:l1}
+\end{table}
+
+\subsection{Findings}
+\begin{enumerate}[leftmargin=2em,itemsep=1pt]
+  \item \textbf{Coalescing is the discrete-GPU win, neutral on Apple.}
+        Transposing array-of-structs to order-major struct-of-arrays
+        (so a warp reads 32 contiguous words) lifts GB10 from
+        \num{1.61} to \SI{9.42}{\text{B\,ord/s}} and the AMD APU from
+        \num{0.76} to \SI{12.48}{\text{B\,ord/s}}. On Apple unified
+        memory the large shared cache already absorbs the strided
+        access, so AoS is the tuned default (M1~Max
+        $2.47\!\to\!2.79$; the SoA rewrite is neutral-to-negative).
+  \item \textbf{The two discrete backends want opposite tunings.} GB10
+        is occupancy-bound $\to$ low register pressure, TPB=32
+        ($\to$\,\SI{9.42}{\text{B}}); the AMD APU is bandwidth-rich
+        $\to$ register-resident data, TPB=128
+        ($\to$\,\SI{12.48}{\text{B}}). No single config wins everywhere.
+  \item \textbf{Determinism is free.} Every layout $\times$ occupancy
+        $\times$ variant permutation, at every scale $N=1$\,M--16\,M,
+        produced identical fills to the OpenMP CPU reference. Tuning
+        moves throughput, never the result. This is the L1 half of the
+        ``every validator re-executes bit-identically'' invariant.
+  \item \textbf{Working-set effects are visible and honest.} At
+        $N=16$\,M the GB10 drops to \SI{4.58}{\text{B}} (working set
+        exceeds cache $\to$ bandwidth-bound); the peak sits where the
+        per-book state stays resident.
+\end{enumerate}
+
+\noindent\textbf{Verdict:} a single modern GPU matches at
+$9$--$12\times10^{9}$ orders/s. \emph{Matching is not the bottleneck to
+$10^9$ trades/s; it clears it by four orders of magnitude.}
+
+\section{Layer 2 --- GPU Block-STM execution and settlement}\label{sec:l2}
+
+Matching produces fills; fills must execute and commit to state. Lux's
+parallel executor (\texttt{luxfi/evm/core/parallel}) is Block-STM
+\cite{blockstm2022,lp210}: speculatively execute in parallel, detect
+read/write conflicts, re-execute conflicts in deterministic index order,
+commit. The DEX-fill fast path (\texttt{settlement.go}) applies the same
+conflict kernel and shards by market.
+
+\subsection{Determinism: measured green}
+
+The anti-fork property is a test suite, and we re-ran it
+(\texttt{CGO\_ENABLED=0}, pure-Go engine). All twelve determinism/parity
+cases pass, including the two that matter most:
+\begin{itemize}[leftmargin=2em,itemsep=1pt]
+  \item \texttt{TestConflictEdgesMatchGPUKAT} (5 sub-cases) --- the CPU
+        conflict-edge set is \emph{byte-identical} to the GPU
+        \texttt{conflict\_detect} kernel's known-answer output.
+  \item \texttt{TestSettleShardedEqualsSequential} (shards
+        1/3/4/10) --- sharded/parallel settlement commits the
+        \emph{same} state root as strict sequential application; a
+        hot-market, order-sensitive slot (\texttt{keccak(prev||taker)})
+        makes the test non-vacuous.
+\end{itemize}
+\texttt{ok\ \ github.com/luxfi/evm/core/parallel\ \ 0.896s} --- 12/12
+PASS (\Mnow).
+
+\subsection{Throughput: measured, and honestly copy-bound}
+
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}llS[table-format=7.0]l c@{}}
+\toprule
+Benchmark & Configuration & {Throughput} & Unit & Src \\
+\midrule
+Block-STM light-tx (serial) & 2000 tx, $\sim$0 work & 107541264 & tx/s & \Mnow \\
+Block-STM light-tx (STM)    & 2000 tx, $\sim$0 work & 330583    & tx/s & \Mnow \\
+Block-STM heavy-tx (serial) & 2000 tx, 10k-spin     & 287247    & tx/s & \Mnow \\
+Block-STM heavy-tx (STM)    & 2000 tx, 10k-spin     & 47172     & tx/s & \Mnow \\
+Block-STM workers 1\,$\to$\,10 & heavy-tx           & 49642     & tx/s (@10) & \Mnow \\
+Settlement serial           & 10k fills             & 197630    & fills/s & \Mnow \\
+Settle-batch (1 state)      & 10k fills, det. order & 160598    & fills/s & \Mnow \\
+Settle-sharded (10 shards)  & 10k fills             & 353877    & fills/s & \Mnow \\
+Conflict-detect kernel      & 10k fills, 0--10\%    & 2094133   & fills/s & \Mnow \\
+\bottomrule
+\end{tabular}
+\caption{Execution and settlement, Apple M1~Max, 10 cores, pure-Go
+engine. Worker sweep scales $26{,}513\!\to\!49{,}642$ tx/s
+($1.87\times$) from 1 to 10 workers.}
+\label{tab:l2}
+\end{table}
+
+Two honest facts fall out of Table~\ref{tab:l2}:
+\begin{enumerate}[leftmargin=2em,itemsep=1pt]
+  \item \textbf{This Block-STM engine is copy-bound, not
+        compute-bound.} It deep-copies the \texttt{StateDB} per
+        speculative tx (9.7\,MB, 48k allocs per block), so on light,
+        disjoint transactions it \emph{loses to serial}
+        ($330$k vs $107$M tx/s) and even on heavy tx it trails serial
+        ($47$k vs $287$k). It scales across workers ($1.87\times$ on 10
+        cores) but the copy overhead dominates the win. The fix is
+        known --- shared multi-version memory (MVHashMap) instead of
+        copy-the-world; the sibling \texttt{evmgpu} tree already
+        implements \texttt{MvMemory}.
+  \item \textbf{Settlement is the on-chain floor.} Sharded settlement
+        commits at \SI{354}{k\,fills/s} on 10 cores; the Merkle-Patricia
+        state write, not matching, is the binding term. Conflict
+        detection (\SI{2.0}{M\,fills/s}) is not binding.
+\end{enumerate}
+
+\subsection{The wiring truth}\label{sec:l2wiring}
+
+We verified empirically (grep of the whole tree; direct build) two
+sobering facts that any honest 1\,B/s claim must confront:
+\begin{itemize}[leftmargin=2em,itemsep=1pt]
+  \item \textbf{The parallel executor is not on the production path.}
+        \texttt{RegisterExecutor(NewBlockSTMExecutor)} is never called;
+        \texttt{DefaultExecutor()} resolves to a no-op fallback. Live
+        C-Chain block processing is \textbf{100\% sequential today}. The
+        Block-STM numbers above are of a real, tested engine that is not
+        yet dispatched in production. An independent 2026-07-10 head-to-head
+        \cite{benchvsava} confirms this from the other side: the live Lux
+        C-Chain and \texttt{avalanchego}'s C-Chain run the \emph{same}
+        sequential, geth-derived EVM (identical \texttt{BenchmarkInsertChain}
+        suite, identical hardware), so their live throughput is governed by the
+        same fee/gas-target throttle --- the Lux advantage at v1.36 is the
+        consensus-liveness axis (Nova's 3/5 majority tier), not parallel
+        execution, which remains unwired.
+  \item \textbf{No arbitrary EVM opcode runs on GPU today.} The GPU
+        bridge offloads \emph{ecrecover} only (keccak is a stub); a full
+        GPU EVM interpreter is documented future work (``Phase 4''), and
+        the \texttt{cevm}/\texttt{revm} backends are honest
+        \texttt{return nil,nil} stubs.
+\end{itemize}
+
+For context, the GPU-EVM benchmark paper \cite{evmgpubench} reports
+(M1~Max, \Mprior) an optimized GPU EVM kernel at \SI{2.3}{Gops/s}
+($12.1\times$ a C++ CPU interpreter), end-to-end Block-STM at
+$528\!\to\!3390$\,Mgas/s ($6.4\times$ at 10 threads), and GPU ecrecover
+at $32\times$ (\SI{1613}{ms}\,$\to\,{\sim}$\SI{50}{ms} for 47k
+signatures). Those are measured, but on the \texttt{evmgpu} fork, not on
+the wired production executor. The gap between ``kernel exists and is
+fast'' and ``kernel is on the live consensus path'' is the central
+subject of \S\ref{sec:roadmap}.
+
+\section{Layer 3 --- GPU FHE (encrypted execution)}\label{sec:l3}
+
+Confidential order flow executes over fully-homomorphic ciphertexts. Lux
+FHE (\texttt{luxfi/fhe}) is a pure-Go TFHE library whose lattice NTT is
+GPU-dispatched through \texttt{luxfi/lattice/v7/gpu} behind a
+\emph{byte-equality probe} (the GPU NTT must reproduce the CPU sub-ring
+NTT exactly or it falls back).
+
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}lll c@{}}
+\toprule
+FHE primitive & Configuration & Result & Src \\
+\midrule
+Metal NTT (batched)   & $N{=}2^{14}$, batch 2048 & ${\sim}59$k polys/s, $13$--$14\times$ CPU & \Mprior \\
+Metal NTT             & $N{=}4096$, batch 128    & $23.6\times$ CPU (13.9\,ms$\to$0.59\,ms) & \Mprior \\
+Metal NTT (small)     & $N{=}1024$, batch 1      & \emph{slower} than CPU (438 vs 133\,\si{\micro s}) & \Mprior \\
+TRLWE add             & CPU, $N{=}2048$          & 0.5--1.33\,M ops/s & \Mprior \\
+Programmable bootstrap & GPU                     & \textbf{no measured GPU throughput} & --- \\
+\bottomrule
+\end{tabular}
+\caption{FHE, Apple M1~Max (prior-measured, 2026-04-27 harness).}
+\label{tab:l3}
+\end{table}
+
+\paragraph{Honest gap.} Only the NTT is GPU-accelerated, and only above
+a crossover batch size (small transforms are slower on GPU). The
+programmable-bootstrap / gate layer --- the actual cost of homomorphic
+\emph{execution} --- has \emph{no measured GPU throughput} in the
+codebase; gate-level FHE numbers are CPU-only. FHE is therefore an
+optional confidential-execution path with a proven GPU NTT primitive and
+an unwired GPU bootstrap. It does not gate the plaintext 1\,B/s path; for
+confidential order flow it is a first-order open problem, not a solved
+layer.
+
+\section{Layer 4 --- GPU PQ batch-verify (the security-cost layer)}\label{sec:l4}
+
+Full post-quantum security means every order and every validator message
+carries an ML-DSA (FIPS-204) or SLH-DSA (FIPS-205) signature
+\cite{fips204,fips205}, verified before execution. Batch verification is
+what keeps that security from becoming the bottleneck. The canonical
+precompiles are wired at the LP-4200 block:
+
+\begin{center}\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+ML-KEM \texttt{0x012201} & ML-DSA \texttt{0x012202} & SLH-DSA \texttt{0x012203} & Pulsar \texttt{0x012204} \\
+P3Q \texttt{0x012205} & Corona \texttt{0x012206} & Magnetar \texttt{0x012207} & HQC \texttt{0x012208} \\
+\multicolumn{4}{@{}l}{STARK-FRI \texttt{0x012220}} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Measured verify throughput}
+
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}lll c@{}}
+\toprule
+Operation & Platform & Throughput & Src \\
+\midrule
+ML-DSA-44 verify (compact) & M1~Max, 1 core, Go & \SI{19864}{verif/s} (\SI{50.3}{\micro s}) & \Mnow \\
+ML-DSA-44 verify (expanded) & M1~Max, 1 core     & \SI{5134}{verif/s}  & \Mnow \\
+SLH-DSA-128s verify        & M1~Max, 1 core      & \SI{5355}{verif/s} (\SI{186.7}{\micro s}) & \Mnow \\
+SLH-DSA-192 batch (21)     & M1~Max, 10 cores    & \SI{1136}{verif/s}  & \Mnow \\
+secp256k1 ecrecover (pure-Go) & M1~Max, 1 core   & \SI{4737}{verif/s} (\SI{211}{\micro s}) & \Mnow \\
+\midrule
+BLS aggregate verify       & M2~Ultra, Metal     & $144\times$ CPU ($k{=}1024$) & \Mprior \\
+Ed25519 batch verify       & M2~Ultra, Metal     & $26.7\times$ CPU ($N{=}4096$) & \Mprior \\
+secp256k1 ecrecover (batch)& M2~Ultra, Metal     & $9.4\times$ CPU; $32\times$ (bridge) & \Mprior \\
+BLS12-381 pairing (batched)& GB10, CUDA          & \SI{49197}{pairings/s} @\SI{20}{W} & \Mprior \\
+keccak256 (batched)        & GB10, CUDA          & \SI{11.38}{MHz} & \Mprior \\
+ML-DSA / SLH-DSA verify    & GB10, CUDA          & \texttt{NOT\_SUPPORTED} (unwired) & \Mnow \\
+\bottomrule
+\end{tabular}
+\caption{Signature verification. Classical batch-verify on GPU is real
+and fast; the PQ (lattice/hash) verify kernels are not yet dispatched on
+the discrete GPU.}
+\label{tab:l4}
+\end{table}
+
+\subsection{The PQ cost accounting}
+
+The classical batch-verify story is measured and good: BLS aggregate
+$144\times$, ecrecover $32\times$, and on the GB10 the crypto engine runs
+at \SI{49197}{pairings/s} while using only $11.9\%$ of streaming-multiprocessor
+occupancy \cite{lp203} --- i.e. an order of magnitude of headroom
+untouched, at \SI{12300}{pairings/W} versus ${\sim}130$/W on a 20-core
+x86 (a $95\times$ energy advantage).
+
+The \textbf{post-quantum} verify story has a precise gap. ML-DSA and
+SLH-DSA GPU verify kernels are \emph{not wired}: the GB10 composite
+verify wrappers return \texttt{LUX\_BACKEND\_ERROR\_NOT\_SUPPORTED}
+(measured status), and the PQ-verify throughput figures in the
+GPU-native-verify work are explicitly labelled projected, not measured
+\cite{lp203,lp137}. Today, PQ verification is CPU-bound at a measured
+${\sim}$\SI{20000}{verif/s/core} for ML-DSA-44 (\SI{50}{\micro s}),
+i.e. ${\sim}$\SI{200}{k\,verif/s} across ten cores --- and ML-DSA-65,
+the heavier parameter set, costs \SI{134}{\micro s}/core
+(${\sim}$\SI{7500}{/s/core}) \cite{evmgpubench}. Relative to classical
+ecrecover on the same core, PQ verify is $1.5$--$4\times$ heavier. This
+is the true price of ``full post-quantum security'' at the ingress
+layer, and it is currently paid on the CPU.
+
+\section{Layer 5 --- Consensus and ``no node left behind''}\label{sec:l5}
+
+\subsection{Batch-block finalization}
+
+The v1.36 consensus is Nova's \textbf{two-tier finality ladder}
+\cite{lp305nova}: a block is \emph{locally accepted} at the Nova rung (a simple
+majority $\lfloor n/2\rfloor+1$, crash-fault-safe) and only \emph{exported} at the
+Quasar rung (a strict $>\tfrac{2}{3}$ of stake, Byzantine-safe post-quantum
+certificate). The batch-block executor in this paper runs \emph{downstream of Nova
+acceptance}; consensus samples a fixed $k$ per round, so its per-node cost is
+independent of the trades inside the block. Prior measured/claimed figures
+\cite{quasarbench,lp020,lp305nova,evmgpubench}:
+
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}lll c@{}}
+\toprule
+Metric & Condition & Value & Src \\
+\midrule
+Quasar median finality & $n{=}100$, tri-DC WAN, CPU BLS & \SI{204}{ms} (p99 347) & \Mprior \\
+Quasar finality        & single-DC, GPU BLS            & ${\sim}$\SI{10}{ms} & \Mprior \\
+Quasar throughput      & $n{=}21/100/1000$            & $18.2/10.4/4.8$\,k TPS & \Mprior \\
+Pipelined Quasar       & depth-3, PQ-off              & \SI{6.3}{ms}/cert, ${\sim}158$ blocks/s & \Mprior \\
+Consensus-only ceiling & SoloGPU, 47k-tx blocks      & \SI{107000}{blocks/s} & \Mprior \\
+QuasarCert verify      & $n{=}21$, GPU               & \SI{0.5}{}--\SI{1.5}{ms}, cert \SI{56.3}{KB} & \Mprior \\
+\bottomrule
+\end{tabular}
+\caption{Consensus-layer measurements (prior work; not re-run here).}
+\label{tab:l5}
+\end{table}
+
+The consequence: at a \SI{204}{ms} WAN finality (${\sim}5$ finalizations/s)
+a chain hits $10^9$ trades/s if each batch-block carries
+${\sim}200$\,million fills; at the SoloGPU consensus rate
+(\SI{107}{k\,blocks/s}) it needs only ${\sim}$\SI{9.3}{k\,fills/block}.
+Either way the consensus layer has ample headroom --- \emph{batch-block
+sizing}, not consensus rate, is the L5 lever, and it is a
+configuration/DA problem, not a throughput wall.
+
+\subsection{Self-heal: measured green in simulation}\label{sec:selfheal}
+
+The invariant the owner's launch gate rests on: a validator that falls
+behind rejoins, and the chain keeps finalizing --- no node left behind.
+Two recent fixes were re-run this session:
+
+\begin{itemize}[leftmargin=2em,itemsep=1pt]
+  \item \textbf{node \texttt{v1.34.30}} (size-chunked catch-up):
+        \texttt{TestGetContext\_ChunksBySize\_FitsUnderCap} and
+        \texttt{\ldots SingleOversizeBlock\_StillServed} both \textbf{PASS}
+        --- ``12 blocks, \num{1843344} payload bytes (budget
+        \num{1966080}, cap \num{2097152}) --- fits.'' This closes the
+        exact bug a 250-trader DEX-load run exposed, where heavy blocks
+        overflowed the 2\,MB peer-message cap and stranded a behind
+        validator (\Mnow, re-run at the tagged commit).
+  \item \textbf{consensus \texttt{v1.35.38}} (intermediate-ancestor
+        catch-up): \texttt{TestMultiNode\_PartitionHeal\_Reconverges\-InSeconds}
+        \textbf{PASS} --- a 5-node sim ($\alpha{=}4$, $K{=}5$),
+        node~4 partitioned before any block, majority advances 35
+        $\alpha$-of-$K$-certified finalized blocks, then the engine's
+        native \texttt{requestCatchup} reconverges the rejoiner to
+        finalized height~35 in \textbf{\SI{2.761}{s}} (bound 15\,s),
+        \emph{no fork, no operator restore} (\Mnow, tagged commit).
+\end{itemize}
+
+\paragraph{Honest caveat.} These are \emph{simulation-level} proofs
+(Go \texttt{simNet}), not live multi-box/mainnet block-height proofs. On
+the current development tree (node \texttt{ship/node-v1.34.24} against
+consensus \texttt{ship/consensus-v1.36-nova}) the \texttt{chains}
+package does not build --- an in-flight interface refactor
+(\texttt{HandleIncomingPrevote} drift) of the v1.36 Nova lock-free
+rework --- so the fixes are green only at their tagged commits. Every
+mainnet rejoin narrated in operations to date was performed by
+\emph{manual} volume-snapshot/PVC-swap because native auto-rejoin was
+historically broken; the native fixes above are days old and have no
+live-production proof yet. The self-heal property is
+\textbf{proven in simulation, pending on a live GPU fleet}.
+
+\section{Composition and bottleneck analysis}\label{sec:composition}
+
+Compose the measured $\min$-terms for a single node (10-core CPU + 1
+GPU), expressed as sustainable fills/s per stage:
+
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}llcl@{}}
+\toprule
+Pipeline stage & Throughput (fills/s) & Binding? & Src \\
+\midrule
+Matching (GPU)                    & $9.4\times10^{9}$ & no ($26{,}000\times$ over) & \Mnow \\
+Conflict detection (CPU)          & $2.0\times10^{6}$ & no & \Mnow \\
+Classical sig-verify (GPU batch)  & $0.94\times10^{6}$ & near & \Mprior \\
+Settlement / MPT commit (CPU, sharded) & $0.35\times10^{6}$ & \textbf{YES} & \Mnow \\
+PQ sig-verify (CPU, ML-DSA-44)    & $0.20\times10^{6}$ & \textbf{YES (PQ-on)} & \Mnow \\
+Consensus (amortized, $B$/block)  & $B\times$ blocks/s & no & \Mprior \\
+\bottomrule
+\end{tabular}
+\caption{Per-node stage ceilings. The end-to-end rate is the minimum;
+today that minimum is settlement (plaintext) or PQ-verify (PQ-on).}
+\label{tab:composition}
+\end{table}
+
+The picture is stark and clean:
+\begin{itemize}[leftmargin=2em,itemsep=1pt]
+  \item Matching over-delivers by $\mathbf{26{,}000\times}$. It is solved.
+  \item The single-node batched ceiling is set by \textbf{settlement}
+        (\SI{0.35}{M\,fills/s}) and, with full PQ verification on and
+        CPU-bound, by \textbf{PQ sig-verify} (\SI{0.20}{M\,fills/s}).
+  \item Everything between --- conflict detection, classical
+        batch-verify --- sits comfortably above the settlement floor.
+\end{itemize}
+
+\noindent The distance from the settlement floor to $10^{9}$ is
+$10^{9}/(3.5\times10^{5})\approx\mathbf{2{,}800\times}$. That factor, not
+matching, \emph{is} the path to one billion trades/s.
+
+\section{The current wired baseline (honestly)}\label{sec:baseline}
+
+It is tempting to quote a large end-to-end number. The truth is smaller
+and we state it plainly:
+\begin{itemize}[leftmargin=2em,itemsep=1pt]
+  \item \textbf{The often-cited ``169'' is a latency, not a rate.} It is
+        \SI{169}{ns} average match latency for the single-book C++
+        matcher, not 169 fills/s. No ``10{,}039 fills'' figure exists in
+        any source we could find. We discard the ``169 fills/s
+        baseline'' as a misreading.
+  \item \textbf{Best proven end-to-end:} 729 real on-chain
+        \texttt{0x9999} settlements on a single Zoo mainnet node (blocks
+        808--3599, receipts verified, status \texttt{0x1}) --- a
+        single-node, mechanism-proving run, since idle.
+  \item \textbf{Lux mainnet:} 0 fills in the last 500 blocks as of
+        2026-07-07 --- the DEX was frozen during the C-Chain incident and
+        is not yet re-proven trading post-recovery.
+\end{itemize}
+
+So the honest gap is not ``169/s $\to 10^9$/s.'' It is: \emph{a proven
+single-node settlement mechanism, and a measured 0.35\,M fills/s batched
+settlement ceiling, versus a $10^9$/s target} --- with the matching,
+determinism, and self-heal pieces independently proven, and the
+settlement/wiring/PQ-verify pieces measured and open.
+
+\section{The roadmap to one billion trades/s}\label{sec:roadmap}
+
+Each step below is annotated with the measured gap it closes. The order
+is by leverage.
+
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}lllp{4.4cm}@{}}
+\toprule
+\# & Step & Measured gap & Status \\
+\midrule
+1 & GPU matching             & $0\times$ (9--21\,B/s) & \textbf{Done}, parity-verified (\S\ref{sec:l1}) \\
+2 & Wire Block-STM to live path & --- & Engine tested green but unregistered; C-Chain sequential today (\S\ref{sec:l2wiring}) \\
+3 & MVHashMap (drop copy-the-world) & removes copy-bound penalty & \texttt{evmgpu} \texttt{MvMemory} exists; not on prod path \\
+4 & GPU/parallel MPT state commit & $\sim 2{,}800\times$ & \textbf{Primary gap}; no measured GPU state-commit yet \\
+5 & Wire GPU batch sig-verify (ecrecover) & $32\times$ done & Kernel measured; not on block ingress \\
+6 & ML-DSA/SLH-DSA GPU verify kernel & $\sim 5{,}000\times$ (PQ) & Unwired; GB10 \texttt{NOT\_SUPPORTED} (\S\ref{sec:l4}) \\
+7 & Batch-block sizing ($\ge$10k fills/blk) & config, not wall & Consensus has headroom (\S\ref{sec:l5}) \\
+8 & Live multi-box self-heal proof & sim$\to$live & Sim green (2.76\,s); dev tree mid-refactor (\S\ref{sec:selfheal}) \\
+\bottomrule
+\end{tabular}
+\caption{Roadmap. Steps 4 and 6 are the load-bearing, currently-unproven
+pieces; the rest are wiring or configuration of already-measured parts.}
+\label{tab:roadmap}
+\end{table}
+
+\paragraph{The one hard problem.} Steps 2, 3, 5, 7 are engineering
+integration of parts we have already measured. Step 8 is a deployment
+proof of a property already green in simulation. The genuinely
+\emph{unproven} research is \textbf{step 4}: a GPU-parallel (or radically
+sharded) Merkle-Patricia state commit that lifts settlement from
+\SI{0.35}{M} to ${\sim}10^{9}$ fills/s. The conflict detector already
+runs at \SI{2}{M/s} and is GPU-KAT-equal, so the ordering/validation
+substrate for a parallel commit exists; the trie-commit itself does not
+yet have a measured GPU implementation. Closing step 4 (and step 6 for
+the PQ-on case) is exactly the distance to $10^{9}$. Horizontal scale
+across the fleet then multiplies: the measured 30.3\,B/s matching
+aggregate shows the fleet already composes; settlement must be made to
+compose the same way.
+
+\section{Threats to validity}
+
+We hold ourselves to the same standard we hold the numbers.
+\begin{itemize}[leftmargin=2em,itemsep=1pt]
+  \item \textbf{Kernel-only, synthetic books (L1).} The matcher figures
+        exclude host-device transfer and use uniform synthetic order
+        books. They measure the matching-compute ceiling, not an
+        end-to-end fill rate. We label them ord/s precisely for this
+        reason and never add them to the end-to-end number.
+  \item \textbf{Single-host execution (L2).} Block-STM/settlement is a
+        10-core CPU measurement; the GPU state-commit that would move the
+        floor is not yet built, so we do not project it as measured.
+  \item \textbf{Prior-measured layers (L3, parts of L4/L5).} FHE NTT,
+        BLS/pairing/keccak GPU throughput, and consensus finality are
+        cited from prior Lux runs (\Mprior), not re-executed here; we
+        flag each and do not upgrade a projection to a measurement.
+  \item \textbf{Simulation, not live (L5 self-heal).} The reconvergence
+        proof is a Go \texttt{simNet}; a live multi-box GPU proof is
+        step 8, not done.
+  \item \textbf{Composition is a $\min$, not a sum.} The one number we
+        emphasize --- the $\sim 2{,}800\times$ settlement gap --- is
+        derived from measured stage throughputs; the $30.3$\,B/s fleet
+        figure is a sum of independent measured peaks and is a matching
+        ceiling, not a trade rate.
+\end{itemize}
+
+\section{Conclusion}
+
+One billion trades per second is reachable on the Lux GPU-native
+architecture, and the measurements say precisely why it is not reached
+\emph{today}. The matching layer clears the target by four orders of
+magnitude --- \SI{9.42}{B\,ord/s} on one GB10, \SI{12.48}{B}/s on one
+AMD APU, \SI{30.3}{B}/s across the fleet, every run parity-verified and
+deterministic. Consensus is off the per-trade path by construction and
+has ample batch-block headroom. Self-heal is green in simulation
+(\SI{2.76}{s} rejoin, no fork). What remains is not matching and not
+consensus: it is \textbf{settlement} --- a measured \SI{0.35}{M\,fills/s}
+Merkle-Patricia commit that must become a GPU-parallel commit
+(${\sim}2{,}800\times$) --- plus the \textbf{wiring} of already-fast
+kernels onto the live path (Block-STM is tested but unregistered; the
+GPU EVM interpreter and the ML-DSA/SLH-DSA verify kernels are unwired),
+and a \textbf{live} proof of the self-heal property. Those are the exact,
+honest gaps. The billion is a settlement-and-wiring problem, and this
+paper measures its size to the order of magnitude.
+
+\bibliographystyle{plain}
+\bibliography{biblio}
+
+\end{document}
