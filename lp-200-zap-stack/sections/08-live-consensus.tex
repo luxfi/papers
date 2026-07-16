@@ -81,44 +81,108 @@ not independent local mining.
 \midrule
 \texttt{WindowDuration}=\SI{5}{\second} (mainnet default) & 44  & \SI{14}{\second} & 571 \\
 \texttt{WindowDuration}=\SI{1}{\second}                   & 104 & \SI{3.8}{\second} & 393 \\
-20-sender saturation, \SI{1}{\second} window             & 108 & \SI{2.8}{\second} & 303 \\
+\SI{100}{\milli\second} window, sub-second timestamps    & 150 & \SI{1.4}{\second} & 210 \\
+\SI{100}{\milli\second} window, \SI{100}{M} gas (peak)   & 950 & --- & 862 \\
 \bottomrule
 \end{tabular}
 \caption{Live five-node strict-PQ C-Chain (EVM) block production, M1
 Max, no automining. All rows: five validators, $K{=}5$/$\alpha{=}4$,
 ML-DSA-65 + ML-KEM-768, every block byte-identical on all five nodes.
 Contract deploy + \texttt{SSTORE} verified with cross-node state
-agreement (slot value identical on all five). EVM per-block capacity is
-gas-bounded ($\ge 300$ tx/block observed, up to 571).}
+agreement (slot value identical on all five). Rows 3--4 add the
+sub-second cadence path (millisecond block timestamps, \S\ref{ssec:subsec})
+and the raised-gas-limit path; \SI{950}{} TPS is the peak observed with
+\SI{100}{M}-gas blocks (\SI{862}{} tx/block). Per-block capacity is
+gas-bounded; execution is never the limit (below).}
 \label{tab:live-consensus}
 \end{table}
 
-\subsection{The throughput law, and where the ceiling is}
+\subsection{The throughput law: cadence, not execution}
 
 The measured data obey a simple relation:
 \[
   \mathrm{TPS} \;=\; \frac{\text{transactions per block}}{\text{block cadence}}.
 \]
-Per-block capacity is high and gas-bounded (300--571 tx/block); the
-binding constraint is \emph{cadence}, which is set by proposer rotation,
-not by execution or by ZAP serialization (submission latency is
-$p_{50}=\SI{2.9}{\milli\second}$; the node is never serialization-bound
---- that is the whole point of the ZAP stack). Halving cadence doubles
-throughput. Thus the roadmap to $10^3$--$10^4$ TPS on this same
-five-node net is sub-second cadence, and the remaining obstacle is
-precisely characterized: at a \SI{100}{\milli\second} window the slot
-recomputed in the builder from a drifted wall-clock can differ from the
-slot the scheduler elected, reintroducing the proposer mismatch of
-gate~(2). Pinning the elected slot through the build path --- so the
-builder always builds for a slot it is elected to win --- is the single
-change that unlocks the sub-second regime. On a co-located, fiber-linked
-deployment (the DEX / D-Chain case, InfiniBand-class RTT) the
-consensus-finality floor is sub-millisecond, so \SI{1}{\milli\second}
-block times are physically admissible once the slot handoff is pinned;
-a public chain wants a \SI{100}{\milli\second}--\SI{1}{\second} window
-for propagation headroom. Cadence is therefore a per-chain policy knob,
-not a protocol constant --- the same binary serves an HFT DEX and a
-global settlement chain by configuration alone.
+Per-block capacity is high and gas-bounded (210--862 tx/block observed);
+the binding constraint is \emph{cadence}. Two independent measurements
+pin down that execution is nowhere near the limit. First, the consensus
+engine itself processes \num{4067} value-transaction blocks per second
+and \num{5844} empty blocks per second (\texttt{consensus/BENCHMARKS.md},
+\texttt{InsertChain} on the same hardware) --- roughly four orders of
+magnitude above the $\sim\!0.6$ blocks/s the node was producing. Second,
+the parallel EVM execution kernel executes transactions at
+\SI{12}{}--\SI{13}{} million per second (kernel-only, CPU). Neither the
+consensus algebra nor the EVM nor the ZAP wire (submission
+$p_{50}=\SI{2.9}{\milli\second}$) is the ceiling. \emph{The ceiling was
+node-side block-production wiring} --- the proposer window and the block
+clock --- and it is now a set of policy knobs, not a protocol constant.
+
+\subsection{Sub-second cadence: the block clock}
+\label{ssec:subsec}
+
+Halving cadence doubles throughput, so the roadmap to
+$10^3$--$10^4$ TPS on the same five nodes is sub-second block time. The
+last floor was subtle: the proposer-VM block wire stored the timestamp
+as Unix \emph{seconds}, so a sub-second proposer window inflated slot
+numbers without finer time resolution --- the builder computed the
+proposer slot from a sub-second clock while the verifier read back a
+second-granular timestamp and computed a \emph{different} slot,
+resurfacing gate~(2)'s proposer mismatch below a \SI{1}{\second} window.
+Storing the block timestamp at millisecond resolution
+(\texttt{UnixMilli}) makes build and verify agree at any window; the
+mismatch rate at a \SI{100}{\milli\second} window fell to zero and
+cadence dropped from \SI{2.8}{\second} to \SI{1.4}{\second}. Below the
+proposer VM, two further floors are per-chain configuration, not
+protocol: the C-Chain EVM paces on an integer-seconds
+\texttt{targetBlockRate} (an opt-in \texttt{min-block-build-interval}
+decouples the build cadence from the second-granular fee window without
+touching the fee math --- default off, so mainnet is byte-identical),
+and the coreth block-gas-cost rate-limiter must be relaxed
+($\texttt{maxBlockGasCost}=0$) or it escalates the required per-block fee
+for fast blocks until building fails. The DEX chain (\texttt{dexvm}) has
+none of these: it already carries nanosecond timestamps and a
+\SI{1}{\milli\second} default block interval. On a co-located,
+fiber/InfiniBand deployment the consensus-finality floor is
+sub-millisecond, so \SI{1}{\milli\second} DEX blocks are physically
+admissible; a public chain wants \SI{100}{\milli\second}--\SI{1}{\second}
+for propagation headroom. \emph{Cadence is a per-chain policy knob ---
+the same binary serves an HFT DEX and a global settlement chain by
+configuration alone.}
+
+\subsection{Where the remaining parallelism lives}
+
+Given that execution is not the bottleneck, the levers that raise the
+ceiling further are (i) bigger blocks --- raising the gas limit from
+\SI{12}{M} to \SI{100}{M} took the peak from \SI{407}{} to \SI{950}{}
+TPS; (ii) intra-block parallel execution (Block-STM), which already
+exists in the tree behind a determinism gate --- a parallel executor may
+become the default only once it produces a byte-identical state root and
+receipts to the serial path, so it stays fail-closed until that gate is
+met; and (iii) GPU-resident execution, where the CPU kernel's
+\SI{12}{}--\SI{13}{}M~tx/s is the floor. Notably, \emph{multi-proposer
+DAG block-building is not the shortcut} it appears: the DAG engine in the
+tree is test-grade with no Byzantine certificate, and the UTXO chain
+that would most naturally use it was deliberately kept on the linear
+certificate path for safety. The parallelism that ships safely is
+intra-block (Block-STM under the unchanged single-proposer certificate),
+not cross-proposer.
+
+\subsection{Safety under saturation}
+
+Under deliberate overload --- a single node driven with the entire
+transaction stream --- that node can build a chain of locally-accepted
+blocks faster than the four-of-five quorum certifies them; when a peer's
+certified block then conflicts with the driven node's uncertified tip,
+the node's finality guard \emph{halts the chain rather than reorganize a
+block it locally treated as final}. This is the guard working, not
+failing: no certified block is ever orphaned, safety is preserved, and
+the chain continues on the healthy four-of-five. The reconciliation of
+build-rate against certification --- so a node never builds ahead of
+quorum finality in the first place, matching avalanchego's
+build-after-accept invariant --- is the one hardening item that touches
+finality-critical code and is therefore treated as a deliberate,
+separately-verified change rather than a throughput tweak. Load spread
+across proposers, the normal deployment, does not exhibit it.
 
 \subsection{Relation to avalanchego}
 
