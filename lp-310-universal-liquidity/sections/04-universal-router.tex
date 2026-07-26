@@ -1,0 +1,118 @@
+\section{The Universal Router}
+\label{sec:router}
+
+The router is the component that turns three structurally different
+liquidity sources (\S\ref{sec:sources}) into one best-execution fill. Its
+governing principle is a single design law, stated here and justified
+through the rest of the section.
+
+\begin{quote}
+\textbf{Router Law.} \emph{Best execution is decided off-chain and settled
+on-chain. Price discovery, quote aggregation, and source selection happen
+before any transaction is sent; the settlement transaction only
+\emph{verifies and executes} a decision already made.}
+\end{quote}
+
+The reason is economic, not merely engineering. Resolving best execution
+\emph{inside} the settlement transaction --- iterating pools, pulling
+signed quotes, comparing venues on-chain --- would (i) pay gas to discover
+a price the router already knows, (ii) expose the in-flight comparison to
+the mempool, reintroducing exactly the front-running the signed-quote RFQ
+(\S\ref{sec:rfq}) exists to remove, and (iii) make the fill's gas cost a
+function of how many sources were consulted. Deciding off-chain and
+settling on-chain makes settlement cost constant and the executed price a
+cryptographic commitment rather than the outcome of an on-chain race.
+
+\subsection{The waterfall}
+\label{sec:router-waterfall}
+
+Given a request to trade size $q$ of pair $(A,B)$, the router evaluates the
+sources in a fixed precedence and returns the single fill, or split of
+fills, that maximizes the trader's received amount net of fees and gas:
+
+\begin{enumerate}[label=\textbf{W\arabic*.}]
+  \item \textbf{Native first.} Quote the native venues --- the
+  constant-function AMM (V2/V3) and the D-Chain limit-order book, whose
+  fills settle atomically through the \texttt{0x9999} precompile. These are
+  pure functions of on-chain state (\S\ref{sec:sources}), so their quotes
+  are exact and require no counterparty: a native fill cannot be reneged.
+  \item \textbf{Signed quote when it improves.} Request a firm signed quote
+  from the private market maker (PMM). If, after its spread, the PMM price
+  beats the native price for size $q$, route to the PMM under the RFQ
+  settlement predicate (\S\ref{sec:rfq}). The PMM prices against external
+  reference venues and hedges after filling, which is how \emph{global}
+  off-chain liquidity reaches an on-chain trader.
+  \item \textbf{Split when the book is thin.} For sizes that walk the
+  native book past the PMM's marginal price, the router splits: fill the
+  first tranche natively and the remainder against the signed quote, still
+  in one atomic settlement (\S\ref{sec:router-atomic}).
+  \item \textbf{External DEX only to avoid a revert.} If neither native nor
+  PMM can fill --- an exotic pair, a venue outage --- the router falls back
+  to third-party on-chain liquidity. This is last precisely because it is
+  trustless-but-uncompetitive: it exists so a request degrades to a worse
+  price rather than to a failure.
+\end{enumerate}
+
+\begin{property}[Monotone best execution]
+For any request, the router's returned amount is $\geq$ the amount from any
+single source in isolation. Adding a source can only weakly improve the
+fill (a source that never improves is never selected), and the split in
+\textbf{W3} dominates any single-source fill whenever the sources' marginal
+prices cross within $q$.
+\end{property}
+
+\subsection{Global aggregation}
+\label{sec:router-global}
+
+``Universal'' is not confined to one chain. Two mechanisms extend the
+waterfall across the whole Lux family and beyond:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{Cross-L1 liquidity.} Each sovereign Lux L1 runs its own
+  native venues; the router quotes pools and books on \emph{sibling} L1s
+  and settles cross-chain through the bridge, whose transfers are attested
+  by the same dealerless threshold-MPC group that custodies assets. A
+  request on one tenant's venue can therefore be filled against liquidity
+  resident on another, without either operator taking custody of the other's
+  assets.
+  \item \textbf{Off-chain global reference.} The PMM leg (W2) is the
+  conduit for centralized-venue depth: the maker prices against global
+  reference markets, commits a firm on-chain quote, and hedges off-chain
+  afterward. The trader receives global-market pricing with on-chain,
+  non-custodial, atomic settlement --- the property no purely-on-chain AMM
+  and no purely-off-chain OTC desk delivers alone.
+\end{itemize}
+
+\subsection{One atomic settlement}
+\label{sec:router-atomic}
+
+Whatever the router decides --- one source or a split across several --- the
+result settles in a \emph{single} transaction that succeeds in full or
+reverts in full. The settlement contract validates each leg's predicate
+(native pool invariant for AMM legs; the signed-quote predicate of
+\S\ref{sec:rfq} for the PMM leg; the pool constraint for an external leg),
+moves all legs, and emits one settlement receipt through the
+\texttt{0x9999} conduit.
+
+\begin{property}[All-or-nothing]
+A router fill has no partial-execution state visible to the trader: either
+every leg settles in the same block and the trader receives the aggregate
+quoted amount, or the transaction reverts and no leg settles. There is no
+intermediate state in which one leg filled and another did not.
+\end{property}
+
+Atomicity is what makes the split safe: without it, a two-source fill could
+leave the trader having paid for one leg while the other reneged. With it,
+the router can compose native depth and signed-quote depth as freely as if
+they were one book --- which, from the trader's single-signature vantage,
+they are.
+
+\subsection{What the settlement transaction is not}
+
+The router deliberately keeps three things \emph{out} of the settlement
+transaction: price discovery (done in the quote phase), counterparty
+solicitation (the PMM signed its quote before the transaction was built),
+and source iteration (the split was computed off-chain). What remains
+on-chain is verification and movement --- a bounded, constant-shaped
+computation. This is the concrete meaning of the Router Law, and the reason
+a universal fill costs the same gas whether it drew from one source or four.

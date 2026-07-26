@@ -24,6 +24,7 @@ Auto-generated catalogue of research papers — regenerated 2026-05-18.
 | `lux-zap-wire-protocol` | `lux-zap-wire-protocol.tex` | ✓ |
 | `lux-zero-trust-validators` | `lux-zero-trust-validators.tex` | ✓ |
 | `quasar-4-activation-announcement` | `quasar-4-activation-announcement.tex` | — |
+| `w3a-patent-acquisition` | `w3a-patent-acquisition.tex` | ✓ |
 
 ## Directory papers
 
@@ -31,6 +32,9 @@ Auto-generated catalogue of research papers — regenerated 2026-05-18.
 |-------|-----|-----|
 | `chain-first-architecture` | `chain-first-architecture/chain-first-architecture.tex` | ✓ |
 | `dag-evm-formal` | `dag-evm-formal/dag-evm-formal.tex` | ✓ |
+| `sovereign-exchange` | `sovereign-exchange/sovereign-exchange.tex` | ✓ |
+| `lux-growth-round` | `lux-growth-round/lux-growth-round.tex` | ✓ |
+| `lp-310-universal-liquidity` | `lp-310-universal-liquidity/lp-310-universal-liquidity.tex` | ✓ |
 | `dex-price-coherence` | `dex-price-coherence/dex-price-coherence.tex` | ✓ |
 | `evmgpu-benchmark` | `evmgpu-benchmark/evmgpu-benchmark.tex` | ✓ |
 | `gpu-evm-whitepaper` | `gpu-evm-whitepaper/gpu-evm-whitepaper.tex` | ✓ |
