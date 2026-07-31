@@ -1,12 +1,20 @@
-name: Defense Pack
+name: Release
 
-# Builds the reproducible Defense Pack from luxfi/papers + hanzoai/papers
-# given the manifest at defense-pack.yaml. Triggered by:
-#   * pushing a tag matching defense-pack-* (cuts a Release)
-#   * manual dispatch (uploads workflow artifacts only)
+# Builds the reproducible Defense Pack from luxfi/papers + hanzoai/papers per
+# the manifest at defense-pack.yaml, on the native runners
+# (git.hanzo.ai → git-runner).
 #
-# Both repos are public, so the default GITHUB_TOKEN can clone hanzoai/papers
-# without extra secrets.
+# A `defense-pack-*` tag cuts a Release; a manual dispatch uploads workflow
+# artifacts only.
+#
+# This replaces .github/workflows/defense-pack.yml, which named
+# `runs-on: lux-build-amd64`. No runner on this forge carries that label — the
+# pools are `lux-build-linux-<arch>` — and a job naming a label nothing carries
+# does not fail, it waits.
+#
+# hanzoai/papers is still fetched with actions/checkout + `repository:`, which
+# resolves against GITHUB_SERVER_URL. That is deliberate: it is a fleet repo, so
+# it resolves on whichever forge is running the job.
 
 on:
   push:
@@ -19,12 +27,18 @@ on:
         default: 'main'
 
 permissions:
-  contents: write  # required for gh release upload
+  contents: write  # gh release create / upload
+
+# A release is not made irrelevant by a newer one — let it finish.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     name: Build Defense Pack
-    runs-on: ubuntu-latest
+    runs-on: [lux-build-linux-amd64]
+    timeout-minutes: 45
     steps:
       - name: Checkout luxfi/papers
         uses: actions/checkout@v4
@@ -42,10 +56,10 @@ jobs:
 
       - name: Install build deps
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             poppler-utils python3-yaml coreutils tar gzip
-          # mikefarah yq for fastest parse
           sudo curl -fsSL -o /usr/local/bin/yq \
             https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
           sudo chmod +x /usr/local/bin/yq
@@ -54,8 +68,8 @@ jobs:
         env:
           HANZO_PAPERS_DIR: ${{ github.workspace }}/hanzoai-papers
           OUT_DIR: ${{ github.workspace }}/dist
-          # Allow UNRESOLVED entries to be skipped — a tagged release that
-          # needs a missing paper should resolve it in the manifest first.
+          # UNRESOLVED entries are skipped rather than fatal — a tagged release
+          # that needs a missing paper should resolve it in the manifest first.
           ALLOW_UNRESOLVED: '1'
         run: |
           cd luxfi-papers
@@ -81,9 +95,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           tag="${GITHUB_REF#refs/tags/}"
           cd "${GITHUB_WORKSPACE}/dist"
-          # Create release if missing, then upload (clobber to keep tag idempotent).
+          # Create the release if missing, then upload with --clobber so
+          # re-running the tag is idempotent.
           if ! gh release view "$tag" -R "${{ github.repository }}" >/dev/null 2>&1; then
               gh release create "$tag" \
                 -R "${{ github.repository }}" \
