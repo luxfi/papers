@@ -78,6 +78,8 @@ cd ~/work/lux/papers
 `site/` is the source for https://papers.lux.network. Its prebuild catalog generator reads
 the tracked PDF set from Git, copies every tracked artifact into the static export, and
 combines that complete archive with curated metadata for the featured papers. Do not hand
-maintain a partial PDF list. The GitHub Pages workflow in
-`.github/workflows/deploy-site.yml` builds the static export from `main`; the custom domain
-is pinned by `site/public/CNAME`.
+maintain a partial PDF list. `.github/workflows/deploy-site.yml` verifies and uploads the
+static export from `main`, but does not deploy it: the private application repository's
+GitHub plan does not support Pages. Production is the Cloudflare Pages project
+`lux-papers`, whose custom domain is `papers.lux.network`; publish `site/out` there from a
+trusted deployment environment with Pages edit credentials.
