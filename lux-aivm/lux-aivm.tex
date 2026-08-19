@@ -12,6 +12,7 @@
 \usepackage{booktabs}
 
 \geometry{margin=1in}
+\setlength{\emergencystretch}{2em}
 
 % listings has no built-in Rust or Solidity; define them so code blocks compile and highlight.
 \lstdefinelanguage{Rust}{
@@ -46,6 +47,10 @@
 \newtheorem{property}{Property}
 
 \hypersetup{
+  pdftitle={AIVM: Proof of AI},
+  pdfauthor={Zach Kelling},
+  pdfsubject={A-Chain settlement for deterministic, verifiable AI computation},
+  pdfkeywords={Proof of AI, AIVM, A-Chain, integer inference, Freivalds verification},
   colorlinks=true,
   linkcolor=blue!50!black,
   citecolor=blue!50!black,
@@ -64,7 +69,9 @@
 \maketitle
 
 \begin{abstract}
-We present the AIVM (AI Virtual Machine) and its settlement primitive, \emph{Proof of AI} (PoAI): a cryptographic proof that an AI computation \emph{graph} ran correctly. Inference, embedding, and training are all computation graphs --- training is simply a forward pass composed with its backward pass --- so PoAI is \emph{one} proof system, not three. The proof rests on Freivalds' matrix-product verifier evaluated over the prime field $\mathbb{F}_p$, $p = 2^{61}-1$, on the \emph{exact-integer} accumulator of the engine's quantized \texttt{int8} matmul path. Because integer arithmetic is bit-exact across CPUs, GPUs, and backends, the verifier has zero false-reject; its soundness error is information-theoretic, $1/p \approx 2^{-61}$ per challenge vector, giving $\le 2^{-122}$ at two challenges and inheriting no computational hardness assumption --- hence post-quantum by construction. A prover commits each proof-bearing matrix multiplication as a \textsc{keccak}-Merkle leaf over its exact-integer operands; a beacon-selected leaf is opened and Freivalds-checked. Whole-graph soundness then follows by induction over a typed, well-formed trace. The same commitment is reproduced byte-for-byte by the Rust prover, the Go verifier, and a Solidity on-chain verifier; we exhibit a unit test in which a proof emitted by the Go path verifies inside the EVM unchanged. The AIVM is the Lux network's settlement layer for this work: it reconciles minting across every Lux chain through a global, chain-independent compute-claim ledger, sources cross-chain state through a trustless post-quantum validator-quorum relay verified by an ML-DSA precompile, bonds and automatically slashes compute providers, and is governed by a leaderless, sortition-selected quorum of node-operator language models. The native coin is fair-mined under a Bitcoin-shaped schedule (a one-billion hard cap, a four-year halving, and a deflationary fee-burn tail), but the work that mints it is \emph{useful, cryptographically verified AI computation} rather than wasted hashing. Every property in this paper is grounded in shipped, tested code: the soundness core passes 22 Go tests and 27 Rust tests; the on-chain settlement and governance layer passes 256 Solidity tests across 20 suites, all green.
+We present the AIVM (AI Virtual Machine) and its settlement primitive, \emph{Proof of AI} (PoAI): a protocol for committing, challenging, and settling deterministic integer AI computation. The arithmetic core uses Freivalds' matrix-product verifier over the prime field $\mathbb{F}_p$, $p = 2^{61}-1$, on the exact-integer accumulator of a quantized \texttt{int8} matrix multiplication. Honest CPU and GPU implementations therefore agree byte-for-byte. For one committed matrix product, one unpredictable challenge has information-theoretic error at most $1/p \approx 2^{-61}$; two independent vectors reduce the local error to at most $2^{-122}$. This local bound is not, by itself, a whole-model bound: a graph protocol must additionally ensure coverage of every operation, or quantify random sampling and guarantee transcript data availability. The current implementation provides an optimistic commitment-and-fraud-proof backend plus unit-tested typed-graph components; production integration into a complete model pipeline remains work in progress.
+
+The A-Chain runs the sole Proof-of-AI useful-work consensus. It admits a demand-backed job before mining, fixes the model and execution policy, verifies that the committed computation was actually performed, consumes a global work nullifier, and finalizes one canonical receipt. Z-Chain is the P3Q proof-compression and settlement rollup: it batches A-Chain receipt transitions into a Plonky3-derived, pairing-free STARK/FRI settlement proof. Lux Quasar orders and finalizes the A-Chain and Z-Chain state on the post-quantum base layer. A miner may choose a payout destination, but neither Z-Chain nor that destination independently admits raw work or decides that computation occurred. Other chains verify the Z-settled, PQ-finalized A-Chain receipt and release the authorized asset representation. This gives the network one issuance schedule and no-double-mint ledger while allowing permissionless CPU or GPU execution and omnichain payout.
 \end{abstract}
 
 \tableofcontents
@@ -73,25 +80,29 @@ We present the AIVM (AI Virtual Machine) and its settlement primitive, \emph{Pro
 
 A blockchain settles claims about value because anyone can cheaply verify them. Bitcoin settles ``this work was done'' by making the work (a partial hash preimage) trivial to check and expensive to produce; the work itself is otherwise useless. The open question for a decentralized AI network is whether one can settle a far more valuable claim --- ``this AI computation was performed correctly'' --- with the same asymmetry: cheap to verify, expensive to fake, and \emph{the work is the product}.
 
-The AIVM answers yes. Its settlement primitive, Proof of AI, makes a single observation precise: a modern neural network forward pass is roughly $95\%$ matrix multiplications $C = A \cdot B$, and a matrix product is exactly the object Freivalds' 1977 algorithm verifies probabilistically an order of magnitude cheaper than recomputation~\cite{freivalds}. If the proof is anchored on the \emph{exact integer} accumulator of a quantized model --- not a floating-point shadow that disagrees across hardware --- the check becomes bit-exact, deterministic, and information-theoretically sound. From this one primitive the entire economic machine follows: a unit of verified computation mints a fair-launch subsidy exactly once, network-wide; a fabricated computation is caught and the prover's bond is slashed; and the proof, the commitment, and the field arithmetic are identical in the prover (Rust), the off-chain watcher (Go), and the on-chain verifier (Solidity).
+The AIVM answers yes for a deliberately constrained execution domain. Its settlement primitive, Proof of AI, makes a single observation precise: most work in a quantized neural-network pass is matrix multiplication $C = A \cdot B$, and a matrix product is exactly the object Freivalds' 1977 algorithm verifies probabilistically more cheaply than recomputation~\cite{freivalds}. If the proof is anchored on the \emph{exact integer} accumulator of a canonical quantized model --- not a floating-point shadow that disagrees across hardware --- the local check becomes bit-exact and deterministic. The protocol then adds transcript binding, graph chaining, data availability, challenge coverage, and A-Chain settlement. Only after those layers succeed may one unit of accepted computation authorize subsidy once, under the A-Chain's global nullifier state.
 
 \subsection{Contributions}
 
 \begin{enumerate}
-  \item \textbf{One proof for inference, embedding, and training (\S\ref{sec:graph}).} We define a typed computation trace whose well-formedness plus per-operation local correctness imply, by induction, that the committed output equals the deterministic forward pass on the committed input. Training is the same machinery: a gradient step is a longer graph over the same operations (Theorem~\ref{thm:graph}). Data-sharing is orthogonal --- the graph's committed input \emph{is} its data provenance.
-  \item \textbf{An information-theoretic, post-quantum soundness core (\S\ref{sec:soundness}).} Freivalds over $\mathbb{F}_p$, $p = 2^{61}-1$, on an exact-integer accumulator, with $\le 2^{-122}$ soundness at two challenges and zero false-reject (Theorems~\ref{thm:freivalds},~\ref{thm:zero-fr}). The argument cites no computational assumption, so a quantum adversary gains nothing.
-  \item \textbf{Tri-language byte parity (\S\ref{sec:parity}).} A prover-side Rust commitment, a Go verifier, and a Solidity on-chain verifier that share one hash, one field, and one canonical serialization, proven by golden cross-language tests and by an EVM test that verifies a Go-produced opening unchanged.
-  \item \textbf{The AIVM as Lux settlement (\S\ref{sec:settlement}--\S\ref{sec:governance}).} A global no-double-mint compute ledger, a trustless permissionless post-quantum cross-chain root relay, capacity-proportional bonding with automated fraud-slashing, and a leaderless sortition-quorum governance layer that settles canonical decisions and executes arbitrary approved operations behind a timelock.
-  \item \textbf{Bitcoin-shaped, fair-mined economics on useful work (\S\ref{sec:economics}).} A capped, halving, deflationary issuance schedule mined entirely by verified cognition.
+  \item \textbf{A common trace for supported inference, embedding, and training graphs (\S\ref{sec:graph}).} We define a typed deterministic-integer trace whose well-formedness plus verification of every operation imply, by induction, that the committed output equals execution on the committed input. This statement covers graphs expressible in the specified operation set; it is not a claim about arbitrary floating-point training stacks.
+  \item \textbf{An information-theoretic local soundness core (\S\ref{sec:soundness}).} Freivalds over $\mathbb{F}_p$, $p = 2^{61}-1$, on an exact-integer accumulator, with error $1/p$ per independent challenge vector and zero false-reject for an honest matrix product. Hash commitments and signatures remain computational post-quantum assumptions of the complete protocol.
+  \item \textbf{Cross-language byte parity (\S\ref{sec:parity}).} Rust and Go golden vectors share one field and challenge derivation, while a Solidity test verifies a Go-produced opening unchanged. This establishes wire compatibility of the tested fixtures, not production integration of every model kernel.
+  \item \textbf{A-Chain PoAI useful-work consensus (\S\ref{sec:settlement}--\S\ref{sec:governance}).} A-Chain owns job admission, proof finality, the global work-nullifier set, and issuance authorization. Z-Chain rolls finalized receipts into P3Q settlement proofs; Lux provides post-quantum ordering and finality beneath both state machines. Destination chains consume certified receipts and do not run an independent PoAI acceptance path.
+  \item \textbf{Bitcoin-shaped economics applied to accepted useful work (\S\ref{sec:economics}).} A capped, halving, deflationary issuance schedule whose subsidy is authorized only by finalized A-Chain work receipts. Demand establishes usefulness; the execution proof establishes computational correctness.
 \end{enumerate}
 
 \subsection{The shape of the system}
 
-The canonical contract implementation lives once, at \texttt{luxfi/standard} under \texttt{contracts/ai/} (split by concern into \texttt{governance/}, \texttt{mining/}, \texttt{token/}, \texttt{compute/}, \texttt{relay/}, \texttt{registry/}; license BSD-3-Clause), and is consumed everywhere via the \texttt{@luxfi/standard/ai/} import path (e.g.\ \texttt{@luxfi/standard/ai/governance/AIGovernor.sol}); there is no second implementation. The soundness core is mirrored three ways: the prover in \texttt{hanzo-engine} (\texttt{src/poi.rs}, \texttt{poi\_forward.rs}, \texttt{poi\_graph.rs}, \texttt{poi\_transcript.rs}), the verifier in \texttt{luxfi/crypto} (\texttt{crypto/poi/}), and the on-chain verifier in Solidity (\texttt{ComputeWitnessLib.sol}). The remainder of this paper walks the system bottom-up: the field arithmetic and Freivalds core; the per-matmul transcript; the whole-graph composition; the cross-language parity; and finally the settlement, governance, post-quantum, and economic layers that turn a proof into money.
+The reference contracts live at \texttt{luxfi/standard} under \texttt{contracts/ai/}, while the arithmetic core is mirrored in \texttt{hanzo-engine}, \texttt{luxfi/crypto}, and \texttt{ComputeWitnessLib.sol}. These components are at different maturity levels. The arithmetic, serialization, and small-graph tests are implemented; a production-scale proof emitted by a complete Zen model and consumed by A-Chain consensus is not yet the default inference path. The contracts are therefore reference mechanisms and test surfaces until A-Chain integration, data availability, challenge finality, and deployment wiring are complete.
+
+\paragraph{Mining-authority invariant.} ``Mine into another chain'' means that an A-Chain job names a destination for settlement. It never means that Z-Chain or the destination chain runs PoAI, owns an independent mining spent set, or decides whether work occurred. A-Chain PoAI consensus finalizes exactly one issuance authorization; Z-Chain compresses and settles that authorization, and a destination adapter verifies it and releases the corresponding representation.
+
+\paragraph{Three-layer finality and settlement.} PoAI is the A-Chain domain consensus that decides whether an admitted useful-compute claim is valid and final. Z-Chain is the P3Q settlement rollup that batches and proves finalized A-Chain receipt transitions; it is not a second work-admission or mining authority. Quasar supplies validator ordering, fork choice, and finality for the A-Chain and Z-Chain state, with activated post-quantum authentication securing the exported settlement root. Thus ``finalized by PoAI consensus,'' ``settled through P3Q,'' and ``secured by Lux consensus'' describe complementary layers, not competing leader-election mechanisms.
 
 \subsection{Threat model}\label{sec:threat}
 
-We assume compute providers may be Byzantine: they may return fabricated outputs, claim outputs they never computed, splice unrelated activations into a trace, replay one piece of work to many chains, claim hardware they do not possess, or collude to extract the subsidy without performing the work. We assume the underlying \textsc{keccak}-256 hash is collision- and preimage-resistant and that the standardized post-quantum signature ML-DSA (FIPS 204) is unforgeable. We do \emph{not} assume any trusted hardware enclave, any trusted relayer, any privileged sequencer, or any honest-majority computational hardness for the \emph{soundness} of a single proof: that soundness is information-theoretic. We do assume an honest super-majority of the registered governance operator population for the \emph{liveness and policy} layer, and an unpredictable post-commitment public beacon (a future block hash or VRF output) for challenge derivation and committee sortition.
+We assume compute providers may be Byzantine: they may return fabricated outputs, claim outputs they never computed, splice unrelated activations into a trace, withhold transcript data, replay one piece of work to many destinations, claim hardware they do not possess, or collude to extract subsidy without performing the work. We assume \textsc{keccak}-256 is collision- and preimage-resistant, ML-DSA is unforgeable, and A-Chain finality is not captured. The Freivalds equality test for one opened matrix product has information-theoretic error; the complete protocol does not, because commitment binding, authentication, data availability, challenge coverage, and consensus rely on additional assumptions. We require an unpredictable post-commitment public beacon and enough transcript availability for an honest challenger to reconstruct an inclusion proof before finality. Confidential TEE evidence is optional and has an explicit vendor trust assumption.
 
 \section{The Soundness Core: Freivalds over a Prime Field}\label{sec:soundness}
 
@@ -127,10 +138,10 @@ pub fn exact_matmul(a: &Mat, b: &Mat) -> Mat {
 \end{lstlisting}
 
 \begin{property}[Cross-backend determinism]\label{prop:det}
-Integer matrix multiplication is associative and commutative over $\mathbb{Z}$ and incurs no rounding. Therefore two honest machines --- regardless of CPU, GPU, SIMD width, or reduction order --- produce the bit-identical accumulator $C$, hence the bit-identical operands the verifier checks.
+For operand and dimension bounds that prevent accumulator overflow, integer matrix multiplication incurs no rounding and all valid reduction orders produce the same value over $\mathbb{Z}$. Alternatively, an execution specification may define identical modular or saturating overflow semantics. Under one of those explicit policies, honest CPU and GPU implementations produce the bit-identical accumulator $C$.
 \end{property}
 
-This is the property the entire scheme stands on. A floating-point matmul would produce platform-dependent low bits, and the verifier would have to tolerate a fuzz window that an adversary could hide a fabrication inside. By committing the integer accumulator and dequantizing it only as a final public affine map (\S\ref{sec:forward}), the proof checks the \emph{same} value the layer returns.
+This is the property the entire scheme stands on. A floating-point matmul may produce platform-dependent low bits, and a tolerance window complicates soundness. The production execution specification must therefore bind accumulator width, maximum inner dimension, overflow behavior, and dequantization rules rather than relying on the language's default integer or floating-point behavior.
 
 \subsection{Soundness}
 
@@ -154,11 +165,11 @@ With $k$ independent challenge vectors, a fabricated $C$ passes all of them with
 
 The Go verifier states and enforces exactly this bound~(\texttt{crypto/poi/freivalds.go}): ``Soundness error is $1/p \sim 2^{-61}$ per challenge vector; $k=2$ vectors give $\le 2^{-122}$.''
 
-\begin{theorem}[Post-quantum by construction]\label{thm:pq}
-The soundness of Theorem~\ref{thm:freivalds} and Corollary~\ref{cor:two} is information-theoretic: it is a counting argument over a finite field and invokes no computational hardness assumption. A computationally unbounded adversary --- in particular any quantum adversary --- still fails to pass a beacon-derived challenge except with probability $\le 2^{-122}$.
+\begin{theorem}[Post-quantum local equality test]\label{thm:pq}
+The soundness of Theorem~\ref{thm:freivalds} and Corollary~\ref{cor:two}, conditioned on an unpredictable challenge and a binding opening, is information-theoretic: it is a counting argument over a finite field and invokes no computational hardness assumption. A computationally unbounded adversary gains no advantage against that equality test.
 \end{theorem}
 
-This is the structural reason PoAI is post-quantum where zero-knowledge SNARK approaches are not: a SNARK's soundness rests on, e.g., elliptic-curve or pairing assumptions that Shor's algorithm breaks, whereas Freivalds' soundness is the probability that a random low-degree polynomial vanishes, which no amount of computation reduces.
+This is the structural reason the arithmetic core is post-quantum. The complete PoAI protocol additionally uses \textsc{keccak} commitments, ML-DSA authentication, A-Chain consensus, and an availability/challenge game. Those are computational or system assumptions and must not be collapsed into the local information-theoretic bound.
 
 \begin{theorem}[Zero false-reject]\label{thm:zero-fr}
 If $C = A \cdot B$ exactly over $\mathbb{Z}$ and every entry of $A, B, C$ is reduced into $[0,p)$ consistently, then \eqref{eq:freivalds} holds for \emph{every} $r$. Thus an honest prover is never rejected.
@@ -172,15 +183,31 @@ Theorem~\ref{thm:zero-fr} is what makes the scheme safe to put on the critical p
 
 \subsection{Challenge unpredictability}
 
-A prover must not be able to pre-fit $(A,B,C)$ to a known $r$. The canonical derivation hashes a public, post-commitment beacon together with the task and the committed transcript root; the verifier and prover derive the identical vectors~(\texttt{poi.rs}/\texttt{freivalds.go}, \texttt{derive\_challenges\_keccak}):
+A prover must not be able to pre-fit $(A,B,C)$ to a known $r$. The canonical Rust and Go derivation hashes a public, post-commitment beacon with the task and transcript root:
 \[
   r[j][i] \;=\; \mathrm{BE\_u64}\!\big(\textsc{keccak}(\,\text{seed} \,\|\, \mathrm{BE32}(j) \,\|\, \mathrm{BE64}(i)\,)[\,0{:}8\,]\big) \bmod p,
 \]
 with $\text{seed} = \textsc{keccak}(\text{beacon} \,\|\, \text{task} \,\|\, \text{root})$. Because the beacon is fixed only \emph{after} the prover commits the root, the challenge is unpredictable at commit time; because the derivation is a pure function of public inputs, both sides reproduce it without interaction.
 
+\subsection{From local checks to protocol soundness}\label{sec:coverage}
+
+Freivalds answers ``is this opened matrix product correct?'' It does not answer ``did the verifier inspect the fraudulent operation?'' Suppose a trace contains $L$ operations, $b \ge 1$ of which are invalid, and the protocol samples $s$ operations independently and uniformly. The probability that sampling misses every invalid operation is
+\[
+  \left(1-\frac{b}{L}\right)^s .
+\]
+If each selected matrix product is checked with $k$ independent Freivalds vectors, a conservative acceptance bound is
+\[
+  \Pr[\text{accept invalid trace}]
+  \;\le\;
+  \left(1-\frac{b}{L}\right)^s + \frac{s}{p^k}.
+\]
+For a sparse one-operation fraud in a large graph, the sampling term dominates; quoting only $1/p^k$ would be incorrect. A protocol may instead use an optimistic fraud-proof game in which independent watchers re-execute the graph and may challenge \emph{any} invalid committed operation. In that design, security requires the complete transcript (or enough erasure-coded data to reconstruct it) to be available throughout the challenge window, plus a finality rule that prevents irreversible issuance before the challenge resolves.
+
+The Go and Rust verifiers support multiple challenge vectors. The current Solidity witness derives one vector, so its local error is $1/p \approx 2^{-61}$, not $2^{-122}$. Production parameters must state both $s$ and $k$ and bind them in the A-Chain execution policy.
+
 \subsection{What the core proves, and what it does not}
 
-The Freivalds core proves a \emph{single} matmul output is genuine. Two gaps remain, each closed by a later layer. First, a prover could commit \emph{correct} matmuls on \emph{unrelated} inputs --- a valid-looking transcript that is not a real forward pass on the actual prompt; \S\ref{sec:graph} closes this with graph chaining. Second, a prover could compute the matmul correctly but \emph{return} a different value than it committed; \S\ref{sec:forward} closes this by making the returned value a public function of the committed accumulator. The core is deliberately backend-agnostic and dependency-free so that its soundness can be unit-tested in isolation.
+The Freivalds core proves a \emph{single opened} matmul output is genuine, conditioned on the commitment and challenge assumptions. Three gaps remain. First, a prover could commit correct matmuls on unrelated inputs; \S\ref{sec:graph} addresses this with graph chaining. Second, a prover could return a different value than it committed; \S\ref{sec:forward} binds the returned value to the accumulator. Third, a verifier may never inspect the bad operation; \S\ref{sec:coverage} makes that coverage term explicit. None of these checks proves that an answer is semantically true, useful, unbiased, or worth a particular reward. Demand-backed A-Chain job admission supplies usefulness; PoAI supplies execution accountability.
 
 \subsection{Verified test evidence for the core}\label{sec:core-tests}
 
@@ -188,23 +215,23 @@ The Rust core (\texttt{poi.rs}) and the Go core (\texttt{crypto/poi}) each ship 
 
 \begin{table}[h]
 \centering
-\begin{tabular}{lll}
+\begin{tabular}{p{0.34\textwidth}p{0.46\textwidth}l}
 \toprule
 \textbf{Test} & \textbf{Asserts} & \textbf{Lang} \\
 \midrule
-\texttt{honest\_matmul\_passes} & $C = A\!\cdot\!B$ passes every challenge & Rust/Go \\
-\texttt{tampered\_output\_is\_caught} & one flipped entry of $C$ is rejected & Rust/Go \\
-\texttt{negative\_entries\_field\_reduction} & signed int8 reduces exactly & Rust \\
-\texttt{larger\_random\_matmul\_catches\_sparse\_cheat} & one off-by-one in $16\!\times\!16$ caught & Rust/Go \\
-\texttt{challenge\_derivation\_deterministic} & both sides derive identical $r$ & Rust \\
-\texttt{wrong\_dims\_rejected} & shape mismatch fails closed & Rust/Go \\
-\texttt{derive\_challenges\_keccak\_golden\_parity} & Rust $r$ = Go $r$, byte-for-byte & Rust/Go \\
+Honest product & $C = A\!\cdot\!B$ passes every challenge & Rust/Go \\
+Tampered output & one flipped entry of $C$ is rejected & Rust/Go \\
+Signed reduction & negative int8 values reduce exactly & Rust \\
+Sparse fabrication & one off-by-one entry in $16\!\times\!16$ is caught & Rust/Go \\
+Challenge determinism & both sides derive identical $r$ & Rust \\
+Shape mismatch & invalid dimensions fail closed & Rust/Go \\
+Golden parity & Rust $r$ equals Go $r$ byte-for-byte & Rust/Go \\
 \bottomrule
 \end{tabular}
 \caption{Representative soundness-core tests (all passing).}
 \end{table}
 
-Running \texttt{go test ./...} in \texttt{crypto/poi} yields \textbf{22 passed, 0 failed}; running \texttt{cargo test --lib poi} in \texttt{hanzo-engine} yields \textbf{27 passed, 0 failed}. The Go suite also measures the verifier on the host machine at \textbf{1.13\,ms} per opening verification, i.e. \textbf{882 verifications/second/node} single-threaded~(\texttt{crypto/poi/scale\_test.go}, \texttt{TestScale\_VerificationThroughput}); this is a measured figure from that run, not a projection.
+At the recorded snapshot, the Go suite reported 22 passing tests and the Rust suite reported 27. A small Go fixture measured 1.13\,ms per opening, or 882 verifications/second on one test-host thread. Section~\ref{sec:evidence} states the limits of this measurement.
 
 \section{The Transcript: Committing a Forward Pass}\label{sec:transcript}
 
@@ -231,10 +258,10 @@ unpredictable before the prover commits the root. The prover \emph{opens} that i
 \end{enumerate}
 
 \begin{lemma}[Opening soundness]\label{lem:opening}
-If \texttt{verify\_opening} returns false for an opening that is Merkle-included under \texttt{root}, then with probability $\ge 1 - 2^{-122}$ the committed matmul at that index is fabricated ($C \neq A\cdot B$). Conversely an honest, included opening always returns true.
+For an opening that is Merkle-included under \texttt{root}, an honest $C=A\cdot B$ passes every challenge. If $C\neq A\cdot B$, it passes $k$ independent unpredictable Freivalds vectors with probability at most $1/p^k$. The Go and Rust paths commonly test $k=2$; the current Solidity path uses $k=1$.
 \end{lemma}
 
-This lemma is the production interface: the off-chain watcher imports \texttt{VerifyOpening} and slashes a bond exactly when it returns false on a Merkle-included opening, and the symmetric on-chain predicate \texttt{provesFraud} (\S\ref{sec:witness}) returns \emph{true} on precisely that event.
+This lemma is the local interface used by the off-chain watcher and on-chain fraud predicate. It says nothing about the chance that an invalid operation is opened; that is the separate coverage and availability problem of \S\ref{sec:coverage}.
 
 \subsection{Sound forward pass: the returned value is the committed value}\label{sec:forward}
 
@@ -245,22 +272,26 @@ The transcript binds operands, but an honest-looking transcript is worthless if 
 where the scales are public model parameters. Dequantization is therefore a public affine map of $C$.
 
 \begin{theorem}[Output-commitment binding]\label{thm:output}
-Committing $C$ commits $y$: anyone holding the committed $C$ and the public scales recomputes $y$ exactly, so a prover cannot claim an output that its committed matmuls did not produce.
+Committing $C$ and the canonical scale encoding commits the intended dequantized $y$. Exact consensus replay additionally requires a fixed-point dequantization and rounding specification; ordinary floating-point evaluation with a tolerance is not byte-exact across all backends.
 \end{theorem}
 
-The test \texttt{test\_output\_is\_the\_committed\_value} asserts the returned $y$ equals $\mathrm{dequant}(\text{committed } C)$ to within floating-point dequant tolerance, and \texttt{test\_provable\_ffn\_emits\_verifiable\_transcript} runs a real SwiGLU feed-forward block (gate, up, down projections), confirms it emits exactly three committed matmuls, and verifies every one of them under a beacon-selected challenge.
+The current output-binding test checks returned $y$ against $\mathrm{dequant}(\text{committed } C)$ with floating-point tolerance. That is useful engine evidence but is not a consensus determinism proof. A production proof-bearing output must remain integer or fixed-point through the committed decision boundary, or define a canonical bit-exact dequantizer. A separate SwiGLU fixture exercises three committed matmuls.
 
-\section{Whole-Graph Composition: One Proof for Inference, Embedding, and Training}\label{sec:graph}
+\section{Graph Composition for Deterministic Programs}\label{sec:graph}
 
 \subsection{The gap the graph closes}
 
 Per-matmul soundness still permits a prover to commit individually-correct matmuls computed on activations it never derived from the prompt --- splicing an unrelated tensor mid-stream. The graph layer~(\texttt{poi\_graph.rs}) makes the \emph{wiring} of the computation part of the commitment.
 
 \begin{definition}[Computation trace]
-A \texttt{GraphTrace} is a sequence of typed operations over hash-identified activations. An activation tensor $M$ is named by its commitment $\mathrm{act}(M) = \textsc{keccak}(\texttt{"hanzo/poi/activation/v1"} \,\|\, \mathrm{mat}(M))$. Each operation commits a leaf binding its kind, the commitments of its input activations, any inline parameters, and the commitment of its output activation. The trace also declares a set of \emph{input} activations (the prompt, the weights, an upstream gradient).
+A \texttt{GraphTrace} is a sequence of typed operations over hash-identified activations. An activation tensor $M$ is named by
+\[
+  \mathrm{act}(M)=\textsc{keccak}(\texttt{"hanzo/poi/activation/v1"}\,\|\,\mathrm{mat}(M)).
+\]
+Each operation commits a leaf binding its kind, input commitments, inline parameters, and output commitment. The trace also declares its input activations.
 \end{definition}
 
-The supported operation kinds are exactly those a transformer and its backward pass require, each a pure deterministic integer function of its inputs:
+The prototype operation set contains the following pure deterministic integer functions. It is sufficient for the included attention, MoE, and linear-SGD fixtures; production model support requires a complete manifest for every operator actually executed by the chosen architecture and optimizer.
 \begin{center}
 \begin{tabular}{ll}
 \toprule
@@ -298,17 +329,19 @@ If a trace is well-formed and every operation is locally correct, then the commi
 Induction over the topological order of the trace (the operations are recorded in execution order, which is a valid topological order). \emph{Base:} a declared input activation's committed value is, by definition, the true input. \emph{Step:} consider operation $o$ with inputs $u_1, \dots, u_m$. By chaining, each $u_\ell$ is either a declared input or the output of an earlier operation; by the inductive hypothesis its committed value is the true intermediate value. Local correctness of $o$ guarantees that the committed output of $o$ equals the operation applied to those true inputs. Since each op is the exact-integer deterministic function the reference forward pass uses, the committed output of $o$ is the true intermediate value at $o$. Applying the step to the final operation yields the claim.
 \end{proof}
 
-Because everything is exact integer, the activation commitments are reproducible and the glue recomputation is exact; in particular attention's $QK^{\top}$/$AV$ matmuls and a complete MoE block (router $\to$ top-$k$ $\to$ gather $\to$ expert matmuls $\to$ combine) are expressible with no floating-point reduction in the committed trace. The test \texttt{test\_moe\_graph\_emits\_and\_every\_op\_verifies} traces a real MoE feed-forward block and verifies every op; \texttt{test\_attention\_scores\_av\_chain\_verifies} does the same for an attention block including the integer softmax.
+Because everything is exact integer, activation commitments and glue recomputation are reproducible. The fixtures express attention's $QK^{\top}$ and $AV$ products plus an MoE route, gather, expert, and combine sequence. The tests verify every operation in those standalone blocks, including integer softmax.
+
+Theorem~\ref{thm:graph} is conditional: its antecedent says \emph{every} operation is locally correct. A verifier that checks only a sampled subset has not established that antecedent; its guarantee is instead the coverage bound of \S\ref{sec:coverage}. The current tests exercise standalone blocks and synthetic graphs, not a complete production Zen inference with transcript emission on the normal serving path.
 
 \subsection{Training is a graph, not a separate proof system}\label{sec:training}
 
-The single operation a backward pass needs that a forward pass does not is \texttt{Transpose}: gradients are $\mathrm{d}A = \mathrm{d}C \cdot B^{\top}$ and $\mathrm{d}B = A^{\top} \cdot \mathrm{d}C$. With it, an SGD step is just a longer graph over the same ops --- forward $Y = X\cdot W$; backward $\mathrm{d}W = X^{\top}\!\cdot \mathrm{d}Y$, $\mathrm{d}X = \mathrm{d}Y \cdot W^{\top}$; update $W' = W - \text{lr}\cdot \mathrm{d}W$ via \texttt{Scale} and \texttt{Add}. The same \texttt{MatMul} op kind and the same Freivalds check cover both the forward (activation $\times$ parameter) and the backward (activation $\times$ activation) products; the trace exposes a \texttt{matmul\_act} for the two-activation case.
+For the included linear-SGD fixture, the additional operation is \texttt{Transpose}: gradients are $\mathrm{d}A = \mathrm{d}C \cdot B^{\top}$ and $\mathrm{d}B = A^{\top} \cdot \mathrm{d}C$. The same \texttt{MatMul} kind and Freivalds check cover its forward and backward products. Real training systems additionally require optimizer state, normalization, loss functions, stochasticity policy, precision rules, distributed collectives, and overflow behavior to be specified as deterministic trace operations before they fall within the theorem.
 
-\begin{corollary}[One proof system]\label{cor:one-system}
-Inference, embedding, and training are all instances of Theorem~\ref{thm:graph}; only the shape of the graph differs, not the proof. A fabricated gradient is caught exactly as a fabricated inference output is.
+\begin{corollary}[One proof framework for admitted graphs]\label{cor:one-system}
+Inference, embedding, and training computations expressible entirely in the admitted deterministic operation set are instances of Theorem~\ref{thm:graph}. A fabricated opened gradient matmul is subject to the same local check as a fabricated opened inference matmul.
 \end{corollary}
 
-This is verified directly: \texttt{test\_training\_step\_is\_just\_a\_graph} traces a full linear-layer SGD step (seven ops: forward, two transposes, two backward matmuls, the scaled negation, the residual update), checks the graph chains, verifies every op, and then fabricates the weight gradient and confirms Freivalds catches it. Embedding is likewise a forward graph. Data-sharing is orthogonal to all of this: the graph's committed \emph{input} is its data provenance, so a proof of computation \emph{is} a proof over the declared data without any separate mechanism.
+This is verified for the fixture: \texttt{test\_training\_step\_is\_just\_a\_graph} traces a linear-layer SGD step, checks the graph, verifies every op, and fabricates a weight gradient that Freivalds catches. An input commitment identifies declared data; it does not prove authorship, licensing, completeness, or real-world provenance. Those require separate evidence and policy.
 
 \subsection{Adversarial test evidence}\label{sec:adversarial}
 
@@ -316,18 +349,18 @@ The graph module ships a battery of attack tests, each asserting a specific chea
 
 \begin{table}[h]
 \centering
-\begin{tabular}{ll}
+\begin{tabular}{p{0.32\textwidth}p{0.58\textwidth}}
 \toprule
 \textbf{Attack test} & \textbf{What it proves is caught} \\
 \midrule
-\texttt{attack\_chain\_splice\_is\_caught} & op reading an unproduced activation (chaining + per-op) \\
-\texttt{attack\_tamper\_output\_at\_open\_is\_caught} & claiming a different output at open time \\
-\texttt{attack\_fabricated\_matmul\_in\_graph\_caught\_by\_freivalds} & committing a faked matmul output \\
-\texttt{attack\_forged\_softmax\_is\_caught} & tampering attention weights \\
-\texttt{attack\_forged\_route\_is\_caught} & routing a token to a different expert \\
+Chain splice & operation reads an unproduced activation \\
+Output substitution & opening claims a different output \\
+Fabricated matmul & committed matrix output is invalid \\
+Forged softmax & attention weights are altered \\
+Forged route & token is sent to a different expert \\
 \bottomrule
 \end{tabular}
-\caption{Graph adversarial tests (all passing). A dedicated integration binary, \texttt{tests/poi\_adversarial.rs}, adds further end-to-end attacks.}
+\caption{Graph adversarial fixtures at the recorded implementation snapshot.}
 \end{table}
 
 Across the four \texttt{poi} source modules, \texttt{cargo test --lib poi} runs \textbf{27 tests, 0 failed} (Property~\ref{prop:det} through Corollary~\ref{cor:one-system} are exercised by name in this set).
@@ -338,7 +371,7 @@ A proof is only useful at settlement if the prover, the off-chain watcher, and t
 
 \subsection{One hash, one field, one serialization}
 
-All three implementations use Ethereum \textsc{keccak}-256 (the same primitive as \texttt{luxfi/crypto.Keccak256} and Solidity \texttt{keccak256}), the same field $p = 2^{61}-1$, the same domain tags, the same canonical $(\text{rows},\text{cols},\text{data})$ serialization, the same Merkle index-fold, and the same $\mathrm{BE32}(j)\,\|\,\mathrm{BE64}(i)$ challenge derivation. The Solidity verifier is pure (no external calls), so the same verification logic runs on any EVM.
+All three implementations use Ethereum \textsc{keccak}-256, the field $p=2^{61}-1$, shared domain tags, canonical matrix serialization, the same Merkle fold, and the same challenge-index encoding. The Solidity arithmetic is pure and portable, although only an A-Chain-finalized receipt may authorize mining payout.
 
 \subsection{The on-chain witness}\label{sec:witness}
 
@@ -357,52 +390,60 @@ function freivalds(Matrix memory a, Matrix memory b, Matrix memory c, uint256[] 
 }
 \end{lstlisting}
 
-The library exposes two complementary predicates. \texttt{verifyOpening} returns true iff the opening is Merkle-included \emph{and} Freivalds-valid (an honest matmul). \texttt{provesFraud} returns true iff the opening is Merkle-included \emph{and} Freivalds-\emph{invalid} (a committed-but-fabricated matmul) --- this is the on-chain fraud proof: a challenger exhibits one such matmul from a prover's committed pass, an honest pass has none, so an honest prover can never be slashed (the on-chain restatement of Theorem~\ref{thm:zero-fr}). The opened dimensions are hard-capped at $\texttt{MAX\_DIM} = 1024$ so a griefing prover cannot submit an unboundedly large opening; a full layer is challenged in bounded slices, and the witness stays small even though the model is large --- the gas-side expression of Freivalds' asymmetry.
+The library exposes two complementary predicates. \texttt{verifyOpening} returns true iff the opening is Merkle-included and Freivalds-valid. \texttt{provesFraud} returns true iff it is Merkle-included and Freivalds-invalid. The current Solidity implementation derives one challenge vector and accepts dense matrices with each dimension capped at $\texttt{MAX\_DIM}=1024$. That cap prevents unbounded allocation but does not make a worst-case opening inexpensive: calldata and hashing still include every element of $A$, $B$, and $C$. The repository describes bounded slicing, but the current whole-matrix leaf format does not yet provide a production slice-to-parent binding. Production deployment therefore requires either a committed tiling scheme, an A-Chain native verifier, or a succinct proof backend, together with measured gas and payload bounds.
 
 \subsection{Proven parity}
 
-Parity is enforced by golden tests, not by inspection. On the engine side, \texttt{test\_derive\_challenges\_keccak\_golden\_parity} pins the exact hex of the challenge vectors that the Go path emits and asserts the Rust path reproduces it byte-for-byte; the Go side asserts the same pinned value in \texttt{TestDeriveChallengesGolden}. On the contract side, the Foundry suite \texttt{ComputeWitness.t.sol} carries:
+Parity of the tested primitives is enforced by golden vectors shared by the engine, Go verifier, and Solidity witness suite. The Solidity suite checks:
 \begin{itemize}
   \item \texttt{test\_LeafParityWithProver} --- the Solidity \texttt{matmulLeaf} equals the prover's leaf;
   \item \texttt{test\_GoOpeningVerifiesOnChain} --- an opening produced by the Go verifier verifies inside the EVM unchanged;
   \item \texttt{test\_FabricatedOutputCaughtOnChain} and \texttt{test\_SwappedRevealCaughtOnChain} --- the two attack classes are caught on-chain;
   \item \texttt{test\_FreivaldsOverField} --- the field arithmetic matches.
 \end{itemize}
-All five pass. This is the load-bearing interoperability claim: a proof emitted off-chain in Rust is verified on-chain in Solidity with no re-hashing and no re-encoding.
+All five pass in the recorded suite. The strongest demonstrated end-to-end fixture is Go opening $\to$ Solidity verification; Rust $\leftrightarrow$ Go parity is established through shared golden vectors. A complete Rust model-run transcript consumed by A-Chain remains an integration milestone.
 
 \section{The AIVM as the Lux Settlement Layer}\label{sec:settlement}
 
-PoAI proves a computation; the AIVM turns a proof into settled value across the whole Lux network. The Lux flavor of the AIVM is precisely this: the virtual machine that \emph{proves AI computation graphs} and \emph{reconciles minting across all Lux chains}. Four contracts realize it, each owning one concern.
+PoAI consensus establishes that useful work was actually done: usefulness comes from a pre-admitted, demand-backed job whose requested output and consumer are fixed before mining, while execution evidence binds the model, input, trace, metering, and output. The A-Chain is the only state machine allowed to decide that this mining claim is valid. It owns the job, usefulness policy, execution policy, challenge beacon, proof status, work nullifier, reward calculation, and final receipt. Z-Chain compresses and settles finalized receipt transitions through P3Q, and Quasar orders and finalizes both state machines. Other chains consume this finality; neither Z-Chain nor a destination is an alternate PoAI authority.
 
 \subsection{Mining a proof into a coin}\label{sec:miner}
 
-\texttt{AIMiner.sol} turns one verified A-Chain inference receipt into a fair-launch subsidy mint, in pure Solidity so the same code runs on any EVM. The A-Chain (the AIVM's attestation chain) settles an inference under its own consensus and provider quorum and commits a \textsc{keccak}-Merkle root over the resulting receipts. Mining checks, in order:
+An A-Chain mining job binds a task identifier, accepted model and runtime, input commitment, proof policy, reward budget, expiration, destination chain, destination recipient, and nonce. The miner commits an execution transcript before the challenge beacon is known. A-Chain then performs, or accepts under its configured finality policy, the following checks:
 \begin{enumerate}
-  \item \textbf{Shape and finality.} The receipt is the canonical 355-byte encoding, version 1, status \textsc{completed}, with a non-zero output.
-  \item \textbf{Attestation.} The receipt's leaf is recomputed byte-for-byte against the shared A$\leftrightarrow$C wire spec and proven included under a root the chain has accepted.
-  \item \textbf{Compute proof (the load-bearing gate).} A \texttt{ComputeProof} must bind the receipt's \emph{own} measured model, prompt, output, and task --- fields the submitter cannot forge because they are inside the Merkle-proven receipt --- to a governance-accepted runtime. The contract \emph{fails closed}: if no verifier is wired, no mint occurs. A forged root over a fabricated receipt is therefore insufficient; the compute proof certifying real $(\text{model},\text{prompt},\text{output})$ computation is mandatory.
-  \item \textbf{Global reconciliation.} The computation is claimed on the cross-chain ledger (\S\ref{sec:registry}).
-  \item \textbf{Mint.} Following checks-effects-interactions, the intent is marked consumed, the reward is clamped to the vested halving allowance, and the subsidy is minted to the receipt's \emph{bound requester} --- never the submitter --- so a relayer cannot redirect rewards.
+  \item \textbf{Usefulness.} The job existed before the miner's result, was admitted under a demand or network-service policy, binds a real consumer and deliverable, and cannot be created and self-certified solely by the miner. This is a protocol definition of useful work, not a proof that an answer is universally true or socially valuable.
+  \item \textbf{Binding.} The result binds the A-Chain job, model, runtime, input, output, miner, and destination selected before execution.
+  \item \textbf{Execution evidence.} The configured backend verifies deterministic recomputation, an optimistic transcript after its challenge period, a succinct proof, or an approved attestation policy. A bare signature or output quorum may settle a paid subjective task but cannot authorize subsidy by itself.
+  \item \textbf{PoAI finality.} Optimistic evidence is not final while a fraud window is open. No irreversible issuance receipt may be exported until PoAI consensus resolves every challenge and transcript-availability obligation.
+  \item \textbf{Global uniqueness.} A-Chain consumes the job's canonical work nullifier atomically with finalization.
+  \item \textbf{Receipt.} A-Chain emits one receipt containing the reward authorization and destination. The destination may release only that amount to only that recipient.
 \end{enumerate}
 
-The compute-proof binding itself lives in \texttt{ComputeProofLib.sol} as a two-step \textsc{keccak} chain that collapses $(\text{task},\text{intent},\text{model},\text{prompt},\text{open-block},\text{operator},\text{output},\text{runtime})$ into one 32-byte \texttt{reportData} that every proof backend must reproduce. The pre-execution \emph{challenge} fixes what was asked, to whom, and in what chain context \emph{before} the model runs; the post-execution \emph{report} attests what came out under which measured model and runtime. Folding the challenge into the report means a proof for task $A$/operator $X$ can never be replayed for task $B$/operator $Y$. The \texttt{ComputeProof} struct carries a \texttt{proofType} (1 = confidential-compute TEE, 2 = zkML, 3 = optimistic Freivalds re-execution, 4 = $M$-of-$N$ TEE), so the proof backend can be swapped without touching the economics; the binding (\texttt{reportData}) is identical across all four.
+The reference proof binding collapses the task, intent, model, prompt, open block, operator, output, and runtime into one \texttt{reportData}. In the canonical topology, that binding is judged and finalized on A-Chain. A Solidity deployment elsewhere is a receipt-verification or testing adapter, not a second mining authority. The current optimistic backend reports attestation while a challenge is pending, and the reference miner consumes that pending status. Production A-Chain issuance must instead require final backend state; slashing after an irreversible mint is not finality.
 
 \subsection{The global no-double-mint ledger}\label{sec:registry}
 
-A proof's on-chain binding includes the chain id, so a single proof cannot be replayed on another chain. But a prover could do the work \emph{once} and submit distinct, chain-bound proofs of the \emph{same} computation to many chains, minting the fair-launch subsidy $N$ times for one piece of work. \texttt{AIComputeRegistry.sol} closes this. It keys on the \emph{chain-independent} computation commitment
-\[
-  \text{computationKey} \;=\; \textsc{keccak}\big(\texttt{"hanzo/poi/compute-claim/v1"} \,\|\, \text{modelSpec} \,\|\, \text{promptHash} \,\|\, \text{outputHash}\big)
-\]
-and records the first claimant. A second claim for the same $(\text{model},\text{prompt},\text{output})$ --- from any miner, any chain --- reverts. First-correct-proof wins; redundant recomputation earns nothing, which is exactly the Bitcoin-style incentive to do \emph{novel} work rather than re-mine what is already settled. The miner claims inside its mint flow before the external mint (checks-effects-interactions), so a mint revert rolls back the claim. A claimer is always a proof-enforcing \emph{contract}, never an externally-owned account --- the same god-key defense as the coin's mint seam.
+The global no-double-mint set is A-Chain state. Its key is derived from the A-Chain job/challenge identity and the accepted proof commitment, not from a destination-local chain id. Finalizing the job consumes that key exactly once. A second result for the same mining challenge cannot produce a second issuance authorization, regardless of requested destination.
 
-This is verified by \texttt{test\_FirstClaimWins\_DoubleMintPreventedAcrossChains}, \texttt{test\_ComputationKey\_IsChainIndependent}, \texttt{test\_DistinctComputationsClaimIndependently}, \texttt{test\_OnlyAuthorizedMinerCanClaim}, and \texttt{test\_MinerMustBeContract} (all passing).
+A key based only on $(\text{model},\text{prompt},\text{output})$ is insufficient as the canonical job identity: two legitimate paid jobs may deterministically request the same computation, while an attacker may try to pre-claim a predictable tuple. The A-Chain task identifier, challenge nonce, policy epoch, and receipt identifier provide explicit domain and lifecycle binding. Destination replay protection is then simple: each destination records the finalized A-Chain receipt/nullifier it has consumed. That local consumed set prevents replay of \emph{the same A-Chain authorization}; it does not decide whether work was valid.
 
-\subsection{Trustless, permissionless, post-quantum cross-chain state}\label{sec:oracle}
+\subsection{Post-quantum-rooted omnichain settlement}\label{sec:oracle}
 
-For the global ledger to be visible on every chain, each chain must learn the A-Chain's committed roots without trusting a bridge. \texttt{AChainRootOracle.sol} provides this. Each epoch the A-Chain commits its receipt-root and consumed-set-root, and a \emph{quorum} of A-Chain validators signs $(\text{root},\text{height})$ with ML-DSA --- the same post-quantum scheme \texttt{luxfi/warp} carries as an \texttt{MLDSACertSet}. \emph{Anyone} may relay a signed root (permissionless, a public good), and the oracle verifies the quorum on-chain through the ML-DSA precompile: a relayer can only assert what the validators signed, never forge it, never mint. Acceptance requires that every key is a registered validator, the signer key hashes are strictly ascending (so no validator is double-counted), at least \texttt{threshold} signatures verify, and the height advances monotonically (no rollback).
+The omnichain design uses Lux as the post-quantum root of useful-work truth:
+\begin{enumerate}
+  \item A-Chain PoAI consensus admits the job, verifies that the bound work was performed, consumes the global nullifier, and commits the final receipt under its receipt root.
+  \item Z-Chain batches finalized A-Chain receipt transitions and, once the PoAI AIR and verifier are activated, verifies their Plonky3-derived P3Q STARK/FRI settlement proof. Z-Chain proves compression and settlement of A-Chain decisions; it does not admit mining jobs or validate an unrelated raw-work claim.
+  \item Quasar finalizes the A-Chain receipt root, the corresponding Z-Chain settlement root, and the validator set. The activated PQ authentication policy certifies the roots and heights; selecting ML-DSA alone is insufficient without validator-key and threshold wiring.
+  \item A native atomic boundary, Warp/Teleport message, or quorum-authenticated relay carries the Z-settled A-Chain receipt and inclusion proof to the destination named before mining.
+  \item The destination verifies base-layer finality, Z-Chain settlement, A-Chain receipt inclusion, destination binding, amount, recipient, and local non-consumption, then releases the authorized representation exactly once.
+\end{enumerate}
 
-\begin{property}[Nation-state resistance]\label{prop:nation-state}
-Forging an accepted root requires \emph{either} breaking ML-DSA (post-quantum hard) \emph{or} corrupting at least \texttt{threshold} of the A-Chain validator set. This replaces the trusted single-relayer model with a verified validator quorum.
+Before the P3Q PoAI circuit is activated, Z-Chain may record only an authenticated, already-final A-Chain receipt root; it MUST NOT represent that record as a succinct proof of the underlying work. Activation is fail-closed: the PoAI AIR, prover, verifier, recursion policy, and A-to-Z state-transition binding must be complete, audited, and enabled by protocol version before a P3Q proof can replace the direct finality path.
+
+\texttt{AChainRootOracle.sol} is the reference EVM verifier for the direct, pre-rollup path: a quorum of A-Chain validators signs the root and height with ML-DSA, and anyone may relay it. The production omnichain adapter SHOULD verify the Z-settled commitment or a native proof of A-Chain/Z-Chain finality. A destination MUST NOT accept a raw \texttt{ComputeProof}, TEE quote, Freivalds opening, or miner signature as a substitute for that PQ-authenticated receipt. This is how mining can settle into any supported chain while Proof-of-AI consensus exists only on A-Chain.
+
+\begin{property}[Authenticated A-Chain root]\label{prop:nation-state}
+Forging an accepted root requires either breaking the configured authentication or violating A-Chain finality. This replaces a trusted single relayer with an authenticated finality proof; the precise security level depends on the deployed validator-set and threshold protocol, not merely on selecting ML-DSA as a signature algorithm.
 \end{property}
 
 This is verified by the \texttt{AChainRootOracle.t.sol} suite (7 tests, passing), which exercises quorum acceptance, sub-threshold rejection, non-ascending-key rejection, stale-height rejection, and unregistered-validator rejection.
@@ -421,7 +462,7 @@ A miner is \texttt{eligible} to mine iff bonded above a floor, bonded in proport
 By Theorem~\ref{thm:zero-fr}, an honest miner's openings always verify, so \texttt{provesFraud} can never return true against honest work; the slasher therefore cannot slash an honest bond. Slashing is reachable only by a Merkle-included opening whose Freivalds check fails --- a genuinely fabricated matmul.
 \end{property}
 
-The \texttt{MinerStakeRegistry.t.sol} suite (8 tests, passing) covers bonding, the capacity-proportional floor, the unbond cooldown, slasher-only slashing, and the blacklist veto.
+The recorded stake-registry suite covers bonding, the capacity floor, unbond cooldown, slasher authorization, and blacklist veto.
 
 \section{Governance: A Leaderless Quorum of Operator LLMs}\label{sec:governance}
 
@@ -467,27 +508,30 @@ So ``should consensus execute operation $X$?'' is literally the governance quest
 
 \subsection{Governance as a second proof of useful cognition}\label{sec:govmint}
 
-Consensus itself is useful cognition, and the network mints for it too --- but only when it is backed by proven compute. A vote is $\sim\!1$ bit, so ``guess the modal YES/NO'' must not mint. \texttt{AIConsensusMiner.sol} closes this: a winning validator is paid only if it has \emph{also} submitted a valid \texttt{ComputeProof} binding the settled Thought's $(\text{task},\text{model},\text{prompt})$ to that validator's own output. Consensus says ``they agreed''; the compute proof says ``they computed''; both, or no mint. The reward is split among the proven winners and goes to them, never to the caller. Critically, \texttt{AICoin} shares one \texttt{mintedSubsidy} counter across both mint paths (the attestation miner of \S\ref{sec:miner} and this governance miner), so the halving schedule bounds them \emph{jointly} --- adding a second proof-of-cognition mint seam never inflates past the cap (\S\ref{sec:economics}). \texttt{AIGovernanceBridge.sol} additionally turns each settled decision into a permanent, indexable Proof-of-Thought receipt in \texttt{AIThoughtRegistry.sol}, so the cognitive ledger is queryable.
+Consensus itself can produce useful cognitive artifacts, but a vote is approximately one bit and a quorum signature proves agreement rather than execution. A governance participant may earn demand fees for an accepted judgment. Subsidy requires a separate proof-bearing A-Chain job that binds the participant's model, prompt, and output. \texttt{AIConsensusMiner.sol} is a reference contract for this conjunction; in the canonical topology it cannot create an independent mint seam on C or another destination. A-Chain finalizes the proof and consumes the same global issuance allowance used by every other mining job. \texttt{AIGovernanceBridge.sol} may index the resulting Proof-of-Thought receipt, but the receipt becomes subsidy-bearing only through A-Chain finality.
 
 \section{Economics: Bitcoin-Shaped, Fair-Mined on Useful Work}\label{sec:economics}
 
 \subsection{The issuance schedule}
 
-\texttt{AICoin.sol} is the pure value layer; it knows nothing of tasks, receipts, or governance --- only the issuance schedule and a single \texttt{minter} seam. Its parameters are Bitcoin-shaped:
+The target AI monetary policy has two fixed pools:
 \begin{itemize}
-  \item a hard cap $\texttt{MAX\_SUBSIDY} = 1{,}000{,}000{,}000$ coins, with \emph{no pre-mine}: supply starts at zero and every coin is minted to a cognitive node for accepted work;
-  \item a halving period $\texttt{HALVING\_PERIOD} = 4 \times 365$ days, so the emission slope halves every four years.
+  \item $D = 1{,}000{,}000{,}000{,}000$ AI is allocated at genesis to the Hanzo DAO treasury. It is not mineable and cannot be reclassified as mining emission.
+  \item $M = 1{,}000{,}000{,}000{,}000$ AI is reserved exclusively for PoAI miner and validator rewards. It has no discretionary mint path: every unit must fit the schedule and a finalized A-Chain receipt.
+  \item total nominal supply is bounded by $S_{\max}=D+M=2{,}000{,}000{,}000{,}000$ AI before burns. Destination representations do not add supply.
 \end{itemize}
-Within an epoch the allowance vests linearly and the slope halves each epoch. With $k = \lfloor (t - \text{genesis})/\texttt{HALVING\_PERIOD} \rfloor$ the current epoch and $f \in [0,1)$ the fractional progress through it, the cumulative allowance is
+
+The mining pool follows a Bitcoin-shaped geometric emission. Let $H$ be the governance-fixed halving interval in finalized A-Chain blocks (nominally four years), $k=\lfloor(h-h_0)/H\rfloor$ the era, and $f\in[0,1)$ progress through it. Within an era the aggregate allowance vests linearly and its slope halves at the next era:
 \begin{equation}\label{eq:allowed}
-  \text{allowed}(t) \;=\; \text{MAX}\,(1 - 2^{-k}) \;+\; f \cdot \text{MAX}\, 2^{-(k+1)} .
+  \text{allowedMining}(h) \;=\; M(1 - 2^{-k}) \;+\; f \cdot M 2^{-(k+1)} .
 \end{equation}
+Thus the first era may emit at most 500 billion AI, the second 250 billion, the third 125 billion, and so on. Jobs share the available era budget according to finalized useful work under the active reward policy; raw self-reported FLOPs do not determine payout.
 
 \begin{theorem}[Capped, continuous, exact]\label{thm:cap}
-$\text{allowed}(\text{genesis}) = 0$; $\text{allowed}$ is continuous and strictly increasing; and $\text{allowed}(t) \to \text{MAX}$ as $t \to \infty$. The geometric sum of per-epoch emissions equals exactly $\text{MAX}$: $\sum_{k \ge 0} \text{MAX}\cdot 2^{-(k+1)} = \text{MAX}$.
+$\text{allowedMining}(h_0)=0$; the allowance is continuous and increasing; and $\text{allowedMining}(h)\to M$. The geometric sum of era budgets is exactly $M$: $\sum_{k\ge0}M2^{-(k+1)}=M$. Consequently total nominal issuance never exceeds $D+M=2$ trillion AI, and burns can only reduce it.
 \end{theorem}
 
-The mint function clamps every mint to $\text{allowed}(t) - \text{mintedSubsidy}$, so cumulative minted can never exceed \eqref{eq:allowed} $\le \text{MAX}$ --- the cap is structurally enforced, not merely checked. The contract handles a unified network-wide genesis that may sit \emph{ahead} of a given chain's clock by returning a zero allowance before genesis rather than underflowing, so the same coin emits on one shared curve across every EVM that mints it.
+The canonical settlement function clamps mining issuance to $\text{allowedMining}(h)-\text{mintedMining}$, so cumulative mining and validator rewards cannot exceed \eqref{eq:allowed}. Only the canonical ledger owns this counter. Destination contracts conserve against finalized A-Chain authorizations and canonical escrow; duplicating the counter and schedule on multiple EVMs would multiply supply and is forbidden. The current reference \texttt{AICoin.sol} still implements a legacy one-billion, no-preallocation schedule and must be upgraded and tested before this monetary policy can activate.
 
 \subsection{Deflation}
 
@@ -495,19 +539,27 @@ The mint function clamps every mint to $\text{allowed}(t) - \text{mintedSubsidy}
 
 \subsection{Why this is the next Bitcoin}
 
-Bitcoin's social contract is a capped, fairly-distributed asset whose issuance is earned by verifiable work that no one can counterfeit. PoAI keeps the contract and replaces the substrate:
+Bitcoin's social contract is a capped asset whose issuance is earned by publicly verifiable work. PoAI applies that economic shape to demand-backed AI execution while preserving the distinct roles of A-Chain work consensus, Z-Chain P3Q settlement, and Lux Quasar finality:
 \begin{itemize}
-  \item \textbf{Capped and fair-mined} (Theorem~\ref{thm:cap}, \texttt{test\_NoPremine}, \texttt{test\_FairMineEntireCapThenFeesOnly}): one billion, no pre-mine, halving, deflationary tail.
-  \item \textbf{Public and permissionless} (\S\ref{sec:miner}, \ref{sec:registry}): anyone may submit a valid (receipt, proof) pair and the subsidy mints to the bound requester; first-correct-proof wins.
+  \item \textbf{Capped with fair mining} (Theorem~\ref{thm:cap}): two trillion total, a fixed one-trillion DAO allocation, and a separate one-trillion proof-earned pool with halving and a deflationary tail.
+  \item \textbf{Public and permissionless} (\S\ref{sec:miner}, \ref{sec:registry}): anyone may perform an open A-Chain job under its admission and proof policy; the finalized receipt binds the reward recipient and optional destination.
   \item \textbf{Leaderless} (Property~\ref{prop:leaderless}): no sequencer, no privileged operator; governance is sortition over the whole operator population.
   \item \textbf{Operator-safe} (Property~\ref{prop:operator-safe}): bond-and-slash, never exploitable against honest work, by the zero-false-reject theorem.
-  \item \textbf{Post-quantum / nation-state-proof} (Theorem~\ref{thm:pq}, Property~\ref{prop:nation-state}): the proof's soundness is information-theoretic, and cross-chain trust rests on a post-quantum validator quorum.
+  \item \textbf{Post-quantum-oriented} (Theorem~\ref{thm:pq}, Property~\ref{prop:nation-state}): the local arithmetic check is information-theoretic, while commitments, authentication, and finality use explicitly stated post-quantum and consensus assumptions.
 \end{itemize}
-The decisive difference is that the work is \emph{useful}. Bitcoin spends exahashes computing partial preimages whose only value is their difficulty. PoAI spends the same economic effort on inference, embedding, and training that the world wants performed anyway, and proves --- information-theoretically, cheaply, and on-chain --- that the work was done correctly. The hashing is not wasted; it \emph{is} the AI.
+The intended difference is that the work is useful because an admitted job requests it. PoAI can establish execution accountability for supported deterministic graphs; it does not establish semantic truth or market value. A-Chain PoAI governs eligibility for AI-work rewards and subsidy, Z-Chain P3Q compresses and settles finalized receipt transitions, and Quasar secures and finalizes both chains.
+
+\subsection{Why existing AI clouds participate}
+
+PoAI is designed as an incremental revenue rail, not only a replacement marketplace. A centralized cloud, a decentralized provider, or an idle workstation may attach a job-specific transcript to inference, embedding, evaluation, or admitted training work it is already paid to run. The provider keeps its ordinary demand fee and, if PoAI consensus finalizes the evidence, earns a declining share of the mining allowance. The same adapter can accept open decentralized jobs when capacity would otherwise be idle.
+
+This ``compute once, earn twice'' claim is valid only when proof capture is substantially cheaper than the original job and validators do not replay the full accelerator workload. Exact-integer commitments plus CPU-verifiable openings supply that asymmetry for supported operations: the provider performs an $O(n^3)$ matrix product, while a CPU checks a challenged product in $O(n^2)$ plus commitment overhead. Full-work accountability still requires graph binding, unpredictable post-commitment challenges, coverage or an activated succinct proof, transcript availability, and verifiable metering.
+
+Subsidy eligibility must resist circular demand. A miner-created job, a self-reported GPU-hour, a copied output, or a customer signature alone cannot mint AI. The active policy must bind independent demand or a governed network-service budget, cap rewards per epoch, reject replay through the global nullifier, and make the reward no larger than the available schedule. These controls turn cloud workloads into public evidence without turning fake invoices into a mint.
 
 \section{Verified Test Evidence (Aggregate)}\label{sec:evidence}
 
-Every property in this paper is grounded in shipped, tested code that we executed to completion. No benchmark or count below is projected.
+The following suites are implementation evidence for individual components. They are not evidence of a production end-to-end mining deployment.
 
 \begin{table}[h]
 \centering
@@ -520,49 +572,52 @@ Every property in this paper is grounded in shipped, tested code that we execute
 \texttt{contracts/ai} (Solidity, 20 suites) & 256 passed, 0 failed & \texttt{forge test} \\
 \bottomrule
 \end{tabular}
-\caption{Test results, all green. The Solidity figure spans \texttt{AICoin}, \texttt{AIMiner}, \texttt{AIComputeRegistry}, \texttt{AChainRootOracle}, \texttt{MinerStakeRegistry}, \texttt{ComputeWitness}, \texttt{ComputeProofEnforcement}, \texttt{AIApproval}, \texttt{Sortition}, \texttt{AIGovernor} (and its commit-reveal and red-team suites), \texttt{AIParams}, \texttt{AIConsensusMiner}, \texttt{AIReputation}, \texttt{AIGovernanceBridge}, \texttt{AIObservatory}, and the \texttt{Governance} suite.}
+\caption{Recorded component-test results at the paper's implementation snapshot. Counts may change as suites evolve.}
 \end{table}
 
-The single measured performance figure is the Go verifier's opening-verification latency: \textbf{1.13\,ms}, i.e. \textbf{882 verifications/second} on one thread of the test host (\texttt{scale\_test.go}). With $N$ independent verifying nodes the aggregate scales linearly while the probability of catching a fraud committed at honest-fraction $0.1$ rises toward $1$ as challenges accumulate, exactly as the suite's printed table reports.
+The recorded Go fixture measured 1.13\,ms per small opening on its test host. This is not an on-chain gas benchmark or a production-model benchmark. Before launch the project still requires a real Zen model to emit a complete transcript on the normal execution path, a published availability protocol, measured worst-case challenge payloads, a finalized-not-pending issuance gate, and an end-to-end A-Chain receipt exported to and consumed by a destination chain.
 
 \section{Post-Quantum Primitives}\label{sec:pq}
 
-The AIVM is post-quantum throughout, anchored in the standardized lattice and hash-based schemes, registered as EVM precompiles in the LP-4200 unified PQCrypto address block:
+The AIVM targets post-quantum security across its arithmetic, authentication, and transport layers. The following address assignments and candidate primitives are defined in the Lux precompile namespace; registration does not by itself establish production deployment or threshold-protocol maturity:
 
 \begin{table}[h]
 \centering
-\begin{tabular}{lll}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.17\linewidth}p{0.53\linewidth}}
 \toprule
 \textbf{Primitive} & \textbf{Address} & \textbf{Role} \\
 \midrule
 ML-KEM (FIPS 203) & \texttt{0x012201} & module-LWE KEM \\
 ML-DSA (FIPS 204) & \texttt{0x012202} & module-LWE signature; the AChainRootOracle verifier \\
 SLH-DSA (FIPS 205) & \texttt{0x012203} & hash-based signature \\
-Pulsar & \texttt{0x012204} & module-LWE threshold (FIPS 204 byte-equal) \\
-P3Q & \texttt{0x012205} & post-quantum rollup-commit threshold verifier (LP-218) \\
+Pulsar & \texttt{0x012204} & module-LWE threshold research implementation \\
+P3Q & \texttt{0x012205} & Plonky3-derived, pairing-free STARK/FRI settlement substrate \\
 X-Wing KEM & \texttt{0x002221} & X25519 $+$ ML-KEM-768 hybrid (encapsulate) \\
 \bottomrule
 \end{tabular}
 \caption{Post-quantum precompiles (verified addresses from each precompile's \texttt{contract.go}).}
 \end{table}
 
-The ML-DSA precompile (default mode ML-DSA-65, NIST Level 3) is the verifier \texttt{AChainRootOracle} invokes for the cross-chain root quorum (\S\ref{sec:oracle}); the address is supplied to the oracle by deployment configuration rather than hard-coded in Solidity. The P3Q precompile at \texttt{0x012205} verifies a Pulsar-threshold signature for the LP-218 rollup commit and dispatches through the same FIPS-204 ML-DSA verifier core. \texttt{luxfi/warp} carries an optional \texttt{MLDSACertSet} on its envelope and refuses to downgrade in strict-PQ mode.
+The ML-DSA precompile is the intended verifier for authenticated A-Chain and Z-Chain root certificates. Production claims require node wiring, active validator keys, threshold policy, downgrade prevention, and deployment tests. P3Q supplies the Plonky3-derived, pairing-free STARK/FRI substrate intended for the Z-Chain settlement rollup, but the exact PoAI AIR, recursive batch policy, A-to-Z state binding, and end-to-end verifier remain work in progress until audited and activated. Pulsar remains threshold-signature research and must not be described as a deployed malicious-secure DKG/signing service until that protocol and its networking are complete.
 
 Prompt confidentiality for proof-of-inference is provided by \texttt{luxfi/crypto/promptseal} --- a pure-Go HPKE envelope (not a precompile) that seals a user's prompt to an operator's registered public key under the X-Wing hybrid KEM (X25519 $+$ ML-KEM-768), HKDF-SHA256, and ChaCha20-Poly1305, with domain tag \texttt{"hanzo/poi/prompt-seal/v1"}. Hybrid means the seal stays confidential if \emph{either} X25519 \emph{or} ML-KEM-768 holds; only the chosen operator, inside its compute boundary, can open it. The matching on-chain surface is the X-Wing \emph{encapsulate} precompile at \texttt{0x002221}; key generation and decapsulation are intentionally excluded on-chain because they would expose secret material, and run off-chain in the \texttt{promptseal} library.
 
 \section{Related Work}
 
-\textbf{zkML.} Zero-knowledge proofs of ML inference~\cite{zkml} give a succinct non-interactive proof but at $100$--$1000\times$ prover overhead, and their soundness rests on computational assumptions (pairings, discrete log) that a quantum adversary breaks. PoAI's interactive Freivalds check is an order of magnitude \emph{cheaper} than recomputation rather than orders of magnitude more expensive, and its soundness is information-theoretic (Theorem~\ref{thm:pq}). PoAI also natively spans training (\S\ref{sec:training}), which most zkML systems do not.
+\textbf{zkML.} Zero-knowledge proofs of ML inference~\cite{zkml} can provide succinct non-interactive verification, usually with substantial prover overhead and system-specific computational assumptions. Pairing-based constructions are not post-quantum. The Freivalds core is cheaper for one opened matrix product, but the complete optimistic system additionally pays for commitments, availability, watcher re-execution, and dispute latency. A fair comparison must measure the complete protocol on the same model and threat policy.
 
-\textbf{Trusted execution environments.} TEE attestation (SGX, SEV-SNP, H100 confidential computing) assumes hardware trust and has a history of microarchitectural breaks. The AIVM \emph{accommodates} TEE evidence as one \texttt{ComputeProof.proofType} (\S\ref{sec:miner}) but does not \emph{depend} on it: the canonical, fail-closed path is the software-only, hardware-independent Freivalds witness.
+\textbf{Trusted execution environments.} TEE attestation assumes hardware, firmware, collateral, measurement, and revocation trust. The AIVM accommodates TEE evidence for confidential jobs, but the intended public deterministic path is hardware-independent exact-integer execution. That path is not production-final until transcript availability and A-Chain challenge finality are integrated.
 
 \textbf{Optimistic rollups.} PoAI's fraud-proof structure --- commit a root, allow anyone to challenge an opening within a window, slash on a proven discrepancy --- shares optimistic rollups' philosophy~\cite{optimistic}, specialized to matrix computation where the fraud proof is a single Freivalds check with $O(\log n)$ Merkle overhead rather than a full re-execution.
 
-\textbf{Proof of work.} Bitcoin~\cite{bitcoin} settles useless work; PoAI keeps the capped, fair-mined, leaderless economics and substitutes useful, cryptographically verified AI computation (\S\ref{sec:economics}).
+\textbf{Proof of work.} Bitcoin~\cite{bitcoin} couples work directly to leader election and consensus security. A-Chain PoAI is instead a useful-work validity consensus: it determines that an admitted job was actually performed and may authorize issuance; Z-Chain P3Q compresses and settles that finalized state; Lux Quasar supplies base-layer ordering and finality. The computation is useful because a real, pre-admitted consumer job requests and consumes its result.
+
+\textbf{Matrix-multiplication proof of work.} Komargodski and Weinstein~\cite{matmulpow} propose reusing arbitrary matrix multiplication for both an external workload and proof of work; BTX~\cite{btx} explores a header-derived finite-field MatMul instantiation. Deterministic kernels, canonical transcripts, cross-device parity tests, and staged proof activation are useful engineering patterns. A chain-derived matrix race, however, does not by itself settle a requested model execution: unless the product is bound to a demand-backed job, its utility is hardware adjacency rather than a consumed AI result. Exact replay also makes verification the same asymptotic order as execution, while delegating replay to signed GPU attestors adds an explicit trust assumption. AIVM therefore adopts deterministic integer computation and proof-friendly commitments without making AI execution the leader-election oracle. A-Chain PoAI consensus validates useful work; Z-Chain P3Q settles the proof batches; Lux supplies the PQ-secured base layer; destination chains consume the resulting receipt.
 
 \section{Conclusion}
 
-Proof of AI is the settlement primitive a decentralized AI network needs: a cheap-to-verify, expensive-to-fake, information-theoretically sound proof that an AI computation graph ran correctly, where the work is the product. Because inference, embedding, and training are all graphs, it is one proof system rather than three; because it is anchored on the exact-integer accumulator of a quantized model, it is bit-exact, deterministic, and zero-false-reject; and because its soundness is a counting argument over a finite field, it is post-quantum by construction. The AIVM builds the full economic machine on top: a global no-double-mint ledger, a trustless post-quantum cross-chain relay, bonded providers with automated slashing, a leaderless sortition-quorum of operator LLMs that settles canonical decisions and executes arbitrary approved operations, and a Bitcoin-shaped, fair-mined coin whose subsidy is earned entirely by verified cognition. Every claim here is backed by shipped code and passing tests --- 22 in Go, 27 in Rust, 256 in Solidity, all green --- and one measured benchmark of 1.13\,ms per on-chain-equivalent verification. The hashing is not wasted. It is the AI, and it is proven.
+Proof of AI is a useful-work consensus: it validates that a pre-admitted, demand-backed AI job was actually executed and produced its committed result. Its strongest implemented primitive is an exact-integer Freivalds check with zero false-reject for an honest opened matrix product and information-theoretic local error. Typed graph commitments, cross-language fixtures, evidence backends, and settlement contracts extend that primitive, but their composition requires explicit coverage, availability, finality, and deployment assumptions. The A-Chain is the sole PoAI authority that admits mining jobs, finalizes proofs, consumes work nullifiers, and authorizes subsidy. Z-Chain is the P3Q proof-compression and settlement rollup for those finalized transitions, and Lux Quasar plus activated PQ authentication make the A/Z settlement root the omnichain base-layer fact. Other chains verify that receipt and route value; they never create an independent proof or supply schedule. The remaining engineering milestone is an end-to-end production model run whose transcript is available, challenged, finalized by A-Chain PoAI consensus, proven and settled through the activated P3Q rollup on Z-Chain, PQ-certified by Lux, and consumed exactly once at a destination. Until that test is green, this paper is a protocol and implementation report, not a claim of a completed production mining network.
 
 \section*{Acknowledgments}
 
@@ -579,6 +634,10 @@ This work was supported by Hanzo Industries, Lux Industries, and the Zoo Labs Fo
 \bibitem{ibert} S. Kim, A. Gholami, Z. Yao, M. W. Mahoney, K. Keutzer, \textit{I-BERT: Integer-only BERT Quantization}, ICML, 2021.
 
 \bibitem{bitcoin} S. Nakamoto, \textit{Bitcoin: A Peer-to-Peer Electronic Cash System}, 2008.
+
+\bibitem{matmulpow} I. Komargodski and O. Weinstein, \textit{Proofs of Useful Work from Arbitrary Matrix Multiplication}, arXiv:2504.09971, 2025.
+
+\bibitem{btx} BTX Contributors, \textit{BTX Reference Node: MatMul Proof of Work}, \url{https://github.com/btxchain/btx}, accessed August 2026.
 
 \bibitem{zkml} D. Kang, T. Hashimoto, I. Stoica, Y. Sun, \textit{Scaling up Trustless DNN Inference with Zero-Knowledge Proofs}, arXiv:2210.08674, 2022.
 
