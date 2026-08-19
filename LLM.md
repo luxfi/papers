@@ -72,3 +72,12 @@ cd ~/work/lux/papers
 /Library/TeX/texbin/pdflatex -interaction=nonstopmode lp-020-quasar-consensus.tex
 # Run twice for cross-references
 ```
+
+## Papers website
+
+`site/` is the source for https://papers.lux.network. Its prebuild catalog generator reads
+the tracked PDF set from Git, copies every tracked artifact into the static export, and
+combines that complete archive with curated metadata for the featured papers. Do not hand
+maintain a partial PDF list. The GitHub Pages workflow in
+`.github/workflows/deploy-site.yml` builds the static export from `main`; the custom domain
+is pinned by `site/public/CNAME`.
