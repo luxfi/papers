@@ -157,3 +157,4 @@ Auto-generated catalogue of research papers — regenerated 2026-05-18.
 | `pq` | `pq/pq.tex` | ✓ |
 | `pqsafe-il5` | `pqsafe-il5/pqsafe-il5.tex` | ✓ |
 | `threshold-fhe-compliance` | `threshold-fhe-compliance/threshold-fhe-compliance.tex` | ✓ |
+| `vehicle` | `vehicle/vehicle.tex` | ✓ |
