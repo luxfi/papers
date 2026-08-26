@@ -1,0 +1,381 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{../shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,backgrounds}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\newtheorem{definition}{Definition}[section]
+\newtheorem{property}{Property}[section]
+\newtheorem{remark}{Remark}[section]
+
+\title{The Lux Institutional Exchange:\\A Non-Custodial, HFT-Grade Venue for Crypto and\\
+Tokenized Securities --- Nanosecond Matching,\\Real-Time On-Chain Settlement, Global Regulatory Reach}
+
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+
+\date{2026}
+
+\begin{document}
+
+\luxcoverpage
+
+\begin{abstract}
+We describe the \emph{Lux Institutional Exchange}: a white-label venue on
+which an operator runs a fully regulated market --- Alternative Trading
+System (ATS), Broker-Dealer (BD), and Transfer Agent (TA) --- whose
+trust-critical functions are \emph{native protocol primitives of a sovereign
+Lux L1} rather than bolted-on vendors. The design targets institutional
+high-frequency trading and settles it with cryptographic finality. Its
+central properties are four. (i) \textbf{HFT-grade matching}: a deterministic
+central-limit-order-book engine matches in \textbf{169\,ns} on average
+(p50~125\,ns, p99~292\,ns) at \textbf{5.91M orders/s} single-threaded and
+\textbf{11.88M orders/s} across ten threads, with 49\,ns cancels and
+bit-exact CPU/GPU parity. (ii) \textbf{Non-custodial custody}: the venue
+never takes possession of client assets --- balances sit under a dealerless
+threshold-MPC key that is never assembled at any single party, so the ATS is
+non-custodial by construction and carries none of the qualified-custodian
+single-point-of-compromise risk. (iii) \textbf{Real-time settlement}: fills
+settle atomically \emph{inside the block}, delivery-versus-payment, at T+0 ---
+the chain is the tape and the register. (iv) \textbf{Global regulatory
+reach}: jurisdiction is a declarative configuration axis, so the same core
+instantiates a U.S., Canadian, EU (MiCA), U.K., or Singapore venue by
+swapping a brand profile, with FHE-confidential compliance keeping client PII
+off-chain. We report the on-chain settlement primitive running live on Lux
+mainnet, and give the security and performance properties that make the
+architecture suitable for regulated, institutional trading of both crypto and
+tokenized securities.
+\end{abstract}
+
+\tableofcontents
+
+\section{Introduction}
+
+An institutional trading venue is, structurally, four obligations bound
+together: it must \emph{onboard} counterparties under KYC/AML rules (the
+broker-dealer function), \emph{match} their orders fairly and at competitive
+speed and record the trades (the ATS function), \emph{settle} and keep the
+authoritative ownership register (the transfer-agent function), and
+\emph{custody} the assets throughout. Incumbents discharge each obligation
+with a separate vendor --- a KYC provider, a matching engine, a
+books-and-records database, a qualified custodian --- and the operator
+inherits the union of their risks. Two of those risks dominate. The
+\emph{custodian} is a single institution (or HSM boundary) that, if
+compromised or coerced, moves client assets unilaterally. And the
+\emph{matching-plus-settlement} split forces a choice every venue makes
+badly: fast centralized matching with slow, trust-based settlement, or slow
+on-chain matching with no real throughput.
+
+The Lux Institutional Exchange refuses both trade-offs. Matching runs at
+hardware speed in a deterministic order-book engine; settlement runs on-chain
+with cryptographic finality; and custody is \emph{non-custodial} --- assets
+never enter an exchange omnibus account, they move under a dealerless
+threshold key. The venue is delivered white-label: an operator supplies a
+declarative brand-and-jurisdiction profile and provisions a tenant. This
+paper specifies the architecture, grounds each claim in the shipped
+implementation and measured benchmarks, and states the properties that follow.
+
+\paragraph{Contributions.}
+\begin{itemize}[leftmargin=1.4em]
+  \item An HFT-grade matching layer (\S\ref{sec:hft}) with published
+        nanosecond-class latencies and multi-million-order-per-second
+        throughput, with deterministic CPU/GPU parity.
+  \item A \emph{non-custodial} ATS custody model (\S\ref{sec:custody}) in
+        which no party ever holds the signing key.
+  \item Real-time, in-block, delivery-versus-payment settlement
+        (\S\ref{sec:settle}), reported running live on Lux mainnet.
+  \item A securities framework (\S\ref{sec:securities}) spanning crypto,
+        tokenized public equities, and private offerings.
+  \item Global regulatory reach as configuration (\S\ref{sec:global}), with
+        FHE-confidential compliance (\S\ref{sec:fhe}).
+\end{itemize}
+
+\section{Architecture}
+\label{sec:arch}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  svc/.style={draw,rounded corners,minimum width=2.4cm,minimum height=0.8cm,fill=blue!5},
+  prim/.style={draw,rounded corners,minimum width=2.4cm,minimum height=0.8cm,fill=red!5},
+  cfg/.style={draw,rounded corners,minimum width=2.4cm,minimum height=0.8cm,fill=gray!8},
+  >=Latex, node distance=0.5cm and 0.35cm]
+
+  \node[cfg] (admin) {SuperAdmin};
+  \node[cfg, right=of admin] (platform) {White-label platform};
+
+  \node[svc, below=1.0cm of admin] (bd) {BD (KYC/AML)};
+  \node[svc, right=of bd] (ats) {ATS (CLOB match)};
+  \node[svc, right=of ats] (ta) {TA (register)};
+
+  \node[prim, below=1.0cm of bd] (custody) {Non-custodial MPC};
+  \node[prim, right=of custody] (dex) {Settlement (0x9999)};
+  \node[prim, right=of dex] (bridge) {Bridge};
+  \node[prim, right=of bridge] (fhe) {FHE};
+
+  \node[draw,dashed,rounded corners,fit=(custody)(dex)(bridge)(fhe),
+        inner sep=0.28cm,label=below:{\textit{Sovereign Lux L1 \; (networkID $=$ EVM chainID)}}] (l1) {};
+
+  \draw[->] (admin) -- (bd);
+  \draw[->] (platform) -- (ats);
+  \draw[->] (bd) -- (custody);
+  \draw[->] (ats) -- (dex);
+  \draw[->] (ta) -- (custody.north);
+  \draw[->] (ats) -- (custody.north east);
+\end{tikzpicture}
+\caption{A role-scoped operator surface (ATS/BD/TA) and a white-label config
+surface over four native primitives of a per-tenant sovereign L1. Matching is
+HFT-grade; settlement and custody are on-chain and non-custodial.}
+\label{fig:arch}
+\end{figure}
+
+The system has three tiers (Figure~\ref{fig:arch}): a \emph{configuration}
+surface (SuperAdmin + tenant platform) that provisions and brands tenants and
+binds external providers; an \emph{operator} surface (ATS/BD/TA) exposing the
+regulated functions as role-scoped consoles; and a \emph{protocol substrate}
+of four native primitives --- non-custodial matching-adjacent custody,
+on-chain settlement, bridging, and FHE confidentiality --- running on a
+sovereign L1 per tenant, isolated at consensus (the tenant's primary-network
+identifier equals its EVM chain identifier).
+
+\section{HFT-Grade Matching}
+\label{sec:hft}
+
+The order-matching core is a deterministic central-limit-order-book (CLOB)
+engine. It is not a smart contract loop; it is a purpose-built matcher with a
+C++ hot path and a portable Go reference, benchmarked under
+\texttt{cmd/dexbench}.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lllr@{}}
+\toprule
+\textbf{Engine} & \textbf{Avg match} & \textbf{p50 / p99} & \textbf{Throughput}\\
+\midrule
+C++ (single thread) & 169\,ns & 125\,ns / 292\,ns & 5.91M orders/s\\
+C++ (10 threads)    & ---     & ---               & 11.88M orders/s\\
+Pure Go (\texttt{pkg/lx}) & 381\,ns & --- & 2.2M orders/s\\
+\bottomrule
+\end{tabular}
+\caption{Measured matching performance (\texttt{luxfi/dex}). Order-cancel on
+the C++ engine is \textbf{49\,ns}. Matching is deterministic per book, with
+bit-exact CPU/GPU parity, so a GPU-accelerated deployment reproduces the CPU
+result exactly rather than approximating it.}
+\label{tab:hft}
+\end{table}
+
+\begin{property}[Nanosecond, deterministic matching]
+The engine matches at a mean of 169\,ns with a 292\,ns 99th percentile and
+sustains millions of orders per second single-threaded. Determinism (per-book,
+CPU/GPU-identical) means the match sequence is reproducible and auditable ---
+a requirement for a regulated ATS that a nondeterministic or
+approximate-accelerated engine cannot meet.
+\end{property}
+
+Two architectural choices make this compatible with an on-chain venue rather
+than at odds with it. First, the \textbf{wire path is zero-copy}: the node's
+ZAP transport removes serialization and HTTP/2 overhead on the hot path (it is
+several times faster to (de)serialize than protobuf and materially lower
+latency), so order ingress and market-data egress are not the bottleneck the
+matcher is fast enough to expose. Second, matching is \emph{separated from
+settlement}: the engine produces fills at hardware speed, and those fills
+settle on-chain (\S\ref{sec:settle}) with cryptographic finality. The venue
+thus gets HFT latency \emph{and} trustless settlement, instead of choosing
+one.
+
+\section{Non-Custodial Custody}
+\label{sec:custody}
+
+Custody is where incumbent venues are weakest and where regulators scrutinize
+hardest: a qualified custodian, or the HSM inside it, is one entity that can
+move assets. The Lux venue removes that entity. Client assets are never held
+in an exchange account; they sit under a \emph{dealerless threshold-MPC} key
+on the M-Chain.
+
+\begin{definition}[Dealerless threshold custody]
+A group of $n$ validators holds a $t$-of-$n$ threshold signing capability such
+that (i) the private key is never computed or stored at any single party at
+any time, including at generation; (ii) any $t$ parties jointly sign; and
+(iii) any coalition of fewer than $t$ learns nothing about the key.
+\end{definition}
+
+Keys are generated by a verifiable secret-sharing DKG --- each party samples
+its own polynomial and publishes commitments; the group key is the sum of
+contributions, so no dealer ever holds it. Signing is threshold ECDSA
+(CGGMP21-style) or Schnorr (FROST); the output is byte-identical to an
+ordinary signature and verifies under the standard verifier, so the scheme is
+transparent to every wallet and chain.
+
+\begin{property}[The ATS is non-custodial]
+No single validator, no operator, and no platform ever holds material
+sufficient to move client assets. The exchange does not take custody; it
+coordinates a threshold that the client's own key share participates in.
+Asset movement requires a $t$-of-$n$ threshold, so there is no
+qualified-custodian single point of compromise and no exchange omnibus honeypot.
+\end{property}
+
+For a regulated venue this is decisive: non-custodial operation reduces the
+operator's custody liability and capital burden, and converts the strongest
+counterparty risk in the industry --- ``the exchange holds my assets'' --- into
+a cryptographic threshold the client participates in.
+
+\section{Real-Time On-Chain Settlement}
+\label{sec:settle}
+
+Fills settle on a native settlement precompile at the reserved address
+\texttt{0x9999}. An order and its fill are ordinary transactions; the fill
+settles \emph{atomically inside the block that includes it}, moving both legs
+--- delivery of the asset and payment --- in a single receipt. Settlement is
+therefore \textbf{real-time (T+0), delivery-versus-payment, and final on
+inclusion}: there is no T+1/T+2 window, no settlement-risk exposure between
+match and finality, and no separate clearing intermediary. The chain is both
+the trade tape and the ownership register, so the venue is self-auditing.
+
+\paragraph{Live evidence.}
+The settlement primitive is running on Lux mainnet. A maker bid and a taker
+fill executed against a live concentrated-liquidity pool: the taker sold 10
+units of the base asset into a bid priced at 1.1, and the settlement receipt
+carried the on-chain fill event with output amount 11 together with both
+ERC-20 transfer legs in the same accepted transaction, conserving value
+exactly ($10 \times 1.1 = 11$). Real-time, atomic, on-chain settlement is a
+shipped, exercised primitive --- not a specification.
+
+\section{The Securities Framework}
+\label{sec:securities}
+
+One venue, one order book, one custody root, one register --- across three
+asset classes:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{Crypto} --- spot markets (e.g.\ BTC, ETH, and native assets)
+        under the same non-custodial custody and real-time settlement.
+  \item \textbf{Tokenized public equities} --- shares represented on-chain
+        (identified by their real CUSIPs), traded on the ATS and registered by
+        the TA, with corporate actions (dividends, splits) as native
+        operations.
+  \item \textbf{Private offerings} --- Reg~D~506(c) accredited raises, Reg~A+
+        tiers, and Reg~CF crowdfunding, issued through the TA and gated by
+        FHE-evaluated accreditation checks, with an on-chain cap table.
+\end{itemize}
+
+Because the ATS/BD/TA roles are the same regardless of asset class, a single
+venue lists a crypto pair, a tokenized equity, and a private placement side by
+side --- something no incumbent stack does without three separate systems.
+
+\section{Global Regulatory Reach}
+\label{sec:global}
+
+Each tenant runs its own sovereign primary network (network ID $=$ EVM chain
+ID), isolated at consensus. A declarative brand profile then specializes it,
+and \emph{jurisdiction is one of the axes}: the same substrate and the same
+operator services instantiate venues in different regulatory regimes by
+swapping providers and compliance parameters --- not by rewriting code.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Jurisdiction} & \textbf{Regulatory mapping} & \textbf{Configured surface}\\
+\midrule
+United States & SEC / FINRA (ATS, BD, TA) & Reg D/A+/CF, OFAC, ACH rails\\
+Canada & CIRO / provincial commissions & FINTRAC AML, Interac/EFT, CAD\\
+European Union & MiCA / national NCAs & EU sanctions, SEPA rails, EUR\\
+United Kingdom & FCA & UK sanctions, Faster Payments, GBP\\
+Singapore & MAS & local KYC/AML, local rails\\
+\bottomrule
+\end{tabular}
+\caption{Jurisdiction as configuration. The hard, trust-critical layer ---
+matching, non-custodial custody, real-time settlement, confidentiality --- is
+built and audited once; only the regulatory surface is localized per tenant.}
+\end{table}
+
+\begin{remark}
+The custody, matching, settlement, and confidentiality primitives are
+jurisdiction-invariant. Expanding to a new regime is a provider-binding and
+compliance-rules exercise, not a re-architecture --- which is what makes a
+single white-label core viable as a \emph{global} exchange platform.
+\end{remark}
+
+\section{FHE-Confidential Compliance}
+\label{sec:fhe}
+
+A chain-authoritative venue must not publish the client data that securities
+and privacy law protect. Sensitive state --- beneficial ownership on the cap
+table, accreditation and sanctions attributes, pre-print order size --- is
+stored as ciphertext, and the compliance predicates that gate activity
+(accreditation thresholds, sanctions/PEP screening, position and concentration
+limits) are evaluated \emph{over the ciphertext} with lattice-based FHE, with
+threshold decryption gated by the MPC group.
+
+\begin{property}[Authoritative without disclosure]
+For a compliance predicate $P$ and encrypted client attributes
+$\mathsf{Enc}(x)$, the venue computes $\mathsf{Enc}(P(x))$ and reveals only the
+boolean outcome under threshold decryption; $x$ is never disclosed to
+validators, the operator, or counterparties.
+\end{property}
+
+\section{Cross-Chain Bridging}
+\label{sec:bridge}
+
+Assets originating on other chains enter through the B-Chain bridge, attested
+by the \emph{same} dealerless-MPC group that provides custody. A transfer is
+authorized by a threshold signature of the validator group; no bridge operator
+holds a unilateral minting key, and bridge fees are taken from the bridged
+amount. Because bridging shares the custody root, a bridged asset is held under
+the same non-custodial threshold guarantee as a natively issued one --- there
+is no weaker bridge-custody tier.
+
+\section{Security and Performance Properties}
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item \textbf{HFT matching.} 169\,ns average match (p99 292\,ns), up to
+        11.88M orders/s, deterministic with CPU/GPU parity (\S\ref{sec:hft}).
+  \item \textbf{Non-custodial.} No party holds the signing key; movement
+        needs a $t$-of-$n$ threshold; no omnibus honeypot (\S\ref{sec:custody}).
+  \item \textbf{Real-time settlement.} Atomic, in-block, DvP, T+0; finality on
+        inclusion; live on mainnet (\S\ref{sec:settle}).
+  \item \textbf{Multi-asset.} Crypto, tokenized equities, and private
+        offerings on one book and register (\S\ref{sec:securities}).
+  \item \textbf{Global.} Jurisdiction as configuration; one audited core, many
+        regimes (\S\ref{sec:global}).
+  \item \textbf{Confidential.} Compliance over ciphertext; client PII never
+        on-chain in clear (\S\ref{sec:fhe}).
+  \item \textbf{Tenant isolation.} Each tenant a sovereign L1 isolated at
+        consensus.
+  \item \textbf{Post-quantum root.} Lattice-based FHE and the Lux
+        post-quantum certificate/threshold constructions underpin
+        confidentiality, finality, and custody.
+\end{enumerate}
+
+\section{Related Work and Conclusion}
+
+The design continues the ``chain-first'' line --- the blockchain as
+authoritative source of truth for regulated financial infrastructure --- and
+extends it from a settlement-and-registry substrate to a complete,
+institutional-grade venue. Its distinguishing choices are (i) an HFT matching
+core that makes on-chain settlement compatible with professional trading
+rather than a compromise against it; (ii) \emph{non-custodial} custody, which
+removes the qualified-custodian single point of compromise instead of
+hardening it; (iii) real-time DvP settlement with cryptographic finality; and
+(iv) jurisdiction-as-configuration, which makes one audited core a global
+platform. We reported the settlement primitive running live on Lux mainnet and
+the matching benchmarks from the shipped engine. The result is a white-label
+substrate on which a regulated, high-frequency venue for crypto and tokenized
+securities --- in any supported jurisdiction --- is a configuration over a
+shared, cryptographically-grounded core.
+
+\end{document}

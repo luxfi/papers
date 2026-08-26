@@ -1,0 +1,108 @@
+\section{Introduction}
+\label{sec:intro}
+
+A trader who wants to convert one asset into another should not have to
+know \emph{where} the liquidity comes from. Whether the best price at
+that instant sits in a Lux native AMM pool, in the inventory of a
+market maker hedging on a centralized venue, or in some external DEX,
+the trader's experience should be identical: ask for a price, receive a
+firm quote, sign once, and obtain exactly that price or nothing. We
+call this property \emph{universal liquidity}, and this paper specifies
+the protocol that delivers it.
+
+\subsection{Three sources, one fill}
+
+Lux exposes three structurally different sources of liquidity:
+
+\begin{enumerate}[label=(\roman*)]
+  \item \textbf{Native on-chain liquidity} --- the V2 (constant-product)
+  and V3 (concentrated-liquidity) constant-function AMM contracts, whose
+  price is a pure function of on-chain reserves, together with the
+  D-Chain limit-order-book venue whose fills settle on-chain through the
+  \texttt{0x9999} DEX receipt-settlement precompile (a V4-shaped ABI,
+  \emph{not} itself a constant-function AMM). Execution is trustless and
+  atomic.
+
+  \item \textbf{Signed-quote market maker (PMM)} --- a private market
+  maker that prices a pair against an external reference (e.g.\ a
+  centralized exchange), adds a spread, and commits to a firm quote
+  with a short lifetime. After filling on-chain it hedges off-chain to
+  restock. Pricing depends on \emph{off-chain} state (reference price,
+  inventory) and so cannot be a pure on-chain function.
+
+  \item \textbf{External DEX} --- third-party on-chain liquidity, used
+  only when neither of the above can fill, and only to avoid a hard
+  revert.
+\end{enumerate}
+
+A universal-liquidity request returns a \emph{single} fill drawn from
+whichever source(s) give the trader the best execution, settled in one
+atomic transaction. The waterfall the operator runs is, in one line:
+
+\begin{center}
+\emph{native pools first $\rightarrow$ if insufficient, the PMM
+$\rightarrow$ else external DEX $\rightarrow$ else revert.}
+\end{center}
+
+\noindent Section~\ref{sec:router} examines when ``ours first'' is the
+right ordering and when it silently costs the trader, and resolves the
+tension into a single, stated rule.
+
+\subsection{What makes it hard}
+
+The naive picture --- ``ask a backend for a price, then trade'' --- hides
+three failure modes that this paper is built to close.
+
+\paragraph{The price must be a commitment, not a hint.} If the backend
+merely \emph{tells} the user a price and the settlement contract does
+not enforce it, the realized fill can differ from the quote. The fix is
+that the market maker \emph{signs} the quote; the settlement contract
+verifies that signature and guarantees the signed output amount or
+reverts (\S\ref{sec:rfq}).
+
+\paragraph{A firm quote with no expiry is a free option.} A signed
+quote that never expires lets the holder wait: execute when the market
+has moved in their favor, discard it otherwise. This ``last-look in
+reverse'' bleeds the market maker. The fix is a short, on-chain-checked
+expiry baked into the signed order (\S\ref{sec:rfq}, Thm.~\ref{thm:nooption}).
+
+\paragraph{Best execution must not be computed on-chain.} Resolving the
+waterfall inside the settlement transaction --- calling external pools
+mid-fill to discover the best route --- is gas-heavy, reentrancy-prone,
+and non-deterministic. The fix is a strict separation: \emph{decide
+off-chain, settle on-chain} (\S\ref{sec:router}).
+
+\subsection{The dividing line}
+
+The single most clarifying idea in this design is a law about where
+state lives:
+
+\begin{principle}[Backend only for unavoidable off-chain state]
+\label{prin:dividing}
+A server-side service is justified for an operation if and only if that
+operation depends on state that is not on-chain. Swap-via-market-maker
+depends on the reference price, on inventory, and on the hedge --- all
+off-chain --- so it requires a backend. Liquidity provision
+(mint/burn of an AMM position) is a pure on-chain interaction --- no
+quote, no inventory, no hedge --- so it requires \emph{no} backend at
+all.
+\end{principle}
+
+Principle~\ref{prin:dividing} decomplects the system: the
+\texttt{exchange-api} relayer is the swap path's quote-and-settle
+engine, and liquidity provision is built entirely client-side from the
+\texttt{@luxamm} SDK and the deployed contract addresses, depending on
+nothing external (\S\ref{sec:lp}). Re-introducing a ``liquidity
+service'' that merely assembles add/remove calldata would add a trusted
+middleman that re-derives what the SDK already produces; the design
+forbids it.
+
+\subsection{Post-quantum from the signature up}
+
+The quote commitment is only as strong as the signature that binds it.
+Universal Liquidity inherits the Lux post-quantum signature stack: the
+market-maker key is an ML-DSA-65 key, the same scheme that anchors
+validator identity and the Pulsar threshold layer (LP-073, LP-020;
+\cite{lp073,lp020}). A quantum adversary that breaks classical ECDSA
+cannot forge a quote, so ``you will receive $y$'' remains a binding
+commitment in the post-quantum setting (\S\ref{sec:security}).

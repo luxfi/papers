@@ -1,0 +1,220 @@
+\section{Live Multi-Node Consensus: Measured Block Production}
+\label{sec:live-consensus}
+
+Sections~\ref{sec:performance} report per-operation and cert-finality
+microbenchmarks. This section reports the \emph{end-to-end} result: a
+real five-node Byzantine-fault-tolerant network producing and finalizing
+C-Chain (EVM) blocks under load, with post-quantum validator identity,
+and \emph{no} automining --- blocks are built only by the elected
+proposer through consensus. All numbers are measured on a single Apple
+M1~Max host running five \texttt{luxd} processes (network id
+\num{1337}), sybil protection on, sample size $K{=}5$, quorum
+$\alpha{=}4$ (Byzantine-safe: $2\alpha - K = 3 \ge \lfloor(K{-}1)/3\rfloor
++ 1 = 2$), each validator presenting an ML-DSA-65 (FIPS~204) staking
+identity and an ML-KEM-768 (FIPS~203) handshake key.
+
+\subsection{The block-production dependency chain}
+
+Bringing a fresh strict-PQ network from ``all five nodes up'' to
+``sustained finalized blocks'' surfaced a chain of four distinct gates,
+each of which had to be cleared in order. They are worth recording
+because each is a consequence of the post-quantum identity pivot
+composing with the proposer-VM lineage.
+
+\begin{enumerate}[leftmargin=1.4em,nosep]
+\item \textbf{Bootstrap frontier (NodeID scheme match).} Under the
+  strict-PQ profile the canonical NodeID is ML-DSA-derived
+  ($\mathrm{DeriveMLDSA}(\texttt{chainID}{=}\varnothing, \mathit{pub})$),
+  so the P-Chain validator set and the proposer windower are keyed by
+  ML-DSA NodeIDs. A genesis whose \texttt{initialStakers} carry any
+  other NodeID leaves the hardened bootstrap frontier gate with zero
+  connected beacons (no connected peer is a staked beacon), and the
+  native chains (C/X/Q) never leave bootstrapping. The fix is to build
+  genesis from the nodes' \emph{runtime} ML-DSA NodeIDs; the gate itself
+  is correct.
+\item \textbf{Proposer identity (height~$\ge 2$).} The proposer-VM signed
+  post-fork blocks with the classical TLS leaf and derived the block's
+  \texttt{Proposer()} via a cert hash --- a different value than the
+  ML-DSA NodeID the windower elects. Every \emph{signed} block therefore
+  failed its own proposer-window check
+  ($\texttt{expectedProposer} \ne \texttt{blk.Proposer()}$). Block~1
+  survived only because the pre-fork$\to$post-fork transition block is
+  unsigned. The fix threads the ML-DSA identity into the block wire as a
+  scheme-tagged slot ($\texttt{[scheme:1B}\,|\,\texttt{identity]}$: 0x90
+  classical cert, 0x42 raw ML-DSA-65 pubkey), signs with ML-DSA-65 under
+  a FIPS~204~\S5.2 domain-separation context
+  (\texttt{lux-proposervm-block-v1}), and derives \texttt{Proposer()} via
+  the same $\mathrm{DeriveMLDSA}$ the validator set uses. A strict-PQ
+  chain additionally refuses a 0x90-scheme block outright (fail-closed,
+  before the sync gate).
+\item \textbf{Engine build-loop spin.} On a \texttt{BuildBlock} error the
+  engine held the pending-build demand and retried it every
+  notification. Under single-proposer scheduling a non-leader's
+  \texttt{BuildBlock} \emph{always} fails (``not our slot'') until its
+  window opens, so four of five nodes burned CPU rebuilding a slot they
+  could never win --- an unbounded, silent loop (the engine logger
+  defaulted to a no-op, so not one line named the cause). The fix
+  consumes the demand per attempt (avalanchego's model) and waits for a
+  fresh trigger; the loop is now bounded and quiet.
+\item \textbf{Cadence floor.} The proposer-slot spacing
+  (\texttt{WindowDuration}) was a hardcoded \SI{5}{\second}, tuned for
+  mainnet-scale validator sets; a non-slot-0 leader waits
+  $\mathrm{slot}\times\SI{5}{\second}$. It is now a startup-configurable
+  parameter, and the block-timestamp truncation tracks it
+  ($\min(\SI{1}{\second}, \texttt{WindowDuration})$) so a sub-second
+  window actually yields sub-second timestamps.
+\end{enumerate}
+
+\subsection{Measured throughput and finality}
+
+With the chain above cleared, the network produces and finalizes blocks
+from real transactions. Every block was byte-identical across all five
+nodes (identical block hash at every height) --- genuine BFT agreement,
+not independent local mining.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Configuration} & \textbf{Sustained TPS} & \textbf{Cadence} & \textbf{Tx/block} \\
+\midrule
+\texttt{WindowDuration}=\SI{5}{\second} (mainnet default) & 44  & \SI{14}{\second} & 571 \\
+\texttt{WindowDuration}=\SI{1}{\second}                   & 104 & \SI{3.8}{\second} & 393 \\
+\SI{100}{\milli\second} window, sub-second timestamps    & 150 & \SI{1.4}{\second} & 210 \\
+\SI{100}{\milli\second} window, \SI{100}{M} gas (peak)   & 950 & --- & 862 \\
+\bottomrule
+\end{tabular}
+\caption{Live five-node strict-PQ C-Chain (EVM) block production, M1
+Max, no automining. All rows: five validators, $K{=}5$/$\alpha{=}4$,
+ML-DSA-65 + ML-KEM-768, every block byte-identical on all five nodes.
+Contract deploy + \texttt{SSTORE} verified with cross-node state
+agreement (slot value identical on all five). Rows 3--4 add the
+sub-second cadence path (millisecond block timestamps, \S\ref{ssec:subsec})
+and the raised-gas-limit path; \SI{950}{} TPS is the peak observed with
+\SI{100}{M}-gas blocks (\SI{862}{} tx/block). Per-block capacity is
+gas-bounded; execution is never the limit (below).}
+\label{tab:live-consensus}
+\end{table}
+
+\subsection{The throughput law: cadence, not execution}
+
+The measured data obey a simple relation:
+\[
+  \mathrm{TPS} \;=\; \frac{\text{transactions per block}}{\text{block cadence}}.
+\]
+Per-block capacity is high and gas-bounded (210--862 tx/block observed);
+the binding constraint is \emph{cadence}. Two independent measurements
+pin down that execution is nowhere near the limit. First, the consensus
+engine itself processes \num{4067} value-transaction blocks per second
+and \num{5844} empty blocks per second (\texttt{consensus/BENCHMARKS.md},
+\texttt{InsertChain} on the same hardware) --- roughly four orders of
+magnitude above the $\sim\!0.6$ blocks/s the node was producing. Second,
+measured EVM execution sits orders of magnitude above the produced rate:
+the sequential interpreter alone runs $\sim\!\num{305}$k~tx/s on
+contract-heavy transactions on this host (and far more on trivial
+transfers), and a C++ state-layer path (\texttt{luxcpp/cevm}) sustains
+\SI{22756}{} Mgas/s ($\approx\!\num{1.08}$M~tx/s) on a
+\num{10000}-transfer block --- against the $\sim\!130$--\SI{520}{}~tx/s the
+node was actually producing, a $\sim\!10^3\times$ margin. (We quote neither
+of two figures that do not survive scrutiny: a $12$--$13$ million~tx/s
+ceiling measured on empty transfers with \emph{assumed} intrinsic gas, and
+a \SI{614}{}k~tx/s / \SI{3.9}{} Ggas/s figure that appears in no committed
+harness. The intra-block Block-STM executor is not among these wins
+either --- at present block sizes its bookkeeping makes it slower than the
+serial path.) Neither the
+consensus algebra nor the EVM nor the ZAP wire (submission
+$p_{50}=\SI{2.9}{\milli\second}$) is the ceiling. \emph{The ceiling was
+node-side block-production wiring} --- the proposer window and the block
+clock --- and it is now a set of policy knobs, not a protocol constant.
+
+\subsection{Sub-second cadence: the block clock}
+\label{ssec:subsec}
+
+Halving cadence doubles throughput, so the roadmap to
+$10^3$--$10^4$ TPS on the same five nodes is sub-second block time. The
+last floor was subtle: the proposer-VM block wire stored the timestamp
+as Unix \emph{seconds}, so a sub-second proposer window inflated slot
+numbers without finer time resolution --- the builder computed the
+proposer slot from a sub-second clock while the verifier read back a
+second-granular timestamp and computed a \emph{different} slot,
+resurfacing gate~(2)'s proposer mismatch below a \SI{1}{\second} window.
+Storing the block timestamp at millisecond resolution
+(\texttt{UnixMilli}) makes build and verify agree at any window; the
+mismatch rate at a \SI{100}{\milli\second} window fell to zero and
+cadence dropped from \SI{2.8}{\second} to \SI{1.4}{\second}. Below the
+proposer VM, two further floors are per-chain configuration, not
+protocol: the C-Chain EVM paces on an integer-seconds
+\texttt{targetBlockRate} (an opt-in \texttt{min-block-build-interval}
+decouples the build cadence from the second-granular fee window without
+touching the fee math --- default off, so mainnet is byte-identical),
+and the coreth block-gas-cost rate-limiter must be relaxed
+($\texttt{maxBlockGasCost}=0$) or it escalates the required per-block fee
+for fast blocks until building fails. The DEX chain (\texttt{dexvm}) has
+none of these: it already carries nanosecond timestamps and a
+\SI{1}{\milli\second} default block interval. On a co-located,
+fiber/InfiniBand deployment the consensus-finality floor is
+sub-millisecond, so \SI{1}{\milli\second} DEX blocks are physically
+admissible; a public chain wants \SI{100}{\milli\second}--\SI{1}{\second}
+for propagation headroom. \emph{Cadence is a per-chain policy knob ---
+the same binary serves an HFT DEX and a global settlement chain by
+configuration alone.}
+
+\subsection{Where the remaining parallelism lives}
+
+Given that execution is not the bottleneck, the levers that raise the
+ceiling further are (i) bigger blocks --- raising the gas limit from
+\SI{12}{M} to \SI{100}{M} took the peak from \SI{407}{} to \SI{950}{}
+TPS; (ii) intra-block parallel execution (Block-STM), which exists in the
+tree but is \emph{not yet} a throughput win --- at present block sizes the
+Go executor's per-block bookkeeping makes it slower than the sequential
+path, so it stays gated (fail-closed, non-default) until a lower-overhead
+executor clears a byte-identical-to-serial determinism gate; and (iii) a
+C++ state-layer executor (\texttt{luxcpp/cevm}) that genuinely outruns the
+sequential path \emph{for transfer-heavy blocks} (\SI{22756}{} Mgas/s,
+$\approx\!\num{1.08}$M~tx/s on \num{10000} transfers) but today handles
+only pure value transfers, declines contract-call blocks under its strict
+mode, and is not yet wired to production behind a determinism gate that
+does not exist. GPU-resident execution is \emph{below} the CPU path on
+every end-to-end harness measured --- a correctness-proven foundation, not
+a present throughput win. What avalanchego has no analog for is this C++
+transfer accelerator and the intra-block Block-STM scaffolding: its
+\texttt{coreth}/\texttt{subnet-evm} C-Chain runs the stock CPU,
+\emph{sequential} go-ethereum interpreter. Notably, \emph{multi-proposer DAG block-building is not the
+shortcut} it appears: the DAG engine in the tree is test-grade with no
+Byzantine certificate, and the UTXO chain that would most naturally use it
+was deliberately kept on the linear certificate path for safety. The
+parallelism that ships safely is intra-block (Block-STM under the
+unchanged single-proposer certificate), not cross-proposer.
+
+\subsection{Safety under saturation}
+
+Under deliberate overload --- a single node driven with the entire
+transaction stream --- that node can build a chain of locally-accepted
+blocks faster than the four-of-five quorum certifies them; when a peer's
+certified block then conflicts with the driven node's uncertified tip,
+the node's finality guard \emph{halts the chain rather than reorganize a
+block it locally treated as final}. This is the guard working, not
+failing: no certified block is ever orphaned, safety is preserved, and
+the chain continues on the healthy four-of-five. The reconciliation of
+build-rate against certification --- so a node never builds ahead of
+quorum finality in the first place, matching avalanchego's
+build-after-accept invariant --- is the one hardening item that touches
+finality-critical code and is therefore treated as a deliberate,
+separately-verified change rather than a throughput tweak. Load spread
+across proposers, the normal deployment, does not exhibit it.
+
+\subsection{Relation to avalanchego}
+
+Lux runs its own consensus engine (the Photon$\to$Wave$\to$Focus family,
+not snowman) but retains a proposer-VM of common lineage. Three of the
+four gates above are Lux-specific consequences of the post-quantum
+identity pivot (a classical single-scheme network like avalanchego never
+hits gates 1--2, and its engine consumes the build demand so it never
+hits gate~3). The measured advantage the ZAP stack contributes is
+orthogonal to cadence: a validated block is held as bytes plus light
+views rather than a materialized object graph
+(\S\ref{sec:performance}, $114\times$ less resident memory), and the
+proposer signature is post-quantum (ML-DSA-65) where avalanchego's is
+classical (ECDSA over the TLS leaf) --- so Lux's block-production path is
+strictly a security \emph{superset} at equal cadence.

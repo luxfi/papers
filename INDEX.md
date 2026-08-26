@@ -158,3 +158,16 @@ Auto-generated catalogue of research papers — regenerated 2026-05-18.
 | `pqsafe-il5` | `pqsafe-il5/pqsafe-il5.tex` | ✓ |
 | `threshold-fhe-compliance` | `threshold-fhe-compliance/threshold-fhe-compliance.tex` | ✓ |
 | `vehicle` | `vehicle/vehicle.tex` | ✓ |
+| `fee-settlement` | `fee-settlement/fee-settlement.tex` | ✓ |
+| `gpu-native-billion-tps` | `gpu-native-billion-tps/gpu-native-billion-tps.tex` | ✓ |
+| `lp-200-zap-stack` | `lp-200-zap-stack/lp-200-zap-stack.tex` | ✓ |
+| `lp-202-unified-pq-transport` | `lp-202-unified-pq-transport/lp-202-unified-pq-transport.tex` | ✓ |
+| `lp-208-dag-mempool` | `lp-208-dag-mempool/lp-208-dag-mempool.tex` | ✓ |
+| `lp-225-xss-x-chain-settlement-spine` | `lp-225-xss-x-chain-settlement-spine/lp-225-xss-x-chain-settlement-spine.tex` | ✓ |
+| `lp-305-nova-consensus` | `lp-305-nova-consensus/lp-305-nova-consensus.tex` | ✓ |
+| `lp-310-universal-liquidity` | `lp-310-universal-liquidity/lp-310-universal-liquidity.tex` | ✓ |
+| `lp-magnetar-threshold-slhdsa` | `lp-magnetar-threshold-slhdsa/lp-magnetar-threshold-slhdsa.tex` | ✓ |
+| `lux-growth-round` | `lux-growth-round/lux-growth-round.tex` | ✓ |
+| `sovereign-exchange` | `sovereign-exchange/sovereign-exchange.tex` | ✓ |
+| `lp-311-one-venue-dex-settlement` | `lp-311-one-venue-dex-settlement.tex` | ✓ |
+| `w3a-patent-acquisition` | `w3a-patent-acquisition.tex` | ✓ |

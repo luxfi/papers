@@ -1,0 +1,689 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{../shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{siunitx}
+\usepackage{listings}
+\usepackage{longtable}
+\usepackage{array}
+\input{../shared/lstlang}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  breaklines=true,
+  frame=single,
+  showstringspaces=false,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  keywordstyle=\color{blue!70!black},
+  commentstyle=\color{green!45!black},
+  stringstyle=\color{red!60!black},
+}
+
+% Provenance tags — every quantitative claim carries one (house convention, matches
+% gpu-native-billion-tps.tex).
+\newcommand{\Mnow}{\textbf{\textcolor{black}{M}}}   % measured by us this session (2026-07-10)
+\newcommand{\Mprior}{M$^\star$}                      % measured in prior cited work
+\newcommand{\Proj}{P}                                % projected / derived by calculation
+\newcommand{\Claim}{C}                               % external / cited claim
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{remark}{Remark}[section]
+
+\title{Nova: A Two-Tier Metastable Finality Ladder for Lux\\[4pt]
+       \large Majority-accept and \(\tfrac{2}{3}\)-stake export, decomposed --- the v1.36 consensus}
+\author{Lux Industries, Inc. \\
+        \texttt{research@lux.network}}
+\date{2026-07-10}
+
+\begin{document}
+\luxcoverpage
+
+\begin{abstract}
+Lux v1.36 (\texttt{consensus v1.36.0}, \texttt{node v1.36.0}, \texttt{evm v1.104.8})
+ships \emph{Nova}: a leaderless, post-quantum, metastable consensus whose defining
+structural choice is a \textbf{two-tier finality ladder}. A block climbs five distinct
+authorization rungs --- \(\textbf{Photon} \to \textbf{Wave} \to \textbf{Nova} \to
+\textbf{Quasar} \to \textbf{Horizon}\) --- and the two load-bearing rungs are kept
+\emph{orthogonal}. \textbf{Nova} is \emph{local acceptance} at a simple majority of the
+validator set, \(\mathrm{NovaQuorum}(n)=\lfloor n/2\rfloor + 1\); it is crash-fault-safe
+and authorizes local execution but is reorgable. \textbf{Quasar} is \emph{export
+finality}: a strict \(>\tfrac{2}{3}\)-of-stake, Byzantine-safe post-quantum certificate
+that alone authorizes bridges, DEX settlement, and cross-chain messages. The invariant is
+one line: \emph{a block below Quasar can never be exported}. This separation --- majority
+to make local progress, supermajority to make irreversible external claims --- is why a
+five-validator fleet keeps producing at three live nodes (where a single
+\(\tfrac{2}{3}\)-only engine freezes) while never exporting an unsafe block.
+
+We specify the ladder against the shipped code (\texttt{engine/chain/finality.go},
+\texttt{quorum.go}, \texttt{cert.go}, \texttt{config/quorum\_threshold.go}), give the
+safety arguments (crash-fault majority-intersection for Nova; the Byzantine overlap bound
+\(2\alpha - K > f\) and a no-two-conflicting-certificates theorem for Quasar), describe the
+ZAP-native plugin transport (\texttt{luxfi/zap}, no gRPC, no BFT round machine), and show
+the rule is size-invariant from \(n=1\) to \(n=10^{6}\) because \(K\) is a \emph{sample}
+size, not the set size. We then report measured evidence: a live \num{5}-validator testnet
+(\texttt{ghcr.io/luxfi/node:v1.36.0}) held common-height coherence through a
+\(5/5 \to 4/5 \to 3/5\) node-drop while producing (\(+20,+8,+6\) blocks per \SI{70}{s}
+phase), and a steady load run measured the live C-Chain mining at
+\(\sim\!\SI{1.6}{\percent}\) block fullness with the base fee pinned at its floor ---
+locating the live throughput ceiling in the EVM fee/gas-target throttle, \emph{not} in
+consensus, which stayed coherent and idle. Every number is tagged by provenance
+(\Mnow\ measured-now, \Mprior\ measured-prior, \Proj\ projected, \Claim\ cited).
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Introduction: one ladder, five rungs, two tiers that matter}
+
+A consensus stack answers one hard question --- \emph{when is a block irreversible?} ---
+and a well-built stack answers it in exactly one place. Lux answers it with a
+\textbf{finality ladder}: an ordered set of authorization tiers, each a strictly higher
+authority than the last, with the boundaries between them never collapsed. The ladder is
+named in the Lux astrophysics ontology --- light is emitted, it propagates, a star
+ignites, it blazes into the brightest beacon in the sky, it crosses the event horizon:
+
+\begin{center}
+\(\textbf{Photon} \;\to\; \textbf{Wave} \;\to\; \textbf{Nova} \;\to\; \textbf{Quasar}
+\;\to\; \textbf{Horizon}\)
+\end{center}
+
+\begin{center}
+\begin{tabular}{@{}l l l@{}}
+\toprule
+\textbf{Rung} & \textbf{Meaning} & \textbf{Authorizes} \\
+\midrule
+Photon  & a vote is in flight; the block is being sampled           & nothing \\
+Wave    & the sampling wave has made this block the build tip       & nothing \\
+\textbf{Nova}   & \(\beta\)-ignition: a \emph{majority} sustained \(\beta\) rounds & \textbf{local execution} (reorgable) \\
+\textbf{Quasar} & a strict \(>\tfrac{2}{3}\)-stake certificate exists       & \textbf{export}: bridges / DEX / cross-chain \\
+Horizon & a post-quantum signature seals the certificate            & irreversible settlement \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The two rungs that carry the protocol's weight are \textbf{Nova} and \textbf{Quasar}, and
+the central design decision of v1.36 is that \emph{they are different tiers with different
+thresholds and different jobs}:
+
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{Nova} is \emph{local acceptance}. It fires at a \emph{simple majority} of the
+validator set. It is crash-fault-safe --- it survives any minority going down --- and it
+authorizes the node to execute the block locally. It is \emph{reorgable}: a lone equivocator
+can, in principle, split a bare majority, so Nova is safe to \emph{act on} but never to
+\emph{export}.
+\item \textbf{Quasar} is \emph{export finality}. It fires only when a strict
+\(>\tfrac{2}{3}\) of \emph{stake} has signed --- the Byzantine-safe threshold --- and it is
+the \emph{only} tier that may drive an irreversible external effect: a bridge withdrawal, a
+\texttt{0x9999} DEX settlement receipt, a cross-chain message, a validator-set transition.
+\end{itemize}
+
+\begin{quote}
+\textbf{THE INVARIANT.} A block below Quasar can \emph{never} be exported as
+deterministically final to a bridge, another chain, or an irreversible settlement. Nova
+authorizes local execution; export requires Quasar; quantum-irreversibility requires
+Horizon. (\texttt{engine/chain/finality.go}.)
+\end{quote}
+
+This paper is the rigorous, measured treatment of that ladder. It is the companion to the
+normative specification \textbf{LP-305}~\cite{lp305} and the cross-system landscape
+\textbf{LP-306}~\cite{lp306}; where this paper and the code disagree, the code
+(\texttt{consensus v1.36.0}) governs and this paper is the defect.
+
+\paragraph{Why two tiers and not one.} A single threshold cannot be both maximally live and
+maximally safe. Set the bar at a majority and you get liveness down to \(n/2\) but you
+cannot make a Byzantine-safe external claim. Set it at \(\tfrac{2}{3}\) of stake and you get
+a Byzantine-safe claim but you freeze the moment more than a third is unreachable --- a
+five-node fleet stops at three live nodes. Nova refuses the false choice: it runs \emph{both}
+thresholds, on \emph{different rungs}, for \emph{different purposes}. The majority tier keeps
+the chain making local progress; the supermajority tier gates only what leaves the chain. A
+node that has lost its supermajority keeps accepting and executing (Nova) while \emph{honestly}
+declining to export (no Quasar) until the supermajority returns.
+
+\paragraph{Provenance discipline.} This is a measurement paper; it does not launder
+projections as results. Every quantitative claim is tagged: \Mnow{} = measured by us this
+session (2026-07-10) on the hardware named in \S\ref{sec:eval}; \Mprior{} = measured in
+prior cited Lux work; \Proj{} = projected or derived by calculation; \Claim{} = an external
+cited claim. Untagged numbers are definitions.
+
+\section{Nova --- majority local-acceptance}
+\label{sec:nova}
+
+Nova is the \emph{lower} of the two load-bearing tiers and the one that carries chain
+liveness. It is driven by a leaderless metastable sampler (Photon committee sampling
+\(\to\) Wave / FPC threshold voting \(\to\) Focus \(\beta\)-confidence; LP-111 / LP-027 /
+LP-028 / LP-114), and it \emph{ignites} --- transitions a block to the Nova rung and calls
+\texttt{VM.Accept} --- when a majority of the validator set has sustained the block for
+\(\beta\) consecutive rounds.
+
+\subsection{The quorum: \(\mathrm{NovaQuorum}(n)=\lfloor n/2\rfloor + 1\)}
+
+The Nova ignition threshold is a clean function of the live validator count \(n\)
+(\texttt{engine/chain/quorum.go}):
+
+\begin{lstlisting}[language=Go]
+// NovaQuorum is the majority the sampler needs to IGNITE a block to Nova
+// (acceptance, local execution). It tolerates floor((n-1)/2) crash faults --
+// the MOST a net of n can lose and still make safe local progress under the
+// crash-fault model: any two majorities intersect, a non-equivocating node
+// cannot back two conflicting blocks, and a partition lets at most one side
+// hold a majority. It is DELIBERATELY below the Quasar 2/3 stake gate.
+func NovaQuorum(n int) int {
+    if n < 1 { return 1 }   // a lone node self-ignites; never 0
+    return n/2 + 1
+}
+
+// CrashTolerance = n - NovaQuorum(n) = ceil(n/2) - 1: crash faults Nova
+// ignition survives. Beyond it Nova PAUSES fail-closed (no ignition => no
+// acceptance => no fork) and resumes the instant a node returns.
+func CrashTolerance(n int) int {
+    if n < 2 { return 0 }
+    return n - NovaQuorum(n)
+}
+\end{lstlisting}
+
+\begin{definition}[Nova quorum and crash tolerance]
+For a validator set of size \(n\), \(\mathrm{NovaQuorum}(n)=\lfloor n/2\rfloor+1\) and
+\(\mathrm{CrashTolerance}(n)=n-\mathrm{NovaQuorum}(n)=\lceil n/2\rceil-1\).
+\end{definition}
+
+For the live \(n=5\) primary-network fleet this is \(\mathrm{NovaQuorum}(5)=3\) and
+\(\mathrm{CrashTolerance}(5)=2\): \textbf{Nova keeps accepting with any three of five nodes
+responsive}. This single fact is the operational heart of v1.36 --- and it is exactly where a
+\(\tfrac{2}{3}\)-only engine dies, because \(\lceil 2\cdot 5/3\rceil = 4 > 3\).
+
+\subsection{The confidence depth \(\beta\)}
+
+Ignition additionally requires \(\beta\) \emph{consecutive} majority rounds (hysteresis), so
+a one-round flap cannot ignite (\texttt{quorum.go}):
+
+\begin{lstlisting}[language=Go]
+// NovaBeta: n==1 -> 1 (a lone node ignites immediately; any wait is a
+// phantom-peer stall). 2<=n -> 2 (one confirming round of hysteresis, without
+// the fragility of a deep beta at zero margin). On K=n nets beta is NOT a
+// Byzantine knob -- that is Quasar's job; large permissionless nets (K<n, real
+// subsampling) raise beta to the classical negl(beta) metastable depth.
+func NovaBeta(n int) int { if n <= 1 { return 1 }; return 2 }
+\end{lstlisting}
+
+\subsection{Fail-closed, never fork-open}
+
+When responsive stake drops below \(\mathrm{NovaQuorum}(n)\), Nova does not lower its bar and
+it does not guess --- it \textbf{pauses}. No ignition means no acceptance means no fork; the
+chain halts safely and resumes, via bounded event-driven re-poll and runtime ancestor
+catch-up (LP-303~\cite{lp303}), the instant a node returns. A paused Lux chain is a
+recoverable operational event; it is never a divergent chain. This is the crash-fault
+contract: \emph{make progress at a majority, or make no unsafe move at all}.
+
+\begin{theorem}[Nova crash-fault safety]
+\label{thm:nova}
+Under the crash-fault model (validators may halt but do not equivocate), if
+\(\mathrm{NovaQuorum}(n)=\lfloor n/2\rfloor+1\) distinct validators must accept a block at a
+height before it is Nova-final, then no two conflicting blocks are ever both Nova-final at
+that height.
+\end{theorem}
+\begin{proof}
+Let \(B\) and \(B'\) be Nova-final at the same height, certified by acceptor sets \(S,S'\)
+with \(|S|,|S'|\ge \lfloor n/2\rfloor+1\). Then
+\(|S\cap S'| \ge |S|+|S'|-n \ge 2(\lfloor n/2\rfloor+1)-n \ge 1\), so some validator \(v\in
+S\cap S'\) accepted both. Under the crash-fault model a validator never accepts two
+conflicting blocks at one height (it accepts, then halts or continues, but does not
+equivocate), so \(B=B'\). A network partition cannot manufacture two majorities: at most one
+side of any partition can hold \(\lfloor n/2\rfloor+1\) of \(n\).
+\end{proof}
+
+Theorem~\ref{thm:nova} is exactly why Nova is safe to \emph{act on locally} but is still
+labeled \emph{reorgable}: the crash-fault guarantee does not cover a genuine equivocator, who
+could sign for two blocks and split a bare majority. Guarding against that adversary is not
+Nova's job --- it is Quasar's.
+
+\section{Quasar --- \(\tfrac{2}{3}\)-stake export finality}
+\label{sec:quasar}
+
+Quasar is the \emph{upper} load-bearing tier. It produces a portable, post-quantum
+certificate that a strict supermajority of \emph{stake} attested to a block Nova already
+accepted. It is the only tier the invariant permits to leave the chain.
+
+\subsection{The stake predicate: one definition, strict \(>\tfrac{2}{3}\)}
+
+The supermajority floor has exactly one definition
+(\texttt{config/quorum\_threshold.go}), overflow-safe, shared by both the certificate
+verifier and the live-set parameter sizer so the two can never drift:
+
+\begin{lstlisting}[language=Go]
+// TwoThirdsStakeFloor(total) = floor(2*total/3), overflow-safe.
+// A Quasar certificate is valid iff signed stake is STRICTLY greater.
+func TwoThirdsStakeFloor(total uint64) uint64 {
+    q, r := total/3, total%3
+    floor := 2 * q
+    if r == 2 { floor++ }          // floor(2r/3): r in {0,1}->0, r==2->1
+    return floor
+}
+// Equal-stake vote-count form: floor(2n/3)+1.
+func EqualStakeSupermajorityThreshold(n int) int {
+    if n <= 0 { return 1 }
+    return int(TwoThirdsStakeFloor(uint64(n))) + 1
+}
+\end{lstlisting}
+
+\subsection{The certificate carries its tier}
+
+A \texttt{QuorumCert} is tagged with the rung it certifies, and verification dispatches on
+that tag --- the two-tier ladder is not a convention layered over the wire, it \emph{is} the
+wire (\texttt{engine/chain/cert.go}):
+
+\begin{lstlisting}[language=Go]
+func (c *QuorumCert) VerifyWeighted(v VoteVerifier, stake StakeSource, epochHeight uint64) error {
+    if err := c.Verify(v, epochHeight); err != nil { return err }
+    switch c.Tier {
+    case Nova:   return c.verifyNovaMajority(stake, epochHeight)       // >= floor(n/2)+1 voters
+    case Quasar: return c.verifyQuasarSupermajority(stake, epochHeight) // > floor(2/3 * stake)
+    default:     return fmt.Errorf("%w: tier=%s", ErrQCUnknownTier, c.Tier)
+    }
+}
+
+func (c *QuorumCert) verifyQuasarSupermajority(stake StakeSource, epochHeight uint64) error {
+    total := stake.TotalStake(epochHeight)          // read at the P-CHAIN EPOCH height
+    if total == 0 { return ...fail-closed... }
+    var voted uint64
+    for i := range c.Votes { voted += stake.Weight(c.Votes[i].NodeID, epochHeight) }
+    if voted <= config.TwoThirdsStakeFloor(total) { return ...below supermajority... }
+    return nil                                       // STRICT > floor(2/3 * total)
+}
+\end{lstlisting}
+
+Three details make this correct rather than merely plausible:
+\begin{enumerate}[leftmargin=1.4em]
+\item \textbf{Strict inequality.} Acceptance is \(\texttt{voted} > \lfloor\tfrac{2}{3}\,
+\texttt{total}\rfloor\) (Tendermint \(+\tfrac{2}{3}\)), never \(\ge\).
+\item \textbf{Read at the epoch height.} The stake tally is read at the block's P-chain
+\emph{epoch} height --- the same height the certificate's set-root and per-voter public keys
+are read at --- not the value-chain height, which races ahead of the P-chain and which the
+platform VM would reject as unfinalized. This binds every counted vote to the weight the
+signer actually held when it signed.
+\item \textbf{One floor everywhere.} \texttt{verifyQuasarSupermajority} and the live-set
+\(\alpha\)-sizer both call \texttt{config.TwoThirdsStakeFloor}, so the count threshold a node
+sizes to can never disagree with the stake predicate a verifier enforces.
+\end{enumerate}
+
+\subsection{Trails acceptance; gates only export}
+
+Quasar runs \emph{strictly after} \texttt{VM.Accept}. Each validator, \emph{having already
+accepted} block \(B\), signs the canonical finality message for \(B\) (which binds the inner
+canonical execution identity and the epoch set-root and excludes the outer proposer-VM
+envelope); a collector aggregates signatures bucketed by \((\text{height},\ \text{inner-id})\)
+and emits one certificate when the bucket clears the stake floor. Consequently:
+
+\begin{itemize}[leftmargin=1.4em]
+\item An absent, late, or never-formed Quasar certificate \textbf{cannot} stall the chain,
+revert a block, or change which block Nova accepted. Quasar \emph{describes} an outcome; it
+does not \emph{decide} one.
+\item What Quasar gates is \emph{export}, not \emph{progress}. A node below its stake
+supermajority keeps climbing to Nova and executing locally; it simply does not emit the
+export certificate. This is the honest degraded mode, not a failure: local progress
+continues, external claims wait.
+\item The signed bytes are the unchanged \texttt{CanonicalVoteMessage}, the certificate is
+the unchanged \texttt{QuorumCert}, and external verification is the unchanged
+\texttt{VerifyWeighted}; bridges, \texttt{0x9999} DEX receipts, and light clients are
+unaffected by anything internal to the engine (LP-182, LP-217).
+\end{itemize}
+
+\subsection{Post-quantum composition}
+
+The certificate's signature legs are the Lux PQ suite, selected by the operator's cert
+profile (LP-217): \texttt{PQ-off} (BLS only), \texttt{PQ-fast} (BLS \(\parallel\) Pulsar),
+\texttt{PQ-strict} (BLS \(\parallel\) Pulsar \(\parallel\) Corona, mainnet default),
+\texttt{PQ-heavy} (adds Magnetar SLH-DSA). Pulsar contributes Module-LWE threshold signatures
+byte-equal to FIPS-204 ML-DSA; Magnetar contributes hash-based SLH-DSA; the Horizon rung
+seals the certificate so that it is irreversible even against a quantum adversary. Because
+Quasar is post-accept, \textbf{the post-quantum cost is off the critical finality path} --- the
+chain has already advanced to Nova when the certificate is being assembled.
+
+\section{The two-tier separation as a safety theorem}
+\label{sec:safety}
+
+The value of separating the tiers is that each carries exactly one obligation and the two
+compose without a seam.
+
+\subsection{Quasar's Byzantine overlap bound}
+
+The metastable sampler is configured so that two acceptance quorums must overlap in
+\emph{more than} \(f\) honest nodes, where \(f=\lfloor (K-1)/3\rfloor\). This is the
+BFT-overlap bound enforced in \texttt{config.Parameters.Valid()}:
+\[
+2\alpha - K \;\ge\; \left\lfloor \tfrac{K-1}{3} \right\rfloor + 1 \;=\; f+1 ,
+\]
+i.e.\ \(2\alpha - K > f\). Configurations that fail it (e.g.\ \(K{=}3,\alpha{=}2\) posing as
+BFT) are rejected with \texttt{ErrAlphaBelowBFTQuorum}; mainnet additionally requires
+\(K\ge 11\) so \(f\ge 3\), and a value/PoS chain requires \(K\ge 4\). The node
+\emph{fails closed}: it refuses to start a multi-node value chain with non-BFT parameters
+rather than run an unsafe quorum.
+
+\begin{theorem}[No two conflicting Quasar certificates]
+\label{thm:quasar}
+Assume honest validators sign a finality message only for a block they accepted, Nova accepts
+at most one block per height (Theorem~\ref{thm:nova}, w.h.p.\ under the sampler margin), and
+Byzantine stake is \(< \tfrac{1}{3}\) of total. Then no two Quasar certificates for
+conflicting blocks \(B\ne B'\) at the same height can both verify.
+\end{theorem}
+\begin{proof}
+A valid Quasar certificate for \(B\) carries signed stake \(w>\lfloor\tfrac{2}{3}T\rfloor\),
+so strictly more than \(\tfrac{2}{3}\) of total stake \(T\). Two such certificates for
+\(B\ne B'\) would together require \(> \tfrac{4}{3}T\) signed stake, exceeding \(T\) by
+\(>\tfrac{1}{3}T\); by inclusion--exclusion the overlap carries \(>\tfrac{1}{3}T\) of stake
+that signed \emph{both}. Since Byzantine stake is \(<\tfrac{1}{3}T\), the overlap contains
+honest stake, and an honest validator signs only what it accepted, so it signed at most one
+of \(B,B'\) --- contradiction. Hence at most one conflicting certificate verifies.
+\end{proof}
+
+\subsection{Why the reduction is clean}
+
+Quasar adds \emph{no} new safety assumption and \emph{no} liveness dependency beyond what the
+legacy \(\tfrac{2}{3}\)-stake certificate already carried. Its safety reduces to Nova's
+single-accept-per-height (Theorem~\ref{thm:nova}) plus the same \(\ge\tfrac{2}{3}\)-honest-
+stake assumption; nothing waits on it. The composition is therefore:
+\[
+\underbrace{\text{Nova (majority)}}_{\text{liveness to }n/2,\ \text{crash-safe local accept}}
+\;\prec\;
+\underbrace{\text{Quasar (}\tfrac{2}{3}\text{ stake)}}_{\text{Byzantine-safe export}}
+\;\prec\;
+\underbrace{\text{Horizon (PQ seal)}}_{\text{quantum-irreversible}} .
+\]
+Each rung is independently complete; each authorizes strictly more than the last; and the
+invariant --- nothing below Quasar exports --- is a single comparison, \(\texttt{finality}
+\ge \texttt{Quasar}\), checked at every export boundary (\texttt{Finality.AuthorizesExport}).
+
+\subsection{Where Lux sits among the thresholds}
+
+\begin{center}
+\begin{tabular}{@{}l l l@{}}
+\toprule
+\textbf{Family} & \textbf{Safety threshold} & \textbf{Finality} \\
+\midrule
+\textbf{Lux Nova (local)}   & majority \(\lfloor n/2\rfloor+1\), crash-safe & sub-second, reorgable \\
+\textbf{Lux Quasar (export)}& strict \(>\tfrac{2}{3}\) stake, Byzantine     & deterministic PQ certificate \\
+Classical BFT (Tendermint, HotStuff) & \(\tfrac{1}{3}\) of a fixed committee & instant, but \(O(n^2)\), does not scale \\
+Nakamoto (Bitcoin)          & \(>\!50\%\) hashpower                          & probabilistic, minutes \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Lux keeps the metastable sampler's scale (a fixed small sample finalizes among millions of
+validators) and \emph{adds} a deterministic post-quantum export certificate --- without
+paying BFT's quadratic message cost or Nakamoto's latency. The full cross-system comparison is
+LP-306~\cite{lp306}.
+
+\section{ZAP-native transport --- no gRPC, no round machine}
+\label{sec:zap}
+
+Nova's messages ride the ZAP wire (\texttt{luxfi/zap v0.8.1}, a direct dependency of
+\texttt{consensus v1.36.0}; LP-022 / LP-200--204). ZAP is the single Lux plugin transport:
+the engine's \texttt{Transport[ID]} interface (\texttt{engine/chain/engine.go}) is satisfied
+by the ZAP plugin, and there is \textbf{no gRPC plugin server, no Tendermint p2p, and no
+BFT round/gossip state machine} anywhere on the acceptance path. This matters for the ladder
+in three ways:
+
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{Sampling, not broadcast.} Photon queries a \(k\)-subset per round; the transport
+carries \(O(k)\) point-to-point polls, not an \(O(n^2)\) all-to-all vote. The transport cost
+of a round is independent of \(n\).
+\item \textbf{Post-quantum by construction.} ZAP frames carry the Lux PQ suite, so a Quasar
+attestation is a signed ZAP message; the certificate is an aggregate of ZAP-carried
+signatures. No transport translation layer sits between the signature and the wire.
+\item \textbf{No transport-level view or leader.} Because there is no BFT round machine, there
+is no view-change, no leader-election message class, and no lock/precommit traffic to carry ---
+the wire has nothing to say about ``rounds'' because the decider has no rounds.
+\end{itemize}
+
+\section{Size-invariance: the same rule from \(n=1\) to \(n=10^6\)}
+\label{sec:scale}
+
+\(K\) is the \textbf{sample} size, not the validator-set size --- the load-bearing
+distinction. For \(n\le K\) a node polls the whole set (\(k=n\)); for \(n>K\) it polls a fixed
+\(k\)-subset each round. The \emph{rule} --- repeated \(k\)-sampling, \(\alpha\)-of-\(k\)
+threshold, \(\beta\)-confidence, accept at the Nova majority, export at the Quasar
+supermajority --- is identical at every scale, and the per-round cost stays \(O(k)\) per node
+regardless of \(n\).
+
+\begin{center}
+\begin{tabular}{@{}l r r r l@{}}
+\toprule
+\textbf{Deployment} & \(K\) & \(\alpha\) & \(\beta\) & \textbf{Source} \\
+\midrule
+Primary-network fleet (live)   & 5  & 4  & 2  & \texttt{node/chains/quorum.go} live sizing \\
+\texttt{DefaultParams}         & 20 & 14 & 14 & \texttt{config/config.go} \\
+\texttt{MainnetParams} (floor) & 21 & 15 & --- & \texttt{config/config.go} \\
+Testnet                        & 11 & 8  & --- & \texttt{config/config.go} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+At the live operating point \(K{=}5, \alpha{=}4\) the sampler's per-round agreement bar is
+\(\alpha/K = 80\%\), comfortably clearing the BFT-overlap bound \(2\alpha-K = 3 \ge f+1 = 2\).
+Note the two thresholds this paper separates are visible here as \emph{distinct knobs}: the
+sampler's per-round \(\alpha\) (how many of the \(k\) polled must agree to score a round) is
+not the Nova acceptance count (a majority of the set) and is not the Quasar export floor
+(\(>\tfrac{2}{3}\) stake). What an operator changes as \(n\) grows is only which small \(k\)
+to pin; the ladder never changes.
+
+This is exactly the property that a ``\(\tfrac{2}{3}\)-of-\emph{all}-stake certificate
+decides'' model destroys: collecting a supermajority of \emph{every} validator's signature per
+height is \(O(n)\) work on the critical path. Nova restores size-invariance by keeping the
+decider a fixed-sample metastable process, and keeps the \(\tfrac{2}{3}\)-stake artifact ---
+but moves it \emph{off} the critical path, onto the Quasar export rung.
+
+\section{Empirical evaluation}
+\label{sec:eval}
+
+\paragraph{Environments.} Two environments, named once here and referenced by tag:
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{Cluster} (\Mnow): the live Lux \emph{testnet}, \num{5} validators
+\texttt{luxd-0..4} running \texttt{ghcr.io/luxfi/node:v1.36.0} (\texttt{consensus v1.36.0},
+\texttt{evm v1.104.8}), namespace \texttt{lux-testnet} on \texttt{do-sfo3-lux-k8s}, C-Chain
+id \num{96368}, internal RPC \texttt{/v1/bc/C/rpc} port \num{9640}. Measured 2026-07-10.
+\item \textbf{Host} (\Mnow): Apple M1 Max, 10 cores, \SI{64}{GB}, macOS 26.5.1, \texttt{go
+1.26.4}, \texttt{arm64}. Used for the in-process consensus-engine microbenchmarks.
+\end{itemize}
+
+\subsection{Coherence under a node-drop --- the two-tier property, live}
+\label{sec:eval:drop}
+
+The one property the two-tier ladder exists to deliver is: \emph{a validator falls behind, the
+chain keeps finalizing locally, the validator rejoins, and no fork ever appears}. We drove a
+five-validator testnet under steady load (24 in-cluster senders) and scaled the validator set
+\(5 \to 4 \to 3 \to 4 \to 5\), measuring at each phase the Nova (latest) height advance and
+\emph{common-height coherence} --- all live nodes must hold the \emph{same} block hash at a
+confirmed height (height skew is not a fork; a hash disagreement is). Harness:
+\texttt{bench/vs-ava}\slash\ (\texttt{nova\_proof.sh}, \texttt{nova\_loadgen.py}).
+
+\begin{center}
+\begin{tabular}{@{}l r c c l@{}}
+\toprule
+\textbf{Phase} & \textbf{Nova advance} & \textbf{Coherent} & \textbf{Tier} & \textbf{Note} \\
+ & (blocks / \SI{70}{s}) & (1 hash @ conf.) & & \\
+\midrule
+\(5/5\) baseline        & \(+20\) & yes & Nova + Quasar & both tiers advance \\
+\(4/5\) drop \texttt{luxd-4} & \(+8\)  & yes & Nova + Quasar & \(4/5 \ge \tfrac{2}{3}\): export still forms \\
+\(\mathbf{3/5}\) drop \texttt{luxd-3} & \(\mathbf{+6}\)  & \textbf{yes} & \textbf{Nova only} & \textbf{majority holds; \(<\tfrac{2}{3}\) so export honestly pauses} \\
+\(4/5\) restore \texttt{luxd-3} & (rejoin) & yes & Nova + Quasar & \texttt{luxd-3} caught up \(150\!\to\!161\), converged \\
+\(5/5\) restore \texttt{luxd-4} & (rejoin) & yes & Nova + Quasar & full set restored, coherent \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent All phases held \texttt{distinct@conf = 1} (a single common-height hash across live
+nodes) and \texttt{clamp\_ok} (the exported/finalized tag never exceeded the latest height).
+The load-bearing row is \(\mathbf{3/5}\): the majority tier keeps producing and stays coherent
+at exactly the point a \(\tfrac{2}{3}\)-only engine freezes (\(\lceil 2\cdot5/3\rceil=4>3\)),
+while the export tier \emph{honestly pauses} because no \(>\tfrac{2}{3}\)-stake certificate can
+form on three of five. The dropped validator rejoined and converged to the common chain
+(observed \texttt{luxd-3}: \(150\to161\)). This is Nova (majority, \S\ref{sec:nova}) and Quasar
+(\(\tfrac{2}{3}\)-stake, \S\ref{sec:quasar}) doing precisely their separate jobs, live. \Mnow
+
+\subsection{Live C-Chain throughput --- the ceiling is the fee/gas-target, not consensus}
+\label{sec:eval:tput}
+
+To locate the live throughput ceiling we ran two in-cluster loads against the same
+five-validator testnet over \(\sim\!\SI{90}{s}\) windows: a \emph{closed-loop} run (each
+account advances one nonce only after the prior tx is accepted;
+\texttt{bench/vs-ava/tp\_loadgen.py}) and an \emph{open-loop, saturating} run (a deep
+per-account nonce pipeline floods the mempool so the block builder is the only throttle;
+\texttt{tp\_loadgen\_open.py}). The result is unambiguous under \emph{both} loads: the chain
+mines a low transaction rate \emph{at low block fullness with the base fee pinned at its floor}
+--- so the binding constraint is the EVM's dynamic-fee / gas-target throttle, not consensus,
+which stayed fully coherent.
+
+\begin{center}
+\begin{tabular}{@{}l r r l@{}}
+\toprule
+\textbf{Metric} & \textbf{closed-loop} & \textbf{open-loop (sat.)} & \textbf{Tag} \\
+\midrule
+window / blocks               & \SI{91}{s} / 18 & \SI{90}{s} / 21 & \Mnow \\
+mined throughput (tx/s)       & \num{1.81}      & \num{5.72}      & \Mnow \\
+mean block interval           & \SI{4.38}{s}    & \SI{4.15}{s}    & \Mnow \\
+mean tx / block               & \num{9.17}      & \num{24.6} (peak \textbf{106}) & \Mnow \\
+\textbf{block fullness}       & \(\mathbf{1.60\%}\) & \(\mathbf{4.31\%}\) mean, \(\mathbf{18.55\%}\) peak & \Mnow \\
+base fee                      & \SI{25}{gwei} floor & \SI{25}{gwei} floor & \Mnow \\
+cross-node coherence          & \textbf{yes} (all 5 = \texttt{0x5960dc41\dots}) & \textbf{yes} (all 5 = \texttt{0x9fb2b542\dots}) & \Mnow \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Even when \emph{saturated} (open-loop), blocks peak at only \(\sim\!19\%\) full with the base
+fee still at its \SI{25}{gwei} floor, and consensus stays coherent --- so the chain is
+nowhere near execution-bound or consensus-bound; blocks are throttled by the coreth/evm
+gas-target and block-cadence policy, not by the sampler and not by the EVM's execution
+capacity. Consensus was coherent and idle throughout (identical hashes across all five nodes).
+This reproduces, on v1.36, the prior in-cluster finding that the C-Chain's live mined ceiling
+is a \emph{fee-policy} ceiling: consensus absorbs offered load coherently, and the EVM
+fee/gas-target caps what is mined~\cite{luxquasarbench}~(\Mprior). It is the honest frame for
+the head-to-head against \texttt{avalanchego} in \S\ref{sec:eval:exec}: both C-Chains run the
+same sequential, fee-throttled, geth-derived EVM, so their \emph{live} mined rates are
+governed by the same throttle --- the Lux advantage at v1.36 is the consensus-liveness axis
+(\S\ref{sec:eval:drop}), not raw live TPS.
+
+\subsection{Relationship to execution --- Block-STM is downstream and (today) sequential}
+\label{sec:eval:exec}
+
+Execution is orthogonal to the decider and \emph{downstream} of it: Nova accepts, then the EVM
+executes the accepted block. On the live C-Chain that execution is \textbf{100\%\ sequential
+coreth-lineage EVM} --- the parallel GPU-native Block-STM executor is built and benchmarked but
+\emph{not wired into the production path} (\texttt{RegisterExecutor} has zero callers;
+\texttt{DefaultExecutor()} is a no-op fallback;
+\texttt{evm/core/state\_processor.go} falls through to the sequential loop). This is the same
+execution model \texttt{avalanchego}'s C-Chain runs, and the honest reason the two chains'
+\emph{live} throughput is comparable. The measured parallel-executor headroom (CPU
+copy-bound today; projected on GPU) and the standalone \texttt{avalanchego} head-to-head are
+reported in the companion benchmark study (\texttt{bench/vs-ava}) and the GPU-native execution
+paper~\cite{gpubtps}; consensus does not gate any of it.
+
+\subsection{Consensus engine bookkeeping is not the bottleneck}
+\label{sec:eval:engine}
+
+The in-process chain-engine microbenchmarks (\texttt{engine/chain/benchmark\_test.go}, Host
+\Mnow, median of 5) confirm that block/vote/finalization \emph{bookkeeping} runs orders of
+magnitude above anything the fee-throttled EVM asks of it:
+
+\begin{center}
+\begin{tabular}{@{}l r r@{}}
+\toprule
+\textbf{Operation} & \textbf{median} & \textbf{rate} \\
+\midrule
+finalization check     & \SI{19}{ns}   & \(\sim\)\num{52} M/s \\
+vote processing        & \SI{424}{ns}  & \(\sim\)\num{2.4} M/s \\
+block acceptance       & \SI{251}{ns}  & \(\sim\)\num{4.0} M/s \\
+block ingestion        & \SI{1.2}{\micro s} & \(\sim\)\num{0.83} M/s \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Every engine operation is sub-microsecond to low-microsecond --- six-plus orders of
+magnitude above the \(\sim\!\num{1.8}\) tx/s and \(\sim\!\num{0.2}\) blk/s the fee-throttled
+live chain produces (\S\ref{sec:eval:tput}). The engine's data-structure throughput is
+therefore never the live ceiling. (This microbenchmark exercises the engine's bookkeeping
+harness, not the full Nova quorum decision, and is reported as a lower bound on engine
+headroom, not as the Nova finality rate. Raw:
+\texttt{bench/vs-ava/results/engine\_bench\_raw.txt}.)
+
+\section{Terminology reconciliation and relationship to prior LPs}
+\label{sec:reconcile}
+
+``Nova'' has been used three ways in the Lux corpus; v1.36 fixes the meaning to the one in the
+shipped code, and this section states the reconciliation so no reader conflates them.
+
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{v1.36 Nova (this paper, canonical).} A \emph{rung} on the finality ladder ---
+majority local-acceptance --- and, by extension, the \emph{linear-chain consensus mode} that
+climbs that ladder (\texttt{protocol/nova}, \texttt{engine/chain/finality.go}). This is the
+meaning in \texttt{consensus v1.36.0} and in LP-134's taxonomy (Nova = linear mode; Nebula =
+DAG mode).
+\item \textbf{LP-020 ``Nova''} named the linear-chain \emph{engine} (as opposed to Nebula the
+DAG engine); its component vocabulary (Photon / Wave / Focus / Prism / Horizon / Flare) and its
+QuasarCert wire survive here \emph{as the attestation layer}. Consistent with this paper once
+one reads ``Nova'' as ``linear-chain mode.''
+\item \textbf{The earlier ``supernova-burst'' DAG Nova} (a chapter of
+\texttt{lux-consensus-engines}) described a DAG-frontier burst finalizer. That is a
+\emph{Nebula}-family (DAG-mode) design; it is \emph{not} the v1.36 linear-chain two-tier
+ladder specified here, and where the two disagree on what the ``Nova'' rung means, this paper
+and LP-305 govern for the shipped linear-chain C-Chain.
+\end{itemize}
+
+\noindent Relationship to the specifications:
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{LP-305}~\cite{lp305} is the normative spec of record for this ladder; this paper
+is its rigorous, measured companion.
+\item \textbf{LP-306}~\cite{lp306} is the cross-system landscape (Lux vs Tendermint /
+Avalanche / Nakamoto / Gasper / Sui / Aptos / Solana).
+\item \textbf{LP-105} remains the authoritative \emph{lexicon} (public vocabulary and internal
+names); its finality \emph{state-machine} description predates Nova and is refined by this
+ladder --- read the Nova/Quasar tiers here for the mechanism, LP-105 for the names.
+\item \textbf{LP-010 / LP-210} specify Block-STM (the execution layer, \S\ref{sec:eval:exec});
+\textbf{LP-303} the bounded re-poll / catch-up that heals a paused chain; \textbf{LP-217} the
+cert profile modes (\S\ref{sec:quasar}).
+\end{itemize}
+
+\section{Conclusion}
+
+Nova's contribution is not a new voting rule; it is a \emph{decomposition}. By splitting
+finality into a majority \emph{local-accept} tier and a \(\tfrac{2}{3}\)-stake \emph{export}
+tier --- and forbidding, by a one-line invariant, any export below the supermajority --- Lux
+v1.36 gets crash-fault liveness (three of five keep producing) \emph{and} Byzantine-safe
+external finality (nothing leaves the chain without \(>\tfrac{2}{3}\) of stake), without the
+false choice a single threshold forces. The decider stays a fixed-sample metastable process,
+so the rule is size-invariant from one validator to a million; the \(\tfrac{2}{3}\)-stake
+certificate stays post-quantum and portable, but rides the upper rung, off the critical path.
+The live testnet shows the two tiers doing their separate jobs: coherence held through a
+\(5/5\to4/5\to3/5\) drop while the export tier honestly paused, and the live throughput ceiling
+sat in the EVM fee policy, not in consensus. The ladder is the spec; the code is the proof.
+
+\begin{thebibliography}{9}
+\bibitem{lp305} Lux Industries. \emph{LP-305: Lux Consensus --- Canonical Specification (Nova
+\(\cdot\) Quasar \(\cdot\) Block-STM).} \url{https://github.com/luxfi/lps}.
+\bibitem{lp306} Lux Industries. \emph{LP-306: Consensus Comparison --- Lux (Nova/Quasar) vs
+Tendermint, Avalanche, Nakamoto, Gasper, Sui, Aptos, Solana.}
+\url{https://github.com/luxfi/lps}.
+\bibitem{lp303} Lux Industries. \emph{LP-303: Bounded Re-poll and Runtime Ancestor Catch-up.}
+\url{https://github.com/luxfi/lps}.
+\bibitem{gpubtps} Lux Industries. \emph{The Path to One Billion Trades per Second: GPU-Native
+Execution on Lux.} Lux Papers, 2026.
+\bibitem{luxquasarbench} Lux Industries. \emph{Lux Quasar Benchmarks and In-Cluster C-Chain
+Throughput Measurements.} Lux Papers, 2026.
+\bibitem{avalanche2020} Team Rocket et al. \emph{Scalable and Probabilistic Leaderless BFT
+Consensus through Metastability.} 2020. \url{https://arxiv.org/abs/1906.08936}.
+\bibitem{blockstm2022} Gelashvili et al. \emph{Block-STM: Scaling Blockchain Execution by
+Turning Ordering Curse to a Performance Blessing.} 2022. \url{https://arxiv.org/abs/2203.06871}.
+\end{thebibliography}
+
+\end{document}

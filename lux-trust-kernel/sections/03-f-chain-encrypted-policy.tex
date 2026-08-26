@@ -1,0 +1,104 @@
+
+%% ===================================================================
+%% LP-134 canonical naming:
+%% Per LP-134 (Lux Chain Topology), the former T-Chain is REMOVED and
+%% split with zero remainder:
+%%   M-Chain — MPC ceremonies / threshold signing + bridge custody
+%%   F-Chain — FHE compute + TFHE bootstrap-key gen + threshold-FHE decrypt
+%%   B-Chain — teleport / cross-chain messaging (bridgevm)
+%% This section is the F-Chain concern (encrypted-policy evaluation +
+%% quorum-controlled reveal via threshold-FHE). It COMPOSES M-Chain
+%% (Section~\ref{sec:mchain}) for the signing that a governance decision
+%% authorizes. There is no T-Chain and no teleportvm.
+%% ===================================================================
+
+\section{F-Chain: Encrypted Policy \& Threshold Reveal}
+\label{sec:fchain-policy}
+%% ===================================================================
+
+The F-Chain handles quorum-controlled operations whose \emph{inputs} must stay
+encrypted: actions that require $t$-of-$n$ authorization computed over private
+votes before execution. Unlike simple multi-signature schemes, F-Chain supports
+\emph{policy evaluation over encrypted inputs} via TFHE and \emph{confidential
+aggregation} via CKKS, and reveals only the quorum \emph{result} through
+threshold-FHE decryption. The signing that a positive result authorizes is
+performed on M-Chain (Section~\ref{sec:mchain}); F-Chain owns the encrypted
+compute, M-Chain owns the signature.
+
+\subsection{Quorum-Controlled Reveal}
+
+\begin{definition}[Quorum Policy]\label{def:quorum}
+A quorum policy $Q$ is a tuple:
+\[
+    Q = (n, t, \mathsf{voters}, \mathsf{predicate}, \mathsf{timeout})
+\]
+where $n$ is the total number of authorized voters, $t$ is the threshold,
+$\mathsf{voters} \subseteq \mathsf{DID}^n$ is the voter set,
+$\mathsf{predicate}$ is a boolean circuit evaluated on voter inputs,
+and $\mathsf{timeout}$ is a block height deadline.
+\end{definition}
+
+Applications of quorum-controlled reveal include:
+\begin{itemize}
+    \item \textbf{Treasury approval}: $t$-of-$n$ board members must approve a
+          disbursement before the transaction is signed on M-Chain.
+    \item \textbf{Admin recovery}: a compromised admin key can be rotated if $t$
+          recovery contacts authorize the rotation on K-Chain.
+    \item \textbf{Conditional access}: a document is revealed to a requestor only
+          if $t$ data stewards approve the access request.
+\end{itemize}
+
+\subsection{TFHE Policy Evaluation}
+
+For policies where voter inputs must remain private (e.g., salary-based approval
+thresholds, credit scoring), F-Chain evaluates the quorum predicate as a
+boolean circuit over TFHE-encrypted bits. Each voter submits an encrypted vote
+$\hat{v}_i = \mathsf{TFHE.Enc}(v_i)$. The chain evaluates the predicate
+circuit homomorphically:
+\[
+    \hat{r} = \mathsf{Circuit}(\hat{v}_1, \ldots, \hat{v}_n)
+\]
+and the result is threshold-decrypted by the F-Chain validators, yielding
+$r \in \{0, 1\}$ without revealing individual votes. The TFHE parameters
+follow \cite{lux-tfhe}: $N = 1024$, $q \approx 2^{27}$, 128-bit security.
+
+\subsection{CKKS Confidential Compute}
+
+For policies requiring arithmetic over real-valued inputs (e.g., weighted voting,
+aggregate risk scores), F-Chain supports CKKS approximate homomorphic encryption.
+Each party submits $\hat{x}_i = \mathsf{CKKS.Enc}(x_i)$ where $x_i \in \mathbb{R}$.
+The chain computes:
+\[
+    \hat{y} = \sum_{i=1}^{n} w_i \cdot \hat{x}_i
+\]
+and compares the result against a threshold $\tau$. The aggregated value $y$ is
+revealed; individual inputs $x_i$ are not.
+
+\begin{proposition}[Vote Privacy]\label{prop:vote-privacy}
+Under the LWE assumption with parameters $(N, q, \sigma)$ as specified in
+\cite{lux-pq-crypto-suite}, no coalition of fewer than $t$ F-Chain validators
+can recover any individual vote $v_i$ from the transcript of a quorum evaluation.
+\end{proposition}
+
+\subsection{Treasury Approval and Admin Recovery}
+
+Treasury operations bind F-Chain encrypted-policy evaluation to M-Chain signing.
+A disbursement follows a strict sequence:
+
+\begin{enumerate}
+    \item A proposer submits a \textsc{TreasuryProposal} to F-Chain with
+          the target address, amount, and justification hash.
+    \item Authorized voters submit encrypted approvals.
+    \item F-Chain evaluates the quorum predicate homomorphically and
+          threshold-decrypts only the boolean result.
+    \item If approved, F-Chain emits a \textsc{GovernanceReceipt} that
+          authorizes M-Chain to produce a threshold signature on the
+          disbursement transaction.
+    \item M-Chain produces the signature only upon verifying the receipt.
+\end{enumerate}
+
+Admin recovery follows the same pattern with the rotation request replacing the
+disbursement transaction. The recovery quorum is stored on the K-Chain as part
+of the key record's policy (Definition~\ref{def:rotation}).
+
+%% ===================================================================

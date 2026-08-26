@@ -1,0 +1,219 @@
+\section{The mesh and access model}
+\label{sec:mesh}
+
+Section~\ref{sec:model} said \emph{what} holds value. This section says
+\emph{who may touch it, and how}. XSS is not only a ledger
+consolidation; it is an access discipline over a heterogeneous mesh of
+chains, where most validators do not run most VMs. The rule, stated
+once and then made precise:
+
+\begin{quote}
+\textbf{Execution follows the chain, settlement follows X,
+communication follows proofs.} A VM executes only on the nodes
+validating its chain; value settles only on X (and its shielded
+counterpart Z); and a node that validates neither X nor a chain $C$
+learns $C$'s results only through an authenticated cross-chain message
+or a verifiable proof --- never by trusting $C$'s RPC.
+\end{quote}
+
+\subsection{Execution follows the chain}
+
+A validator validates only the chains it has joined, and a chain's VM
+executes only on the nodes validating that chain. This is the existing
+Lux topology, not a new constraint: the chain manager hands each VM the
+per-chain context and the per-chain \texttt{atomic.SharedMemory} for
+exactly the chains that node validates
+(\texttt{lux/chains/dexvm/vm.go:155--160}, the \texttt{consensusRuntime}
+that ``provides chain identity \ldots\ and the per-chain
+\texttt{atomic.SharedMemory} used by the settlement leg''). \IMPL{} The
+consequence XSS leans on: \emph{the set of nodes that can re-execute a
+chain $C$ is exactly $C$'s validator set}; everyone else is a
+non-executing observer of $C$. P4 (no optional VM on a non-validating
+node, Section~\ref{sec:validation}) is the formal statement of this.
+
+\subsection{The three roles of a non-D validator}
+
+Fix a chain $D$ (the DEX is the running example; the argument is
+identical for any computing chain). A node that does \emph{not} validate
+$D$ may still interact with $D$, but in exactly three roles, and no
+others:
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Client.} It submits work to $D$ --- an order over the ZAP
+  wire, or an EVM call that routes to $D$ --- and reads results back. It
+  runs no $D$ state and trusts $D$'s consensus for the outcome it asked
+  for. This is the role the DEX proxy plays toward the D-Chain matcher:
+  it forwards byte-identical \texttt{clob\_*} frames over ZAP and is
+  ``NOT atomic, NOT consensus --- pure transport''
+  (\texttt{lux/chains/dexvm/vm.go:129--131}). \IMPL{}
+\item \textbf{Source-chain validator.} It validates a chain $S$ (say X
+  or C) from which value is \emph{exported to} $D$, or \emph{imported
+  from} $D$. In this role it does not execute $D$; it executes $S$, and
+  its only coupling to $D$ is the one-time atomic mailbox
+  (Section~\ref{sec:mailbox}). An X validator that processes a
+  \texttt{LockTx}/\texttt{ExportTx} bound for $D$ is acting in this role.
+  \IMPL{} (the X export/import executors,
+  \texttt{vms/xvm/txs/executor/executor.go:107--150} export,
+  \texttt{:87--105} import).
+\item \textbf{Verifier.} It verifies a $D$-produced proof or certificate
+  --- a P3Q attestation, a starkfri STARK, a warp/Polaris certificate
+  --- \emph{without replaying} $D$. This is the seam
+  \texttt{VerifyChainCommitment} (Section~\ref{sec:primitives})
+  formalizes: X accepts $D$'s settlement result by checking a proof, not
+  by re-running the match. The verifiers are \IMPL{}
+  (\texttt{precompile/p3q/contract.go} slot \texttt{0x012205};
+  \texttt{precompile/starkfri/contract.go:75}); the settlement-validity
+  AIR they would verify is \DESIGN{} (Section~\ref{sec:open}).
+\end{enumerate}
+
+\noindent There is no fourth role. In particular there is no role in
+which a non-$D$ validator reads $D$'s internal state directly and acts
+on it as if authoritative. That non-role is the whole point of the next
+two subsections.
+
+\subsection{``Shared memory'' is a mailbox, not a database}
+\label{sec:mailbox}
+
+The phrase ``shared memory'' in the Lux atomic rail is a persistent
+source of confusion, so XSS pins its meaning. \textbf{Shared memory is a
+one-time cross-chain atomic mailbox, not a globally readable database.}
+A message is \emph{written once} by the source chain (an export) and
+\emph{consumed once} by the destination chain (an import); after
+consumption it is gone. It is neither a shared key-value store both
+chains can poll, nor a window into the other chain's ledger.
+
+This is exactly what the code does. On export, X writes UTXO elements
+into the destination chain's mailbox as \texttt{PutRequests}
+(\texttt{vms/xvm/txs/executor/executor.go:144--148}). \IMPL{} On import,
+the destination reads those elements with \texttt{SharedMemory.Get} and
+removes them with \texttt{RemoveRequests}, so a given element is
+claimable exactly once
+(\texttt{vms/xvm/txs/executor/semantic\_verifier.go:102--105} the
+\texttt{Get}; \texttt{executor.go:99--103} the \texttt{RemoveRequests}).
+\IMPL{} The DEX proxy makes the consume-once explicit with a persisted
+consumed-set: ``a UTXO already consumed by a prior import cannot be
+claimed again \ldots\ the proxy's replay protection for the
+atomic-value leg'' (\texttt{lux/chains/dexvm/atomic.go:126--138},
+\texttt{IsConsumed}/\texttt{MarkConsumed}). \IMPL{} The proxy's own
+header states the boundary precisely: it ``holds ZERO canonical DEX
+state'' and does exactly two orthogonal things --- order relay (pure
+transport) and value settlement (atomic mailbox import/export) ---
+``do NOT conflate them'' (\texttt{lux/chains/dexvm/vm.go:125--138}).
+\IMPL{}
+
+\noindent The mailbox is therefore a \emph{transfer} primitive, not a
+\emph{read} primitive. Value crosses a chain boundary by being removed
+from one ledger and placed, once, in the other's mailbox to be consumed
+once. No chain ever ``reads X's balances''; it consumes a specific
+mailbox element that X put there for it. This is what makes the atomic
+rail conserve value without either chain trusting the other's live
+state, and it is the implemented substrate on which the XLock /
+\texttt{SettleTx} discipline (Sections~\ref{sec:xlock},
+\ref{sec:primitives}) is layered.
+
+\subsection{The three-tier access model}
+
+The roles and the mailbox semantics combine into a single layered
+access model. Every interaction with value-bearing chain state sits in
+exactly one tier, and a higher tier never silently degrades into a
+lower one.
+
+\begin{center}
+\begin{tabular}{@{}p{1.1cm}p{4.4cm}p{6.6cm}@{}}
+\toprule
+Tier & What it is & Trust / mechanism \\
+\midrule
+\textbf{T1} & \textbf{Client} (RPC) &
+  Submit work, read results. No local validation of the target chain.
+  Trust the target chain's consensus for the answer you asked for. Pure
+  transport (e.g. ZAP relay, \texttt{vm.go:129--131}). \IMPL{} \\
+\addlinespace
+\textbf{T2} & \textbf{Cross-chain authenticated messages} &
+  One of: atomic import/export over the mailbox; a warp / Polaris
+  certificate; a zk proof; a P3Q / starkfri proof; an X settlement
+  proof. \emph{No raw-RPC trust} --- every T2 fact is authenticated by
+  the message's own validity, not by believing a remote node's API.
+  Atomic-mailbox part \IMPL{} (\texttt{executor.go}, \texttt{atomic.go});
+  proof-routing part \DESIGN{} (\texttt{VerifyChainCommitment},
+  Section~\ref{sec:primitives}). \\
+\addlinespace
+\textbf{T3} & \textbf{X settlement spine} &
+  The single canonical economic ledger. Value becomes spendable only
+  here (or as a Z note via the bridge). All T2 value movements settle
+  to T3. \DESIGN{} for the lock primitives; \IMPL{} for the underlying
+  UTXO/conservation engine (\texttt{vms/xvm/}). \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The discipline is: \textbf{never trust a lower tier where a
+higher tier is required.} A node must not read another chain's RPC (T1)
+and treat it as an authenticated cross-chain fact (T2); it must not
+treat a T2 proof of computation as a T3 settlement (a verified match is
+not spendable value until X's \texttt{SettleTx}). The tiers are
+strictly ordered, and the XSS primitives are exactly the transitions
+between them: a T1 client submits, a T2 message authenticates the
+result, a T3 \texttt{SettleTx} makes it value.
+
+\subsection{The \texttt{0x9999} ingress rule}
+\label{sec:ingress}
+
+The EVM entrypoint to the DEX --- the precompile at \texttt{0x9999}
+(the LP-9999 PoolManager / CLOB facade) --- is the concrete instance of
+``execution follows the chain'' for a smart-contract caller. It is the
+boundary where an EVM transaction on C becomes a T1 client of D, and it
+must obey one hard operational invariant:
+
+\begin{quote}
+\textbf{\texttt{0x9999} must never locally simulate D.} It routes the
+intent to ZAP/D and commits the server-returned result. If ZAP/D is
+unavailable, it \textbf{reverts} --- it never fabricates a fill, a
+delta, or a quote.
+\end{quote}
+
+\paragraph{Current state \IMPL{} (inert $\mid$ ZAP$\to$D).} The
+precompile has exactly one configured backend and one default, and the
+embedded matcher was ripped out:
+
+\begin{itemize}[leftmargin=2em,nosep]
+\item \textbf{Default: inert.} The package default \texttt{Engine} is
+  \texttt{inertEngine}, which ``performs NO matching and holds NO
+  state: every operation returns \texttt{ErrDEXBackendNotConfigured} so
+  that a chain which deploys the LP-9999 precompile but has not wired a
+  real backend reverts cleanly instead of silently running a wrong
+  matcher'' (\texttt{precompile/dex/engine\_inert.go:12--28}). Its
+  contract: ``never panics, never moves value, never fabricates a
+  fill'' (\texttt{engine\_inert.go:26--27}). \IMPL{}
+\item \textbf{Configured: ZAP$\to$D.} The only real backend,
+  \texttt{ZAPEngine}, ``forwards every operation to the d-chain CLOB
+  gateway over ZAP'' and ``keeps NO canonical order/pool state --- the
+  resting book lives server-side on the D-Chain DEX''
+  (\texttt{precompile/dex/engine.go:25--27},
+  \texttt{engine\_zap.go} header). \IMPL{}
+\item \textbf{The embedded engine was ripped.} ``The previous default
+  --- an embedded Uniswap-V4 concentrated-liquidity AMM --- was both
+  the WRONG engine and a SECOND matcher living on the EVM side,
+  duplicating the d-chain's authority. There is exactly ONE matcher in
+  the tree'' (\texttt{engine\_inert.go:17--24}). The removal is pinned
+  by tests: \texttt{TestUnconfiguredPrecompileRevertsNoEmbeddedFallback}
+  and \texttt{TestNoLocalQuotePath} drive a fully-liquid pool through an
+  unconfigured precompile and assert it reverts and quotes zero ---
+  ``the proof that no embedded fallback fabricates value''
+  (\texttt{precompile/dex/inert\_no\_embedded\_test.go:24--119}).
+  \IMPL{} (and tested).
+\end{itemize}
+
+\paragraph{XSS-future form \DESIGN{}.} Under XSS the same invariant
+extends one step: \texttt{0x9999} references an X \emph{lock} (the
+caller's order funded by a \texttt{LockTx(purpose=dex)},
+Section~\ref{sec:per-chain}), routes the order intent to D, and settles
+the fill via an X settlement proof (\texttt{SettleTx} consuming the
+referenced lock, Section~\ref{sec:primitives}). The EVM never holds a
+spendable wrapped balance; it holds a claim over an X lock, exactly like
+every other module. The revert-not-simulate rule is unchanged: if the
+order cannot be routed and proven, the EVM transaction reverts and the
+lock is untouched (recoverable by \texttt{UnlockTx}). This is ``execution
+follows the chain'' made enforceable at the EVM entrypoint --- the C
+chain executes the contract, D executes the match, X settles the value,
+and \texttt{0x9999} is forbidden from collapsing those three into a
+local fiction.

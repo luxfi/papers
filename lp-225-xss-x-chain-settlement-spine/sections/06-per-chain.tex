@@ -1,0 +1,139 @@
+\section{Per-chain under XSS}
+\label{sec:per-chain}
+
+Each computing chain keeps its computation and drops its parallel
+ledger. Below, ``KEEPS'' and ``DROPS'' are stated against what the code
+holds today.
+
+\subsection{D --- the DEX}
+
+\textbf{Computation.} A matching engine over X-locked claims.
+
+\textbf{Flow.}
+\begin{enumerate}[leftmargin=2em,nosep]
+\item User funds an order with \texttt{LockTx(targetChainID=D,
+  targetModuleID=clob, purpose=dex, amount, expiry)}. The lock amount
+  is the order's collateral: for a buy, $\lceil
+  \texttt{size}\cdot\texttt{price}\rceil$ quote units; for a sell,
+  \texttt{size} base units --- exactly the
+  \texttt{orderLock} split the venue computes today
+  (\texttt{lx/dex/pkg/dchain/settle.go:108}).
+\item D records an order \emph{claim} keyed by \texttt{lockID} and runs
+  the book: price/time priority, signature checks, matching --- the
+  matcher it already has.
+\item On a match, D proves the CLOB settled correctly over locks
+  $L_1,L_2,\dots$: prices and time priority respected, signatures valid,
+  balances conserve, producing outputs $O_1,O_2,\dots$. This is the
+  \texttt{settleFills} computation it already performs
+  (\texttt{settle.go:178}), now emitted as a \texttt{settlementProof}.
+\item X \texttt{SettleTx} consumes the settled locks and creates new X
+  UTXOs (visible fill) or Z commitments (shielded fill), checking the
+  per-asset conservation sum --- not re-running the match.
+\end{enumerate}
+
+\textbf{KEEPS:} orders, fills, market state, matching rules, proof
+generation. \textbf{DROPS:} the canonical \texttt{available}/\texttt{locked}
+balance ledger (\texttt{lx/dex/pkg/dchain/state.go:54--59}), the
+withdraw ledger (\texttt{debitWithdraw}, \texttt{settle.go:139}), and the
+proxy's atomic UTXO custody (\texttt{lux/chains/dexvm/custody.go}). The
+$\texttt{available}\to\texttt{locked}\to$ settle motion the venue does
+internally becomes $\texttt{LockTx}\to\texttt{SettleTx}$ on X.
+
+\textbf{Correction to a common assumption.} The D-Chain venue today is
+a \emph{CLOB only}; it has \textbf{no} \texttt{PoolManager} and \textbf{no}
+AMM reserves --- a search of \texttt{lx/dex/pkg/dchain/} finds the
+account ledger, order rows, and trade log, but no liquidity-pool
+reserve store. So XSS does \emph{not} ``drop PoolManager reserves'' on
+D; there are none to drop. \emph{If} an AMM is later added, its reserves
+must enter XSS as a lock-funded pool (a \texttt{purpose=dex} lock the
+pool module settles against), never as an independent reserve balance
+--- this is a design constraint XSS places on future AMM work, not a
+description of current code.
+
+\subsection{P --- staking}
+
+\textbf{Computation.} Validator lifecycle: registration, uptime,
+rewards, reward-eligibility.
+
+\textbf{Flow.}
+\begin{enumerate}[leftmargin=2em,nosep]
+\item Stake is committed with \texttt{LockTx(targetChainID=P,
+  purpose=stake, amount, expiry)} producing a \texttt{stakeLockID}. The
+  stake stays \emph{locked on X} --- it is never copied into a P-Chain
+  UTXO.
+\item P references \texttt{stakeLockID} and manages the validator's
+  lifecycle --- the same lifecycle logic it has today, minus custody.
+\item At unlock/reward/abort, P emits a settlement commitment and X
+  finalizes: a \texttt{SettleTx} that returns principal plus reward to a
+  visible UTXO (reward minting becomes a settlement output), or a
+  settlement reflecting reward eligibility (principal always returned).
+\end{enumerate}
+
+\textbf{KEEPS:} validator set, uptime, reward schedule, reward-eligibility rules.
+\textbf{DROPS:} its parallel staking custody --- the locked
+\texttt{StakeOuts} held as P-Chain outputs
+(\texttt{txs/add\_permissionless\_validator\_tx.go:50}), the
+return-stake-and-mint-reward on P's own state
+(\texttt{txs/executor/proposal\_tx\_executor.go:283--325}), and ---
+critically --- P's independent \texttt{utxoDB}
+(\texttt{vms/platformvm/state/state.go:429--431}). \textbf{Contradiction
+surfaced:} P today also has its own \texttt{CreateAssetTx}
+(\texttt{txs/executor/create\_asset\_tx.go:61}), i.e. P can mint
+\emph{new assets} independently. Under XSS, asset creation must move to
+X (or be gated as a settled result); P retaining mint authority directly
+violates ``other chains compute, X settles.'' This is the single
+clearest place current code contradicts the model and must be resolved
+in P4 (Section~\ref{sec:migration}).
+
+\subsection{B --- the bridge}
+
+\textbf{Computation.} An operator-NFT-gated proof module over X locks.
+
+\textbf{Flow.}
+\begin{enumerate}[leftmargin=2em,nosep]
+\item \texttt{RequireNFT(operatorNFT, targetChainID=B, moduleID)} gates
+  the operator (the \texttt{nftfx} capability is \IMPL{}).
+\item User locks value with \texttt{LockTx(purpose=bridge)}; B emits an
+  outbound bridge message referencing the \texttt{lockID}.
+\item On the return/burn proof from the foreign chain, a
+  \texttt{SettleTx} consumes the lock --- releasing to a visible X UTXO
+  on a verified return, or finalizing a burn.
+\end{enumerate}
+
+\textbf{KEEPS:} bridge records, foreign-chain proof verification,
+operator set. \textbf{DROPS:} any locally-held bridged-asset balance;
+bridged value is always an X lock, released only by an accepted return
+proof.
+
+\subsection{C --- the EVM}
+
+Two models; we document both and recommend one.
+
+\textbf{Execution-only (recommended).} Contracts \emph{reference} X
+locks and X settles results. A contract receives a \texttt{lockID} as
+the funding handle, computes, and emits a settlement the EVM proves;
+\texttt{SettleTx} consumes the lock to a visible UTXO. The EVM never
+holds a spendable wrapped balance --- it holds claims over X locks, like
+every other module. This keeps one state per unit.
+
+\textbf{Wrapped-asset (documented, not recommended).} Lock on X
+$\to$ mint a wrapped ERC-20 inside C $\to$ burn the wrapped token
+$\to$ release the X lock. This re-introduces a parallel balance (the
+wrapped-token supply inside C) and therefore a second place value lives
+and a second conservation invariant to reconcile --- exactly what XSS
+removes. It is acceptable only as a compatibility shim for unmodified
+EVM contracts, and even then the wrapped supply must be exactly backed
+by outstanding X locks, with the backing checkable on X.
+
+\textbf{Recommendation.} Execution-only. Reserve wrapped-asset strictly
+for unmodifiable third-party contracts, with a hard backing invariant.
+
+\subsection{Z --- shielded}
+
+Z is not a computing module in the P/D/B/C sense; it is the shielded
+counterpart of X, covered by the bridge (Section~\ref{sec:bridge}). Its
+role under XSS is to hold value in the shielded pool and to be the
+settlement target for \texttt{shieldedOutputs}. It KEEPS its note pool,
+nullifier set, and proof system; it DROPS nothing, because it never held
+a parallel \emph{transparent} balance --- but it gains the obligation to
+participate in the visible$+$shielded$=$total invariant.

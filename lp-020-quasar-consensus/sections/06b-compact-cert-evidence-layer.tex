@@ -1,0 +1,166 @@
+\section{The Compact-Certificate Evidence Layer (Released, \texttt{consensus v1.26.0})}
+\label{sec:compact-cert}
+%% ============================================================================
+
+The three-lane QuasarCert of \S\ref{sec:quasarcert} is refined, in the
+released implementation (\texttt{github.com/luxfi/consensus}, tag
+\texttt{v1.26.0}, package \texttt{protocol/quasar}), into a typed
+\emph{compact-certificate} envelope (\texttt{ConsensusCert}). The refinement
+makes three changes, all motivated by the arrival of a byte-equal threshold
+ML-DSA seal (Pulsar / TALUS, LP-073~\cite{lp073}):
+\begin{enumerate}[leftmargin=2em,nosep]
+  \item the post-quantum threshold seal becomes the \emph{primary} finality
+        object --- one Pulsar threshold signature compresses the entire
+        quorum to a single FIPS-204 signature --- so the per-validator
+        ML-DSA Groth16 rollup of \S\ref{sec:lane3} is demoted to a
+        \emph{fallback} evidence kind;
+  \item every threshold lane shares one group-key-per-era (\texttt{KeyEra});
+  \item relying parties select finality posture from an operator-facing
+        policy table over the evidence kinds.
+\end{enumerate}
+The envelope is $O(1)$ in committee size.
+
+\subsection{Four typed evidence kinds}
+\label{sec:compact-cert:kinds}
+
+The envelope carries evidence drawn from exactly four typed kinds
+(\texttt{compact\_evidence.go}):
+\begin{itemize}[leftmargin=2em,nosep]
+  \item \texttt{EvidenceBeamBLS} (\texttt{"beam-bls"}) --- the classical
+        BLS12-381 aggregate (the Beam).
+  \item \texttt{EvidencePulsarThresholdMLDSA}
+        (\texttt{"pulsar-threshold-mldsa"}) --- one Pulsar (TALUS) threshold
+        signature, byte-equal to FIPS-204 ML-DSA and verifying under the
+        \emph{stock} FIPS-204 verifier.
+  \item \texttt{EvidenceCoronaRingtail} (\texttt{"corona-ringtail"}) --- one
+        Corona Module-LWE threshold signature (Ringtail/Raccoon lineage; the
+        natively-dealerless leg, LP-220~\cite{corona}).
+  \item \texttt{EvidenceP3QMLDSARollup} (\texttt{"p3q-mldsa-rollup"}) ---
+        the \emph{fallback}: a rollup of $N$ per-validator ML-DSA signatures
+        (the Lane-3 construction of \S\ref{sec:lane3}), bound to the
+        committed validator set.
+\end{itemize}
+Beam, Pulsar, and Corona are each \emph{one} $O(1)$ signature. P3Q is the
+only kind whose footprint grows with $N$, and it is used only as a fallback
+(migration, recovery, bridge, audit), never as the primary finality object
+when a compact Pulsar threshold leg is available.
+
+\begin{remark}[Four kinds, not four legs]
+Underneath, dispatch resolves each \texttt{EvidenceKind} to a
+\texttt{(LegKind, EvidenceMode)} pair. A fifth leg kind --- Magnetar /
+SLH-DSA (FIPS-205, the Polaris profile) --- exists \emph{outside} this
+four-kind vocabulary for hash-based cross-family diversity; it is not one of
+the four compact evidence kinds, and STRICT finality does not require it.
+\end{remark}
+
+\subsection{\texttt{KeyEra}: one group key per era (value, not place)}
+\label{sec:compact-cert:keyera}
+
+Each threshold kind verifies against a single group public key pinned to one
+validator-set era. The released code decomplects this into a single generic
+\texttt{KeyEra} type (\texttt{key\_era.go}): a registry record qualified by
+its \texttt{SchemeID} (ML-DSA \emph{vs} Ringtail), not a Pulsar-specific
+place --- \emph{one type, all threshold lanes}. The same \texttt{KeyEra}
+serves both the Pulsar and the Corona lane; the \texttt{SchemeID} says how to
+interpret the group-key bytes. Beam (a classical aggregate) and P3Q (a
+per-validator rollup) are \emph{not} compact group-key threshold lanes and
+are explicitly refused by the era-suite resolver. One group key verifies a
+whole committee's threshold signature; this is precisely what makes the
+certificate $O(1)$.
+
+\subsection{The policy table: operator-facing posture}
+\label{sec:compact-cert:policy}
+
+A relying party selects a posture from a four-row policy table
+(\texttt{cert\_policy\_table.go}). Each posture names the set of evidence
+legs that MUST be present and verify (AND-composition):
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Posture} & \textbf{Required legs} & \textbf{Use} \\
+\midrule
+\texttt{BLS\_FAST}             & $\mathrm{Beam}$
+  & classical fast path (no PQ) \\
+\texttt{HYBRID\_PQ\_CHECKPOINT} & $\mathrm{Beam} \wedge (\mathrm{Pulsar} \vee \mathrm{P3Q})$
+  & PQ checkpoint (compact leg or fallback) \\
+\texttt{STRICT\_QUASAR}        & $\mathrm{Beam} \wedge \mathrm{Pulsar} \wedge \mathrm{Corona}$
+  & dual-lattice AND-mode strict finality \\
+\texttt{RECOVERY\_MODE}        & $\mathrm{Beam} \wedge \mathrm{P3Q}$
+  & degraded path (compact legs unavailable) \\
+\bottomrule
+\end{tabular}
+\caption{The four released finality postures. \texttt{STRICT\_QUASAR} is the
+never-trust-a-single-lattice-leg posture: it requires both the Pulsar
+(byte-FIPS-204) and the Corona (Module-LWE, Ringtail/Raccoon) threshold
+seal, and it structurally refuses the P3Q rollup mode. \texttt{HYBRID\_PQ\_CHECKPOINT}
+accepts either the compact Pulsar leg \emph{or} the P3Q fallback.}
+\label{tab:policy}
+\end{table}
+
+Enforcement (\texttt{VerifyConsensusCert}) is a straight AND: the verifier
+rejects the certificate if any required leg is missing, is disallowed by the
+posture, or fails its per-lane verifier, plus a cardinality check that each
+required leg appears exactly once. Because every required leg must verify,
+an adversary must defeat \emph{every} lane of the chosen posture
+simultaneously; under \texttt{STRICT\_QUASAR} that means breaking BLS
+\emph{and} Pulsar's Module-LWE/MSIS \emph{and} Corona's distinct Module-LWE
+parameter set and codebase at once. Both lattice legs are Module-LWE, so
+this is construction- and parameter-level diversity (both must be cracked),
+\emph{not} a disjoint hardness family; cross-family insurance is the
+hash-based Magnetar leg.
+
+\subsection{Compact: $O(1)$ not $O(N)$}
+\label{sec:compact-cert:compact}
+
+Because Beam, Pulsar, and Corona are each a single aggregate / threshold
+signature, the compact checkpoint footprint is invariant in committee size
+$N$. The released proof corpus asserts the compact-to-naive ratio is at
+least $100\times$ and \emph{measures} it at runtime
+(\texttt{TestCompact\_O1NotON\_For1000Validators}): at $N{=}1000$ validators
+(ML-DSA-65), a Beam$+$Pulsar compact checkpoint is $3{,}466$ bytes versus a
+naive $1000$-signature object of $3{,}320{,}000$ bytes --- a measured
+$957\times$ reduction. (The $957\times$ is the measured value; only
+$\geq 100\times$ is asserted as a bound.)
+
+This is the point of promoting Pulsar to the primary post-quantum object.
+The Lane-3 Groth16 rollup (\S\ref{sec:lane3}) compresses $N$ per-validator
+ML-DSA signatures into a $192$-byte SNARK plus a public-inputs hash, but it
+still requires $N$ \emph{individual} signatures and a trusted-setup SNARK.
+The Pulsar threshold leg instead compresses the \emph{quorum} to one
+FIPS-204 signature --- no per-validator list, no trusted setup, no
+pairing-based (Shor-breakable) SNARK in the finality root --- and P3Q remains
+only as the fallback for when a compact threshold leg cannot be produced.
+
+\subsection{A deliberately boring verifier}
+\label{sec:compact-cert:verifier}
+
+The certificate verifier is deliberately straight-line. It dispatches each
+required kind to exactly one per-lane verifier --- Beam $\to$ BLS aggregate,
+Pulsar $\to$ \emph{stock} FIPS-204 ML-DSA, Corona $\to$ Module-LWE
+(Ringtail/Raccoon) --- checks each in its own lane through the suite
+registry, and ANDs the results. There
+are no fast paths and no clever shortcuts. The verifier is \emph{not}
+constant-time: it early-returns on the first failing leg. This is
+appropriate here because every input is public (signatures, group keys, the
+finality message $M$); there is no secret-dependent branch. Cross-lane
+confusion is structurally impossible --- the suite registry rejects any
+suite whose kind does not match the verifier's lane
+(\texttt{ErrSuiteLaneMismatch}).
+
+\subsection{Decomplected extensions}
+\label{sec:compact-cert:decomplect}
+
+The dealerless post-quantum core (\texttt{consensus} $+$ \texttt{pulsar} $+$
+\texttt{corona}) depends on neither the optional MPC custody extension
+(\texttt{luxfi/mpc}) nor the optional TEE custody extension
+(\texttt{luxfi/tee}); the quasar package imports neither. Hardware
+attestation, where a deployment uses it, is a separate single verifier
+(\texttt{luxfi/cc}) exposing orthogonal vendor Kinds: AMD SEV-SNP and NVIDIA
+NVTrust are production verifiers, Intel TDX is a fail-loud stub, and further
+vendor Kinds are the framework's extension surface. The compact-certificate
+evidence layer above is independent of all three.
+
+%% ============================================================================

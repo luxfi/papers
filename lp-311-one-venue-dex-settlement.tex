@@ -1,0 +1,447 @@
+%% ===================================================================
+%% One-Venue DEX Settlement on Lux
+%% Companion paper to LP-311 (lps/LP-311-one-venue-dex-settlement.md)
+%% and LP-032 (DEX VM). Standalone; compiles with shared/luxcover.
+%% ===================================================================
+
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{array}
+\usepackage{tabularx}
+\input{shared/lstlang}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+\lstset{basicstyle=\ttfamily\scriptsize,breaklines=true,frame=single,numbers=left,numberstyle=\tiny\color{gray}}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}{Proposition}[section]
+\newtheorem{definition}{Definition}[section]
+\newtheorem{lemma}{Lemma}[section]
+\newtheorem{remark}{Remark}[section]
+
+\title{One-Venue DEX Settlement\\Stateless Conduit, Synchronous Atomic Carry-Fills, and Post-Quantum Cross-Network Transport}
+\author{Zach Kelling \\
+\textit{Lux Architecture Team}}
+\date{June 2026}
+
+\begin{document}
+\luxcoverpage
+
+\begin{abstract}
+The Lux decentralized exchange is \emph{one venue}---the D-Chain, a virtual machine that runs a
+central-limit order book as a consensus-native operation (LP-032)---reached from every EVM chain
+through \emph{one settlement primitive}, the \texttt{0x9999} precompile (LP-9999). This paper
+specifies and proves correct the settlement \emph{layer} that composes them. We make the
+\texttt{0x9999} precompile a \emph{stateless conduit} that holds no order book and no ledger:
+the single book and the single ledger live on the venue. We show that settlement on the Lux
+primary network is synchronous within a single block---preserving the Uniswap-V4
+\texttt{swap()} interface that returns a balance delta in the same transaction---via atomic
+shared-memory \emph{carry-fills}, and we prove this construction is consensus-safe whereas the
+na\"ive per-validator venue call is not. We show that settlement across networks is asynchronous
+via Lux Warp (the LP-225 cross-chain settlement spine), with the venue's own post-quantum consensus quorum certificate---not a bespoke
+exchange certificate---as the sole cross-network trust anchor, and we prove the cross-network
+path adds zero trust surface beyond the venue's existing validator set. Finally, we show that
+removing state from the conduit dissolves an empty-account reaping hazard that otherwise strands
+funds on every EVM chain, and that one venue makes LUX a universal cross-chain fee currency with
+shared, unfragmented liquidity.
+\end{abstract}
+
+\tableofcontents
+
+\section{Introduction}
+
+A decentralized exchange must answer three questions: \emph{where do orders match}, \emph{where
+does custody live}, and \emph{how does value move across chain boundaries}. The Lux design answers
+the first two with a single object---the D-Chain venue (LP-032)---and the third with a single
+primitive---the \texttt{0x9999} settlement precompile (LP-9999). The discipline that keeps the
+system simple is that these answers stay separate: matching and custody are the venue's; movement
+is the conduit's; and the only thing that varies between chains is the transport that carries
+intents to the venue and fills back.
+
+That discipline had drifted. The \texttt{0x9999} precompile accumulated an in-trie matching engine
+and a per-account ledger inside its own account storage, becoming a second venue beside the
+D-Chain venue. The drift was not merely inelegant: it manifested as a reproducible,
+fund-stranding production failure (Section~\ref{sec:reaping}) that blocked every real fill on every
+EVM chain. The failure is the symptom; the disease is the braiding of \emph{where state lives}
+into the settlement adapter. This paper decomplects them and proves the resulting system correct.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item A stateless-conduit settlement architecture (Section~\ref{sec:arch}) in which the venue is
+      the unique holder of the order book and ledger, the conduit holds only escrow, and transport
+      is the single orthogonal axis.
+\item A consensus-safety result for synchronous in-block settlement
+      (Section~\ref{sec:sync}): the atomic carry-fills construction yields deterministic replay
+      (Theorem~\ref{thm:determinism}), while the per-validator venue call admits a safety violation
+      (Theorem~\ref{thm:fork}).
+\item A zero-new-trust result for cross-network settlement (Section~\ref{sec:async}): a
+      cross-network fill is accepted exactly when a $\geq\!\tfrac{2}{3}$-of-venue-stake certificate
+      validates it (Theorem~\ref{thm:trust}), reusing the venue's post-quantum consensus
+      certificate rather than a bespoke exchange certificate.
+\item A reaping-immunity result (Theorem~\ref{thm:reap}) and a universal-fee-rail construction
+      (Section~\ref{sec:fee}).
+\end{enumerate}
+
+\section{The empty-account reaping hazard}
+\label{sec:reaping}
+
+The \texttt{0x9999} precompile is \emph{always-on}: it is dispatchable by its address whether or
+not a state account object exists there. When the precompile owns a ledger, it writes that ledger
+into its own account's storage. We recall the Ethereum emptiness predicate.
+
+\begin{definition}[EIP-158/161 emptiness]
+A state account is \emph{empty} iff $\mathrm{nonce}=0 \wedge \mathrm{balance}=0 \wedge
+\mathrm{codeHash}=\texttt{keccak256}(\varepsilon)$. Storage contents are not part of the predicate.
+\end{definition}
+
+The per-transaction finalization step \texttt{Finalise}$(\mathit{deleteEmptyObjects}=\texttt{true})$
+deletes every empty account \emph{together with all of its storage}. An ERC-20 deposit credits the
+token contract's storage (so $\texttt{balanceOf}(\mathit{token},\texttt{0x9999})$ rises) and writes
+the precompile's reserve and credit rows into \texttt{0x9999}'s storage---leaving \texttt{0x9999}'s
+own account empty (no balance, no nonce, no code). Finalization then reaps it.
+
+A real-\texttt{StateDB} probe matrix (geth host, EIP-158 enabled) isolates the discriminator: the
+empty account, not the nested token call.
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{Xccc c}
+\toprule
+\textbf{deposit shape} & \textbf{nested call} & \textbf{\texttt{0x9999} non-empty} &
+\textbf{EIP-158} & \textbf{ledger survives \texttt{Finalise(true)}} \\
+\midrule
+native (adds balance)        & yes & \textbf{yes} & on  & \textbf{yes} \\
+ERC-20 (token storage only)  & yes & no          & on  & \textbf{no (reaped)} \\
+ERC-20, no nested call       & no  & no          & on  & \textbf{no (reaped)} \\
+ERC-20                       & yes & no          & off & yes \\
+\bottomrule
+\end{tabularx}
+\caption{Empty-account reaping isolated. Native deposits survive because the balance credit makes
+\texttt{0x9999} non-empty; ERC-20 deposits do not, with or without a nested call; disabling EIP-158
+prevents reaping. The discriminator is emptiness, not the nested call.}
+\end{table}
+
+\paragraph{Consequence.} No market can be funded, so no fill ever settles
+($\mathit{DEXFill}$ count $=0$ on every EVM chain), and any ERC-20 deposited to \texttt{0x9999} is
+stranded: its claim row is reaped while the tokens remain in the token contract. Because
+\texttt{0x9999} is always-on on every Lux EVM past the activation fork, the exposure is latent on
+every chain.
+
+\paragraph{Why the marker is the wrong fix.} Forcing $\mathrm{nonce}(\texttt{0x9999})=1$ keeps the
+account non-empty and suppresses the symptom, but it preserves the disease: a precompile owning a
+ledger, now defended against the host. The correct remedy is to remove the state from the conduit.
+Section~\ref{sec:arch} does so; Theorem~\ref{thm:reap} shows the hazard then cannot arise.
+
+\section{The decomplected architecture}
+\label{sec:arch}
+
+\subsection{Values, venue, conduit, transport}
+
+\begin{definition}[Settlement values]
+An \emph{order intent} is the tuple a trader submits: market, side, limit, size, and an escrow
+reference; it is content-addressed and chain-agnostic. A \emph{fill receipt} is the tuple the venue
+produces: the matched legs as per-leg asset deltas
+$\langle \mathit{rail}, \mathit{owner}, \mathit{asset}, \mathit{amount}, \mathit{spent}\rangle$
+together with a quorum certificate; it is self-authenticating and chain-agnostic.
+\end{definition}
+
+\begin{definition}[Venue]
+The \emph{venue} is the D-Chain (LP-032): the unique holder of the order book
+($\texttt{order:}, \texttt{book:}, \texttt{market:}, \texttt{trade:}$), the ledger
+($\texttt{balance:}, \texttt{locked:}$), and the seam-escrow record
+($\texttt{seamintent:}, \texttt{seamout:}$). Matching is a VM-native operation at block execution,
+deterministic and parallel across markets.
+\end{definition}
+
+\begin{definition}[Conduit]
+The \emph{conduit} is the \texttt{0x9999} precompile, identical on every EVM chain. It performs
+exactly: escrow the physical asset; forward an intent to the venue; apply a fill the venue
+produced; release escrow. It holds no order book, reserve, or credit ledger, and writes no durable
+row to its own account storage (Section~\ref{sec:conduit}). It does not branch on the transport.
+\end{definition}
+
+\begin{definition}[Transport]
+A \emph{transport} provides $\textsc{Submit}(\mathit{intent}) \to \mathit{ref}$ (forward C$\to$D,
+revert-safe) and $\textsc{Apply}(\mathit{ref}) \to \mathit{receipt}$ (deliver D$\to$C, value-bound,
+exactly-once). Two implementations exist: \emph{atomic} (same network as the venue; synchronous)
+and \emph{warp} (a separate network; asynchronous). The venue and the conduit never branch on which.
+\end{definition}
+
+A new chain---L1, L2, or L3---adds no settlement code; it binds a transport. This is the sense in
+which all chains ``work the same.''
+
+\section{Synchronous settlement on the primary network}
+\label{sec:sync}
+
+On the Lux primary network the C-Chain, the D-Chain venue, and any co-resident L1/L2/L3 execute
+inside a single \texttt{luxd} process with atomic shared memory between chains. A swap therefore
+settles synchronously within one block and returns a balance delta from \texttt{swap()}, preserving
+the Uniswap-V4 interface.
+
+\subsection{Carry-fills}
+
+\begin{definition}[Carry-fills]\label{def:carry}
+The block proposer computes the match \emph{once} against the venue's consensus-accepted state and
+records the resulting fill in the block via atomic shared memory. Validators do not re-run the
+match; they replay the carried fill from the block bytes and verify consistency with the venue
+accepted state they also hold. The C-Chain block and the corresponding venue state transition are
+co-committed within the single-proposer block.
+\end{definition}
+
+We model a block's settlement as a function of two inputs: the block bytes $b$ and the venue's
+accepted state $\sigma_D$ at the block's parent. Write $\mathsf{Settle}(b,\sigma_D)$ for the
+post-state a validator computes.
+
+\begin{theorem}[Synchronous determinism]\label{thm:determinism}
+Under carry-fills (Definition~\ref{def:carry}) with (C-S1) a single proposer-computed match,
+(C-S2) settlement reading only the venue's accepted state---never live, wall-clock, stream-ordered,
+or non-deterministically-accelerated state---and (C-S3) no per-validator venue query during
+verification, any two honest validators that agree on $b$ and on $\sigma_D$ compute identical
+post-states: $\mathsf{Settle}(b,\sigma_D)=\mathsf{Settle}(b,\sigma_D)$ byte-for-byte.
+\end{theorem}
+
+\begin{proof}
+The settlement-relevant inputs are exactly $b$ and $\sigma_D$. The block bytes $b$ are agreed by
+gossip and consensus on the C-Chain block; $\sigma_D$ is agreed by consensus on the venue (both
+chains being co-resident and at accepted state). By (C-S2) $\mathsf{Settle}$ reads no other input;
+by (C-S1) the carried fill in $b$ is the unique match, not a per-validator recomputation; by (C-S3)
+no validator introduces an independent venue read. Hence $\mathsf{Settle}$ is a pure function of
+the two agreed inputs, and pure functions of equal inputs return equal outputs. A GPU accelerator
+is admitted only when known-answer-tested byte-identical to the reference matcher, so it does not
+enlarge the input set. \qed
+\end{proof}
+
+\begin{theorem}[The per-validator venue call forks]\label{thm:fork}
+Consider the alternative construction in which each validator, during verification of a swap
+transaction, independently queries the venue for a match. There is a reachable execution in which
+two honest validators return different match results and therefore disagree on the block's
+validity---a safety violation.
+\end{theorem}
+
+\begin{proof}[Proof (by the existing adversarial witness)]
+Let two validators verify the same swap against venue states that differ in the transient ordering
+of a concurrently-relayed order---a difference invisible to consensus because the venue query is
+not a function of agreed state alone. One validator matches against a book containing the
+concurrent order and returns fill $f_1$; the other matches against a book without it and returns
+$f_2 \neq f_1$. The two validators then hold different post-states for the same block and vote
+incompatibly. This execution is realized by the D-Chain proxy's adversarial test
+\texttt{TestRED\_PerValidatorRelay\_SplitsConsensus}, which exhibits a concrete split. The degree
+of freedom is the per-validator venue read; Theorem~\ref{thm:determinism} removes it. \qed
+\end{proof}
+
+Theorems~\ref{thm:determinism} and~\ref{thm:fork} together are the standard's mandate: synchronous
+settlement \emph{must} be carry-fills, never a Verify-time venue call.
+
+\subsection{Developer interface}
+\texttt{swap()} keeps its V4 signature and returns a balance delta in the same transaction---no
+intent acknowledgement, no ABI change, no second call. Applications on any primary-network chain
+integrate the DEX as they would a local pool.
+
+\section{Asynchronous settlement across networks}
+\label{sec:async}
+
+A chain on a separate network---its own network identifier, no atomic shared memory with the
+venue---settles across the boundary via Lux Warp. Settlement is asynchronous: the conduit escrows
+the input and forwards the intent; the fill arrives later carrying the venue's certificate. The V4
+call site is unchanged; the realized fill is read from the D$\to$C settlement.
+
+\subsection{The acceptance predicate and zero new trust}
+
+Let $V_D(h)$ be the venue's canonical validator set at P-Chain height $h$, with stake weights, and
+let a certificate $\pi$ over a message $M$ at height $h$ \emph{validate} iff the signing weight is
+$\geq \tfrac{2}{3}$ of $\mathrm{totalWeight}(V_D(h))$ under the registry-pinned scheme.
+
+\begin{theorem}[Cross-network zero-new-trust]\label{thm:trust}
+The conduit accepts a cross-network fill receipt $r$ iff (1) $r$ is the payload of a warp message
+$M$ whose certificate $\pi$ validates against $V_D(h)$ with quorum read from configuration (never
+from $M$); (2) $M.\mathit{sourceChainID}$ is the venue and $M.\mathit{networkID}$ is local; (3) the
+reference is unconsumed and is marked consumed before credit; and (4) the decoded receipt satisfies
+the settlement binds. Under these rules, an adversary that controls the transport (the relayer) and
+$<\tfrac{1}{3}$ of the venue's stake cannot cause acceptance of any fill the venue did not produce.
+The cross-network trust surface equals $V_D$.
+\end{theorem}
+
+\begin{proof}
+Acceptance requires a validating $\pi$ (1). By the unforgeability of the aggregate scheme and
+quorum being read from configuration with a hard $\geq\!\tfrac{2}{3}$ floor, producing a validating
+$\pi$ requires signatures of $\geq\tfrac{2}{3}$ of $V_D(h)$'s weight. An adversary with
+$<\tfrac{1}{3}$ of venue stake cannot reach that threshold even colluding with all non-venue
+parties, since the floor is on venue weight and is not attacker-settable. The relayer's control is
+confined to delivery: it cannot alter the payload (the certificate covers the message bytes),
+cannot replay (3), and cannot redirect (2). Hence acceptance implies $\geq\tfrac{2}{3}$ of venue
+stake attested $r$, i.e.\ the venue produced it. The only trust assumption invoked is honesty of
+$\geq\tfrac{2}{3}$ of $V_D$---which is exactly the trust required to trade on the venue at all.
+Therefore no trust beyond $V_D$ is added. \qed
+\end{proof}
+
+\paragraph{No bespoke exchange certificate.} A DEX-specific aggregate with a verifier registry was
+prototyped and rejected after adversarial review found a value-blind certificate rebind and an
+attacker-settable wire quorum collapsing to a single signer. The standard reuses the consensus
+certificate and never mints a second trust mechanism; condition (1) above pins quorum to
+configuration precisely to exclude the wire-quorum attack.
+
+\subsection{Post-quantum certificate}
+The venue certificate is the consensus quorum certificate, post-quantum under LP-020/LP-073. The
+primary lane is a Corona (Module-LWE) threshold group signature whose validity structurally implies
+the $\geq\tfrac{2}{3}$ floor and which reuses the venue's existing consensus group key (no new
+exchange DKG, hence no trusted-dealer reintroduction). The fallback lane is an ML-DSA (FIPS-204)
+certificate set summed to $\geq\tfrac{2}{3}$ stake at verification, requiring no DKG. A
+\texttt{certType} registry selects classical, Corona, or ML-DSA with no ABI change, profile-gated
+so classical and post-quantum compose rather than braid. Both lanes verify deterministically and
+inline-safely; no non-determinism enters the certificate check, so Theorem~\ref{thm:determinism}
+extends to the cross-network apply.
+
+\section{The stateless conduit}
+\label{sec:conduit}
+
+The conduit exposes four operations, each escrow-then-transport, with no durable write to its own
+account storage:
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{operation} & \textbf{effect} \\
+\midrule
+\texttt{deposit} & escrow in (native balance, or ERC-20 into the token's trie) $\to$ \textsc{Submit}(credit) \\
+\texttt{swap}    & escrow input leg $\to$ \textsc{Submit}(order); same-network: receive the carried fill and \emph{return the balance delta}; cross-network: deliver the V4 delta when the fill lands \\
+\texttt{fill}    & \textsc{Apply}(ref) $\to$ release escrow to the bound owner (value-bound, exactly-once) \\
+\texttt{withdraw}& \textsc{Submit}(withdraw) $\to$ venue debits its ledger $\to$ D$\to$C release $\to$ \texttt{fill} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{theorem}[Reaping immunity]\label{thm:reap}
+If the conduit's only state mutations per transaction are (a) its native balance, (b) writes to a
+token contract's storage, (c) host transport operations on the atomic backend, and (d) a
+transaction-scoped reentrancy guard in transient storage, then
+$\texttt{Finalise}(\mathit{deleteEmptyObjects}=\texttt{true})$ over the conduit account neither
+loses settlement state nor strands escrow.
+\end{theorem}
+
+\begin{proof}
+No persistent \texttt{SetState} to the conduit account survives the transaction: (a) is the account
+balance, not storage; (b) is another account's storage; (c) is the host atomic backend, a distinct
+account; (d) is transient storage, discarded at transaction end and never trie-resident. Hence after
+the transaction the conduit account has no own storage rows. If the account is empty it is reaped,
+but reaping removes only an account with no balance, nonce, code, or storage---so nothing of value
+is lost; the ERC-20 escrow is the token's storage (untouched by reaping the conduit), and the
+claim on it is a venue ledger row (not on the conduit at all). The precompile remains dispatchable
+by address regardless of account existence. Therefore no settlement state is lost and no escrow is
+stranded. \qed
+\end{proof}
+
+The nonce marker is thus unnecessary and is removed. Custody follows: the tokens are a fact (the
+token's storage), the claim is a venue ledger row, and conservation reduces to
+$\sum_{\mathit{asset}} \mathrm{escrow}(\mathit{asset}) \geq \sum_{\mathit{asset}}
+\mathrm{venue\text{-}backed\text{-}releasable}(\mathit{asset})$, enforced fail-closed by the venue's
+debit and by the value-bound conduit release.
+
+\section{Universal LUX fee rail}
+\label{sec:fee}
+
+One venue makes LUX a universal cross-chain fee currency with shared liquidity.
+
+\begin{proposition}[Fee-rail liveness]\label{prop:fee}
+If every chain lists initial $\langle \mathit{native}, \mathrm{LUX}\rangle$ liquidity in the venue
+at genesis, then every transaction can pay a LUX-denominated fee from the chain's native asset by a
+single conduit swap, atomic with the transaction, synchronous on the primary network.
+\end{proposition}
+
+\begin{proof}
+By hypothesis a $\langle \mathit{native}, \mathrm{LUX}\rangle$ market exists in the venue from block
+zero, so the venue can match a $\mathit{native}\!\to\!\mathrm{LUX}$ order of the fee size against
+genesis liquidity. The conduit escrows the native fee input and forwards the order; on the primary
+network the fill is carried in the same block (Definition~\ref{def:carry}), so the LUX proceeds are
+available within the transaction to pay the fee. The swap and the fee debit are committed together
+with the transaction. \qed
+\end{proof}
+
+The fee currency need not be the chain's native asset. We generalise to \emph{any} asset with a
+venue route to LUX (the fee-abstraction standard, LP-312): a transaction declares a fee currency
+$X$ and a bound $\overline{x}$ on the amount of $X$ it authorises for fees.
+
+\begin{proposition}[Fee abstraction: liveness and conservation]\label{prop:feeabs}
+Let a transaction owe a LUX fee $f$ and declare fee currency $X$ with bound $\overline{x}$. On the
+primary network, either (i) the venue's accepted-state liquidity admits an exact-output swap
+producing $f$ LUX from some $x\le\overline{x}$ of $X$, in which case the fee is funded in-block, the
+recipient receives $f$ in LUX, and value is conserved
+\[
+   \text{payer } -x\,(X),\qquad
+   \text{liquidity } +x\,(X)\ -f\,(\mathrm{LUX}),\qquad
+   \text{recipient } +f\,(\mathrm{LUX});
+\]
+or (ii) no such $x\le\overline{x}$ exists, in which case the transaction is rejected before
+execution with no state change. No asset is minted; the recipient is never credited notionally.
+\end{proposition}
+
+\begin{proof}
+The fee swap is an exact-output venue swap for output $f$, bounded input $\overline{x}$, executed at
+fee-buy through the stateless conduit (\S\ref{sec:conduit}) and settled by carry-fills
+(Def.~\ref{def:carry}); by Thm~\ref{thm:determinism} it is replay-deterministic. In case (i) the
+swap fills against accepted liquidity, moving exactly $x$ of $X$ from payer to liquidity and $f$ of
+LUX from liquidity to the fee account, which pays the recipient; summing the three legs gives the
+stated conservation, and no leg creates value (it is a swap plus the ordinary gas debit). In case
+(ii) admissibility is the deterministic predicate ``the exact-output swap settles within
+$\overline{x}$''; its failure is detected at fee-buy (the proposer when building, validators when
+replaying, identically), and the transaction is invalid with no state change---the
+insufficient-funds semantics. The recipient receives LUX from real liquidity in (i) and nothing in
+(ii); there is never a notional credit. \qed
+\end{proof}
+
+\begin{remark}
+Proposition~\ref{prop:feeabs} is the onboarding unlock: a payer holding zero LUX but holding a
+bridged DEX-liquid asset (e.g.\ USDT) transacts immediately, the fee converted in-block through the
+one venue. Admissibility is permissionless and self-gating---an asset is a valid fee currency
+exactly when its swap settles---so no allowlist and no price oracle are introduced, and by
+Thm~\ref{thm:trust}/\ref{thm:determinism} no trust beyond the venue is added. The conversion must be
+synchronous (a transaction cannot await an asynchronous cross-network settlement to pay its own
+fee), so on a sovereign network the fee asset is converted against a local $\langle X,\mathrm{LUX}
+\rangle$ pool rather than the remote venue (LP-312~\S8).
+\end{remark}
+
+Because all chains settle to the same book, $\langle \mathit{native}, \mathrm{LUX}\rangle$ (and every
+$\langle X, \mathrm{LUX}\rangle$) liquidity is shared rather than fragmented per chain---the property
+a per-chain in-trie book cannot provide, and a further reason the second book is removed.
+
+\section{Implementation status}
+
+The venue (LP-032) and the always-on conduit are live on mainnet and testnet; the D-Chain matcher
+is bootstrapped and serving. No real fill has settled to date because of the reaping hazard of
+Section~\ref{sec:reaping}, which is reproduced on a real \texttt{StateDB} harness. The
+stateless-conduit decomplect, the carry-fills synchronous path, the warp cross-network transport,
+the post-quantum certificate gating, and the fee rail are specified here and in LP-311; the
+consensus post-quantum certificate lanes (Corona, ML-DSA) and the D-Chain proxy's atomic relay
+primitive exist. Conformance is reached when a real cross-asset fill settles---synchronously on the
+primary network, asynchronously across networks---with the conduit holding zero reapable storage,
+the venue holding the sole book and ledger, the certificate as the sole cross-network trust, and the
+nonce marker absent.
+
+\section{Related work}
+
+LP-032 specifies the D-Chain venue and the fill receipt. LP-9999 specifies the \texttt{0x9999}
+precompile ABI. LP-007 and LP-008 specify CLOB matching and multi-asset trading; LP-040/041/042
+specify AMM liquidity sources (not matchers). LP-020 and LP-073 specify the Quasar consensus
+certificate and Pulsar post-quantum finality reused for cross-network settlement. LP-201 specifies
+the ZAP universal wire used for the receipt encoding. LP-103 and LP-104 specify the explorer and
+graph engine that index fills from the venue's trade rows.
+
+\begin{thebibliography}{9}
+\bibitem{lp032} Lux Industries, ``LP-032: DEX VM,'' Lux Proposals.
+\bibitem{lp9999} Lux Industries, ``LP-9999: \texttt{0x9999} Receipt-Settlement Precompile,'' Lux Proposals.
+\bibitem{lp311} Z.~Kelling, ``LP-311: One-Venue DEX Settlement,'' Lux Proposals, 2026.
+\bibitem{lp020} Lux Industries, ``LP-020: Quasar Consensus Certificate,'' Lux Proposals.
+\bibitem{lp073} Lux Industries, ``LP-073: Pulsar Post-Quantum Finality,'' Lux Proposals.
+\bibitem{eip158} V.~Buterin, ``EIP-158: State clearing,'' Ethereum Improvement Proposals.
+\end{thebibliography}
+
+\end{document}
