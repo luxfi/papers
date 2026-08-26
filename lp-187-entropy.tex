@@ -1,0 +1,285 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{array}
+\usepackage{tabularx}
+\input{shared/lstlang}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+\lstset{basicstyle=\ttfamily\scriptsize,breaklines=true,frame=single,numbers=left,numberstyle=\tiny\color{gray}}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{definition}{Definition}[section]
+\newtheorem{claim}{Claim}[section]
+
+\title{LP-187: Physical Entropy for Lux\\Where It Belongs, Where It Does Not,
+and How to Build a Source You Can Justify}
+\author{Lux Industries, Inc.}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Lux draws every secret it holds --- validator keys, ML-DSA and ML-KEM key
+pairs, TLS material, signing nonces, threshold dealer seeds --- from some
+source, and each is exactly as unpredictable as that draw. This paper specifies
+a physical entropy source for those draws, and argues the boundary that keeps
+it out of consensus. The boundary is the substantive claim: a hardware source
+improves secrets and would damage sortition, and the reason is not a matter of
+quality but of kind. We give the construction that composes sources so that
+adding one can never weaken the result, the health tests without which a source
+is a noise generator rather than an entropy source, and open reference designs
+at three price points, the cheapest of which is a diode and an ADC. We are
+explicit about what such a device does not establish: entropy delivered over a
+network is not verifiable by its recipient, and no measurement of a byte string
+reveals how it was produced.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Two problems that look alike}
+
+Randomness appears in a blockchain in two places that share a word and share
+nothing else.
+
+The first is secrets. A validator's staking key must be unpredictable to
+everyone but its holder. So must a signing nonce, a session key, and the dealer
+seed from which a threshold ceremony expands its pairwise material. The
+requirement is unpredictability to others, and it is satisfied by any process
+the adversary cannot reproduce.
+
+The second is agreement. When a protocol samples a committee, every honest node
+must arrive at the same committee, and no participant may influence which one.
+The requirement here is not unpredictability alone but \emph{unpredictability
+together with public reproducibility}, which is a strictly harder thing.
+
+A physical noise source answers the first requirement completely and the second
+not at all. Its output is known to exactly one party, which is precisely what a
+secret needs and precisely what agreement forbids.
+
+\begin{claim}
+A value that only one participant can produce is a value that participant can
+produce repeatedly. Any protocol that lets such a value influence a public
+outcome lets that participant choose among outcomes.
+\end{claim}
+
+This is why the boundary in \S\ref{sec:boundary} is not a limitation we accept
+reluctantly. It is the reason the hardware is safe to deploy at all.
+
+\section{The boundary}\label{sec:boundary}
+
+Lux samples Pulsar committees from a seed fixed before the current block
+exists:
+\[
+\mathrm{seed} = H\bigl(\text{``PULSAR\_SORTITION\_V1''} \parallel
+B_{\mathrm{prev}} \parallel S \parallel h_P \parallel e \parallel \pi \bigr)
+\]
+where $B_{\mathrm{prev}}$ is the previously finalised block, $S$ the pinned
+signer set, $h_P$ the P-Chain height, $e$ the epoch and $\pi$ the finality
+posture. Every term was determined before the proposer began work. The seed is
+therefore public, identical for every verifier, and beyond the proposer's
+influence.
+
+Substituting a locally drawn value inverts all three properties. The proposer
+alone knows it; verifiers cannot recompute it; and nothing prevents redrawing
+until the resulting committee is favourable. The substitution reads like an
+upgrade --- physical randomness replacing a hash --- and is a downgrade of the
+only property that mattered.
+
+We state the rule plainly.
+
+\begin{definition}[Entropy boundary]
+A local entropy source may produce values that only its holder will ever know.
+It may not produce, or contribute unaggregated to, any value another party must
+independently reproduce.
+\end{definition}
+
+Public randomness is a separate construction. Where consumers genuinely need a
+fresh public value --- a lottery, an auction ordering, a governance draw --- it
+is produced by threshold signature (LP-176): unpredictable before it exists
+because no minority can compute it, and verifiable afterwards because anyone
+can check the signature. A participant may seed \emph{its own contribution}
+from hardware. That is the single point at which the two layers meet, and it is
+safe because the output is not any one contribution.
+
+\section{What an entropy source is}
+
+A noise source is not an entropy source. The distinction is the difference
+between a component and a device you can justify.
+
+\subsection{Noise source}
+
+A physical process, sampled. The implementation states the process, the
+sampling rate, and the claimed \emph{min-entropy per sample}
+\[
+H_\infty(X) = -\log_2 \max_x \Pr[X = x],
+\]
+which is the right measure because it bounds the adversary's best single guess
+rather than an average over guesses. Raw output is never used directly: it is
+biased, correlated, and drifts.
+
+\subsection{Health tests}
+
+Physical sources fail quietly. A laser dims, a bias resistor warms, an
+amplifier saturates --- and the output remains bytes of the expected length,
+passing casual inspection, while carrying a fraction of the entropy claimed.
+Nothing downstream detects this. A key generated from a degraded source
+verifies, signs, and behaves correctly in every respect except the one that
+matters.
+
+The tests are therefore not diagnostics but part of the source. Two are
+required, both from SP 800-90B \S4.4, each sized so that a healthy source trips
+it with probability at most $2^{-40}$:
+
+\begin{itemize}
+\item \textbf{Repetition count}, which catches a source that has stuck;
+\item \textbf{Adaptive proportion}, over a window of 512 or 1024 samples, which
+catches a source whose distribution has collapsed without stopping.
+\end{itemize}
+
+A source failing either stops emitting and reports a fault. It does not degrade
+gracefully, because there is no graceful degradation available: half-entropy
+output is indistinguishable from full-entropy output at the interface.
+
+\subsection{Conditioning}
+
+Raw samples are compressed by a vetted conditioning function over SHA3-256 or
+SHAKE256, fed at least twice the min-entropy it is credited with emitting. This
+removes bias and correlation and leaves a uniform string.
+
+\section{Composition}
+
+A deployment has several sources; the operating system's generator is always
+one. They combine as
+\[
+\mathrm{seed} = \mathrm{SHAKE256}\bigl(\text{``LUX-ENTROPY-COMBINE-V1''}
+\parallel \mathrm{LE}_{64}(|s_1|) \parallel s_1 \parallel \cdots \parallel
+\mathrm{LE}_{64}(|s_n|) \parallel s_n\bigr)
+\]
+in fixed order, each input length-prefixed, under a tag used nowhere else.
+
+\begin{theorem}[Adding a source cannot weaken the seed]
+If any $s_i$ is unpredictable to the adversary, the seed is unpredictable,
+regardless of the others.
+\end{theorem}
+
+\begin{proof}[Argument]
+SHAKE256 is preimage-resistant, so predicting the output requires predicting
+its input. The length-prefixed encoding is injective, so the input determines
+$(s_1,\dots,s_n)$ uniquely; predicting it therefore requires predicting every
+$s_i$, including the unpredictable one.
+\end{proof}
+
+Two consequences follow, and both are practical rather than decorative. First,
+a new and unproven device may be added to a production deployment without risk:
+at worst it contributes nothing. Second --- and this is why the encoding is
+length-prefixed rather than a plain concatenation --- distinct source sets
+cannot collide into one preimage, so two deployments cannot silently derive the
+same seed.
+
+The operating system source is mandatory. A deployment whose only source is a
+device it cannot itself audit has not eliminated trust; it has relocated it
+into a vendor.
+
+\section{Composition with a DRBG}
+
+The entropy source does not serve callers. It seeds a DRBG (SP 800-90A), and
+callers consume the DRBG, per the composition of SP 800-90C. In Go the
+interface already exists:
+
+\begin{lstlisting}[language=Go]
+type Source interface {
+    io.Reader      // fails closed: an error, never weak bytes
+    Health() error // nil while startup and continuous tests pass
+}
+\end{lstlisting}
+
+Key generation throughout Lux already takes a reader ---
+\lstinline{mldsa.GenerateKey(rand.Reader, ...)},
+\lstinline{ecdsa.GenerateKey(..., rand.Reader)} --- so adopting a source is
+supplying a different reader. There is no consensus change, no fork, and no new
+chain. The seam was always there.
+
+\section{Open reference designs}
+
+We publish these because a source whose construction is secret cannot be
+assessed, and an entropy source that cannot be assessed is a claim rather than
+a component. Each design states what it demonstrates and what it does not.
+
+\subsection{RD-1: avalanche noise (approximately \$15)}
+
+A reverse-biased transistor junction driven into avalanche breakdown, amplified
+and sampled by an MCU's ADC. The randomness is carrier-avalanche timing ---
+genuinely physical, thermally sensitive, and cheap.
+
+\emph{Demonstrates}: a working entropy source, end to end, with real health
+tests and a real min-entropy assessment. This is the design to build first,
+because everything difficult about the discipline is present in it.
+\emph{Does not demonstrate}: any quantum-optical claim.
+
+\subsection{RD-2: optical shot noise (approximately \$150--300)}
+
+An LED or laser diode, a beamsplitter, and two photodiodes; the sampled
+quantity is the difference between the two arms. At low photon flux this
+difference is dominated by shot noise, whose origin is the discreteness of
+photon arrival.
+
+\emph{Demonstrates}: entropy of quantum-mechanical origin under a stated
+physical model. \emph{Does not demonstrate}: that a remote party can verify
+this. The device is a better-argued source, not a verifiable one.
+
+The engineering difficulty is not the optics. It is balancing the arms,
+stabilising the source against temperature, and showing that the sampled
+difference is dominated by shot noise rather than by technical noise --- which
+is the entire content of the min-entropy claim.
+
+\subsection{RD-3: vacuum-fluctuation homodyne (laboratory)}
+
+A balanced homodyne detector measuring the vacuum quadrature. The standard
+high-rate approach, and the point at which the work becomes a physics project:
+optical alignment, local-oscillator stability, and a careful separation of
+quantum from technical noise.
+
+\subsection{What none of them establish}
+
+No design here supports a claim of \emph{device-independent} randomness. That
+requires a loophole-free Bell test, whose entire purpose is to certify
+randomness without trusting the device --- and which is a research programme,
+not a board. We name the distinction because it is the one most often elided:
+a quantum noise source is trusted hardware, and only a Bell violation is not.
+
+\section{What we do not claim}
+
+\begin{itemize}
+\item \textbf{Not remotely verifiable.} A recipient of bytes cannot determine
+how they were produced. Randomness as a network service is a claim about its
+operator.
+\item \textbf{Not a consensus input.} See \S\ref{sec:boundary}. Sortition keeps
+its deterministic seed.
+\item \textbf{Not a standards claim without the assessment.} Conformance to SP
+800-90B is a min-entropy claim plus the analysis supporting it. Without the
+analysis, citing the standard cites its name.
+\item \textbf{Not unbreakable.} The source improves the draw. It says nothing
+about the algorithms consuming it, the software around them, or the operator.
+\end{itemize}
+
+\section{Conclusion}
+
+The useful claim is narrower than the marketing available for it, and stronger
+for being narrow. Lux's secrets are draws from a source; a well-characterised
+physical source with real health tests makes those draws better, composes so
+that it cannot make them worse, and plugs into an interface that already
+exists. Lux's consensus randomness is a different problem, already solved by
+deriving from final state, and hardware entropy would damage it. Holding those
+two apart is what makes the hardware safe to sell and safe to run.
+
+\end{document}
