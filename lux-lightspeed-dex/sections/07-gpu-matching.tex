@@ -44,7 +44,7 @@ step---collapses the per-match cost:
 \renewcommand{\arraystretch}{1.2}
 \begin{tabular}{l r r}
 \toprule
-\textbf{Division routine} & \textbf{GB10 ns/div} & \textbf{M4 Max ns/div} \\
+\textbf{Division routine} & \textbf{GB10 ns/match} & \textbf{M4 Max ns/match} \\
 \midrule
 512-iteration bit-serial (baseline) & 50--61 & 51 \\
 Knuth Algorithm~D (limb-wise)       & \textbf{6.9} & \textbf{4.15} \\
@@ -52,13 +52,10 @@ Knuth Algorithm~D (limb-wise)       & \textbf{6.9} & \textbf{4.15} \\
 Speedup & $\sim$8$\times$ & $\sim$12$\times$ \\
 \bottomrule
 \end{tabular}
-\caption{The Knuth-D division is one of two compounding levers; the other is the coalesced
-structure-of-arrays memory layout (below). Replacing the 512-iteration bit-serial
-\texttt{uint256} VWAP division with Knuth Algorithm~D (base-$2^{32}$ limbs) shrinks the
-\emph{per-lane} division cost by roughly an order of magnitude. Both rows are byte-identical
-to the CPU oracle. These are per-division-op latencies, not matcher throughput: the tuned
-matcher runs thousands of such divisions in parallel across coalesced lanes
-(Table~\ref{tab:gpu-throughput}).}
+\caption{The dominant lever is the division, not the parallelism strategy. Replacing the
+512-iteration bit-serial \texttt{uint256} VWAP division with Knuth Algorithm~D
+(base-$2^{32}$ limbs) shrinks the per-match critical path by roughly an order of magnitude.
+Both rows are byte-identical to the CPU oracle.}
 \label{tab:division}
 \end{table}
 
@@ -67,24 +64,21 @@ matcher runs thousands of such divisions in parallel across coalesced lanes
 \begin{table}[H]
 \centering
 \renewcommand{\arraystretch}{1.25}
-\begin{tabular}{l l r}
+\begin{tabular}{l l r r}
 \toprule
-\textbf{Platform} & \textbf{Kernel} & \textbf{Orders/s} \\
+\textbf{Platform} & \textbf{Kernel} & \textbf{Fills/s} & \textbf{ns/match} \\
 \midrule
-AMD Radeon 8060S              & coalesced SoA (Knuth-D)   & \textbf{12.76\,B} \\
-NVIDIA GB10 (Grace-Blackwell) & coalesced SoA (Knuth-D)   & 9.13\,B \\
-NVIDIA GB10                   & un-coalesced (baseline)   & 1.54\,B \\
-Apple M4 Max (128\,GB UMA)    & coalesced SoA (Knuth-D)   & 5.60\,B \\
-Apple M1 Max                  & coalesced SoA (Knuth-D)   & 2.80\,B \\
+NVIDIA GB10 (Grace-Blackwell) & limb (Knuth-D)        & 104--126\,M & 6.9 \\
+NVIDIA GB10                   & warp-cooperative      & $\sim$99\,M (sustained) & 10.2 \\
+NVIDIA GB10                   & bit-serial (baseline) & 16.5--18.5\,M & 50--61 \\
+Apple M4 Max (128\,GB UMA)    & limb (Knuth-D)        & $\sim$250\,M (sustained) & 4.15 \\
 \bottomrule
 \end{tabular}
 \caption{Measured CLOB matching throughput, byte-parity-gated, single-fill depth-64
-markets. The tuned production path lays each book's arena out as a coalesced
-structure-of-arrays (SoA) so neighboring lanes touch neighboring addresses; on the GB10
-this lifts throughput from a 1.54\,B un-coalesced baseline to 9.13\,B orders/sec, and the
-same SoA preload yields $6.6\times$ over baseline on the AMD Radeon 8060S (the fastest
-device measured). Every row is byte-identical to the CPU oracle. A two-node fabric
-aggregates linearly to 21.9\,B orders/sec.}
+markets. The limb (Knuth-D) kernel is the production path (one match per book per
+dispatch); the warp-cooperative kernel is an optional sustained-compute path that runs the
+GPU harder but adds gather overhead for the rare multiply/divide. The Apple M4 Max's
+unified memory and wide ALUs lead on this workload.}
 \label{tab:gpu-throughput}
 \end{table}
 
@@ -99,61 +93,65 @@ governed by the exact relation
 
 \subsection{What actually limits a single GPU}
 
-An earlier, un-coalesced kernel behaved as if the wall were dependency latency---the
-data-dependent loop inside the division and the serial walk of price levels---because
-forcing higher occupancy (a register cap, or raising occupancy from 16.7\% to 25\%) did not
-move throughput and the GB10 drew only a fraction of its power envelope while reporting the
-GPU fully busy. The lever that broke this apparent wall was \emph{memory layout}, not
-occupancy: laying each book's arena out as a coalesced structure-of-arrays (SoA), so that
-neighboring lanes touch neighboring addresses on every match, turns the matcher
-throughput-bound. On the GB10 this lifts sustained throughput from the 1.54\,B un-coalesced
-baseline to 9.13\,B orders/sec; on the AMD Radeon 8060S the same SoA preload yields
-12.76\,B orders/sec, $6.6\times$ over its un-coalesced baseline. The Apple M4 Max and M1 Max
-reach 5.60\,B and 2.80\,B orders/sec respectively. What looked like a latency ceiling was an
-un-coalesced memory-access pattern.
+The limit is \emph{not} occupancy, PCIe bandwidth, dispatch overhead, or ALU throughput;
+it is dependency latency---the data-dependent loop inside the division and the serial walk
+of price levels on the critical path. We established this on the GB10 four ways:
+
+\begin{enumerate}
+  \item Forcing higher occupancy via a register cap \emph{lowered} throughput (register
+  spills).
+  \item Reducing threads-per-block to raise occupancy from 16.7\% to 25\% did not move
+  throughput.
+  \item At peak limb-kernel throughput the GB10 drew $\sim$25\,W of a 100\,W-plus envelope
+  with the SM clock below its maximum, yet reported the GPU fully busy---characteristic of a
+  latency-bound, not throughput-bound, kernel.
+  \item The warp-cooperative kernel, which shortens the per-match critical path by spreading
+  one \texttt{uint256} across lanes, raises sustained throughput by $\sim$22\% and runs the
+  GPU at $\sim$62\,W---moving the latency wall, not an occupancy wall.
+\end{enumerate}
 
 A second, separate wall appears at high market counts. The per-book arena is large (mostly
 empty depth), so beyond roughly 50--75\,k markets the working set overflows cache and
-throughput falls off a cliff. A compact arena is the lever for very high market counts and
-is not yet built.
+throughput falls off a cliff (on the GB10: 126\,M fills/s at 50\,k markets, 48\,M at 75\,k,
+31\,M at 100\,k). A compact arena is the lever for very high market counts and is not yet
+built.
 
 \subsection{Can it exceed $10^{9}$ matches per second?}
 \label{subsec:billion-matching}
 
-\textbf{Yes---a single device already clears it, per venue.} The tuned coalesced-SoA matcher
-sustains 9.13\,B orders/sec on a GB10, 12.76\,B on an AMD Radeon 8060S, 5.60\,B on an M4 Max,
-and 2.80\,B on an M1 Max---each an order of magnitude past $10^{9}$/s on one device,
-byte-exact against the CPU oracle. An earlier draft, benchmarking an un-coalesced kernel,
-concluded that $10^{9}$/s required an $8$--$10$-node fleet; that conclusion was an artifact
-of the un-tuned memory layout and is withdrawn. Fleet and fabric scaling then compose
-\emph{on top of} the single-device rate, following Equation~\eqref{eq:aggregate}:
+\textbf{Honestly: not on one GPU for byte-exact \texttt{uint256} matching.} The measured,
+latency-bound ceiling is $\sim$100--130\,M fills/s on a GB10 and $\sim$250\,M on an M4 Max.
+A prior internal projection of $\sim$$10^{9}$/s on a single GPU was optimistic and is not
+supported by measurement. There are two honest routes past $10^{9}$/s, both following
+directly from Equation~\eqref{eq:aggregate}:
 
 \begin{description}
-  \item[$N$-node / fabric aggregation.] Per-book arenas are independent, so sharding markets
-  across nodes and summing scales linearly on top of the single-device rate. A two-node
-  fabric measures 21.9\,B orders/sec; larger fleets extend this proportionally.
-  \item[A cheaper representation.] A \texttt{Q64.64} fixed-point path uses 4\,KB arenas
-  and a $64/64$ division instead of full $512$-bit arithmetic, further shortening the critical
-  path and shrinking the working set (10\,k markets in $\sim$41\,MB versus $\sim$1.3\,GB). It
-  trades precision and ABI width and is \emph{not yet built}; we state it as an obvious lever,
-  not as a result.
+  \item[(a) $N$-node aggregation.] Per-book arenas are independent, so sharding markets
+  across nodes and summing yields linear scaling. With $f \approx 100\text{--}130$\,M
+  fills/s per node, $8$--$10$ GB10-class or M4-Max-class nodes clear $10^{9}$ fills/s. This
+  is aggregation of measured single-node rates, not a new measurement.
+  \item[(b) A cheaper representation.] A \texttt{Q64.64} fixed-point path uses 4\,KB arenas
+  and a $64/64$ division instead of full $512$-bit arithmetic. This trades precision and ABI
+  width for a far shorter critical path and a far smaller working set (10\,k markets in
+  $\sim$41\,MB versus $\sim$1.3\,GB). It is a precision/ABI tradeoff and is \emph{not yet
+  built}; we state it as the obvious lever, not as a result.
 \end{description}
 
 We are careful to aggregate correctly: the aggregate rate shards distinct books across
 nodes and sums, never the same books counted on multiple nodes. Per-book compute is never
-the constraint; the remaining constraints are host dispatch and, on discrete GPUs, the
-resident-arena data path, both addressed by batched, persistent-arena kernels rather than
-per-call allocation.
+the constraint---each book needs only on the order of $10^{4}$ fills/s to reach $10^{9}$/s
+across a fleet, hundreds of times below the single-lane rate---so the constraint is host
+dispatch and, on discrete GPUs, the resident-arena data path, both addressed by batched,
+persistent-arena kernels rather than per-call allocation.
 
 \subsection{Retraction of prior figures}
 \label{subsec:retraction}
 
 Earlier drafts of this work claimed ``581\,M orders/sec at 597\,ns,'' ``100\,M+/s,''
-``434\,M GPU orders/sec,'' and a ``billion orders/sec'' headline derived from a
-\texttt{time.Sleep}-based simulation with a hardcoded $597$\,ns/order followed by a
-post-processing step that multiplied a CPU run's throughput by $40$ and divided its latency
-by the same. \textbf{Those figures are fabricated and are retracted}; they measured nothing
-on a GPU. They must not be conflated with the billions-of-orders-per-second rates reported
-in this section, which are independently measured on the stated hardware under the parity
-gate and gated byte-for-byte against the CPU oracle. The numbers in
-Tables~\ref{tab:division} and~\ref{tab:gpu-throughput} supersede every prior claim.
+``434\,M GPU orders/sec,'' ``billion orders/sec,'' and ``planet-scale.'' \textbf{Those
+figures are fabricated and are retracted.} Their lineage is a \texttt{time.Sleep}-based
+simulation with a hardcoded $597$\,ns/order, followed by a post-processing step that
+multiplied a CPU run's throughput by $40$ and divided its latency by the same. They measured
+nothing on a GPU. The numbers in Tables~\ref{tab:division} and~\ref{tab:gpu-throughput} are
+measured on the stated hardware under the parity gate of this section and supersede every
+prior claim.

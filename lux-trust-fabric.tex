@@ -1,0 +1,478 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{shared/luxcover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{array}
+\usepackage{tabularx}
+\input{shared/lstlang}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+\lstset{basicstyle=\ttfamily\scriptsize,breaklines=true,frame=single,numbers=none}
+
+\newtheorem{principle}{Principle}
+\newtheorem{definition}{Definition}[section]
+
+\title{Lux Trust Fabric\\
+Open Post-Quantum Attestation, Physical Entropy, and Confidential I/O}
+\author{Lux Industries, Inc.}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+A workload crossing a modern accelerator touches a network interface, a host
+CPU, a device interconnect, device memory, and often a second accelerator.
+Securing any one of those is not securing the path. This paper describes an
+architecture in which a relying party establishes cryptographic confidence in
+the hardware, firmware, and workload that will process its data \emph{before}
+releasing that data --- and then pays almost nothing for it thereafter.
+
+The organising decision is a split. Post-quantum cryptography establishes
+trust: device identity, firmware authentication, attestation evidence, and
+session establishment. Symmetric cryptography moves data: after a session is
+established, the hot path is AES-GCM at line rate with no post-quantum
+operation per packet, per DMA, or per cache line.
+
+We describe two hardware blocks. \textbf{Lux Entropy} is an open entropy source
+specified in LP-187. \textbf{Lux Attest} is a silicon root of trust providing
+measured boot, a post-quantum device identity, signed evidence, and the key
+establishment that opens a confidential I/O session.
+
+We are precise about what already exists in Lux, what is missing, and what
+neither can do. The missing piece is not a better random number generator. It
+is an open post-quantum attester that an OEM can license and place inside its
+own silicon.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{What is already true}
+
+This is not a greenfield proposal, and the parts already in place determine
+what is worth building.
+
+\begin{itemize}
+\item \textbf{Entropy is specified.} LP-187 defines the entropy source: a
+characterised noise source, startup and continuous health tests, a vetted
+conditioner, and a combiner under which adding a source cannot weaken the
+result.
+\item \textbf{On-chain verification exists.} LP-127 implements attestation
+verification as EVM precompiles, consuming NVIDIA NVTrust GPU evidence, TPM~2.0
+quotes, and compute attestations, with no dependency on a vendor cloud service.
+\item \textbf{Attestation-bound key release exists.} The KMS release path
+verifies composite evidence against pinned vendor roots, binds a
+freshly-generated nonce, and returns a wrapped key that only the attested
+environment can decrypt. The pattern this paper generalises is already running.
+\item \textbf{Vendor evidence is classical.} The verification chains in use ---
+Intel DCAP for SGX, ARM CCA, AWS Nitro, AMD KDS --- are ECDSA over P-256 and
+P-384, because the roots of trust in that silicon are ECDSA.
+\end{itemize}
+
+The last point is the gap, and its shape decides the strategy.
+
+\section{Where the post-quantum gap actually is}
+
+A session key lives for minutes. A workload measurement matters for the
+duration of a job. A \emph{device identity} is minted during manufacture and
+must remain trustworthy for as long as the silicon is deployed --- a decade or
+more in datacenter and far longer in industrial and aerospace equipment.
+
+Of everything in an attestation chain, the device identity has the longest
+horizon and the least ability to be rotated: it is fused into the part. It is
+therefore exactly the wrong thing to leave classical, and exactly the hardest
+thing to change later, because changing it means changing silicon.
+
+\begin{principle}
+The post-quantum problem in confidential computing is not the data path. It is
+the device root, because the device root is the one key in the system that
+cannot be rotated.
+\end{principle}
+
+This has a direct consequence for what Lux should build. An add-on card cannot
+fix a root of trust that is fused into somebody else's die. The product that
+addresses the gap is a \emph{licensable block that goes inside the die}, and
+everything else --- development boards, PCIe cards, verifiers --- exists to make
+that block credible, testable, and adopted.
+
+\section{The performance split}
+
+The objection to post-quantum cryptography in an accelerator path is
+throughput, and it is a fair objection if PQC is placed on the data path. It
+does not belong there.
+
+\begin{principle}[Control plane, data plane]
+Use post-quantum cryptography to establish trust. Use hardware-accelerated
+symmetric cryptography to move data.
+\end{principle}
+
+\subsection{Slow path}
+
+Runs at boot, device admission, workload launch, migration, key rotation, and
+policy-defined revalidation --- events measured in seconds to hours:
+
+\begin{lstlisting}
+measured boot            firmware and configuration digests
+ML-DSA                   sign and verify evidence, authenticate firmware
+ML-KEM                   establish a shared secret with the relying party
+certificate validation   walk the identity chain to a pinned root
+policy evaluation        decide whether this environment may receive keys
+\end{lstlisting}
+
+\subsection{Hot path}
+
+Runs continuously, at interconnect and memory bandwidth:
+
+\begin{lstlisting}
+AES-256-GCM              device link and network transport
+memory encryption        device-attached memory
+authenticated DMA        host to device transfers
+\end{lstlisting}
+
+\subsection{Why the split holds}
+
+Let $C_{\mathrm{PQ}}$ be the cost of one attestation and session establishment,
+and $n$ the number of data operations performed under the resulting session.
+The amortised cost per operation is
+\[
+\frac{C_{\mathrm{PQ}}}{n} + c_{\mathrm{sym}} .
+\]
+For a workload session covering seconds of accelerator time, $n$ is in the
+billions to trillions, so the first term vanishes and the steady-state cost is
+the symmetric term alone --- which is already paid by any encrypted-memory or
+encrypted-link deployment.
+
+The design consequence is a hard rule rather than an optimisation: \textbf{no
+post-quantum operation may appear on a per-packet, per-DMA, or per-cache-line
+path.} An architecture that violates it will be measured, found slow, and
+rejected, and the measurement will be blamed on post-quantum cryptography
+rather than on where it was put.
+
+\section{Architecture}
+
+Five layers, deliberately separable. A deployment may adopt any without the
+others.
+
+\begin{lstlisting}
+WORKLOAD IDENTITY   container / VM / model / kernel measurement
+ATTESTATION         evidence, policy, verification  (LP-127 verifies)
+CONFIDENTIAL I/O    session establishment, then symmetric transport
+ROOT OF TRUST       measured boot, device identity, key vault  (Lux Attest)
+ENTROPY             noise source, health tests, conditioning   (LP-187)
+\end{lstlisting}
+
+Separability is a requirement, not a convenience. Lux Entropy is useful to a
+deployment with no attester. Lux Attest is useful with a conventional entropy
+source. And neither is required by Lux Network consensus --- a point developed
+in \S\ref{sec:consensus}.
+
+\section{Lux Attest}
+
+Lux Attest is an embeddable root of trust. Its function is to turn immutable
+silicon state into signed evidence and a key nobody else holds.
+
+\begin{lstlisting}
+immutable boot ROM        measurement registers    ML-DSA sign / verify
+unique device secret      monotonic counters       ML-KEM encapsulation
+protected key vault       lifecycle controller     SHA-3 / SHAKE
+measured boot             secure mailbox           AES-256-GCM
+firmware authentication   DICE derivation          DRBG + entropy interface
+rollback protection       SPDM endpoint            confidential-I/O key derivation
+\end{lstlisting}
+
+\subsection{Identity derivation}
+
+A unique device secret is established at manufacture and is never readable by
+software after derivation. Identities descend from it by measurement, so each
+stage is bound to the state of the stage below:
+
+\begin{lstlisting}
+physical entropy -> unique device secret -> IDevID
+                                            -> LDevID (firmware-bound)
+                                               -> runtime alias
+                                                  -> workload attestation key
+\end{lstlisting}
+
+Keys are held as protected handles. The secret itself leaves the vault at no
+point in this chain, and a compromise of a later stage does not yield an
+earlier one.
+
+\subsection{Dual identity during migration}
+
+A device shipping before every verifier in its ecosystem understands
+post-quantum signatures carries both a classical and an ML-DSA identity, and
+signs evidence with both. A verifier checks whichever it supports; a verifier
+that supports both gains post-quantum assurance immediately. The classical half
+is retired by policy, without changing silicon.
+
+This is the only practical migration for a part with a ten-year life, and it is
+why the block must ship before the ecosystem is ready rather than after.
+
+\section{What can honestly be attested}
+
+This distinction is the one most often blurred in this field, and blurring it
+is how attestation architectures lose the trust of the people who evaluate them
+carefully.
+
+\subsection{A discrete card}
+
+A PCIe card carrying Lux Attest can attest itself: its own firmware, its own
+configuration, the keys it holds, sensors it directly controls, and I/O that
+passes through it.
+
+It cannot attest the internal execution state of an opaque accelerator on the
+same bus. No amount of cryptography grants a device visibility into a
+neighbour that does not report to it. A vendor claiming otherwise is selling a
+measurement of something else.
+
+\subsection{An integrated block}
+
+A Lux Attest block inside a vendor's SoC, participating in that vendor's boot
+and measurement architecture, can attest what that architecture measures:
+security-processor firmware, accelerator firmware and microcode, confidential
+mode, the workload loader, the workload image, the model manifest, and the
+runtime configuration.
+
+That is the product. The discrete card is how developers reach it.
+
+\section{Evidence and transport}
+
+Lux specifies no new evidence format and no new device protocol. Two existing
+ecosystems already fit.
+
+\textbf{Evidence} uses the IETF RATS Entity Attestation Token. EAT's nested
+token model matches a heterogeneous machine directly: a system token containing
+CPU, per-accelerator, fabric, interface, and workload tokens, evaluated as a
+whole rather than device by device. A verifier that trusts one device in
+isolation has verified one device.
+
+\textbf{Device transport} uses DMTF SPDM, whose recent revisions negotiate
+ML-KEM, ML-DSA, and SLH-DSA. A post-quantum Lux device is therefore reachable
+by existing tooling without a proprietary Lux attestation transport, and the
+work is upstream contribution rather than a fork.
+
+\begin{principle}
+Own the implementation, the IP, the performance, and the tooling. Do not
+attempt to own the wire formats. An architecture that requires everyone to
+adopt a new format has chosen its own ceiling.
+\end{principle}
+
+\section{Confidential I/O}
+
+Once a host environment and an accelerator have attested to each other, the
+established secret keys the link:
+
+\begin{lstlisting}
+attest (ML-DSA evidence)      once per admission
+establish (ML-KEM)            once per session
+derive symmetric keys         once per session
+                              -------------------
+encrypted link (AES-256-GCM)  every transaction thereafter
+\end{lstlisting}
+
+On PCIe this is IDE for link protection with TDISP for assigning a device
+interface to a trusted environment; the same shape applies to CXL, to
+accelerator fabrics, and to the network.
+
+The property worth stating plainly: \textbf{ML-KEM does not encrypt a DMA
+transaction.} It establishes the session under which hardware AES encrypts
+every DMA transaction. Conflating the two is what makes people believe
+post-quantum confidential computing is unaffordable.
+
+\subsection{Attestation-bound sessions}
+
+The same construction applied to the network changes what a connection means.
+A conventional session establishes that the peer holds a private key. An
+attested session establishes that the peer \emph{is a specific workload
+measurement running on an approved device in a confidential mode}, because the
+session key was released only against evidence to that effect.
+
+Authorisation then attaches to what is running rather than to where it is
+running --- a measurement rather than an address.
+
+\section{Key release}
+
+The pattern already implemented in the Lux KMS generalises: evidence is
+verified against pinned roots with a fresh nonce bound in, policy is evaluated,
+and a wrapped key is returned that only the attested environment can unwrap.
+
+Lux Network is useful here as a coordination layer and nowhere else. K-Chain
+gates release; a chain may carry approved firmware roots, endorsements,
+revocations, and policy versions. Confidential evidence does not go on chain;
+commitments and public policy material do. The verifier is not on the critical
+compute path, and no blockchain round trip occurs inside a workload.
+
+\section{Privacy}\label{sec:privacy}
+
+Attestation is a tracking mechanism unless it is designed not to be. A
+permanent hardware identifier presented to every relying party is a
+correlation key across every service a machine touches.
+
+\begin{definition}[Presentation identity]
+The identity a device presents to a relying party is distinct from the identity
+that device holds. The former is ephemeral or relying-party-specific; the
+latter never leaves the vault.
+\end{definition}
+
+Default evidence should carry properties rather than identifiers:
+
+\begin{lstlisting}
+approved device class      true
+firmware policy            approved
+confidential mode          enabled
+debug                      disabled
+workload measurement       <digest>
+freshness                  <nonce>
+\end{lstlisting}
+
+rather than a serial number, a device UUID, a manufacturing lot, or a
+topology. The relying party needs to decide whether to release a key. It does
+not need to know which machine it is talking to, and once it knows, it can
+never be made to forget.
+
+Selective disclosure --- proving membership of an approved class without
+identifying the member --- can be added above the silicon by anonymous
+credentials or zero-knowledge predicates, with no change to the root of trust.
+Designing the evidence around properties from the start is what leaves that
+door open.
+
+\section{Consensus separation}\label{sec:consensus}
+
+One rule is architectural and not negotiable.
+
+\begin{principle}
+Node-local entropy never determines a consensus outcome that peers must
+independently reproduce.
+\end{principle}
+
+Lux samples committees from a seed fixed before the current block existed: the
+previously finalised block, the pinned signer set, the epoch. The seed is
+public, identical for every verifier, and beyond any proposer's influence. A
+locally drawn value has none of those properties --- it is known to one node,
+unverifiable by the rest, and can be redrawn until the outcome suits.
+
+Physical entropy belongs to secrets: device identities, ML-DSA and ML-KEM key
+material, threshold dealing, session establishment, provisioning. Where an
+application genuinely needs public randomness, it comes from a threshold
+protocol whose output is verifiable because it is a signature --- not because a
+remote party can somehow observe physics inside another machine.
+
+\section{What this architecture does not claim}
+
+\begin{itemize}
+\item \textbf{Entropy is not remotely verifiable.} Lux Attest can attest that
+an entropy source passed its defined health tests. It cannot prove to a remote
+party that an unknown physical process was quantum. Remote certification of
+quantumness requires a device-independent construction, which is a different
+and much harder thing.
+\item \textbf{A card cannot attest its neighbours.} See \S6.
+\item \textbf{Standards conformance is an assessment.} Citing SP 800-90B means
+publishing a min-entropy claim and the analysis behind it.
+\item \textbf{Attestation is not correctness.} It establishes what is running,
+not that what is running is right. It reduces the question of trusting an
+operator to the question of trusting a measurement and a policy.
+\end{itemize}
+
+\section{Assurance levels}
+
+Explicit levels make ``confidential by default'' measurable rather than a
+slogan, and let a customer state what they have.
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Level & Established \\
+\midrule
+L0 & Software cryptography, platform CSPRNG, software measurements \\
+L1 & Hardware identity and measured boot \\
+L2 & L1 with a health-tested physical entropy source \\
+L3 & L2 with a trusted execution environment and encrypted device memory \\
+L4 & L3 with confidential I/O across the device interconnect \\
+L5 & L4 across CPU, accelerators, and interfaces, with attested workload identity \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Build sequence}
+
+Each step is usable on its own and creates the credibility for the next. The
+order matters more than the schedule.
+
+\begin{enumerate}
+\item \textbf{FPGA Lux Attest.} The root of trust in reconfigurable logic:
+measured boot, DICE derivation, key vault, ML-DSA identity. Something a
+developer can run and an engineer can read.
+\item \textbf{PCIe Lux Trust development card.} Lux Attest with Lux Entropy on
+a card, exposing SPDM and an open SDK. Honest about attesting itself.
+\item \textbf{Open SPDM and EAT verifier.} The other half. A verifier nobody
+can run is a claim; interoperability is demonstrated by two independent
+implementations, and this one composes with LP-127 on chain.
+\item \textbf{Root-of-trust compatible RTL.} Align with the open datacenter
+root-of-trust ecosystem rather than replacing it, so an OEM evaluates a
+familiar block with post-quantum identity and an entropy interface added.
+\item \textbf{Hardened IP.} The licensable product: hardened macros, tamper
+protection, a certified entropy source, secure manufacturing, and the
+validation an OEM requires.
+\end{enumerate}
+
+Starting at step five is starting with a leading-edge ASIC nobody has evaluated.
+Starting at step one produces something developers use while the case for step
+five is being made.
+
+\section{The proposition to a silicon vendor}
+
+Not \emph{buy our random number generator}.
+
+\begin{quote}
+Add a standards-compatible post-quantum trust domain to every accelerator ---
+device identity, measured boot, firmware authentication, attestation, session
+establishment, and confidential-I/O key control --- without placing
+post-quantum cryptography anywhere on the performance-critical path.
+\end{quote}
+
+The vendor keeps its architecture, memory encryption, firmware, execution
+environment, driver, and fabric. Lux supplies the trust domain underneath, and
+the open implementation is what makes the block evaluable before it is
+licensed.
+
+\section{Open by construction}
+
+The specifications, firmware, drivers, libraries, SPDM and EAT integrations,
+entropy drivers, FPGA targets, reference boards, test vectors, and verification
+tooling are published.
+
+This is not generosity. A root of trust nobody can inspect is a root of trust
+nobody has reason to trust, and an entropy source whose construction is secret
+cannot be assessed at all. The commercial product is hardened macros, tamper
+resistance, a certified source, secure manufacturing, validation, and lifecycle
+integration --- none of which is threatened by publishing the architecture, and
+all of which is easier to sell once the architecture has been read.
+
+\section{Conclusion}
+
+The stack Lux already has verifies attestation evidence on chain, releases keys
+against it, and specifies the entropy underneath. What it does not have is an
+attester whose identity is post-quantum, and that gap sits in the one place an
+add-on product cannot reach: the root fused into somebody else's silicon.
+
+Lux Attest is that block. Lux Entropy feeds it. Confidential I/O turns a
+successful attestation into an encrypted link at symmetric speed, and key
+release turns verified state into authorisation.
+
+\begin{lstlisting}
+entropy -> identity -> measurement -> attestation
+                                   -> authorisation -> key release
+                                                    -> confidential I/O
+\end{lstlisting}
+
+Any workload, any accelerator, post-quantum trust establishment, symmetric-speed
+data, and a set of claims narrow enough to be true.
+
+\end{document}

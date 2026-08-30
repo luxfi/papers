@@ -1,0 +1,291 @@
+\documentclass[11pt]{article}
+\usepackage{shared/luxcover}
+\usepackage{amsmath, amssymb, graphicx, hyperref, booktabs, float}
+\hypersetup{hidelinks}
+
+\newcommand{\ep}[1]{\texttt{\small #1}}
+
+\title{White-Label Banking API:\\The Integration Handover}
+\author{
+Zach Kelling\thanks{Corresponding author: zach@lux.network}\\
+\textit{Lux Industries, Inc.}\\
+\texttt{research@lux.network}
+}
+\date{2026}
+
+\begin{document}
+\luxcoverpage
+
+\begin{abstract}
+This is the complete integration pack for a white-label banking tenant: one authenticated REST surface under \ep{/v1/bank} covering accounts, balances, transfers, outbound payments, beneficiaries, cards, crypto, exchange, FX, and membership plans, plus the typed client (\ep{@luxfi/bank}) and the interface standard (LP-3040). The surface is provider-neutral --- the banking counterparty, card issuer, FX venue, and crypto backend are deployment choices that never appear in the client contract --- and the sandbox serves the identical contract with seeded fixtures, deterministic settlement, and a testnet crypto faucet, so a tenant integrates end to end before any real-money credential exists.
+\end{abstract}
+
+\section{The Platform}
+
+\textbf{Environments.} Two, same binary, same contract:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Environment} & \textbf{API base} & \textbf{Money} \\
+\midrule
+Sandbox & \ep{https://api.sandbox.lux.financial/v1} & Seeded fixtures, testnet crypto, instant settlement \\
+Production & \ep{https://api.lux.financial/v1} & Live rails \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Authentication.} Every route requires
+\ep{Authorization: Bearer <JWT>} issued by Lux IAM (lux.id) unless
+marked public. Ownership is enforced server-side: the authenticated
+principal must own every account-scoped record it touches. There is
+no API-key path on customer routes --- IAM is the only authorizer.
+
+\textbf{White-label model.} Branding (name, legal entity, theme,
+domain) is configuration, not code. A tenant ships its own brand on
+the same surface; the partner disclosure required on customer-facing
+pages is served by \ep{GET /v1/bank/config}.
+
+\textbf{Conventions.} Amounts are integers in minor units; every
+balance and transaction carries \ep{decimals} (2 for most fiat, 0
+for JPY, 6 for crypto). Errors return
+\ep{\{"error": "..."\}} or \ep{\{"message": "..."\}} with the
+matching HTTP status. Additive response fields must be tolerated.
+
+\section{Public Surface}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}llp{7cm}@{}}
+\toprule
+\textbf{Method} & \textbf{Path} & \textbf{Returns} \\
+\midrule
+GET & \ep{/v1/bank/health} & \ep{\{status, sandbox\}} \\
+GET & \ep{/v1/bank/config} & Currencies, network, partner disclosure + legal links \\
+GET & \ep{/v1/bank/plans} & The membership ladder (Section~\ref{sec:plans}) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Accounts, Balances, Dashboard}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}llp{7cm}@{}}
+\toprule
+\textbf{Method} & \textbf{Path} & \textbf{Purpose} \\
+\midrule
+POST & \ep{/v1/bank/onboard} & Create the caller's account from the KYC profile \\
+GET & \ep{/v1/bank/overview} & Dashboard aggregate: account, balances, wallet, cards, activity \\
+GET & \ep{/v1/bank/account/summary} & The caller's accounts \\
+GET & \ep{/v1/bank/transactions} & Transaction stream \\
+GET & \ep{/v1/bank/accounts/:id/balances} & Per-currency \ep{\{available, held, decimals, kind, valueUsd\}} \\
+GET & \ep{/v1/bank/accounts/:id/wallets} & On-chain wallets \\
+GET & \ep{/v1/bank/accounts/:id/transactions} & Account history, newest first \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Money Movement}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}llp{7cm}@{}}
+\toprule
+\textbf{Method} & \textbf{Path} & \textbf{Purpose} \\
+\midrule
+POST & \ep{/v1/bank/transfers} & Book transfer between two own accounts \\
+POST & \ep{/v1/bank/payments/outbound} & Payment to a registered beneficiary; the rail (ACH, SWIFT, SEPA, wire, check, P2P) is selected from the beneficiary record \\
+GET/POST/DELETE & \ep{/v1/bank/beneficiaries[/:id]} & Counterparty registry \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Transfer body: \ep{\{fromAccountId, toAccountId, amount, currency,
+reference\}} $\rightarrow$ \ep{\{debitId, creditId, status\}}.
+Payment body: \ep{\{accountId, beneficiaryId, amount, currency,
+reference\}} $\rightarrow$ \ep{\{transactionId, status\}}.
+
+Status lifecycle, enforced server-side --- all other transitions are
+rejected:
+
+\begin{center}
+\ep{pending -> processing -> completed} \quad · \quad
+\ep{pending|processing -> failed | cancelled}
+\end{center}
+
+Debits hold funds atomically at creation; completion releases the
+hold; failure or cancellation reverses it. A plan on the account
+(Section~\ref{sec:plans}) sets the daily and monthly transaction
+limits.
+
+\section{Cards}
+
+The card ledger is immediate; issuance runs the card issuer's own
+account, KYC, and consent lifecycle behind a provider-neutral
+contract.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}llp{6.6cm}@{}}
+\toprule
+\textbf{Method} & \textbf{Path} & \textbf{Purpose} \\
+\midrule
+GET/POST & \ep{/v1/bank/cards} & List; issue on an account \\
+POST & \ep{/v1/bank/cards/:id/freeze} · \ep{/unfreeze} & Card state \\
+POST & \ep{/v1/bank/cards/account} & Open the issuer card account (cardholder profile) \\
+GET & \ep{/v1/bank/cards/account} & Issuer account state: status, KYC, \ep{virtualAccount}, cards \\
+GET & \ep{/v1/bank/cards/kyc} & Issuer KYC status \\
+POST & \ep{/v1/bank/cards/virtual} & Create the virtual-card account \\
+GET & \ep{/v1/bank/cards/virtual/kyc-url} & Hosted KYC session URL \\
+GET & \ep{/v1/bank/cards/virtual/consent-url} & Consent agreement URL \\
+POST & \ep{/v1/bank/cards/virtual/order} & Order the card once approved \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Branch \emph{only} on the normalized \ep{status} + \ep{nextAction}
+pair:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}llp{6.8cm}@{}}
+\toprule
+\ep{status} & \ep{nextAction} & \textbf{Client action} \\
+\midrule
+\ep{not\_started} & \ep{register} & \ep{POST .../virtual} \\
+\ep{pending} & \ep{complete\_kyc} & Fetch KYC URL, open in the user's browser, poll \\
+\ep{pending} & \ep{accept\_agreement} & Fetch consent URL, open, poll \\
+\ep{pending} & \ep{none} & Wait and poll \\
+\ep{rejected} & \ep{retry\_kyc} & Fresh KYC URL, retry, poll \\
+\ep{approved} & \ep{order\_card} & \ep{POST .../virtual/order} \\
+\ep{error} & \ep{retry\_kyc} & Retry; support if persistent \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The hosted URLs are sensitive: hand them straight to the user's
+browser; never log, persist, or send them to analytics. Platform KYC
+and issuer KYC never substitute for each other. In sandbox the
+issuer is simulated (\ep{approved} / \ep{order\_card}), so the flow
+is exercisable with no upstream credential.
+
+\section{Crypto}
+
+Every account carries a non-custodial wallet
+(\ep{lux-mainnet}; \ep{lux-testnet} in sandbox).
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}llp{6.8cm}@{}}
+\toprule
+\textbf{Method} & \textbf{Path} & \textbf{Purpose} \\
+\midrule
+GET & \ep{/v1/bank/wallet} & Wallet, address, network, crypto holdings \\
+GET & \ep{/v1/bank/crypto/prices} & Reference prices \\
+POST & \ep{/v1/bank/crypto/send} & On-chain send: \ep{\{asset, amount, toAddress\}} $\rightarrow$ \ep{txHash} + balances \\
+POST & \ep{/v1/bank/crypto/deposit} & Sandbox faucet (\$25k equivalent cap per request) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The full loop --- receive, hold, convert, send --- runs end to end in
+sandbox. Conversion between fiat and crypto is the exchange below;
+the banking counterparty only ever sees ordinary fiat.
+
+\section{Exchange and FX}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}llp{6.8cm}@{}}
+\toprule
+\textbf{Method} & \textbf{Path} & \textbf{Purpose} \\
+\midrule
+POST & \ep{/v1/bank/exchange/quote} & Quote any supported pair --- fiat/fiat, fiat/crypto, crypto/crypto: \ep{\{fromCurrency, toCurrency, amount\}} \\
+POST & \ep{/v1/bank/exchange/execute} & Execute; returns amounts, rate, and the updated balances \\
+POST & \ep{/v1/bank/fx/quote} & Dealt FX quote with TTL and \ep{quoteId} \\
+POST & \ep{/v1/bank/fx/execute} & Lock in a quote: \ep{\{accountId, quoteId\}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Webhooks}
+
+Inbound provider events post to \ep{/v1/bank/webhooks/*} and are
+authenticated by HMAC-SHA256: \ep{X-Signature} =
+hex(HMAC-SHA256(secret, body)). Tenant-facing event delivery uses
+the same signing scheme.
+
+\section{Membership Plans}\label{sec:plans}
+
+\ep{GET /v1/bank/plans} publishes the ladder --- one pricing source
+for every surface that renders plans:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lllllll@{}}
+\toprule
+\textbf{Plan} & \textbf{Monthly} & \textbf{Card} & \textbf{IBAN} & \textbf{FX} & \textbf{Wires} & \textbf{Limits (day / month)} \\
+\midrule
+Silver & \$29 & Virtual & --- & 2.25\% & \$95 each & \$10k / \$100k \\
+Gold & \$99 & Plastic & \checkmark & 1.95\% & 1 free & \$50k / \$500k \\
+Black & \$299 & Metal & \checkmark & 1.45\% & 3 free & \$250k / \$2.5M \\
+Sovereign & \$999 · invite & Metal & \checkmark & 0.95\% & 10 free & \$1M / \$10M \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A \ep{plan} on the account overrides the entity-type transaction
+limits. Tenants may publish their own ladder; the mechanism is the
+same.
+
+\section{The SDK}
+
+\ep{@luxfi/bank} (npm) is the typed client over the whole surface
+--- zero dependencies, works in browser and server runtimes, errors
+throw \ep{BankError} with status and parsed body:
+
+\begin{quote}
+\begin{verbatim}
+import { Bank } from '@luxfi/bank'
+
+const bank = new Bank({
+  baseUrl: 'https://api.sandbox.lux.financial',
+  token: () => store.token,
+})
+
+const plans = await bank.plans()
+const { holdings } = await bank.wallet()
+await bank.depositCrypto('BTC', 100_000)       // sandbox faucet, 0.1 BTC
+await bank.sendCrypto('BTC', 40_000, 'bc1q…')  // returns txHash
+
+const { data } = await bank.cardAccount()
+if (data.virtualAccount?.nextAction === 'complete_kyc') {
+  const { url } = await bank.cardKYCURL()      // straight to the browser
+  window.open(url)
+}
+\end{verbatim}
+\end{quote}
+
+\section{Integration Path}
+
+Sandbox first: seed credentials arrive at kick-off, the demo login
+mints a session, and every flow in this pack --- onboarding,
+transfers, payments, the card lifecycle, the crypto loop, exchange
+--- runs against \ep{api.sandbox.lux.financial} with no upstream
+dependency. Production credentials issue after the end-to-end test
+journey passes; the cutover is a base-URL change. The interface
+standard is LP-3040; the living reference is
+\ep{docs.lux.financial}.
+
+\end{document}
