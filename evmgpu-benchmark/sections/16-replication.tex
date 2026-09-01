@@ -44,19 +44,43 @@ Depth 32, 32 takers per book, 32-level arenas, fills $1.000$ per taker.
 
 \begin{table}[h]
 \centering
-\begin{tabular}{llrr}
+\begin{tabular}{llrrr}
 \toprule
-Host & Accelerator & Books & Rate \\
+Host & Accelerator & Books & As found & Limb-loaded \\
 \midrule
-evo   & AMD Radeon 8060S (gfx1151, HIP)   & \num{1048576} & \SI{17.6}{\mega\text{ord}/\second} \\
-evo   & AMD Radeon 8060S                  & \num{262144}  & \SI{13.3}{\mega\text{ord}/\second} \\
-spark & NVIDIA GB10 (CUDA 13.0)           & \num{1048576} & \SI{36.0}{\mega\text{ord}/\second} \\
-spark & NVIDIA GB10                       & \num{65536}   & \SI{33.5}{\mega\text{ord}/\second} \\
+evo   & AMD Radeon 8060S (gfx1151, HIP) & \num{1048576} & \SI{17.9}{\mega\text{ord}/\second} & \SI{74.3}{\mega\text{ord}/\second} \\
+evo   & AMD Radeon 8060S                & \num{262144}  & \SI{12.8}{\mega\text{ord}/\second} & \SI{61.6}{\mega\text{ord}/\second} \\
+spark & NVIDIA GB10 (CUDA 13.0)         & \num{1048576} & \SI{36.0}{\mega\text{ord}/\second} & \SI{46.3}{\mega\text{ord}/\second} \\
+spark & NVIDIA GB10                     & \num{65536}   & \SI{33.5}{\mega\text{ord}/\second} & \SI{46.6}{\mega\text{ord}/\second} \\
 \bottomrule
 \end{tabular}
-\caption{Batched deterministic CLOB matcher, committed kernel, 2026-09-01.}
+\caption{Batched deterministic CLOB matcher, 2026-09-01. ``As found'' is the
+committed kernel; ``limb-loaded'' is the same kernel after the
+\texttt{uint256} helpers stopped walking their operands a byte at a time. The
+byte-parity oracle passes 34/34 on both.}
 \label{tab:replication-dex}
 \end{table}
+
+\subsection{Where the first factor of four went}
+
+The matcher's \texttt{uint256} helpers read their operands one byte at a time,
+and in the batched path those operands are in global memory one arena-stride
+apart per thread. A single compare was 32 uncoalesced transactions and
+\texttt{u256\_mul} was 128, rebuilding every 64-bit limb from eight shifts and an
+or. Reading four limbs instead---the arena is 8-byte aligned and each 32-byte
+field sits on a multiple of 8, and big-endian lexicographic order is numeric limb
+order, so the results are unchanged---takes gfx1151 from
+\SI{17.9}{\mega\text{ord}/\second} to \SI{74.3}{\mega\text{ord}/\second}.
+
+Two alignment details carried most of the remainder. The calldata's two
+\texttt{uint256} fields begin at byte 1 and byte 33, one past an 8-byte boundary,
+so reading them in place fell back to byte loads and returned nothing for the
+wide-load change; staging them into aligned locals once recovers it. The working
+temporaries needed the same treatment.
+
+The gain is uneven across vendors---$4.15\times$ on gfx1151, $1.29\times$ on
+GB10---which is itself informative: the AMD part was paying far more for the
+uncoalesced byte traffic than the Grace-Blackwell memory system was.
 
 For scale on the same host: the C++ CPU engine (\texttt{luxcpp/dex}) sustains
 \SI{65.9}{\mega\text{orders}/\second} across 32 threads on evo, and the
@@ -72,7 +96,7 @@ Poseidon2 \SI{12.15}{\mega\text{ops}/\second}; C-Chain conflict detection
 \subsection{The gap this leaves}
 
 At the workload stated in Section~\ref{sec:production} the committed kernel
-returns \SI{36.0}{\mega\text{ord}/\second} on GB10 against the
+returns \SI{46.3}{\mega\text{ord}/\second} on GB10 against the
 \SI{9.13}{\giga\text{ord}/\second} recorded there, and the two accelerators
 disagree with the recorded figures by a consistent factor. Per-thread cost is
 roughly flat in the number of books, which is the signature of a per-thread cost
