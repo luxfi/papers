@@ -1,0 +1,87 @@
+\section{Replication: the committed kernel, re-measured}
+\label{sec:replication}
+
+The figures in Section~\ref{sec:production} were produced by a harness that was
+never committed---\texttt{bench\_dex\_multi.cu} was an empty file in
+\texttt{gpu-kernels}---so the configuration behind them is not recoverable from
+the tree. This section records a re-run against the kernel that \emph{is}
+committed, so that a number in this paper has a procedure attached to it.
+
+\subsection{Method}
+
+The harness drives \verb|luxgpu_dex_match_batch_kernel| directly: one thread per
+book, over the same \verb|match_one_book| body that the single-order precompile
+path and the CPU oracle share. The byte-parity gate
+(\texttt{tools/kat/test\_dex\_oracle}) passes 34/34 on the same build, so the
+kernel under measurement is the kernel whose output is checked against the
+oracle. Each book is seeded with \texttt{depth} resting ask levels of quantity
+10; each pass sends one crossing bid of quantity 1 per book.
+
+Two properties of the workload decide whether such a rate means anything, and
+both are reported alongside it.
+
+\paragraph{Fills per taker.} A book holds $\texttt{depth} \times \texttt{qty}$
+units. Every taker after those are gone matches nothing, and matching nothing is
+fast: at \num{65536} books and depth 32, the measured rate rises by
+$3.7\times$ once the books are exhausted, while fills fall to $0.00$ per taker.
+A throughput figure with no fills under it is timing an empty loop, so the
+harness prints the fill count beside the rate. Every row below carries
+$1.000$ fills per taker.
+
+\paragraph{Arena stride.} \verb|kMaxLevels| sizes the book arena regardless of
+the depth a workload uses, and that size is the stride between adjacent threads.
+At 1024 levels neighbouring threads sit \SI{128}{\kibi\byte} apart and each
+thread's read becomes its own memory transaction; the rate then \emph{falls}
+with scale, from \SI{41.9}{\mega\text{ord}/\second} at \num{4096} books to
+\SI{6.6}{\mega\text{ord}/\second} at \num{131072}. Sized to the workload at 32
+levels it \emph{rises} with scale, and a million books occupy
+\SI{4.01}{\gibi\byte} rather than \SI{131}{\gibi\byte}. It is now a build-time
+parameter (\verb|-DLUX_DEX_MAX_LEVELS|).
+
+\subsection{Measurements}
+
+Depth 32, 32 takers per book, 32-level arenas, fills $1.000$ per taker.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llrr}
+\toprule
+Host & Accelerator & Books & Rate \\
+\midrule
+evo   & AMD Radeon 8060S (gfx1151, HIP)   & \num{1048576} & \SI{17.6}{\mega\text{ord}/\second} \\
+evo   & AMD Radeon 8060S                  & \num{262144}  & \SI{13.3}{\mega\text{ord}/\second} \\
+spark & NVIDIA GB10 (CUDA 13.0)           & \num{1048576} & \SI{36.0}{\mega\text{ord}/\second} \\
+spark & NVIDIA GB10                       & \num{65536}   & \SI{33.5}{\mega\text{ord}/\second} \\
+\bottomrule
+\end{tabular}
+\caption{Batched deterministic CLOB matcher, committed kernel, 2026-09-01.}
+\label{tab:replication-dex}
+\end{table}
+
+For scale on the same host: the C++ CPU engine (\texttt{luxcpp/dex}) sustains
+\SI{65.9}{\mega\text{orders}/\second} across 32 threads on evo, and the
+single-order GPU path costs \SI{0.074}{\milli\second} per call---launch-latency
+bound, which is the measurement that makes determinism look expensive and is
+the one Section~\ref{sec:accounting-dex-honesty} sets aside.
+
+Companion primitives on evo, same build: TFHE programmable bootstrap
+\SI{62.5}{PBS/\second}; BLS12-381 pairing \num{12.5} operations per second;
+Poseidon2 \SI{12.15}{\mega\text{ops}/\second}; C-Chain conflict detection
+\SI{24.26}{\nano\second} per transaction pair.
+
+\subsection{The gap this leaves}
+
+At the workload stated in Section~\ref{sec:production} the committed kernel
+returns \SI{36.0}{\mega\text{ord}/\second} on GB10 against the
+\SI{9.13}{\giga\text{ord}/\second} recorded there, and the two accelerators
+disagree with the recorded figures by a consistent factor. Per-thread cost is
+roughly flat in the number of books, which is the signature of a per-thread cost
+that dominates rather than a bandwidth ceiling: the matcher's \verb|uint256|
+arithmetic runs byte-wise over big-endian arrays, and VWAP is computed by Knuth
+Algorithm D per fill.
+
+The honest reading is that the committed kernel and the kernel behind
+Section~\ref{sec:production} are not the same artifact, and the harness that
+would settle it was not preserved. Until it is, Table~\ref{tab:replication-dex}
+is the rate this repository can reproduce on demand, and the earlier figures
+stand as recorded but unreproduced.
