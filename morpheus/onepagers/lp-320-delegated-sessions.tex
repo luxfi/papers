@@ -1,0 +1,83 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage{../shared/proposal}
+\usepackage[utf8]{inputenc}\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}\usepackage{listings}\usepackage{xcolor}
+\input{../shared/lstlang}
+
+\begin{document}
+\sloppy
+
+\proposalhead{Delegated Sessions}{\texttt{openSession} already takes the session's owner as its
+first argument. The gateway passes its own address.}{LP-320}
+
+\section*{The problem}
+
+The hosted gateway multiplexes arbitrarily many Web2 callers onto sessions funded by one consumer
+wallet, behind careful engineering: idle-session claiming under \texttt{FOR UPDATE SKIP LOCKED}, a
+cheapest-bid walk with per-provider cool-off, spend fuses that ship inert and arm per environment.
+Better fuses do not reach what is left: one balance is a liveness dependency for every caller at
+once; per-caller accounting lives in \texttt{credits\_ledger} and Redis, which the chain cannot
+correct, while \texttt{routed\_sessions} carries no \texttt{user\_id}; and no caller has a claim on
+the session serving them. The address that staked, that gets refunded, and that
+\texttt{getUserSessions} returns is yours.
+
+\section*{Mechanism}
+
+The diamond carries a \texttt{Delegation} facet initialised against the \texttt{delegate.xyz} v2
+registry. \texttt{openSession(address user\_, \dots)} calls \texttt{\_validateDelegatee} with
+\texttt{DELEGATION\_RULES\_SESSION} at \texttt{SessionRouter.sol}:90, then pulls stake from
+\texttt{user\_} at :104: caller and owner are separate variables, and
+\texttt{SessionRouter.test.ts}:208 already tests the split. Nothing on
+chain has to change for a gateway to stop holding its users' money. One argument in the Go node
+forecloses it: \texttt{session\_router.go}:61 and :78 pass \texttt{opts.From}, fed by
+\texttt{OpenSessionByBidId} reading \texttt{s.GetMyAddress(ctx)} (\texttt{service.go}:1260).
+
+So the gateway holds a delegation instead of custody. The consumer writes
+\texttt{delegateContract(gateway, diamond, DELEGATION\_RULES\_SESSION, true)} to the registry
+itself; the gateway opens with \texttt{user\_} set to that consumer. Stake leaves the consumer's
+balance and every exit is addressed back to them, \texttt{\_rewardUserAfterClose} to
+\texttt{session.user} and \texttt{withdrawUserStakes} to \texttt{user\_}. That is the loss bound:
+pooled, a compromised gateway key yields the pool; delegated, the worst it does is burn a stipend
+claim and day-lock that consumer's principal for under a day, since the contract offers it no
+other address.
+
+Two caps already hold in deployed code and revoke without the gateway's help: the consumer's
+ERC-20 allowance to the diamond, and \texttt{maxSessionDuration}. A boolean
+\texttt{checkDelegateForContract} conveys nothing else, which should be said plainly: no per-open
+size limit, no expiry, no model restriction. The registry holds the first already, since \texttt{delegateERC20(to,
+MOR, rights, amount)} publishes an upper bound readable through \texttt{checkDelegateForERC20};
+expiry and model scope want a small facet, which is the second move.
+
+\textbf{The key problem, head on.} A delegation needs a consumer key, which account-native users
+lack, and that cost does not disappear. But the gateway knows which callers
+have one: \texttt{wallet\_links} stores addresses proved by SIWE, linked today to aggregate staking
+allocations, and that cohort moves with no new onboarding. For the rest the pool stays, much
+smaller, with a sponsored delegation from a smart account as the route off it.
+
+\begin{stake}{Morpheus gets}
+\item Delegated consumers stake their own MOR and draw their own stipend, so one wallet's
+      stake-days stop rationing everyone's throughput.
+\item Who consumed what, on chain in \texttt{userSessions[user\_]} rather than in a ledger the
+      chain cannot correct, which is why \texttt{\_daylock\_from\_close\_receipt} had to be written.
+\end{stake}
+
+\begin{stake}{Hanzo and Lux get}
+\item The shape \texttt{api.hanzo.ai} needs, which is why we will write it either way.
+\end{stake}
+
+\section*{First step, and who takes it}
+
+Thread an optional session owner through \texttt{OpenSessionByBidId} into
+\texttt{session\_router.go}, defaulting to \texttt{opts.From} so existing deployments behave
+identically. That is the whole node change, its contract tests exist, and Hanzo opens it against
+\texttt{dev}; the gateway then opens delegated for its SIWE-linked users first, behind the fuses it
+ships. Neither needs a facet upgrade or a 5-of-9 signature. Reading the ERC-20 cap in
+\texttt{\_validateDelegatee} is the one contract change, small enough for a queued diamond cut.
+
+\noindent\textbf{What this does not solve.} Delegation fixes who owns a session, not what the
+session bought. A delegated consumer is defrauded by a provider substituting its backend exactly as
+a pooled one is, which is LP-313.
+
+\noindent{\color{muted}\footnotesize\sffamily LP-320, full paper available. Market is the diamond at \texttt{0x6aBE1d282f72B474E54527D93b979A4f64d3030a} on Base.}
+
+\end{document}

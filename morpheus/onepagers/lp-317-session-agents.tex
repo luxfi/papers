@@ -1,0 +1,87 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage{../shared/proposal}
+\usepackage[utf8]{inputenc}\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}\usepackage{listings}\usepackage{xcolor}
+\input{../shared/lstlang}
+
+\begin{document}
+\sloppy
+
+\proposalhead{Sessions as the Agent Substrate}{Per-second billing is a poor fit for chat, where the
+session is mostly silence. It is close to the right fit for an agent, whose idle time is the
+work.}{LP-317}
+
+\section*{The problem}
+
+An agent turn is long-lived, serial and tool-heavy, and its gaps are the agent working rather than
+a human pausing, so it is the one workload a per-second clock does not overcharge. Morpheus already
+bills in that unit and carries tool calls over the session, and holds no trajectory across either.
+
+\section*{The mechanism}
+
+A trajectory alternates phases $(g_1,t_1,\dots,g_n,t_n)$: $g_i$ seconds generating at
+$\bar r$ tokens per second, $t_i$ seconds blocked on a tool, $G=\sum g_i$, $T=G+\sum t_i$,
+$\rho=G/T$. A per-token price $\kappa$ charges $\kappa\bar rG$ and ignores every $t_i$; a
+per-second bid $p$ charges $pT$, an effective $p/(\bar r\rho)$ per token. They agree at
+$\rho^{\star}=p/(\kappa\bar r)$: chat sits far below it, an agent burst against local tools near
+$\rho=1$, and per-second is worse exactly where $\rho$ collapses, forty seconds on a slow external
+tool buying forty seconds of GPU price and no work.
+
+It is an admission problem before a pricing one, and admission is factored well already.
+\texttt{HasCapacity(modelID)} is the whole interface (\texttt{capacity\_manager.go}:12):
+\texttt{simple} counts open sessions, \texttt{idle\_timeout} ones active inside a hardcoded fifteen
+minutes (:73), the right instinct at the wrong resolution. \texttt{PromptActivity} carries \texttt{SessionID,
+StartTime, EndTime} (\texttt{structs.go}:32), enough to seat a second consumer in the slot a parked
+one leaves idle. One more case in \texttt{CreateCapacityManager} (:112).
+
+\section*{What a trajectory needs that a session is not}
+
+\textbf{Tools run on the provider.} \texttt{CallAgentTool(ctx, sessionID, agentID, \dots)}
+(\texttt{ai\_engine.go}:195) runs a registered agent's \texttt{command}
+(\texttt{agents\_config.go}:32) as an MCP stdio child of the provider process (:224). The provider
+executes the tool on its own credentials, paid per second for as long as it takes, and the consumer
+authorises by holding a session without seeing what ran. A provider running slow tools is paid
+more: admission and settlement are one question.
+
+\textbf{A session spans neither a second bid nor its own funding.} History keys on
+\texttt{chat\_id}, a client header randomised when absent (\texttt{controller\_http.go}:217); tools
+and payment key on $\texttt{sessionID}=H(\text{user},\text{provider},\text{bidId},\text{nonce})$
+(\texttt{SessionRouter.sol}:159), so a trajectory wanting two models holds two sessions whose tool
+state cannot join although their \texttt{chat\_id} does. And \texttt{endsAt} is fixed at open by
+$\text{stipend}/p$ (:168) with no extend, so outrunning the funding resumes the task under a new
+\texttt{sessionId}, history intact, tool handles gone.
+
+One client-side object closes both: a \texttt{chat\_id} and a set of live \texttt{sessionId}s,
+opened before the current expires rather than after, one per bid, presenting one tool namespace
+across them. Latency under a per-second bid \emph{is} cost, so the policy falls out: hold the cheap
+session open across waits, spend into the expensive one only while generating.
+
+\begin{stake}{Morpheus gets}
+\item Admission on generating load, more consumers per GPU at an unchanged bid, and the first
+      measured $\rho$, a figure absent from all 62 repositories.
+\item An agent story on the marketplace. Today it is seven forks: five Vercel-derived templates set
+      an OpenAI base URL to \texttt{api.mor.org/api/v1} and never touch a session, while
+      \texttt{sim-studio-morpheus} and \texttt{Perplexica-morpheus} carry the name and nothing
+      else.
+\end{stake}
+
+\begin{stake}{Hanzo and Lux get}
+\item A settled, disputable market in the unit agents consume, and a live price for Enso's cost
+      multiplier.
+\end{stake}
+
+\section*{First step, and who takes it}
+
+Hanzo writes the third capacity manager against \texttt{dev} and publishes $\rho$, generate against
+paid seconds, over its own provider's traffic. No facet upgrade, no 5-of-9 signature, and the
+figure is the network's either way.
+
+\section*{What this does not solve}
+
+A trajectory makes provider-side tool execution cheaper to buy and no easier to verify: nothing
+attests that the tool ran, as nothing attests that the advertised model answered.
+
+\vspace{0.5ex}
+\noindent{\color{muted}\footnotesize\sffamily LP-317, full paper available. Market diamond \texttt{0x6aBE1d282f72B474E54527D93b979A4f64d3030a} on Base. See LP-315, LP-313.}
+
+\end{document}

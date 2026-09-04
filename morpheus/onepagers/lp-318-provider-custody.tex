@@ -1,0 +1,45 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage{../shared/proposal}
+\usepackage[utf8]{inputenc}\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}\usepackage{listings}\usepackage{xcolor}
+\input{../shared/lstlang}
+\begin{document}
+\sloppy
+
+\proposalhead{Provider Identity Without Provider Keys}{The key that answers every frame on port 3333 should not be the key that can unstake you.}{LP-318}
+
+A Morpheus provider runs one secp256k1 key. \texttt{proxy-router} loads it from \texttt{WALLET\_PRIVATE\_KEY} or the OS keychain (\texttt{config.go:48}) and uses it for three unrelated jobs: holding stake, pricing bids, and signing every morrpc frame and receipt on a TCP port that must be reachable from the open internet. Those three jobs have different lifetimes and different blast radii. A traffic key should be minutes old and disposable; a stake key should never sit on a host that accepts inbound connections.
+
+\section*{You already built the indirection}
+
+\texttt{SessionRouter.\allowbreak \_isValid\allowbreak ProviderReceipt} accepts a receipt signed by the provider address, by a delegate holding \texttt{DELEGATION\_\allowbreak RULES\_\allowbreak PROVIDER}, or, when the provider is a contract, by its \texttt{owner()} (\texttt{SessionRouter.\allowbreak sol:537--559}). \texttt{proxy-router} mirrors it: \texttt{OnChain\allowbreak ProviderAuthResolver} calls \texttt{owner()} on the consumer's own RPC, keyed by the address the consumer chose, so it cannot be forged in transit. A keyless provider is already a supported shape; this proposal finishes it.
+
+\section*{Mechanism}
+
+The provider address becomes a custody contract whose \texttt{owner()} is a threshold key in a KMS, offline from every node. Stake authority lives there and nowhere else. Bid authority delegates separately: \texttt{DELEGATION\_\allowbreak RULES\_\allowbreak MARKETPLACE} already gates \texttt{postModelBid} and \texttt{deleteModelBid} (\texttt{Marketplace.sol:68,119}), so a warm key that reprices but cannot unstake is one delegation away.
+
+Traffic authority is the right that does not exist yet. \texttt{\_isValid\allowbreak ProviderReceipt} accepts \texttt{DELEGATION\_\allowbreak RULES\_\allowbreak PROVIDER}, the same right that gates \texttt{provider\allowbreak Register} and \texttt{provider\allowbreak Deregister} (\texttt{ProviderRegistry.\allowbreak sol:30,\allowbreak 62}), so letting a datacenter sign receipts also lets it deregister you: forced delisting, not theft, since withdrawal returns to the provider address, but still the wrong radius for a key on a box with \texttt{:3333} open. Split it and rotation stops meaning re-registration: rotating or revoking a traffic key becomes a delegation write, leaving address, endpoint, bids and stake untouched, and consumers pick up the new signer on their next resolve.
+
+Custody keys should be $t$-of-$n$, not a file. Lux's LSS rotates the holders without changing the public key, over two kernels: Lens on secp256k1, which is what Base requires since \texttt{ECDSA.recover} is the diamond's only verifier, and Pulsar, a lattice kernel whose combined output is byte-equal to a single-party FIPS~204 ML-DSA-65/87 signature. Pulsar is review-ready, not production-certified, and does not verify on Base; it is the path for custody that must outlive secp256k1. Lens buys the property today: no machine holds a whole key.
+
+\begin{stake}{What a provider gets}
+\item A staking key that never sits on a host with an open port.
+\item Rotation and revocation without re-registering: no endpoint churn, no rebuilt bids.
+\item A node operator, or a datacenter, that serves traffic but cannot unstake you.
+\end{stake}
+
+\begin{stake}{What MOR holders get}
+\item Provider compromise stops being a stake event. A stolen traffic key is good only inside the ten-minute \texttt{SIGNATURE\_TTL} (\texttt{SessionStorage.sol:35}), each approval single-use.
+\item An on-chain record of which key held which right.
+\end{stake}
+
+\section*{First step, and who takes it}
+
+One constant and one line, in facets Morpheus already owns: add \texttt{DELEGATION\_\allowbreak RULES\_\allowbreak RECEIPT} to \texttt{Delegation\allowbreak Storage} and have \texttt{\_isValid\allowbreak ProviderReceipt} check it instead of \texttt{DELEGATION\_\allowbreak RULES\_\allowbreak PROVIDER}. Existing EOA providers, the \texttt{owner()} branch and \texttt{provider\_auth.go} are unaffected. A core contributor lands it under the existing 5-of-9; we write the custody contract, KMS adapter and tests.
+
+While that is in flight, fix the port checker. MyProvider is the entire supply-side onboarding path, and its check reads a \texttt{TypeError} from \texttt{fetch} as proof the port is open (\texttt{apiService.ts:470--477}). A fetch to a closed port fails exactly that way, and \texttt{:3333} speaks morrpc, not HTTP, so no browser can check it. Operators stake MOR to advertise endpoints nothing can reach. The fix is a server-side probe completing one morrpc handshake.
+
+\vspace{0.5ex}
+\noindent\textbf{What this does not solve.} Nothing here proves inference happened, or that the advertised model served it. Custody bounds who may act as a provider, not what it returns. That is LP-313. {\color{muted}\sffamily\footnotesize LP-318, full paper available.}
+
+\end{document}
